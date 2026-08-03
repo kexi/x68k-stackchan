@@ -33,7 +33,12 @@ public:
     static constexpr std::uint32_t kOffsetBootDevice = 0x018;  // 最優先起動デバイス (2B)
     static constexpr std::uint32_t kOffsetRs232c = 0x01A;      // RS-232C 設定 (2B)
     static constexpr std::uint32_t kOffsetScreenMode = 0x01D;  // 起動時画面モード (1B)
-    static constexpr std::uint32_t kOffsetSasiCount = 0x05A;   // SASI 接続台数 (1B)
+    // テキストパレット 0-15 のシステム規定値 (16 ワード = 32B)。
+    // IPL-ROM $FF63F0 が LEA $ED002E,A0 → MOVE.W (A0)+,(A1)+ ×16 で
+    // $E82200 (テキストパレット) へそのまま転送する。
+    static constexpr std::uint32_t kOffsetTextPalette = 0x02E;
+    static constexpr std::uint32_t kTextPaletteCount = 16;
+    static constexpr std::uint32_t kOffsetSasiCount = 0x05A;  // SASI 接続台数 (1B)
 
     // 工場出荷状態の値。
     static constexpr std::uint32_t kDefaultRamSize = kMainRamSize;

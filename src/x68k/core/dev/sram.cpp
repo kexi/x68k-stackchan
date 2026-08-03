@@ -73,6 +73,43 @@ void Sram::formatDefaults()
 
     data_[kOffsetScreenMode] = kDefaultScreenMode;
 
+    // テキストパレットの規定値。
+    //
+    // IPL-ROM $FF63F0 はここを $E82200 へ丸ごと転送する。0 のままだと
+    // 16 色すべてが黒になり、Human68k が文字を書いても画面は真っ黒のまま。
+    // 実際 TVRAM には字形が入っているのに PPM が全黒だった。
+    //
+    // 色は GGGGG RRRRR BBBBB I。色 0 は背景 (黒)、色 1 は通常文字。
+    // 起動画面が「色 1 = シアン、色 2 = 黄、色 3 = 白」になるよう並べる
+    // (docs/knowledge/x68000-boot-sequence.md)。
+    //
+    // Why not 全色を白にする: 色番号は文字属性として意味を持つ。
+    // 同じ色にすると反転表示や強調が区別できなくなる。
+    {
+        constexpr std::uint16_t kDefaultTextPalette[kTextPaletteCount] = {
+            0x0000,  //  0 黒 (背景)
+            0xFFFF,  //  1 白
+            0x07FF,  //  2 黄 (G+R)
+            0xF83F,  //  3 シアン (G+B)
+            0x07C1,  //  4 赤
+            0xF801,  //  5 緑
+            0x003F,  //  6 青
+            0xFFFF,  //  7 白
+            0x0000,  //  8 黒
+            0xFFFF,  //  9 白
+            0x07FF,  // 10 黄
+            0xF83F,  // 11 シアン
+            0x07C1,  // 12 赤
+            0xF801,  // 13 緑
+            0x003F,  // 14 青
+            0xFFFF,  // 15 白
+        };
+        for (std::uint32_t i = 0; i < kTextPaletteCount; ++i)
+        {
+            write16(kOffsetTextPalette + i * 2, kDefaultTextPalette[i]);
+        }
+    }
+
     // SASI を 1 台繋がっていることにする。
     data_[kOffsetSasiCount] = kDefaultSasiCount;
 

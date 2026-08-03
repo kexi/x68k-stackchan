@@ -145,6 +145,10 @@ bool writePpm(const std::string& path, const x68k::u16* pixels, x68k::u32 width,
 x68k::u8 scanCodeFor(char c)
 {
     // 数字列とアルファベットは並びが連続していないので表で持つ。
+    //
+    // 各行の先頭スキャンコードは IPL-ROM 内の変換表から読み出して確かめた。
+    // 非シフト面は $FF199C + スキャンコード、シフト面は $FF1A1C + スキャンコード。
+    // そこで '1'=$02, 'Q'=$11, 'A'=$1E, 'Z'=$2A, 空白=$35, CR=$1D と読める。
     static const char* kRow1 = "1234567890-^\\";
     static const char* kRow2 = "qwertyuiop@[";
     static const char* kRow3 = "asdfghjkl;:]";
@@ -161,7 +165,7 @@ x68k::u8 scanCodeFor(char c)
     }
     if (const char* p = std::strchr(kRow2, c); p != nullptr && c != '\0')
     {
-        return static_cast<x68k::u8>(0x10 + (p - kRow2));
+        return static_cast<x68k::u8>(0x11 + (p - kRow2));
     }
     if (const char* p = std::strchr(kRow3, c); p != nullptr && c != '\0')
     {
