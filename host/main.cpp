@@ -436,6 +436,32 @@ int main(int argc, char** argv)
         stats.dump();
     }
 
+    if (showStats)
+    {
+        // テキスト VRAM に何か書かれたか。真っ黒な PPM が出たとき、
+        // 描画されていないのか、ラスタライザやパレットの側で見えなく
+        // なっているのかを分ける手がかりになる。
+        for (x68k::u32 plane = 0; plane < x68k::kTvramPlaneCount; ++plane)
+        {
+            const std::size_t base = plane * x68k::kTvramPlaneSize;
+            std::size_t count = 0;
+            std::size_t firstLine = 0;
+            for (std::size_t i = 0; i < x68k::kTvramPlaneSize; ++i)
+            {
+                if (textVram[base + i] == 0)
+                {
+                    continue;
+                }
+                if (count == 0)
+                {
+                    firstLine = i / x68k::kTvramBytesPerLine;
+                }
+                ++count;
+            }
+            std::printf("[tvram] plane%u: %zu バイト 最初の行 %zu\n", plane, count, firstLine);
+        }
+    }
+
     if (!ppmPath.empty())
     {
         // Human68k の標準コンソールは 768x512。
