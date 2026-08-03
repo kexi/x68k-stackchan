@@ -509,26 +509,48 @@ TEST_CASE("停止するとプリスケーラの端数は捨てられる")
 TEST_CASE("TCDCR はタイマ C と D のプリスケーラを別々に捨てる")
 {
     // 保証すること: TCDCR は 1 バイトで 2 つのタイマを制御する。片方だけを
-    // 止めたとき、もう片方の端数まで捨てないこと。
+    // 止めたとき、もう片方の端数まで捨てないこと。C を止めた場合と D を
+    // 止めた場合の両方を見る。
     //
     // 壊れると: タイマ C を止めるたびに動作中のタイマ D の周期が延びる。
     // Human68k はタイマ C を割り込みに使うため、実害が出る。
-    x68k::Mfp mfp = makeMfp();
+    //
+    // Why not 片方向だけ見ないか: ビット位置とタイマ番号の対応を
+    // 取り違えた実装 (C の停止で D の端数を捨てる、など) は、片方向の
+    // テストだけだと素通りする。
+    struct Case
+    {
+        const char* name;
+        x68k::u8 stopped;      // 片方だけ止めた制御値
+        x68k::u32 clearedReg;  // 端数を捨てられた側のデータレジスタ
+        x68k::u32 keptReg;     // 端数が残る側
+    };
 
-    mfp.write(x68k::Mfp::kTcdr, 10);
-    mfp.write(x68k::Mfp::kTddr, 10);
-    // C = 4 分周 (bits 6-4)、D = 4 分周 (bits 2-0)。
-    mfp.write(x68k::Mfp::kTcdcr, 0x11);
+    // C は bits 6-4、D は bits 2-0。0x11 は両方 4 分周。
+    const Case cases[] = {
+        {"C だけ止める", 0x01, x68k::Mfp::kTcdr, x68k::Mfp::kTddr},
+        {"D だけ止める", 0x10, x68k::Mfp::kTddr, x68k::Mfp::kTcdr},
+    };
 
-    // 両方を 1 カウントに満たない端数だけ進める。
-    mfp.tick(3 * 2);
+    for (const Case& c : cases)
+    {
+        CAPTURE(c.name);
+        x68k::Mfp mfp = makeMfp();
 
-    // C だけ止めて再開する。D は動かしたまま。
-    mfp.write(x68k::Mfp::kTcdcr, 0x01);
-    mfp.write(x68k::Mfp::kTcdcr, 0x11);
+        mfp.write(x68k::Mfp::kTcdr, 10);
+        mfp.write(x68k::Mfp::kTddr, 10);
+        mfp.write(x68k::Mfp::kTcdcr, 0x11);
 
-    // 1 サイクル進めると、端数が残っている D は減り、捨てられた C は残る。
-    mfp.tick(1 * 2);
-    CHECK(mfp.read(x68k::Mfp::kTcdr) == 10);
-    CHECK(mfp.read(x68k::Mfp::kTddr) == 9);
+        // 両方を 1 カウントに満たない端数だけ進める。
+        mfp.tick(3 * 2);
+
+        // 片方だけ止めて再開する。もう片方は動かしたまま。
+        mfp.write(x68k::Mfp::kTcdcr, c.stopped);
+        mfp.write(x68k::Mfp::kTcdcr, 0x11);
+
+        // 1 サイクル進めると、端数が残っている側は減り、捨てられた側は残る。
+        mfp.tick(1 * 2);
+        CHECK(mfp.read(c.clearedReg) == 10);
+        CHECK(mfp.read(c.keptReg) == 9);
+    }
 }
