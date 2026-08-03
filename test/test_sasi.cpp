@@ -366,3 +366,309 @@ TEST_CASE("DMAC の転送方向は OCR の bit7 で決まる")
     // 転送されていないので、データフェーズのまま。
     CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
 }
+
+// --- reset() が外から与えた設定を保つか -------------------------------------
+//
+// 実際に起きた退行: 転送バッファを外部注入に変えたとき、reset() が
+// sasi_ を丸ごと初期化してバッファポインタを nullptr に戻してしまい、
+// ディスクが 1 セクタも読めなくなった。当時のテストは reset() を
+// 呼んでいなかったので、テストは通ったまま実機だけが壊れた。
+
+TEST_CASE("reset() の後も SASI の転送バッファが保たれる")
+{
+    // 保証すること: reset() を挟んでも READ が成功すること。
+    //
+    // 壊れると: バッファポインタが nullptr に戻り、READ が必ずエラー
+    // ステータスを返す。IPL-ROM はブートセクタを読めず起動しない。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    m.reset();
+
+    sendCommand(m, 0x08, 2, 1);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+    CHECK(m.ioRead8(kSasiData) == 0x02);
+    CHECK(m.ioRead8(kSasiData) == 0xA5);
+}
+
+TEST_CASE("reset() を繰り返してもディスクとバッファの設定が残る")
+{
+    // 保証すること: setSasiBuffer / setDisk は「外から与えた設定」であり、
+    // 何度リセットしても消えないこと。
+    //
+    // 壊れると: 2 回目以降のリセット (ウォームブート) で起動できなくなる。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    m.reset();
+    m.reset();
+
+    sendCommand(m, 0x08, 4, 1);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+    CHECK(m.ioRead8(kSasiData) == 0x04);
+}
+
+TEST_CASE("reset() で SASI のフェーズはバスフリーへ戻る")
+{
+    // 保証すること: 転送の途中でリセットしても状態機械が中途半端な
+    // フェーズに残らないこと。
+    //
+    // 壊れると: リセット後の最初のセレクションが受け付けられず、
+    // IPL-ROM のセレクション待ちがタイムアウトする。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    // データインフェーズの途中で止める。
+    sendCommand(m, 0x08, 0, 1);
+    m.ioRead8(kSasiData);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+
+    m.reset();
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
+
+    // リセット後も新しいコマンドを受け付けられる。
+    sendCommand(m, 0x08, 1, 1);
+    CHECK(m.ioRead8(kSasiData) == 0x01);
+}
+
+TEST_CASE("reset() を挟んでもメインメモリの内容は保たれる")
+{
+    // 保証すること: setMemory() で与えたメモリ実体は reset() で
+    // クリアされないこと (実体の所有は呼び出し側)。
+    //
+    // 壊れると: ESP32 では PSRAM を再確保することになり、
+    // 起動直後に一括確保するという前提が崩れる。
+    x68k::Machine m;
+    std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+    std::vector<x68k::u8> rom(x68k::kIplromSize, 0);
+    x68k::MemoryMap memory;
+    memory.mainRam = ram.data();
+    memory.iplRom = rom.data();
+    m.setMemory(memory);
+
+    ram[0x1234] = 0x99;
+    m.reset();
+
+    // リセット直後は ROM が $000000 に写像されているので、
+    // 写像を外してから見る。
+    m.bus().setRomMappedAtZero(false);
+    CHECK(m.bus().read8(0x1234) == 0x99);
+}
+
+// --- SASI 状態機械のフェーズ遷移 ---------------------------------------------
+
+TEST_CASE("セレクション直後の 1 回目のステータス読みはバスフリーを返す")
+{
+    // 保証すること: IPL-ROM は $E96007 へ ID を書いた後、$E96003 の bit1 が
+    // 0 になるのを待つ ($FF96DA の BTST #1 → BEQ)。コマンドフェーズの
+    // 値 $0B は bit1 が 1 なので、セレクション直後にいきなり $0B を返すと
+    // この待ちを抜けられない。
+    //
+    // 壊れると: IPL-ROM がセレクション待ちのループから出られず、
+    // コマンドを 1 バイトも送ってこない。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(4);
+    m.setDisk(&disk);
+
+    m.ioWrite8(kSasiSelect, 0x01);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
+    // 2 回目でコマンドフェーズへ移る。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+}
+
+TEST_CASE("コマンド送出中はコマンドフェーズを保つ")
+{
+    // 保証すること: 6 バイト揃うまでフェーズが変わらないこと。
+    //
+    // 壊れると: 途中でフェーズが変わり、IPL-ROM が残りのバイトを
+    // 送らなくなる。コマンドが完成しないので何も起きない。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(4);
+    m.setDisk(&disk);
+
+    m.ioWrite8(kSasiSelect, 0x01);
+    m.ioRead8(kSasiStatus);
+
+    for (int i = 0; i < 5; ++i)
+    {
+        m.ioWrite8(kSasiData, i == 0 ? 0x08 : 0x00);
+        CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+    }
+    // 6 バイト目で実行される。
+    m.ioWrite8(kSasiData, 0x00);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+}
+
+TEST_CASE("メッセージを読み切るとバスフリーへ戻る")
+{
+    // 保証すること: ステータス → メッセージ → バスフリー という
+    // 終わり方をすること。IPL-ROM は 2 バイト読んでバスを解放する。
+    //
+    // 壊れると: バスが解放されず、次のコマンドのセレクションが
+    // 受け付けられない。1 コマンド目だけ動いて 2 コマンド目で固まる。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x00 /* TEST UNIT READY */, 0, 0);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+
+    m.ioRead8(kSasiData);  // ステータス
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueMessage);
+
+    m.ioRead8(kSasiData);  // メッセージ
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
+}
+
+TEST_CASE("$C2 SPECIFY は 10 バイトのパラメータを受け取ってから完了する")
+{
+    // 保証すること: IPL-ROM が最初に発行する $C2 が完走すること。
+    // 通常のデータアウト ($0B) と違い、IPL-ROM はステータスと同じ $03 を
+    // 待ってからパラメータを送ってくる ($FF9910)。
+    //
+    // 壊れると: IPL-ROM がここで止まり、その先の READ に到達しない。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0xC2, 0, 0);
+    CHECK(m.ioRead8(kSasiStatus) == 0x03);
+
+    // 10 バイト送る。最後の 1 バイトで完了する。
+    for (int i = 0; i < 9; ++i)
+    {
+        m.ioWrite8(kSasiData, 0x11);
+        CHECK(m.ioRead8(kSasiStatus) == 0x03);
+    }
+    m.ioWrite8(kSasiData, 0x11);
+
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) == 0x00);  // 正常終了
+}
+
+TEST_CASE("WRITE コマンドがディスクへ書き込む")
+{
+    // 保証すること: データアウトフェーズで 256 バイト受け取ると、
+    // 指定 LBA へ書き込まれること。
+    //
+    // 壊れると: Human68k からのファイル書き込みが黙って捨てられる。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x0A /* WRITE */, 7, 1);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+
+    for (int i = 0; i < 256; ++i)
+    {
+        m.ioWrite8(kSasiData, static_cast<x68k::u8>(i ^ 0x5A));
+    }
+
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(disk.data_[7 * 256 + 0] == 0x5A);
+    CHECK(disk.data_[7 * 256 + 1] == (1 ^ 0x5A));
+    CHECK(disk.data_[7 * 256 + 255] == (255 ^ 0x5A));
+    // 他のセクタは触られていない。
+    CHECK(disk.data_[6 * 256] == 0x06);
+}
+
+// --- READ のセクタ数クランプ -------------------------------------------------
+//
+// 実際に起きた退行: 要求がバッファに収まらないとき黙って切り詰めており、
+// 転送量と bufferLength がずれて「DMA が途中で止まったまま成功に見える」
+// 状態を作っていた。
+
+TEST_CASE("READ の count=0 は 1 セクタを意味する")
+{
+    // 保証すること: SASI のコマンド長フィールドの 0 は 256 ではなく
+    // 1 セクタとして扱われること。
+    //
+    // 壊れると: 0 セクタ = 転送量 0 となり、DMA が 1 バイトも動かないまま
+    // 「完了」する。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 3, 0);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+    CHECK(m.ioRead8(kSasiData) == 0x03);
+
+    // ちょうど 1 セクタ (256 バイト) でステータスへ移る。
+    for (int i = 1; i < 256; ++i)
+    {
+        m.ioRead8(kSasiData);
+    }
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+}
+
+TEST_CASE("READ はバッファに収まる最大セクタ数を扱える")
+{
+    // 保証すること: 上限ちょうど (255 セクタ) は切り詰めずに転送できること。
+    //
+    // 壊れると: 境界を 1 つ間違えて上限ちょうどを弾いてしまい、
+    // 大きな読み出しが理由なく失敗する。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(512);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 0, static_cast<x68k::u8>(x68k::Machine::kSasiMaxSectorsPerCommand));
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+
+    // 255 セクタぶん (65280 バイト) を読み切るまでデータインのまま。
+    const int total = 256 * static_cast<int>(x68k::Machine::kSasiMaxSectorsPerCommand);
+    for (int i = 0; i < total - 1; ++i)
+    {
+        m.ioRead8(kSasiData);
+    }
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+    m.ioRead8(kSasiData);  // 最後の 1 バイト
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+}
+
+TEST_CASE("ディスクの範囲外を読もうとするとエラーになる")
+{
+    // 保証すること: 読めなかったときは黙って成功にせず、
+    // エラーステータスでステータスフェーズへ移ること。
+    //
+    // 壊れると: ゴミの入ったバッファを「読めた」として返し、
+    // ブートセクタの検査が通らない理由が分からなくなる。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(4);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 3, 4);  // セクタ 3 から 4 つ = 範囲外
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) != 0x00);
+    CHECK(disk.readCount == 0);
+}
+
+TEST_CASE("転送バッファを与えないと READ はエラーを返す")
+{
+    // 保証すること: バッファ未設定を「成功」と誤認しないこと。
+    // これは reset() がバッファを消してしまった退行と同じ症状になる。
+    //
+    // 壊れると: nullptr へ書き込もうとするか、0 バイトを転送して
+    // 「読めた」ことにしてしまう。
+    x68k::Machine m;
+    // setSasiBuffer を呼ばない。
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 0, 1);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) != 0x00);
+}
