@@ -142,6 +142,12 @@ private:
         bool interruptEnabled = false;
     };
     SasiState sasi_{};
+
+    // FDC が返す結果バイトの残り数。
+    // コマンドを受けたら設定し、読まれるたびに減らす。0 になったら
+    // コマンド待ちへ戻る。常に結果フェーズのままだと IPL-ROM が
+    // 次のコマンドへ進めない。
+    int fdcResultRemaining_ = 0;
 };
 
 }  // namespace x68k

@@ -38,8 +38,13 @@ public:
     static constexpr std::uint32_t kDefaultRamSize = kMainRamSize;
     static constexpr std::uint32_t kDefaultRomBootAddr = 0x00FC0000;
     static constexpr std::uint32_t kDefaultSramBootAddr = 0x00ED0100;
-    // $0000 = 標準優先順位 (FD → SASI → ROM → RAM)。
+    // 起動デバイスの指定。
+    //   $0000 = 標準優先順位 (FD → SASI → ROM → RAM)
+    //   $8x00 = SASI の x 番目を最優先
+    //   $9x70 = FD の x 番目を最優先
+    //   $A000 = ROM / $B000 = RAM
     static constexpr std::uint16_t kBootDeviceStandard = 0x0000;
+    static constexpr std::uint16_t kBootDeviceSasi0 = 0x8000;
     static constexpr std::uint8_t kDefaultScreenMode = 16;
 
     Sram()

@@ -39,11 +39,13 @@ TEST_CASE("メモリ容量がバスの実装と一致する")
     CHECK(ramSize == x68k::kMainRamSize);
 }
 
-TEST_CASE("起動デバイスが標準優先順位に設定される")
+TEST_CASE("起動デバイスが SASI 優先に設定される")
 {
     x68k::Sram sram;
-    // $0000 = 標準優先順位 (FD → SASI → ROM → RAM)。
-    CHECK(sram.read16(x68k::Sram::kOffsetBootDevice) == x68k::Sram::kBootDeviceStandard);
+    // 標準優先順位 ($0000) だと FD から探し始めるが、本エミュレータの FDC は
+    // ドライブ未接続を表すスタブでしかなく、IPL-ROM のポーリングループが
+    // タイムアウトを持たないため抜けられない。SASI を最優先にして回避する。
+    CHECK(sram.read16(x68k::Sram::kOffsetBootDevice) == x68k::Sram::kBootDeviceSasi0);
 }
 
 TEST_CASE("起動時画面モードが 16 である")

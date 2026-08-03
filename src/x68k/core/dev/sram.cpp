@@ -56,8 +56,17 @@ void Sram::formatDefaults()
     write32(kOffsetRomBoot, kDefaultRomBootAddr);
     write32(kOffsetSramBoot, kDefaultSramBootAddr);
 
-    // 標準の優先順位で起動デバイスを探させる。
-    write16(kOffsetBootDevice, kBootDeviceStandard);
+    // 起動デバイスは SASI を最優先にする。
+    //
+    // Why not 標準優先順位 ($0000): 標準だと FD から探し始める。本エミュレータの
+    // FDC はドライブ未接続を表すスタブでしかなく、IPL-ROM の
+    // 「RQM|DIO|CB が揃うのを待つ」ループ ($FF89DE) はタイムアウトを持たない。
+    // 応答しなければ永久に待ち、応答すれば「FD がある」と誤認されて
+    // コマンド処理へ進みエラー停止する。どちらにも倒せないので、
+    // FD を経由せず直接 SASI から起動させる。
+    //
+    // FDC を正しく実装すれば標準優先順位に戻せる。
+    write16(kOffsetBootDevice, kBootDeviceSasi0);
 
     data_[kOffsetScreenMode] = kDefaultScreenMode;
 

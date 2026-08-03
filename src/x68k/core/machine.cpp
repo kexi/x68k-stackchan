@@ -192,27 +192,48 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kFdcBase:
-            // FDC (uPD72065) のスタブ。
+            // FDC (uPD72065) のスタブ。ドライブ未接続として振る舞う。
             //
-            // $E94001 がステータスレジスタで、bit7 = RQM (データ転送要求)、
-            // bit6 = DIO (転送方向)、bit4 = CB (コマンド実行中)。
-            // IPL-ROM は FDC を初期化する前に RQM が立つのを待つループを持つ
-            // ($FF9054)。0 を返し続けると永久に抜けられない。
+            // レジスタ:
+            //   $E94001 ステータス (bit7 RQM / bit6 DIO / bit4 CB)
+            //   $E94003 データ
             //
-            // ドライブは接続されていない扱いにする。
-            //
-            // IPL-ROM は FDC の応答を 2 段階で待つ:
-            //   $FF9054: RQM (bit7) が立つのを待つ
+            // IPL-ROM は FDC の応答を 2 段階で待ち、どちらもタイムアウトを
+            // 持たない:
+            //   $FF9054: RQM が立つのを待つ
             //   $FF89DE: RQM|DIO|CB ($D0) が揃うのを待つ
+            // 0 を返し続けると永久に抜けられないので、両方を満たす値を返す。
             //
-            // ここで $D0 をそのまま返すと「FDC が応答した」と誤認され、
-            // 続きのコマンド処理へ進んでエラー停止する。RQM だけを立てて
-            // 「コマンドは受け付けるが結果が返らない」状態にしておくと、
-            // IPL-ROM はタイムアウトして次の起動デバイス (SASI) へ移る。
-            if ((addr & 0x0Fu) == 0x01 || (addr & 0x0Fu) == 0x03)
+            // その先ではデータレジスタから結果ステータスを読む ($FF89F0)。
+            // ここに「ドライブ未接続」を示す値を返せば、IPL-ROM は FD からの
+            // 起動を諦めて次の起動デバイス (SASI) へ移る。
+            if ((addr & 0x0Fu) == 0x01)
             {
                 constexpr u8 kFdcRqm = 0x80;  // データ転送要求
+                constexpr u8 kFdcDio = 0x40;  // 転送方向 (FDC → CPU)
+                constexpr u8 kFdcCb = 0x10;   // コマンド実行中
+
+                // 結果バイトを返し切るまでは DIO|CB を立てて「結果フェーズ」を
+                // 示し、返し切ったら RQM だけにしてコマンド待ちへ戻す。
+                // 常に $D0 を返し続けると IPL-ROM が結果を読み終えたことに
+                // 気づかず、次のコマンドへ進めない。
+                if (fdcResultRemaining_ > 0)
+                {
+                    return static_cast<u8>(kFdcRqm | kFdcDio | kFdcCb);
+                }
                 return kFdcRqm;
+            }
+            if ((addr & 0x0Fu) == 0x03)
+            {
+                // 結果ステータス。ST0 の bit7-6 = 11 が「異常終了」で、
+                // ドライブ未接続はこれで表す。IPL-ROM はこれを見て FD からの
+                // 起動を諦め、次の起動デバイス (SASI) へ移る。
+                constexpr u8 kSt0AbnormalTermination = 0xC0;
+                if (fdcResultRemaining_ > 0)
+                {
+                    --fdcResultRemaining_;
+                }
+                return kSt0AbnormalTermination;
             }
             return 0u;
 
@@ -266,6 +287,18 @@ void Machine::ioWrite8(u32 addr, u8 value)
 
         case kSasiBase:
             sasiWrite(addr, value);
+            return;
+
+        case kFdcBase:
+            // データレジスタへの書き込みはコマンドの送出。
+            // ドライブ未接続なので実行はせず、結果フェーズだけを用意する。
+            // uPD72065 の SENSE INTERRUPT STATUS は結果 2 バイトなので
+            // それに合わせておく。
+            if ((addr & 0x0Fu) == 0x03)
+            {
+                constexpr int kResultBytes = 2;
+                fdcResultRemaining_ = kResultBytes;
+            }
             return;
 
         case kAreaSetBase:
