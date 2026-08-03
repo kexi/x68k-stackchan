@@ -216,7 +216,7 @@ void M68k::write32(u32 addr, u32 value)
 
 // --- 例外 ------------------------------------------------------------------
 
-void M68k::takeException(u32 vectorNumber)
+void M68k::takeException(u32 vectorNumber, bool faulting)
 {
     const u16 oldSr = st_.sr;
 
@@ -226,8 +226,17 @@ void M68k::takeException(u32 vectorNumber)
 
     // スタックフレーム: PC (ロング) と SR (ワード) を積む。
     //
-    // 積む PC は「例外を起こした命令の次」。プリフェッチの分だけ手前に戻す
-    // (アドレスエラーの framePc と同じ理屈)。
+    // 積む PC は既定では「例外を起こした命令の次」。プリフェッチの分だけ手前に
+    // 戻す (アドレスエラーの framePc と同じ理屈)。
+    //
+    // faulting のときは「例外を起こした命令そのもの」を積む。命令語は fetch() で
+    // すでに 1 ワード進んでいるので、さらに 2 戻して先頭を指す。
+    //
+    // Why これが要るか: Human68k は DOS コールを F-line 命令 ($FF25 など) で
+    // 発行する。F-line ハンドラ ($8598) は積まれた PC を A5 に取り、そこから
+    // move.w (a5)+,d0 で命令語そのものを読んでコール番号を得る。次の命令を
+    // 積むと後続の命令語をコール番号と誤読し、$FF00 未満なので「不正コール」と
+    // 判定されて不当命令ベクタ経由でエラー表示 (中止/再実行/無視) に落ちる。
     //
     // ここは bus_ を直に叩く。write32 経由だと例外処理の途中でアドレスエラー
     // 判定に入り、フレームが二重に積まれて SP が壊れる。
@@ -235,7 +244,7 @@ void M68k::takeException(u32 vectorNumber)
     // 重要: アドレスに 0x00FFFFFE のマスクをかけてはいけない。RTE 側は
     // read32(a7) で読み戻すので、書き込み位置と読み出し位置が食い違う。
     // 実際これで戻り先の上位バイトにゴミが乗り、PC が壊れていた。
-    const u32 framePc = st_.pc - 4;
+    const u32 framePc = faulting ? (st_.pc - 6) : (st_.pc - 4);
     st_.a[7] = st_.a[7] - 4;
     const u32 pcSlot = st_.a[7] & 0x00FFFFFFu;
     bus_.write16(pcSlot, static_cast<u16>(framePc >> 16));
@@ -319,7 +328,7 @@ bool M68k::requirePrivilege()
     {
         return true;
     }
-    takeException(vector::kPrivilegeViolation);
+    takeException(vector::kPrivilegeViolation, true);
     return false;
 }
 
@@ -710,11 +719,13 @@ u32 M68k::execute(u16 op)
             return groupShift(op);
         case 0xA:
             // A-line: 未実装命令として OS に処理を委ねる仕組み。
-            takeException(vector::kLineA);
+            takeException(vector::kLineA, true);
             return 34;
         default:
             // F-line: コプロセッサ用。X68000 では FPU が無ければ例外。
-            takeException(vector::kLineF);
+            // Human68k はここに DOS コールを載せているので、積む PC は
+            // 命令そのものでなければならない。
+            takeException(vector::kLineF, true);
             return 34;
     }
 }

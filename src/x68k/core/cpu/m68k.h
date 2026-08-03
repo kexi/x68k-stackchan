@@ -93,7 +93,10 @@ private:
     void write32(u32 addr, u32 value);
 
     // --- 例外 ----------------------------------------------------------------
-    void takeException(u32 vectorNumber);
+    // 積む PC の基準が 2 通りある。TRAP / CHK / DIVU の 0 除算 / 割り込みは
+    // 「次の命令」を積み、不当命令・A-line・F-line・特権違反は「例外を起こした
+    // 命令そのもの」を積む。後者は faulting = true。
+    void takeException(u32 vectorNumber, bool faulting = false);
     void takeAddressError(u32 addr, bool isRead);
     void takeBusError(u32 addr, bool isRead);
     // アドレスエラーとバスエラーは同じ 14 バイトフレームを積む。

@@ -50,7 +50,7 @@ u32 M68k::groupMoveq(u16 op)
     // bit8 が 1 の符号は MOVEQ ではない (68000 には該当命令が無い)。
     if ((op & 0x0100u) != 0)
     {
-        takeException(vector::kIllegalInstruction);
+        takeException(vector::kIllegalInstruction, true);
         return 34;
     }
 
