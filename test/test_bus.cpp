@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "bus.h"
+#include "dev/video.h"
 #include "doctest.h"
 
 namespace
@@ -432,4 +433,31 @@ TEST_CASE("領域の末尾へのワードアクセスが範囲外を触らない
 
     (void)bus.read16(lastByte);
     CHECK(ram[x68k::kMainRamSize] == 0x5A);
+}
+
+TEST_CASE("ラスタ番号がフレームの範囲を出ない")
+{
+    // 保証すること: どれだけ大きな cycles を渡しても、ラスタ番号が
+    // 実機の範囲 (0〜567) に収まること。
+    //
+    // 壊れると: tick が 1 フレームぶんしか引かないと frameCycles_ が
+    // 範囲外に残り、存在しないラスタ番号を返す。ラスタ割り込みの比較や
+    // 「今どの行か」の判定が 1 フレームぶんずれる。
+    //
+    // 現在の Machine::step は命令単位の小さい値しか渡さないので通常は
+    // 踏まないが、呼ぶ側の刻み方に依存しない形にしておく。
+    constexpr x68k::u32 kRasterCount = 568;
+
+    x68k::Crtc crtc;
+    crtc.reset();
+
+    // 1 フレームを大きく超える値を一度に渡す。
+    (void)crtc.tick(x68k::Crtc::kCyclesPerFrame * 3 + 12345);
+    CHECK(crtc.rasterNumber() < kRasterCount);
+
+    // フレーム境界のちょうど手前も確かめる。端数が最終ラスタへ
+    // 集中していると、ここで 568 が返る。
+    crtc.reset();
+    (void)crtc.tick(x68k::Crtc::kCyclesPerFrame - 1);
+    CHECK(crtc.rasterNumber() < kRasterCount);
 }

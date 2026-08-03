@@ -592,10 +592,14 @@ TEST_CASE("WRITE コマンドがディスクへ書き込む")
 
 TEST_CASE("READ はバッファに収まる最大セクタ数を扱える")
 {
-    // 保証すること: 上限ちょうど (255 セクタ) は切り詰めずに転送できること。
+    // 保証すること: 上限ちょうど (256 セクタ = 65536 バイト) を切り詰めずに
+    // 転送できること。
     //
     // 壊れると: 境界を 1 つ間違えて上限ちょうどを弾いてしまい、
     // 大きな読み出しが理由なく失敗する。
+    //
+    // 上限は 256 で、コマンドの長さフィールドは 1 バイト。u8 へ落とすと 0 に
+    // なるが、SASI では 0 が 256 を意味するので意図どおりに届く。
     x68k::Machine m;
     m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(512);
@@ -604,7 +608,7 @@ TEST_CASE("READ はバッファに収まる最大セクタ数を扱える")
     sendCommand(m, 0x08, 0, static_cast<x68k::u8>(x68k::Machine::kSasiMaxSectorsPerCommand));
     CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
 
-    // 255 セクタぶん (65280 バイト) を読み切るまでデータインのまま。
+    // 256 セクタぶん (65536 バイト) を読み切るまでデータインのまま。
     const int total = 256 * static_cast<int>(x68k::Machine::kSasiMaxSectorsPerCommand);
     for (int i = 0; i < total - 1; ++i)
     {
@@ -715,7 +719,8 @@ TEST_CASE("WRITE が失敗したらエラーステータスを返す")
 
 TEST_CASE("WRITE は扱える上限ちょうどの要求を受け付ける")
 {
-    // 保証すること: 255 セクタの要求を弾かないこと。
+    // 保証すること: 255 セクタ (長さフィールドで表せる最大の非 0) の
+    // 要求を弾かないこと。
     //
     // 壊れると: 上限の判定が「以上」と「より大きい」を取り違えていると、
     // 正当なサイズの要求がエラーになる。

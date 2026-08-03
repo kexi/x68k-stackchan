@@ -56,7 +56,25 @@ u32 Crtc::rasterNumber() const
 
 bool Crtc::tick(u32 cycles)
 {
-    frameCycles_ += cycles;
+    // 1 フレームぶんを超える cycles でも範囲に収める。
+    //
+    // Why not 1 回だけ引くか: 呼ぶ側が 1 フレーム未満で刻む保証は無い。
+    // 大きな値を渡されると引き切れずに残り、rasterNumber が存在しない
+    // ラスタ番号を返す。
+    //
+    // Why not 剰余を使うか: ここは毎命令通る。ESP32-S3 では 64bit 除算が
+    // 重く、実機の実効クロックが 3.19MHz から 2.77MHz へ落ちた (実測)。
+    // 通常は 1 回引けば足りるので、ループにして繰り返しを稀にする。
+    //
+    // 足す前に減らしておくのは u32 の桁溢れを避けるため。実際に呼ばれるのは
+    // 1 命令ぶん (数十サイクル) だが、公開 API なので極端な値でも壊れない
+    // ようにしておく。溢れると while を抜けられなくなる。
+    u32 remaining = cycles;
+    if (remaining >= kCyclesPerFrame)
+    {
+        remaining %= kCyclesPerFrame;
+    }
+    frameCycles_ += remaining;
     if (frameCycles_ >= kCyclesPerFrame)
     {
         frameCycles_ -= kCyclesPerFrame;

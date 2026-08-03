@@ -101,7 +101,7 @@ bool reserveMemory()
     g_frameBufferB = static_cast<x68k::u16*>(
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
-    // SASI の転送バッファ (64KB 弱)。
+    // SASI の転送バッファ (64KiB)。
     //
     // Machine に埋め込むと内部 SRAM の .bss が 88KB まで膨らみ、
     // すぐ下で IPL-ROM 128KB を内部 SRAM へ置こうとして失敗する。
@@ -126,19 +126,19 @@ bool reserveMemory()
 
     reportMemory("after reserve");
 
-    // 確保できたかを全て確かめる。
+    // 確保できたかを確かめる。
     //
-    // グラフィック VRAM と CGROM は、バスに null チェックがあるので
-    // 確保に失敗してもクラッシュはしない (読むと 0 が返る)。それでも
-    // 止めるのは、どちらも「画面に何も出せない」状態を招くため。
-    // 起動しても使えないものを起動させる意味がない。
+    // グラフィック VRAM は外してある。今の表示はテキスト VRAM しか使わず、
+    // バスに null チェックがあるので (読むと 0、書きは捨てる)、取れなくても
+    // コンソールは出せる。グラフィック画面を実装したら必須に加える。
     //
-    // 512KB や 768KB が取れない時点で PSRAM の断片化が起きており、
-    // そのまま進んでも先で別の失敗を招く。ここで理由付きで止める方が、
-    // あとから原因を探すより早い。
-    const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_graphicVram != nullptr &&
-                    g_iplRom != nullptr && g_cgRom != nullptr && g_frameBufferA != nullptr &&
-                    g_frameBufferB != nullptr && g_sasiBuffer != nullptr;
+    // CGROM は必須にする。バスの null チェックで落ちはしないが、字形が
+    // 1 つも無ければ画面が真っ黒のままで、起動しても何もできない。
+    // 768KB が取れない時点で PSRAM の断片化が起きており、そのまま進んでも
+    // 先で別の失敗を招く。
+    const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
+                    g_cgRom != nullptr && g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
+                    g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
