@@ -119,18 +119,29 @@ u32 M68k::groupMisc(u16 op)
     if ((op & 0xFFF8u) == 0x4E50u)  // LINK An,#<disp>
     {
         const s16 disp = static_cast<s16>(fetch());
+        // LINK A7 では An と A7 が同じレジスタになる。
+        // 積むのは「デクリメントする前の A7」なので、先に控えを取る。
+        // ここを st_.a[reg] のまま読むと、デクリメント後の値を積んでしまう。
+        const u32 pushed = st_.a[reg];
         st_.a[7] = st_.a[7] - 4;
-        write32(st_.a[7], st_.a[reg]);
+        write32(st_.a[7], pushed);
         st_.a[reg] = st_.a[7];
-        st_.a[7] = (st_.a[7] + static_cast<u32>(static_cast<s32>(disp)));
+        st_.a[7] = st_.a[7] + static_cast<u32>(static_cast<s32>(disp));
         return 16;
     }
 
     if ((op & 0xFFF8u) == 0x4E58u)  // UNLK An
     {
+        // 手順は「A7 ← An」「An ← (A7)」「A7 ← A7 + 4」。
+        //
+        // UNLK A7 では An と A7 が同じレジスタなので、最後の +4 が
+        // 読み戻した値に対して行われるのではなく、読み戻した値がそのまま
+        // 最終的な A7 になる (An への書き込みが後から A7 を上書きするため)。
+        // 順番どおりに素直に書けば両方のケースが正しく処理される。
         st_.a[7] = st_.a[reg];
-        st_.a[reg] = read32(st_.a[7]);
+        const u32 restored = read32(st_.a[7]);
         st_.a[7] = st_.a[7] + 4;
+        st_.a[reg] = restored;
         return 12;
     }
 
