@@ -14,6 +14,7 @@
 
 #include "bus.h"
 #include "cpu/m68k.h"
+#include "dev/fdc.h"
 #include "dev/mfp.h"
 #include "dev/rtc.h"
 #include "dev/sram.h"
@@ -93,6 +94,10 @@ public:
     {
         return rtc_;
     }
+    [[nodiscard]] Fdc& fdc()
+    {
+        return fdc_;
+    }
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
@@ -127,6 +132,7 @@ private:
     VideoController video_;
     Mfp mfp_;
     Rtc rtc_;
+    Fdc fdc_;
     DiskImage* disk_ = nullptr;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
@@ -142,18 +148,6 @@ private:
         bool interruptEnabled = false;
     };
     SasiState sasi_{};
-
-    // FDC が返す結果バイトの残り数。
-    // コマンドを受けたら設定し、読まれるたびに減らす。0 になったら
-    // コマンド待ちへ戻る。常に結果フェーズのままだと IPL-ROM が
-    // 次のコマンドへ進めない。
-    int fdcResultRemaining_ = 0;
-
-    // FDC のコマンドに続くパラメータの残り数。
-    // uPD72065 のコマンドは 1〜9 バイトから成るので、全部受け取ってから
-    // 結果フェーズへ移す。1 バイト目で移すと、残りを送ろうとした IPL-ROM が
-    // コマンド待ちの状態を待って止まる。
-    int fdcCommandRemaining_ = 0;
 };
 
 }  // namespace x68k

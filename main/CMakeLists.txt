@@ -20,6 +20,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/dev/sram.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/mfp.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/rtc.cpp"
+        "${X68K_ROOT}/src/x68k/core/dev/fdc.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/video.cpp"
         "${X68K_ROOT}/src/x68k/core/video/text_raster.cpp"
         # --- platform: ESP32 専用 ---
