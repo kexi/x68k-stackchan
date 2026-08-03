@@ -67,7 +67,14 @@ fetch-tests:
 
 [doc('68000 適合性テストをフル実行する (fetch-tests 済みが前提)')]
 test-vectors: build-host
-    ./{{host_build}}/x68k_tests --test-suite=json_full
+    # X68K_TEST_VECTOR_LIMIT=0 で件数の上限を外し、全ケースを回す。
+    # 既定の 200 件は「手元でさっと確かめる」ための数。
+    #
+    # X68K_TEST_VECTORS_REQUIRED=1 はベクタが無いことを失敗にする。
+    # これが無いと、ベクタ未取得のまま「0 件実行して SUCCESS」になり、
+    # CPU が壊れていても緑になる。
+    X68K_TEST_VECTOR_LIMIT=0 X68K_TEST_VECTORS_REQUIRED=1 \
+      ./{{host_build}}/x68k_tests --test-suite=m68k-vectors
 
 # ───── 実機 (M5Stack CoreS3 / ESP32-S3) ────────────────────────────────────
 

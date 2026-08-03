@@ -31,7 +31,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -347,10 +349,28 @@ std::size_t caseLimit()
     return 200;
 }
 
+// ベクタが無いときに失敗させるか。
+//
+// 既定は「無ければ飛ばす」。ベクタは数 GB あってリポジトリに置けないので、
+// 手元でテストを回すたびに落ちると邪魔になる。
+//
+// 一方で `just test-vectors` は「CPU の正しさを機械的に保証する」ための
+// 入口なので、ベクタが無いまま SUCCESS を返してはいけない。そちらでは
+// X68K_TEST_VECTORS_REQUIRED=1 を立てて厳格に振る舞わせる。
+bool vectorsRequired()
+{
+    const char* env = std::getenv("X68K_TEST_VECTORS_REQUIRED");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
 void checkSuite(const char* name)
 {
     if (!vectorsAvailable())
     {
+        // 厳格モードでは、ベクタが無いことをテストの失敗として扱う。
+        // ここを素通りさせると「0 件実行して SUCCESS」になり、CPU が
+        // 全面的に壊れていても緑になる。
+        REQUIRE_MESSAGE(!vectorsRequired(), "test vectors not present; run `just fetch-tests`");
         MESSAGE("test vectors not present; run `just fetch-tests`");
         return;
     }
@@ -373,6 +393,155 @@ void checkSuite(const char* name)
 }
 
 }  // namespace
+
+TEST_SUITE_BEGIN("m68k-vectors");
+
+// upstream が「検証できていない」と明記している命令。
+//
+// TAS は read-modify-write の 5 サイクルのタイミングが未実装、
+// TRAPV は S ビットの解釈に不明な問題があるとされる。突き合わせても
+// 実装の誤りとテストデータの誤りを区別できないので外す。
+const std::set<std::string>& unverifiedUpstream()
+{
+    static const std::set<std::string> names = {"TAS", "TRAPV"};
+    return names;
+}
+
+// まだ通っていない命令。
+//
+// 全ベクタを走査するようにして初めて露見した。それまでは命令ごとに
+// TEST_CASE を書き足す方式で、53 個しか参照しておらず残りは
+// 未検証のまま通っていた。
+//
+// Human68k の起動と dir には影響していない (実際に動いている) が、
+// ゲームを動かすには要る。一つずつ潰す。ここから消せたら直ったということ。
+//
+// Why not これらを CHECK から外すか: 外すと「直したのに気付かない」
+// 状態になる。名前を挙げて既知とし、直った瞬間に「予期しない成功」として
+// 落ちるようにしておけば、リストの更新漏れも捕まえられる。
+const std::set<std::string>& knownFailures()
+{
+    static const std::set<std::string> names = {
+        // BCD 演算。ほぼ全滅なので未実装に近い。
+        "ABCD",
+        "SBCD",
+        "NBCD",
+        // シフト / ローテートのワードサイズ。.b と .l は通る。
+        "ASL.w",
+        "ASR.w",
+        "LSL.w",
+        "LSR.w",
+        "ROL.w",
+        "ROR.w",
+        "ROXL.w",
+        "ROXR.w",
+        // SR を直接触る命令。
+        "ANDItoSR",
+        "EORItoSR",
+        "ORItoSR",
+        "STOP",
+        // 除算と範囲検査。
+        "DIVS",
+        "DIVU",
+        "CHK",
+        // 周辺 I/O 向けの転送。
+        "MOVEP.l",
+        "MOVEP.w",
+        // 少数のケースだけ落ちるもの。
+        "ADDX.b",
+        "BTST",
+    };
+    return names;
+}
+
+TEST_CASE("すべてのベクタを突き合わせる")
+{
+    // 保証すること: 取得済みのベクタを一つ残らず回すこと。
+    //
+    // 命令ごとに TEST_CASE を書き足す方式だと、ベクタはあるのに
+    // 参照を書き忘れた命令が黙って未検証のまま残る。実際 127 個のうち
+    // 53 個しか参照しておらず、DIVS や MULS が抜けていた。
+    // ディレクトリを走査すれば、書き忘れも upstream の追加も取りこぼさない。
+    if (!vectorsAvailable())
+    {
+        REQUIRE_MESSAGE(!vectorsRequired(), "test vectors not present; run `just fetch-tests`");
+        MESSAGE("test vectors not present; run `just fetch-tests`");
+        return;
+    }
+
+    namespace fs = std::filesystem;
+
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(vectorDir(), ec))
+    {
+        const std::string filename = entry.path().filename().string();
+        const std::string suffix = ".json.bin";
+        const bool isVector =
+            filename.size() > suffix.size() &&
+            filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (!isVector)
+        {
+            continue;
+        }
+        names.push_back(filename.substr(0, filename.size() - suffix.size()));
+    }
+    REQUIRE_MESSAGE(!ec, "cannot list " << vectorDir());
+
+    // 走査順は環境依存なので、失敗したときに追える形へ揃える。
+    std::sort(names.begin(), names.end());
+    REQUIRE_MESSAGE(!names.empty(), "no vectors found in " << vectorDir());
+
+    std::vector<std::string> failedSuites;
+    std::vector<std::string> unexpectedlyPassing;
+    std::size_t totalPassed = 0;
+    std::size_t totalSkipped = 0;
+
+    for (const std::string& name : names)
+    {
+        if (unverifiedUpstream().count(name) != 0)
+        {
+            continue;
+        }
+
+        const std::string path = std::string(vectorDir()) + "/" + name + ".json.bin";
+        const SuiteResult r = runSuite(path, caseLimit());
+        totalPassed += static_cast<std::size_t>(r.passed);
+        totalSkipped += static_cast<std::size_t>(r.skipped);
+
+        const bool isKnown = knownFailures().count(name) != 0;
+        if (r.failed != 0 && !isKnown)
+        {
+            // 最初の失敗だけでなく全部を集めてから報告する。1 命令ずつ
+            // 直しては回し直すより、どれが壊れているか一覧で見たい。
+            failedSuites.push_back(name + " (failed=" + std::to_string(r.failed) +
+                                   " first=" + r.firstFailure + ")");
+        }
+        if (r.failed == 0 && isKnown)
+        {
+            // 直ったのに既知リストに残っている。消し忘れを捕まえる。
+            unexpectedlyPassing.push_back(name);
+        }
+    }
+
+    MESSAGE("vectors: " << names.size() << " suites, " << totalPassed << " passed, " << totalSkipped
+                        << " skipped(addr-error)");
+
+    std::string report;
+    for (const std::string& f : failedSuites)
+    {
+        report += "\n  " + f;
+    }
+    CHECK_MESSAGE(failedSuites.empty(), "failing suites:" << report);
+
+    std::string fixed;
+    for (const std::string& f : unexpectedlyPassing)
+    {
+        fixed += "\n  " + f;
+    }
+    CHECK_MESSAGE(unexpectedlyPassing.empty(),
+                  "these now pass; remove them from knownFailures():" << fixed);
+}
 
 TEST_CASE("NOP")
 {
@@ -473,3 +642,5 @@ TEST_CASE("MOVEM")
     checkSuite("MOVEM.w");
     checkSuite("MOVEM.l");
 }
+
+TEST_SUITE_END();
