@@ -303,18 +303,99 @@ TEST_CASE("グループ A のサービス中はグループ B を全て抑止す
     CHECK_FALSE(mfp.hasPendingInterrupt());
 }
 
-TEST_CASE("Automatic EOI へ切り替えると ISR が捨てられる")
+TEST_CASE("Software EOI では同じチャネルの再入も抑止する")
 {
-    // 保証すること: VR の S を 0 にした時点で ISR が 0 になること。
-    // S=0 の間、ISR は強制的に 0 に保たれる。
+    // 保証すること: サービス中のチャネル自身が再び保留になっても、
+    // 受理されないこと。抑止するのは「真に高い優先度だけ通す」であって、
+    // 同じ優先度は通らない。
     //
-    // 壊れると: Software EOI から切り替えた後もサービス中とみなされ、
-    // それ以下の優先度が二度と受理されなくなる。
+    // 壊れると: ハンドラの実行中に同じ割り込みが再入し、スタックを
+    // 食い潰す。別チャネルで見るテストだけだと、サービス中のビット自身を
+    // 許可してしまう実装を見逃す。
     x68k::Mfp mfp = makeMfp();
     mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
     enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+
     mfp.receiveKeyboardByte(0x41);
-    mfp.acknowledgeInterrupt();
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+
+    // 同じチャネルがもう一度上がっても受理されない。
+    mfp.receiveKeyboardByte(0x42);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) != 0);
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+    CHECK(mfp.acknowledgeInterrupt() == 0);
+}
+
+TEST_CASE("Software EOI の優先度基準は最上位のサービス中ビット")
+{
+    // 保証すること: ISR に複数のビットが立っているとき、最も優先度の高い
+    // ものを基準にすること。
+    //
+    // 壊れると: 最下位を基準にする実装だと、その間の優先度が誤って
+    // 受理される。ネストしたハンドラの途中で下位が割り込む。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    // タイマ A ($20) > 受信バッファフル ($10) > 送信バッファ空き ($04)。
+    enableGroupA(mfp, static_cast<x68k::u8>(x68k::Mfp::kIntTimerA | x68k::Mfp::kIntRecvFull |
+                                            x68k::Mfp::kIntSendEmpty));
+
+    // 先に下位 (受信) をサービス中にし、その上から上位 (タイマ A) を
+    // 受理する。ISR に 2 ビットが立った状態をレジスタ直書きではなく
+    // 実際の受理経路で作る。
+    mfp.receiveKeyboardByte(0x41);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    mfp.write(x68k::Mfp::kTadr, 1);
+    mfp.write(x68k::Mfp::kTacr, 0x01);
+    mfp.tick(4 * 2);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerA) != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+
+    // 最上位 (タイマ A) が基準なら、その下の受信は通らない。
+    // 最下位 (受信) を基準にする実装だと、受信自身は抑止されるものの
+    // その 1 つ上の優先度が誤って通る。ここでは受信を使って
+    // 「サービス中の最上位より下は全て止まる」ことを見る。
+    mfp.receiveKeyboardByte(0x42);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) != 0);
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+
+    // タイマ A を落とすと、基準が受信に下がる。受信自身はまだサービス中
+    // なので通らない。
+    mfp.write(x68k::Mfp::kIsra, static_cast<x68k::u8>(~x68k::Mfp::kIntTimerA));
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+
+    // 受信も落とせば通る。
+    mfp.write(x68k::Mfp::kIsra, 0x00);
+    CHECK(mfp.hasPendingInterrupt());
+}
+
+TEST_CASE("Automatic EOI へ切り替えると ISR が捨てられる")
+{
+    // 保証すること: VR の S を 0 にした時点で ISRA/ISRB の両方が 0 に
+    // なること。S=0 の間、ISR は強制的に 0 に保たれる。
+    //
+    // 壊れると: Software EOI から切り替えた後もサービス中とみなされ、
+    // それ以下の優先度が二度と受理されなくなる。
+    //
+    // Why not グループ A だけ見ないか: ISRB を触り忘れた実装でも、
+    // A だけのテストなら通ってしまう。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+    enableGroupB(mfp, x68k::Mfp::kIntGpip4);
+
+    // 先にグループ B をサービス中にする。A を先に受理すると B が
+    // 抑止されて受理できない (ISR は書き込みで立てられない。0 を書いた
+    // ビットが落ちるだけ)。
+    mfp.write(x68k::Mfp::kAer, 0x00);
+    mfp.setVerticalBlank(true);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsrb) & x68k::Mfp::kIntGpip4) != 0);
+
+    // グループ A は B より上位なので、B のサービス中でも受理できる。
+    mfp.receiveKeyboardByte(0x41);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
 
     mfp.write(x68k::Mfp::kVr, 0x40);  // S=0 へ切り替え
