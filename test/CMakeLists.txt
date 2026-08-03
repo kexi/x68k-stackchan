@@ -109,7 +109,9 @@ add_executable(x68k_tests
   test_m68k_vectors.cpp
   test_m68k_alu.cpp
   test_sram.cpp
+  test_sram_persist.cpp
   test_bus.cpp
+  test_gvram_bus.cpp
   test_text_raster.cpp
   test_graphic_raster.cpp
   test_text_scrape.cpp
@@ -123,6 +125,10 @@ add_executable(x68k_tests
   test_scc.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
+# sram_persist.h は platform/ にあるが ESP-IDF に触らないヘッダオンリーなので、
+# ホストのテストから直接読める。sram.dat の保存/復元の方針はここにしか無く、
+# 電源断の隙間を疑似ファイルシステムで再現して検査する必要がある。
+target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/src/x68k/platform)
 add_test(NAME x68k_tests COMMAND x68k_tests)
 
 # --- ホストのエミュレータランナー -------------------------------------------

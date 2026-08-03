@@ -21,6 +21,7 @@
 
 #include "cpu/m68k_types.h"
 #include "dev/sram.h"
+#include "dev/video.h"
 #include "memmap.h"
 
 namespace x68k
@@ -65,6 +66,29 @@ public:
     void setMemory(const MemoryMap& memory)
     {
         mem_ = memory;
+    }
+
+    // G-VRAM のページ折り込みに使うビデオコントローラを教える。
+    //
+    // $C00000-$DFFFFF は 512KB の窓 4 つで、窓ごとに「どのページを見るか」が
+    // 変わる。どのビット幅を折り込むかは色数モード ($E82400 bit1-0) 次第なので、
+    // バスがモードを知らないと 16 色の書き込みを他ページごと潰してしまう。
+    //
+    // Why not IoHandler に色数を問い合わせるメソッドを足さないか: IoHandler は
+    // 「アドレスを渡すと読み書きが起きる」だけの口で、副作用のある経路。
+    // ドット 1 つの書き込みごとにそこを通すと、I/O 側にアクセスログや
+    // ウェイトを足したときに G-VRAM の書き込みが巻き込まれる。
+    //
+    // Why not MemoryMap にモードを持たせないか: MemoryMap は「実体の在りか」を
+    // 表す値の集まりで、platform 層が確保時に一度作って渡す。時間とともに
+    // 変わるモードを混ぜると、モード変更のたびに setMemory を呼ぶ設計になり
+    // 所有の切り分けが崩れる。
+    //
+    // 未設定 (nullptr) なら 16 色モードとして扱う。VideoController::reset() が
+    // $E82400 を 0 (=16 色) にするので、実機のリセット直後と同じ状態になる。
+    void setVideoController(const VideoController* video)
+    {
+        video_ = video;
     }
 
     u8 read8(u32 addr) override;
@@ -146,9 +170,31 @@ public:
 private:
     void markTextDirty(u32 offsetInPlane);
 
+    // G-VRAM のアクセス方法。窓のアドレスと色数モードから 1 回だけ決める。
+    //
+    // 実 VRAM は 1 ワードに全ページのドットが同居する構造なので、CPU 側の
+    // 512KB 窓へのアクセスは「共有ワードの一部だけ」に効く。
+    // shift はそのワード内でのビット位置、mask は幅。
+    struct GvramLane
+    {
+        u32 byteOffset;  // 実 VRAM 内のワード先頭からのバイト位置 (偶数)
+        u32 shift;       // ワード内のビット位置
+        u16 mask;        // 折り込む幅 ($F / $FF / $FFFF)
+    };
+    [[nodiscard]] GvramLane gvramLaneOf(u32 addr) const;
+
+    // 窓アドレスに対応するドットを、ページのぶんだけ残したワードとして返す。
+    // 16 色なら $000X、256 色なら $00XX、65536 色ならワードそのもの。
+    [[nodiscard]] u16 readGvramDot(u32 addr) const;
+
+    // 窓アドレスへ 1 ドット書く。他ページのビットは読み出して保つ。
+    void writeGvramDot(u32 addr, u16 value);
+
     MemoryMap mem_;
     Sram& sram_;
     IoHandler& io_;
+    // 色数モードを引くためだけに持つ。所有しない (Machine が持つ)。
+    const VideoController* video_ = nullptr;
     bool romAtZero_ = true;
     // 直前のアクセスが応答しない領域だったか。
     // IPL-ROM は SCSI ROM ($FC0000) の有無をバスエラーで調べるので、

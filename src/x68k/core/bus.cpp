@@ -22,7 +22,101 @@ constexpr u32 kIoEnd = 0xEC0000u;
 constexpr u32 kRomAtZeroOffset = 0xFF0000u - kIplromBase;  // ROM 内オフセット
 constexpr u32 kRomAtZeroSize = kIplromSize - kRomAtZeroOffset;
 
+// G-VRAM の窓 1 つぶんの大きさ。実 VRAM 全体 (512KB) と同じ。
+//
+// 窓は $C00000 / $C80000 / $D00000 / $D80000 の 4 つで、$E00000 まで届く。
+// 「どの窓か」がページ番号になる。
+//
+// 根拠: IPL-ROM のグラフィックページ設定 ($FFAEE8 と $FFB268 に同じ計算がある)。
+//   MOVE.W D1,D0 / AND.W #$0003,D0 / ASL.W #3,D0 / ADD.W #$00C0,D0
+//   / SWAP D0 / CLR.W D0 / MOVE.L D0,$095C
+// ページ番号を 8 倍して $C0 を足し上位ワードへ送るので、
+// ページ N の先頭は $C00000 + N * $80000。逆変換も $FFB282 にある
+//   (MOVE.L $095C,D0 / SWAP D0 / SUB.W #$00C0,D0 / LSR.W #3,D0 / AND.L #3,D0)。
+//
+// 窓の広さが実 VRAM 全体と同じであることは $FFAAB4 の全消去が示している。
+//   LEA $C00000,A0 / LEA $C80000,A1 / BSR $FFABC0
+//   $FFABC0: CLR.L (A0)+ / CMPA.L A1,A0 / BNE.S -6
+// 512KB ぶんを消すだけで 4 ページすべてが消える。ページごとに VRAM が
+// 分かれているなら 1/4 しか消えないので、この 1 ループでは足りない。
+constexpr u32 kGvramWindowSize = 0x80000u;
+constexpr u32 kGvramWindowMask = kGvramWindowSize - 1u;
+
 }  // namespace
+
+SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
+{
+    const u32 offsetInSpace = addr - kGvramBase;
+    const u32 window = offsetInSpace / kGvramWindowSize;  // 0-3
+    const u32 offsetInWindow = offsetInSpace & kGvramWindowMask;
+
+    // 未設定なら 16 色。VideoController::reset() が $E82400 を 0 にするので、
+    // 実機のリセット直後と同じ扱いになる。
+    const VideoController::GraphicColorMode mode =
+        video_ != nullptr ? video_->graphicColorMode()
+                          : VideoController::GraphicColorMode::k16Color;
+
+    // ワード内でのバイト位置。窓のオフセットをそのままワード境界へ丸める。
+    //
+    // Why not 窓ごとに実 VRAM のオフセットをずらさないか: 4 つの窓は
+    // 「同じワードを別の角度から見る」ものなので、実 VRAM 上の位置は
+    // どの窓から触っても同じでなければならない。ずらすとページ 1 に書いた絵が
+    // ページ 0 と別の座標に出る。
+    const u32 wordBase = offsetInWindow & ~1u;
+
+    switch (mode)
+    {
+        case VideoController::GraphicColorMode::k16Color:
+            // 4 ページぶんの 4bit が 1 ワードに同居する。ページ 0 が最下位ニブル。
+            // 窓 0-3 がそのままページ 0-3。
+            return {wordBase, window * 4u, 0x000Fu};
+
+        case VideoController::GraphicColorMode::k256Color:
+            // 2 ページぶんの 8bit が 1 ワードに同居する。ページ 0 が下位バイト。
+            //
+            // 窓は 4 つあるが使うページは 2 つなので、$D00000 以降は
+            // $C00000 側の繰り返しになる (窓番号の bit0 だけが効く)。
+            return {wordBase, (window & 1u) * 8u, 0x00FFu};
+
+        case VideoController::GraphicColorMode::kReserved:
+        case VideoController::GraphicColorMode::k65536Color:
+        default:
+            // 1 ワードがそのまま 1 ドットの色。ページの概念が無く、
+            // どの窓から触っても同じワード全体に効く。
+            return {wordBase, 0u, 0xFFFFu};
+    }
+}
+
+u16 SystemBus::readGvramDot(u32 addr) const
+{
+    const GvramLane lane = gvramLaneOf(addr);
+    const u8* p = mem_.graphicVram + lane.byteOffset;
+    // 実 VRAM はビッグエンディアンのワード列。ホストのエンディアンに依存しない
+    // よう明示的に組む (video/graphic_raster.cpp の readWord と同じ理由)。
+    const u16 word = static_cast<u16>((static_cast<u16>(p[0]) << 8) | p[1]);
+    return static_cast<u16>((word >> lane.shift) & lane.mask);
+}
+
+void SystemBus::writeGvramDot(u32 addr, u16 value)
+{
+    const GvramLane lane = gvramLaneOf(addr);
+    u8* p = mem_.graphicVram + lane.byteOffset;
+    const u16 word = static_cast<u16>((static_cast<u16>(p[0]) << 8) | p[1]);
+
+    // 読んで、自分のページのビットだけ差し替えて、書き戻す。
+    //
+    // Why not ワードをそのまま上書きしないか: 16 色モードでは 1 ワードに
+    // 4 ページぶんのニブルが同居する。$C80000 (ページ 1) への書き込みで
+    // ワード全体を潰すと、同じ座標のページ 0/2/3 のドットが道連れになる。
+    // IPL-ROM は 4bit のドットを MOVE.W で書く ($FFB0AA 付近: LSR.B #4 で
+    // 取り出したニブルを AND.W #$000F してから MOVE.W (A0)+ する) ので、
+    // 上書きにすると 16 色の描画が毎回 3 ページを消して回ることになる。
+    const u16 field = static_cast<u16>(lane.mask << lane.shift);
+    const u16 next = static_cast<u16>((word & ~field) | ((value & lane.mask) << lane.shift));
+
+    p[0] = static_cast<u8>(next >> 8);
+    p[1] = static_cast<u8>(next & 0xFFu);
+}
 
 void SystemBus::markTextDirty(u32 offsetInPlane)
 {
@@ -95,8 +189,14 @@ u8 SystemBus::read8(u32 addr)
         {
             return 0u;
         }
-        // アドレス空間は 2MB ぶんあるが実 VRAM は 512KB。折り返す。
-        return mem_.graphicVram[(a - kGvramBase) & (kTvramSize - 1)];
+        // 窓が選んだページのぶんだけを取り出し、残りは 0 で埋めたワードを作る。
+        // バイトアクセスはそのワードの上位/下位を切り出したもの。
+        //
+        // Why not 共有ワードのバイトをそのまま返さないか: 16 色モードの
+        // $C80000 を読むとページ 1 とページ 0 のニブルが混ざった値になる。
+        // 実機はページの外を読ませないので、混ざった値を返すと
+        // 「読んで加工して書き戻す」描画が他ページの絵を自分のページへ焼き付ける。
+        return static_cast<u8>(readGvramDot(a) >> (((a & 1u) == 0u) ? 8u : 0u));
     }
 
     // ここまでのどれにも当たらない領域。
@@ -151,6 +251,18 @@ u16 SystemBus::read16(u32 addr)
         return io_.ioRead16(a);
     }
 
+    // グラフィック VRAM はワードが最小単位なので、read8 2 回に分けない。
+    //
+    // Why not read8 を 2 回でよくないか: 窓のアドレスはワード境界へ丸められる
+    // ので、上位バイトと下位バイトが同じワードを指す。分けて読むと同じドットを
+    // 2 度切り出すことになり、65536 色モードで上位バイトが下位バイトの値に
+    // 化ける。ここは 1 回で組み立てる。
+    const bool fitsInGvram = a >= kGvramBase && a + 1 < kGvramEnd;
+    if (fitsInGvram)
+    {
+        return mem_.graphicVram != nullptr ? readGvramDot(a) : 0u;
+    }
+
     // 上のどれにも当たらない領域は read8 を 2 回に分ける。
     // read8 が faulted_ を書き換えるので、どちらかが失敗したら
     // ワード全体を失敗として扱う。
@@ -203,7 +315,17 @@ void SystemBus::write8(u32 addr, u8 value)
     {
         if (mem_.graphicVram != nullptr)
         {
-            mem_.graphicVram[(a - kGvramBase) & (kTvramSize - 1)] = value;
+            // バイト書き込みはワードの片側だけを差し替える。
+            // 既に載っているドットを読んでから、対象のバイトを入れ替える。
+            //
+            // 16 色 / 256 色ではドットが下位バイトに収まるので、
+            // 偶数番地 (上位バイト) への書き込みは何にも当たらない。
+            const bool isHighByte = (a & 1u) == 0u;
+            const u16 dot = readGvramDot(a);
+            const u16 next = isHighByte
+                                 ? static_cast<u16>((static_cast<u16>(value) << 8) | (dot & 0xFFu))
+                                 : static_cast<u16>((dot & 0xFF00u) | value);
+            writeGvramDot(a, next);
         }
         return;
     }
@@ -228,6 +350,18 @@ void SystemBus::write16(u32 addr, u16 value)
     if (a >= kIoBase && a < kIoEnd)
     {
         io_.ioWrite16(a, value);
+        return;
+    }
+
+    // グラフィック VRAM は read16 と同じ理由でワードのまま扱う。
+    // 分けて書くと 2 回目の read-modify-write が 1 回目の結果を消す。
+    const bool fitsInGvram = a >= kGvramBase && a + 1 < kGvramEnd;
+    if (fitsInGvram)
+    {
+        if (mem_.graphicVram != nullptr)
+        {
+            writeGvramDot(a, value);
+        }
         return;
     }
 

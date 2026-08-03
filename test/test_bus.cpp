@@ -350,14 +350,19 @@ TEST_CASE("メモリが未設定でも応答する領域はエラーにしない
     CHECK_FALSE(bus.lastAccessFaulted());
 }
 
-TEST_CASE("グラフィック VRAM は 512KB で折り返す")
+TEST_CASE("グラフィック VRAM の窓は実 VRAM の外へ出ない")
 {
-    // 保証すること: アドレス空間は 2MB あるが実 VRAM は 512KB なので、
-    // 折り返して同じ場所が見えること。
+    // 保証すること: 2MB のアドレス空間のどこを触っても、512KB の実 VRAM の
+    // 中に収まること。
     //
     // 壊れると: 配列外アクセスになる。ESP32 では PSRAM の別の領域を
     // 壊すので、症状が全く関係ない場所に出る。
-    std::vector<x68k::u8> gvram(x68k::kTvramSize, 0);
+    //
+    // 窓の末尾に番兵を置き、空間の末尾 ($DFFFFF) を触っても番兵が
+    // 無事であることで確かめる。
+    std::vector<x68k::u8> gvram(x68k::kTvramSize + 1, 0);
+    gvram[x68k::kTvramSize] = 0x5A;  // 番兵
+
     x68k::Sram sram;
     RecordingIo io;
     x68k::SystemBus bus(x68k::MemoryMap{}, sram, io);
@@ -365,9 +370,10 @@ TEST_CASE("グラフィック VRAM は 512KB で折り返す")
     memory.graphicVram = gvram.data();
     bus.setMemory(memory);
 
-    bus.write8(x68k::kGvramBase, 0x42);
-    // 512KB 先は同じ場所を指す。
-    CHECK(bus.read8(x68k::kGvramBase + x68k::kTvramSize) == 0x42);
+    bus.write16(x68k::kGvramEnd - 2, 0xFFFF);
+    bus.write8(x68k::kGvramEnd - 1, 0xFF);
+    (void)bus.read16(x68k::kGvramEnd - 2);
+    CHECK(gvram[x68k::kTvramSize] == 0x5A);
     CHECK_FALSE(bus.lastAccessFaulted());
 }
 

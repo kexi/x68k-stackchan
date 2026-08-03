@@ -45,23 +45,43 @@ inline ScreenSize screenSizeOf(const VideoController& video)
     return {kGvramPageWidth, kGvramPageHeight};
 }
 
-// 16 色モードで表示すべき最も手前のページを返す。見つからなければ -1。
+// 表示が許可されたページのうち、最も手前のものを返す。見つからなければ -1。
+//
+// 手前かどうかは $E82500 の GP3-GP0 が決める (値が小さいほど手前)。
+// 同じ順位が複数のページに設定されていたら、番号の小さいページを手前とする。
+//
+// Why not ページ番号の小さい順で決め打ちにしないか: GP3-GP0 は
+// ページごとの順位を保持していて、プログラムはこれを書き換えるだけで
+// VRAM を触らずに表示ページを入れ替えられる。SX-Window はこの方法で
+// ウィンドウの重なりと裏画面の切り替えを行うので、番号順に固定すると
+// 常に同じページが見えたままになる。
 //
 // Why not 4 ページを重ね合わせて 1 枚にしないか: 実機の 16 色モードでは
-// 4 ページが独立した画面で、$E82600 の bit3-0 で個別に表示を切り替える。
-// 番号の小さいページが手前に来て、透明ドットの位置だけ後ろのページが
-// 見える。プレーンを合成して 1 つの色番号にする (テキスト画面のやり方) と
-// まったく違う絵になる。
+// 4 ページが独立した画面で、$E82600 の GS3-GS0 で個別に表示を切り替える。
+// 透明ドットの位置だけ後ろのページが見える。プレーンを合成して 1 つの
+// 色番号にする (テキスト画面のやり方) とまったく違う絵になる。
 inline int frontmostEnabledPage(const VideoController& video)
 {
+    int front = -1;
+    u8 frontPriority = 0;
+
     for (u32 page = 0; page < 4; ++page)
     {
-        if (video.graphicPageEnabled(page))
+        if (!video.graphicPageEnabled(page))
         {
-            return static_cast<int>(page);
+            continue;
+        }
+
+        const u8 pagePriority = video.graphicPagePriority(page);
+        const bool isFrontmost = front < 0 || pagePriority < frontPriority;
+        if (isFrontmost)
+        {
+            front = static_cast<int>(page);
+            frontPriority = pagePriority;
         }
     }
-    return -1;
+
+    return front;
 }
 
 }  // namespace
@@ -176,13 +196,17 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     const bool isLarge =
         mode == VideoController::GraphicColorMode::k16Color && video.isGraphic1024();
 
-    // 16 色モードでは表示が許可された最も手前のページを描く。
+    // 表示が許可された最も手前のページを描く。
     //
     // Why not ページ 0 を決め打ちにしないか: Human68k も SX-Window も
     // ページを切り替えて裏画面を作る。$E82600 を無視すると、描き途中の
     // 裏画面が見えてちらつく。
+    //
+    // Why not 16 色モードだけ調べないか: 256 色モードも 2 ページあり、
+    // GS3-GS0 は 2bit ずつで同じように表示を切り替えられる。1024x1024 は
+    // 4 ページを 1 枚として使うのでページ選択そのものが無い。
     int page = 0;
-    if (mode == VideoController::GraphicColorMode::k16Color && !isLarge)
+    if (!isLarge)
     {
         page = frontmostEnabledPage(video);
         if (page < 0)

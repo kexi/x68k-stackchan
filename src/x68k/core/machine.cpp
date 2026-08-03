@@ -88,6 +88,11 @@ Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
     dmac_.setDevice(this);
     dmac_.setMemory(this);
 
+    // G-VRAM の窓 ($C00000-$DFFFFF) はページ選択を兼ねており、CPU の書き込みを
+    // 共有ワードのどのニブル/バイトへ折り込むかが色数モードで決まる。
+    // バスがモードを引けるようにここで繋ぐ。
+    bus_.setVideoController(&video_);
+
     // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
     // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
     // Machine が受け取って処理する。

@@ -95,24 +95,56 @@ void TouchKeyboard::draw()
     }
 }
 
-void TouchKeyboard::poll(KeyQueue& keys)
+void TouchKeyboard::poll(KeyQueue& keys, MouseQueue& mouse)
 {
-    if (!visible_)
-    {
-        return;
-    }
-
     const auto touch = M5.Touch.getDetail();
     if (!touch.isPressed())
     {
         // 離したので次のキーを受け付ける。
         lastKeyIndex_ = -1;
+
+        // ボタンを離したことを伝える。
+        //
+        // Why not 何もしないか: 押したまま指を離すと、ゲストから見ると
+        // ボタンが押しっぱなしになる。SX-Window ではドラッグが終わらず、
+        // ウィンドウが指に貼り付いたままになる。
+        if (isDragging_)
+        {
+            isDragging_ = false;
+            mouse.push(0, 0, false, false);
+        }
         return;
     }
 
-    if (touch.y < kKeyboardTop)
+    // キーボードを出していないときは画面全体をマウスに使う。
+    //
+    // Why not 出していない間も下部をキーボード扱いにするか: 描かれていない
+    // キーを押せることになる。見えないものが反応する状態は、意図しない
+    // 文字が入るだけで害しかない (main.cpp が setVisible(false) している
+    // 理由もこれ)。
+    const bool isMouseArea = !visible_ || touch.y < kKeyboardTop;
+    if (isMouseArea)
     {
-        return;  // 画面側のタッチ
+        // 触り始めは基準点を置くだけ。前に離した位置との差を送ると飛ぶ。
+        if (!isDragging_)
+        {
+            isDragging_ = true;
+            lastTouchX_ = touch.x;
+            lastTouchY_ = touch.y;
+            // 押下だけを伝える。移動量は次のループから。
+            mouse.push(0, 0, true, false);
+            return;
+        }
+
+        const int dx = touch.x - lastTouchX_;
+        const int dy = touch.y - lastTouchY_;
+        lastTouchX_ = touch.x;
+        lastTouchY_ = touch.y;
+
+        // 動いていなくてもボタンの状態は保つ。MouseQueue が
+        // 「変化が無ければ送らない」を判断する。
+        mouse.push(dx, dy, true, false);
+        return;
     }
 
     const int col = touch.x / kKeyWidth;

@@ -27,6 +27,16 @@ constexpr u8 kRxIntSpecialOnly = 0x18;
 // WR2 は割り込みベクタ。A/B で共通の実体を持つ (チップに 1 つしかない)。
 constexpr u32 kWr2Vector = 2;
 
+// ベクタに埋め込む status (V3-V1)。Z8530 は要因ごとの 3bit 符号を bit3-1 に
+// 入れるので、ベースへの加算値は「符号 × 2」になる。
+//
+//   000 ch B 送信空き / 001 ch B 外部状態 / 010 ch B 受信 / 011 ch B 特殊受信
+//   100 ch A 送信空き / 101 ch A 外部状態 / 110 ch A 受信 / 111 ch A 特殊受信
+//
+// 使うのは受信の 2 つだけ。010 → +4、110 → +12。
+constexpr u32 kVectorStatusRxB = 4;
+constexpr u32 kVectorStatusRxA = 12;
+
 // マウスの移動量は 1 バイト符号付き。
 constexpr int kMouseDeltaMin = -128;
 constexpr int kMouseDeltaMax = 127;
@@ -71,6 +81,7 @@ void Scc::reset()
         channel.rxCount = 0;
         channel.rxInterruptPending = false;
     }
+    sharedWr_.fill(0);
 }
 
 u8 Scc::peek(u32 channel, u32 reg) const
@@ -78,6 +89,11 @@ u8 Scc::peek(u32 channel, u32 reg) const
     if (!isValidChannel(channel) || reg >= kRegCount)
     {
         return 0u;
+    }
+    // 共通レジスタはどちらのチャネルから覗いても同じ値を返す。
+    if (isSharedReg(reg))
+    {
+        return sharedWr_[reg];
     }
     return ch_[channel].wr[reg];
 }
@@ -142,13 +158,30 @@ u8 Scc::readControl(u32 channel)
 
         case 2:
         {
-            // RR2 は割り込みベクタ。
+            // RR2 は割り込みベクタ。WR2 はチップ共通なので共通の実体から返す。
             //
-            // チャネル B から読むと、実機は割り込みの原因に応じて status を
-            // 埋め込んだ値を返す (WR9 の VIS が立っている場合)。X68000 の
-            // 初期化表は WR9 に $40 を書くだけで VIS を立てないので、
-            // WR2 の値をそのまま返す。
-            return ch_[kChannelA].wr[kWr2Vector];
+            // チャネル A から読むと WR2 の素の値、チャネル B から読むと
+            // 割り込みの原因に応じた status 込みの値を返すのが実機。
+            // VIS (WR9 bit0) が立っていない場合は status を埋めない。
+            //
+            // Why not 常に素の値を返すか: IPL-ROM の初期化表は最後に
+            // WR9 = $09 を書く ($FF0E6E) ので VIS が立つ。status を
+            // 埋めないと、RR2 を読んで分岐する経路が要因を区別できない。
+            const u8 base = sharedWr_[kWr2Vector];
+            const bool isVis = (sharedWr_[9] & kWr9Vis) != 0;
+            if (channel != kChannelB || !isVis)
+            {
+                return base;
+            }
+            if (ch_[kChannelB].rxInterruptPending)
+            {
+                return static_cast<u8>(base + kVectorStatusRxB);
+            }
+            if (ch_[kChannelA].rxInterruptPending)
+            {
+                return static_cast<u8>(base + kVectorStatusRxA);
+            }
+            return base;
         }
 
         case 3:
@@ -199,16 +232,16 @@ void Scc::writeControl(u32 channel, u8 value)
         const u8 command = static_cast<u8>(value & kCommandMask);
         if (command == kWr0CmdResetHighestIus)
         {
-            // Reset Highest IUS。受信ハンドラの最後に書かれる ($FF1566)。
+            // Reset Highest IUS。受信ハンドラの最後に書かれる ($FF1564 の
+            // MOVE.W #$0038,$E98000)。「サービス中」の印を落とすだけで、
+            // 割り込みの要因そのものを消すコマンドではない。
             //
-            // 実機は「サービス中で最上位のもの」を落とすが、本エミュレータは
-            // 受信割り込みしか上げないので、それを落とせば足りる。
-            //
-            // Why not 無視するか: 無視しても acknowledgeInterrupt() が
-            // 保留を落とすので一見動く。しかし IOCS がハンドラ内で
-            // これを書いた後に再度割り込みを許すため、落とし忘れると
-            // 「サービス中」が残る実装へ拡張したときに固まる。
-            state.rxInterruptPending = false;
+            // Why not 無条件に保留を落とさないか: ハンドラは 1 バイトしか
+            // 読まずにこれを書く。FIFO に 2・3 バイト目が残っている状態で
+            // 保留まで落とすと、次の受信割り込みが上がらず、ROM 側の
+            // $092A のカウンタが 3 のまま止まってマウスが 1 バイトしか
+            // 届かない。残りがあるかどうかで張り直す。
+            refreshRxInterrupt(channel);
         }
         if (command == kWr0CmdErrorReset)
         {
@@ -218,10 +251,30 @@ void Scc::writeControl(u32 channel, u8 value)
         return;
     }
 
-    // WR0 以外は素直に格納する。
+    // WR0 以外は素直に格納する。WR2/WR9 だけはチップ共通の実体へ。
     if (reg < kRegCount)
     {
-        state.wr[reg] = value;
+        if (isSharedReg(reg))
+        {
+            sharedWr_[reg] = value;
+        }
+        else
+        {
+            state.wr[reg] = value;
+        }
+    }
+
+    // MIE を落とされたら両チャネルの保留を落とす。
+    //
+    // WR9 はチップ共通なので、片方のチャネルから禁止しても効くのが実機。
+    // 落とし忘れると、IOCS が割り込みを止めたつもりの区間で受理が起きる。
+    const bool isMasterControl = reg == 9;
+    if (isMasterControl && (value & kWr9Mie) == 0)
+    {
+        for (auto& target : ch_)
+        {
+            target.rxInterruptPending = false;
+        }
     }
 
     // 受信を無効にされたら、溜まっているデータを捨てる。
@@ -236,14 +289,15 @@ void Scc::writeControl(u32 channel, u8 value)
         state.rxInterruptPending = false;
     }
 
-    // 割り込みモードを禁止にされたら保留も落とす。
+    // 割り込みモードが変わったら保留を張り直す。
     //
-    // MFP の IER と同じ考え方。禁止した後に保留が残っていると、
-    // ハンドラを外した後で受理されて不正なベクタへ飛ぶ。
+    // 禁止にされたら落とす。MFP の IER と同じ考え方で、禁止した後に
+    // 保留が残っていると、ハンドラを外した後で受理されて不正なベクタへ飛ぶ。
+    // 逆に許可されたときは、既に FIFO にあるデータが要因として立つ。
     const bool isIntControl = reg == 1;
-    if (isIntControl && (value & kWr1RxIntMask) == kWr1RxIntDisabled)
+    if (isIntControl)
     {
-        state.rxInterruptPending = false;
+        refreshRxInterrupt(channel);
     }
 }
 
@@ -272,15 +326,14 @@ u8 Scc::readData(u32 channel)
     }
     --state.rxCount;
 
-    // FIFO が空になったら受信割り込みの保留も落とす。
+    // 残りに応じて保留を張り直す。空になれば落ち、まだ残っていれば
+    // もう一度上がる。
     //
-    // 実機の Z8530 は文字を取り出すと RR0 の bit0 が下り、割り込みの要因が
-    // 消える。残したままにすると、IOCS が全部読み切った後も割り込みが
-    // 上がり続けて先へ進まない。
-    if (state.rxCount == 0)
-    {
-        state.rxInterruptPending = false;
-    }
+    // 実機の Z8530 は文字を取り出すと RR0 の bit0 が下り、空になった時点で
+    // 割り込みの要因が消える。逆に残っている間は要因が消えないので、
+    // ハンドラを抜けた直後に次の受信割り込みが上がる。これが
+    // 「1 バイト = 1 割り込み」を成り立たせている。
+    refreshRxInterrupt(channel);
 
     return value;
 }
@@ -304,43 +357,70 @@ bool Scc::isMouseEnabled() const
     return isRxEnabled && isRtsAsserted;
 }
 
+bool Scc::wantsRxInterrupt(u32 channel) const
+{
+    // WR1 の bit4-3 が受信割り込みモード。X68000 の初期化表は $10
+    // (全文字で割り込む) を書く ($FF0E6C)。00 (禁止) のときは上げない。
+    const u8 mode = static_cast<u8>(ch_[channel].wr[1] & kWr1RxIntMask);
+    const bool isModeEnabled =
+        mode == kRxIntAllChars || mode == kRxIntFirstOnly || mode == kRxIntSpecialOnly;
+    if (!isModeEnabled)
+    {
+        return false;
+    }
+    // マスタ割り込み許可 (WR9 bit3) も要る。WR9 はチップ共通の実体。
+    return (sharedWr_[9] & kWr9Mie) != 0;
+}
+
+void Scc::refreshRxInterrupt(u32 channel)
+{
+    ChannelState& state = ch_[channel];
+
+    // FIFO に 1 バイトでも残っていれば割り込みを上げ続ける。
+    //
+    // 実機の Z8530 は「受信文字がある」という状態(レベル)で割り込みを出す。
+    // IPL-ROM $FF150A のハンドラは 1 回で 1 バイトしか読まず ($FF1512 の
+    // MOVE.W $E98002,D0)、$092A のカウンタを 1 つ減らして抜ける
+    // ($FF1526 の SUBQ.W #1)。3 バイト揃うのは 3 回目の割り込みのときで、
+    // そこで初めて $0CB1 へ写す ($FF1554 の MOVE.B ×3)。
+    //
+    // Why not 1 レポートを 1 回の割り込みで渡さないか: ハンドラが 1 回で
+    // 1 バイトしか引き取らない以上、割り込みを 1 回しか上げなければ
+    // 2 バイト目以降が FIFO に残ったまま二度と読まれない。ROM 側の
+    // カウンタは 3 のまま止まり、マウスはボタンの 1 バイトしか届かない。
+    state.rxInterruptPending = state.rxCount > 0 && wantsRxInterrupt(channel);
+}
+
 void Scc::pushRxByte(u32 channel, u8 value)
 {
     ChannelState& state = ch_[channel];
     if (state.rxCount >= kRxFifoSize)
     {
-        // 溢れたら捨てる。実機はオーバーランエラーを立てるが、
-        // 捨てた側を IOCS に知らせる手段が無いので、静かに落とす方が
-        // 「途中の 1 バイトだけ欠けたレポート」を作らずに済む。
+        // 呼び出し側が空きを確かめてから積む契約なので、ここへは来ない。
         return;
     }
     state.rxFifo[state.rxCount++] = value;
-
-    // 受信割り込みが許可されていれば保留を立てる。
-    //
-    // WR1 の bit4-3 が受信割り込みモード。X68000 の初期化表は $10
-    // (全文字で割り込む) を書く。00 (禁止) のときは保留にもしない。
-    const u8 mode = static_cast<u8>(state.wr[1] & kWr1RxIntMask);
-    const bool wantsInterrupt =
-        mode == kRxIntAllChars || mode == kRxIntFirstOnly || mode == kRxIntSpecialOnly;
-    if (!wantsInterrupt)
-    {
-        return;
-    }
-    // マスタ割り込み許可 (WR9 bit3) も要る。WR9 はチップ共通なので
-    // チャネル A 側の実体を見る。
-    const bool isMasterEnabled = (ch_[kChannelA].wr[9] & kWr9Mie) != 0;
-    if (!isMasterEnabled)
-    {
-        return;
-    }
-    state.rxInterruptPending = true;
+    refreshRxInterrupt(channel);
 }
 
 void Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 {
     // 無効化中は積まない。有効化した瞬間に古い動きが流れ込むのを避ける。
     if (!isMouseEnabled())
+    {
+        return;
+    }
+
+    // レポートは 3 バイト揃って初めて意味を持つので、全部入らないなら
+    // 1 バイトも積まない。
+    //
+    // Why not 入る分だけ積まないか: IOCS のハンドラは $092A のカウンタで
+    // 3 バイトを数えており ($FF153A で 3 を設定)、境界を知る手段が無い。
+    // 途中で切れたレポートを渡すと以降のバイト境界が恒久的にずれ、
+    // 次のレポートのボタン値が X 移動量として読まれてカーソルが暴れる。
+    // 丸ごと捨てれば「その 1 回の動きが無かった」だけで同期は保たれる。
+    const u32 freeSlots = kRxFifoSize - ch_[kChannelB].rxCount;
+    if (freeSlots < kMouseReportBytes)
     {
         return;
     }
@@ -355,8 +435,8 @@ void Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
         buttons = static_cast<u8>(buttons | kMouseButtonRight);
     }
 
-    // 3 バイトを一度に積む。IOCS 側は 1 バイトずつ割り込みで引き取り、
-    // 3 バイト目でワークへ写す ($FF1554 の MOVE.B ×3)。
+    // IOCS 側は 1 バイトずつ割り込みで引き取り、3 バイト目でワークへ写す
+    // ($FF1554 の MOVE.B ×3)。
     pushRxByte(kChannelB, buttons);
     pushRxByte(kChannelB, saturateDelta(dx));
     pushRxByte(kChannelB, saturateDelta(dy));
@@ -374,28 +454,40 @@ u32 Scc::acknowledgeInterrupt()
         return 0u;
     }
 
-    // ベクタは WR2 に書かれた値をそのまま使う。
+    // ベクタは WR2 のベースに、割り込み要因を表す status を埋め込んだ値。
     //
-    // X68000 の IOCS は WR2 に $70 を書き、$70/$71 (チャネル B 送受信) と
-    // $74/$75 (チャネル A) を使う。VIS (WR9 bit4) は立てないので、
-    // status によるベクタの変化は起きない。
+    // Z8530 は status を V3-V1 (bit3-1) に入れる。受信可能の符号は
+    // チャネル B が 010、チャネル A が 110 なので、ベース +4 / +12 になる。
+    // WR9 の Status High (bit4) が立っていれば V6-V4 (bit6-4) 側へ入るが、
+    // X68000 は立てないので下位側で固定してよい。
+    //
+    // 根拠は IPL-ROM の実測値で二重に取れている。
+    //   $FF0E2C: チャネル A の初期化表が WR2 = $50 を書く
+    //            (WR2 もチップ共通なので、これがチップ全体のベース)
+    //   $FF0DA2: LEA $00000140,A1 / $FF0DA8: LEA $FF0E04,A0 /
+    //            MOVE.W #7,D1 のループが $FF0E04 の 8 エントリを
+    //            1 つずつ 2 回書いて $140-$17F (ベクタ $50-$5F) を埋める
+    //   その並びでマウスの受信ハンドラ $FF150A が入るのはベクタ $54/$55。
+    // つまり $50 + 4 = $54 で、Z8530 の符号化と ROM のベクタ表が一致する。
+    //
+    // Why not 素朴に「ベース +1」にしないか: それでは $51 になり、
+    // $FF0E04 の表では $FF15C0 (未使用要因の共通ハンドラ) へ飛ぶ。
+    // マウスのハンドラが一度も呼ばれず、カーソルが動かない。
     //
     // Why not 自動ベクタにするか: SCC は自分のベクタを返すデバイスで、
     // 自動ベクタにすると IOCS が張ったマウス用ハンドラへ届かない。
     // MFP を自動ベクタにしたときと同じ壊れ方 (不正ベクタへ飛ぶ) になる。
-    const u8 base = ch_[kChannelA].wr[kWr2Vector];
+    const u8 base = sharedWr_[kWr2Vector];
 
     // チャネル B (マウス) を優先する。実機の SCC も B が上位。
     if (ch_[kChannelB].rxInterruptPending)
     {
         ch_[kChannelB].rxInterruptPending = false;
-        // ch B 受信 = ベース +1。
-        return static_cast<u32>(base) + 1u;
+        return static_cast<u32>(base) + kVectorStatusRxB;
     }
 
     ch_[kChannelA].rxInterruptPending = false;
-    // ch A 受信 = ベース +5。
-    return static_cast<u32>(base) + 5u;
+    return static_cast<u32>(base) + kVectorStatusRxA;
 }
 
 }  // namespace x68k

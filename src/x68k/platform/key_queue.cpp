@@ -76,4 +76,65 @@ void KeyQueue::drain(x68k::Machine& machine)
     stepsLeft_ = kStepsPerEvent;
 }
 
+// --- マウス ----------------------------------------------------------------
+
+bool MouseQueue::begin()
+{
+    mutex_ = xSemaphoreCreateMutex();
+    return mutex_ != nullptr;
+}
+
+void MouseQueue::push(int dx, int dy, bool leftButton, bool rightButton)
+{
+    if (mutex_ == nullptr)
+    {
+        return;
+    }
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    // 足し込む。エミュレーションコアが引き取るまでに何度も呼ばれるので、
+    // 上書きすると指の動きの大半が捨てられる。
+    pendingDx_ += dx;
+    pendingDy_ += dy;
+    // ボタンは最後の状態が正しい。押した/離したは足し合わせられない。
+    leftButton_ = leftButton;
+    rightButton_ = rightButton;
+    xSemaphoreGive(mutex_);
+}
+
+void MouseQueue::drain(x68k::Machine& machine)
+{
+    if (mutex_ == nullptr)
+    {
+        return;
+    }
+
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    const int dx = pendingDx_;
+    const int dy = pendingDy_;
+    const bool left = leftButton_;
+    const bool right = rightButton_;
+    pendingDx_ = 0;
+    pendingDy_ = 0;
+    xSemaphoreGive(mutex_);
+
+    // 動きもボタンの変化も無ければ送らない。
+    //
+    // Why not 毎回送らないか: 1 レポートごとに SCC が受信割り込みを上げる。
+    // 触っていない間も送り続けると、IOCS のマウス割り込みハンドラが
+    // スライスごとに走って 68000 の時間を食う。実効 3MHz ではこれが効く。
+    const bool hasMotion = dx != 0 || dy != 0;
+    const bool hasButtonChange = left != sentLeftButton_ || right != sentRightButton_;
+    if (!hasMotion && !hasButtonChange)
+    {
+        return;
+    }
+
+    sentLeftButton_ = left;
+    sentRightButton_ = right;
+
+    // 飽和は Scc::moveMouse が持つ (レポートは 1 バイト符号付き)。
+    machine.moveMouse(dx, dy, left, right);
+}
+
 }  // namespace x68k_platform

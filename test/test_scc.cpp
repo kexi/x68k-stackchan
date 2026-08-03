@@ -19,30 +19,57 @@
 namespace
 {
 
+// IPL-ROM のチャネル A 初期化表 ($FF0E24 の 20 組)。
+//
+// $FF0DBC が LEA $FF0E24,A0 / LEA $E98004,A1 / MOVE.W #$13,D1 のループで
+// 「レジスタ番号, 値」の組を 20 回そのまま流し込む。ここは ROM の実バイト列。
+constexpr x68k::u8 kInitTableA[][2] = {
+    {0x09, 0xC0}, {0x09, 0x80}, {0x04, 0x45}, {0x01, 0x00}, {0x02, 0x50},
+    {0x03, 0xC0}, {0x05, 0xE2}, {0x09, 0x01}, {0x0B, 0x56}, {0x0C, 0x0E},
+    {0x0D, 0x00}, {0x0E, 0x02}, {0x03, 0xC1}, {0x05, 0xEA}, {0x00, 0x80},
+    {0x0E, 0x03}, {0x0F, 0x00}, {0x00, 0x10}, {0x00, 0x10}, {0x01, 0x10},
+};
+
+// IPL-ROM のチャネル B 初期化表 ($FF0E4C の 18 組)。
+//
+// $FF0DDC が LEA $FF0E4C,A0 / LEA $E98000,A1 / MOVE.W #$11,D1 で流し込む。
+// 末尾の WR1=$10 / WR9=$09 ($FF0E6C-$FF0E6F) が割り込みを開くところ。
+constexpr x68k::u8 kInitTableB[][2] = {
+    {0x09, 0x40}, {0x04, 0x4C}, {0x01, 0x00}, {0x03, 0xC0}, {0x05, 0x60}, {0x0B, 0x56},
+    {0x0C, 0x1F}, {0x0D, 0x00}, {0x0E, 0x02}, {0x03, 0xC1}, {0x05, 0xE8}, {0x00, 0x80},
+    {0x0E, 0x03}, {0x0F, 0x00}, {0x00, 0x10}, {0x00, 0x10}, {0x01, 0x10}, {0x09, 0x09},
+};
+
+// IPL-ROM が実際に行う初期化を、表の順序どおり再生する。
+//
+// Why not MIE を直接書いて済ませないか: WR9 がチャネル別の実体だと、
+// 「A へ MIE を書く」人工的な手順では動いてしまい、実 ROM が
+// B の表の末尾でしか MIE を立てない事実を取りこぼす。表をそのまま
+// 流すことでしか、チップ共通レジスタの取り違えは検出できない。
+void replayRomInit(x68k::Scc& scc)
+{
+    for (const auto& entry : kInitTableA)
+    {
+        scc.writeControl(x68k::Scc::kChannelA, entry[0]);
+        scc.writeControl(x68k::Scc::kChannelA, entry[1]);
+    }
+    for (const auto& entry : kInitTableB)
+    {
+        scc.writeControl(x68k::Scc::kChannelB, entry[0]);
+        scc.writeControl(x68k::Scc::kChannelB, entry[1]);
+    }
+}
+
 // マウスを使える状態にした SCC を作る。
 //
-// IOCS が実際に行う手順をなぞる: WR9 でマスタ割り込み許可、WR1 で
-// 受信割り込み (全文字)、WR3 で受信有効、WR5 で RTS。
+// IPL-ROM の初期化表をそのまま流したうえで、マウス有効化 ($FF147E の
+// WR5 へ $62 = RTS on) を行う。ROM の初期化は WR5 に $E8 を書いて
+// 終わる ($FF0E60) ので、RTS は別途立てないと立たない。
 x68k::Scc makeEnabledScc()
 {
     x68k::Scc scc;
     scc.reset();
-
-    // WR9 はチップ共通なのでチャネル A 側の実体に入る。
-    scc.writeControl(x68k::Scc::kChannelA, 9);
-    scc.writeControl(x68k::Scc::kChannelA, x68k::Scc::kWr9Mie);
-
-    // WR2 = 割り込みベクタのベース。IOCS は $70 を書く。
-    scc.writeControl(x68k::Scc::kChannelA, 2);
-    scc.writeControl(x68k::Scc::kChannelA, 0x70);
-
-    // WR1 = $10 (全文字で受信割り込み)。
-    scc.writeControl(x68k::Scc::kChannelB, 1);
-    scc.writeControl(x68k::Scc::kChannelB, 0x10);
-
-    // WR3 = $C1 (Rx 8bit + 受信有効)。
-    scc.writeControl(x68k::Scc::kChannelB, 3);
-    scc.writeControl(x68k::Scc::kChannelB, 0xC1);
+    replayRomInit(scc);
 
     // WR5 = $62 (RTS on)。IPL-ROM $FF1486 と同じ値。
     scc.writeControl(x68k::Scc::kChannelB, 5);
@@ -423,7 +450,8 @@ TEST_CASE("マスタ割り込み許可が無ければ保留にならない")
     // 割り込みが飛び、IOCS の排他が崩れる。
     x68k::Scc scc = makeEnabledScc();
 
-    scc.writeControl(x68k::Scc::kChannelA, 9);
+    // WR9 はチップ共通なので、どちらのチャネルから禁止しても効く。
+    scc.writeControl(x68k::Scc::kChannelA, 0x09);
     scc.writeControl(x68k::Scc::kChannelA, 0x00);
 
     scc.moveMouse(1, 1, false, false);
@@ -431,21 +459,162 @@ TEST_CASE("マスタ割り込み許可が無ければ保留にならない")
     CHECK(!scc.hasPendingInterrupt());
 }
 
-TEST_CASE("割り込みの受理でベクタ番号が返り、保留が落ちる")
+TEST_CASE("WR9 はチップ共通で、A から書いても B から書いても同じ実体に入る")
 {
-    // 保証すること: SCC が自分のベクタ番号を返すこと。
+    // 保証すること: WR9 が A/B 別々のコピーになっていないこと。
     //
-    // 根拠: WR2 に書かれた値がベース。IOCS は $70 を書き、
-    // チャネル B の受信は +1 ($71)。
+    // 根拠: Z8530 の WR9 はチップに 1 つしかない。IPL-ROM の初期化表は
+    // チャネル A 側が WR9=$01 で終わり ($FF0E32)、MIE ($08) を立てるのは
+    // チャネル B の表の末尾 WR9=$09 ($FF0E6E) だけ。
     //
-    // 壊れると: 自動ベクタになり、IOCS が張ったマウス用ハンドラへ
-    // 届かない。MFP を自動ベクタにしたときと同じ壊れ方をする。
+    // 壊れると: A 側の実体を見る実装では MIE が 0 のままになり、
+    // 実 ROM の初期化を終えた後にマウス割り込みが一度も上がらない。
+    x68k::Scc scc;
+    scc.reset();
+
+    // B 側から $09 (MIE + VIS) を書く。
+    scc.writeControl(x68k::Scc::kChannelB, 0x09);
+    scc.writeControl(x68k::Scc::kChannelB, 0x09);
+
+    // A 側から覗いても同じ値が見える。
+    CHECK(scc.peek(x68k::Scc::kChannelA, 9) == 0x09);
+    CHECK(scc.peek(x68k::Scc::kChannelB, 9) == 0x09);
+}
+
+TEST_CASE("IPL-ROM の初期化表を流しただけでマウス割り込みが上がる")
+{
+    // 保証すること: 人工的な手順を一切挟まず、実 ROM が書く順序と値
+    // ($FF0E24 の 20 組 → $FF0E4C の 18 組) をそのまま再生した後に、
+    // マウスの動きが割り込みとして観測できること。
+    //
+    // これがこのファイルで最も重要な回帰テスト。以前は「A へ MIE を
+    // 直接書く」という ROM が決して行わない手順で有効化していたため、
+    // WR9 をチャネル別に持つ実装の誤りが表に出なかった。
+    //
+    // 壊れると: 実機で Human68k が起動してもマウスが完全に無反応になる。
+    x68k::Scc scc;
+    scc.reset();
+    replayRomInit(scc);
+
+    // ROM の初期化直後は WR5=$E8 で RTS が落ちている ($FF0E60)。
+    CHECK(!scc.isMouseEnabled());
+
+    // IOCS のマウス有効化 ($FF147E: WR5 へ $62)。
+    scc.writeControl(x68k::Scc::kChannelB, 5);
+    scc.writeControl(x68k::Scc::kChannelB, 0x62);
+    CHECK(scc.isMouseEnabled());
+
+    scc.moveMouse(3, 4, false, false);
+    CHECK(scc.hasPendingInterrupt());
+    CHECK(scc.acknowledgeInterrupt() == 0x54u);
+}
+
+TEST_CASE("3 バイトのレポートは 1 バイトごとに 3 回割り込む")
+{
+    // 保証すること: 1 レポートが 3 回の受信割り込みとして届くこと。
+    //
+    // 根拠: IPL-ROM $FF150A のハンドラは 1 回の呼び出しで
+    // $FF1512 の MOVE.W $E98002,D0 により 1 バイトだけ読み、
+    // $FF1526 の SUBQ.W #1,$092A でカウンタを減らして抜ける。
+    // 3 バイト揃うのは 3 回目で、そこで $FF1554 の MOVE.B ×3 が
+    // $0CB1 へ写す。つまり ROM は 1 バイト = 1 割り込みを前提にしている。
+    //
+    // 壊れると: 1 回しか割り込まず、2・3 バイト目が FIFO に残ったまま
+    // 二度と読まれない。ROM のカウンタが同期を失い、マウスは
+    // ボタンの 1 バイトしか届かない。
+    x68k::Scc scc = makeEnabledScc();
+    scc.moveMouse(0x11, 0x22, false, false);
+
+    // ROM のハンドラ 1 回分を 3 回繰り返す。
+    x68k::u8 received[3] = {};
+    for (int i = 0; i < 3; ++i)
+    {
+        CHECK(scc.hasPendingInterrupt());
+        CHECK(scc.acknowledgeInterrupt() == 0x54u);
+
+        received[i] = scc.readData(x68k::Scc::kChannelB);
+
+        // ハンドラ末尾の Reset Highest IUS ($FF1564)。
+        scc.writeControl(x68k::Scc::kChannelB, x68k::Scc::kWr0CmdResetHighestIus);
+    }
+
+    CHECK(received[0] == 0x00);
+    CHECK(received[1] == 0x11);
+    CHECK(received[2] == 0x22);
+
+    // 3 バイト読み切ったら要因が消える。
+    CHECK(!scc.hasPendingInterrupt());
+}
+
+TEST_CASE("FIFO に 3 バイト分の空きが無ければレポートを 1 バイトも積まない")
+{
+    // 保証すること: レポートの enqueue が all-or-nothing であること。
+    //
+    // FIFO は 8 段なので、2 レポート (6 バイト) 積むと残りは 2 バイト。
+    // ここで 3 バイトのレポートを積もうとすると、バイト単位で判定する
+    // 実装では「ボタンと X だけ入って Y が落ちる」形になる。
+    //
+    // 壊れると: 以降のバイト境界が恒久的にずれる。ROM の $092A は
+    // 3 バイトを数えるだけで境界を知る手段が無いので、次のレポートの
+    // ボタン値が X 移動量として読まれ、カーソルが暴れ続ける。
+    x68k::Scc scc = makeEnabledScc();
+
+    scc.moveMouse(1, 1, false, false);
+    scc.moveMouse(2, 2, false, false);
+    CHECK(scc.pendingBytes(x68k::Scc::kChannelB) == 6);
+
+    // 残り 2 バイトしか無いので、この 3 バイトは丸ごと捨てられる。
+    scc.moveMouse(3, 3, false, false);
+    CHECK(scc.pendingBytes(x68k::Scc::kChannelB) == 6);
+
+    // 残っているのは最初の 2 レポートで、境界は保たれている。
+    const MouseReport first = readReport(scc);
+    CHECK(first.dx == 1);
+    CHECK(first.dy == 1);
+    const MouseReport second = readReport(scc);
+    CHECK(second.dx == 2);
+    CHECK(second.dy == 2);
+}
+
+TEST_CASE("チャネル B 受信のベクタは $54 になる")
+{
+    // 保証すること: 受信割り込みのベクタが、IPL-ROM がマウスハンドラを
+    // 張ったベクタ番号と一致すること。
+    //
+    // 根拠は ROM から二重に取れる。
+    //   1. $FF0E2C: チャネル A の初期化表が WR2 = $50 を書く
+    //   2. $FF0DA2: LEA $00000140,A1 / LEA $FF0E04,A0 / MOVE.W #7,D1 の
+    //      ループが $FF0E04 の 8 エントリを 1 つずつ 2 回書き、
+    //      $140-$17F (ベクタ $50-$5F) を埋める。その並びで
+    //      マウス受信ハンドラ $FF150A が入るのはベクタ $54/$55。
+    // Z8530 の status 符号化 (ch B 受信 = 010 を bit3-1) でも $50+4 = $54。
+    //
+    // 壊れると: $51 などへ飛び、$FF0E04 の表では未使用要因の共通ハンドラ
+    // $FF15C0 が呼ばれる。マウスのハンドラが一度も動かずカーソルが止まる。
     x68k::Scc scc = makeEnabledScc();
     scc.moveMouse(1, 1, false, false);
 
     const x68k::u32 vector = scc.acknowledgeInterrupt();
-    CHECK(vector == 0x71u);
-    CHECK(!scc.hasPendingInterrupt());
+    CHECK(vector == 0x54u);
+}
+
+TEST_CASE("WR2 はチップ共通で、チャネル A から書いた値が B の受信ベクタに効く")
+{
+    // 保証すること: WR2 を A/B 別々の実体にしないこと。
+    //
+    // 根拠: IPL-ROM は WR2 をチャネル A の表からしか書かない
+    // ($FF0E2C の $50)。チャネル B の表 ($FF0E4C) に WR2 の組は無い。
+    // 別実体にすると B 側のベースが 0 のままになる。
+    //
+    // 壊れると: マウスのベクタが $04 (不正命令ベクタ) 付近になり、
+    // 割り込みのたびに異常終了する。
+    x68k::Scc scc = makeEnabledScc();
+
+    // ROM は A の表でしか WR2 を書いていない。それが B の受信に効く。
+    CHECK(scc.peek(x68k::Scc::kChannelB, 2) == 0x50);
+
+    scc.moveMouse(1, 1, false, false);
+    CHECK(scc.acknowledgeInterrupt() == 0x54u);
 }
 
 TEST_CASE("保留が無ければ受理は 0 を返す")
@@ -458,18 +627,32 @@ TEST_CASE("保留が無ければ受理は 0 を返す")
     CHECK(scc.acknowledgeInterrupt() == 0u);
 }
 
-TEST_CASE("Reset Highest IUS で保留が落ちる")
+TEST_CASE("Reset Highest IUS は FIFO を空にした後だけ保留を落とす")
 {
-    // 保証すること: WR0 へ $38 を書くと割り込みが取り下げられること。
+    // 保証すること: WR0 へ $38 を書いても、まだ読まれていないバイトが
+    // 残っている限り受信割り込みは下がらないこと。
     //
-    // 根拠: IPL-ROM $FF1566 が受信ハンドラの最後に
-    // MOVE.W #$0038,$E98000 を実行する。
+    // 根拠: IPL-ROM $FF1564 が受信ハンドラの最後に
+    // MOVE.W #$0038,$E98000 を実行するが、そのハンドラは $FF1512 で
+    // 1 バイトしか読んでいない。Reset Highest IUS は「サービス中」の印を
+    // 落とすコマンドで、受信データという要因を消すものではない。
+    //
+    // 壊れると: 1 バイト目の処理で保留が落ち、2・3 バイト目の割り込みが
+    // 上がらない。ROM の $092A カウンタが 3 のまま止まり、マウスは
+    // ボタンの 1 バイトしか受け取れずカーソルが動かない。
     x68k::Scc scc = makeEnabledScc();
     scc.moveMouse(1, 1, false, false);
     CHECK(scc.hasPendingInterrupt());
 
+    // 1 バイト読んでから EOI を書く (ROM のハンドラ 1 回分)。
+    (void)scc.readData(x68k::Scc::kChannelB);
     scc.writeControl(x68k::Scc::kChannelB, x68k::Scc::kWr0CmdResetHighestIus);
+    CHECK(scc.hasPendingInterrupt());
 
+    // 残り 2 バイトを読み切れば要因が消える。
+    (void)scc.readData(x68k::Scc::kChannelB);
+    (void)scc.readData(x68k::Scc::kChannelB);
+    scc.writeControl(x68k::Scc::kChannelB, x68k::Scc::kWr0CmdResetHighestIus);
     CHECK(!scc.hasPendingInterrupt());
 }
 

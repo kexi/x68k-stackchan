@@ -20,6 +20,7 @@
 #include "io/ascii_keymap.h"
 #include "machine.h"
 #include "video/cgrom_fallback.h"
+#include "video/graphic_raster.h"
 #include "video/text_raster.h"
 #include "video/text_scrape.h"
 
@@ -148,6 +149,112 @@ bool writePpm(const std::string& path, const x68k::u16* pixels, x68k::u32 width,
     return !hadError && !closeFailed;
 }
 
+// 台本で与えるマウスの 1 イベント。
+//
+// 実機のタッチと同じく相対移動で表す。X68000 のマウスは絶対座標を持たない
+// ので、絶対座標で書ける記法にすると「今カーソルがどこにあるか」を
+// ホスト側が知っている前提になり、実機で再現できない台本ができてしまう。
+struct MouseEvent
+{
+    // 何サイクル目に送るか。キー入力と同じく、起動が落ち着いてから
+    // 送らないと IOCS のマウス初期化前に捨てられる。
+    x68k::u64 atCycle = 0;
+    int dx = 0;
+    int dy = 0;
+    bool leftButton = false;
+    bool rightButton = false;
+};
+
+// --mouse の引数を解く。
+//
+// 書式: CYCLE:DX:DY[:BUTTONS] をカンマで並べる。BUTTONS は L / R の並び。
+//   例: --mouse 400000000:10:0:L,401000000:0:0:
+//       (4 億サイクル目に左ボタンを押しながら右へ 10、その後ボタンを離す)
+//
+// Why not キーの --keys のように「文字列を等間隔で流す」形にしないか:
+// マウスは押下・移動・解放の順序と間隔そのものが試したい対象で、
+// ドラッグの途中でボタンが離れるかどうかが SX-Window の挙動を分ける。
+// 等間隔で流す形だと、その組み立てを表現できない。
+bool parseMouseScript(const std::string& text, std::vector<MouseEvent>* out)
+{
+    std::size_t pos = 0;
+    while (pos <= text.size())
+    {
+        const std::size_t comma = text.find(',', pos);
+        const std::string item =
+            text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+
+        if (!item.empty())
+        {
+            MouseEvent event;
+            // 手で書く台本なので、区切りを数えて素直に切り出す。
+            std::size_t field = 0;
+            std::size_t fieldStart = 0;
+            for (std::size_t i = 0; i <= item.size(); ++i)
+            {
+                const bool isEnd = i == item.size();
+                if (!isEnd && item[i] != ':')
+                {
+                    continue;
+                }
+                const std::string value = item.substr(fieldStart, i - fieldStart);
+                if (field == 0)
+                {
+                    event.atCycle = std::strtoull(value.c_str(), nullptr, 0);
+                }
+                else if (field == 1)
+                {
+                    event.dx = static_cast<int>(std::strtol(value.c_str(), nullptr, 0));
+                }
+                else if (field == 2)
+                {
+                    event.dy = static_cast<int>(std::strtol(value.c_str(), nullptr, 0));
+                }
+                else if (field == 3)
+                {
+                    event.leftButton = value.find('L') != std::string::npos ||
+                                       value.find('l') != std::string::npos;
+                    event.rightButton = value.find('R') != std::string::npos ||
+                                        value.find('r') != std::string::npos;
+                }
+                else
+                {
+                    return false;  // 余分なフィールド
+                }
+                ++field;
+                fieldStart = i + 1;
+            }
+
+            // サイクル・dx・dy は必須。ボタンは省略できる。
+            if (field < 3)
+            {
+                return false;
+            }
+            out->push_back(event);
+        }
+
+        if (comma == std::string::npos)
+        {
+            break;
+        }
+        pos = comma + 1;
+    }
+
+    // 送る順に並べる。台本を時刻順に書かなくてよいようにする。
+    for (std::size_t i = 1; i < out->size(); ++i)
+    {
+        MouseEvent key = (*out)[i];
+        std::size_t j = i;
+        while (j > 0 && (*out)[j - 1].atCycle > key.atCycle)
+        {
+            (*out)[j] = (*out)[j - 1];
+            --j;
+        }
+        (*out)[j] = key;
+    }
+    return true;
+}
+
 void printUsage()
 {
     std::printf(
@@ -157,11 +264,15 @@ void printUsage()
         "  --cgrom PATH    CGROM (768KB)。省略時は IPL-ROM 内蔵 6x12 ANK で代替\n"
         "  --hdd PATH      SASI ハードディスクイメージ\n"
         "  --cycles N      実行する CPU サイクル数 (既定 20000000)\n"
-        "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
+        "  --ppm PATH      終了時に画面 (テキスト+グラフィック合成) を PPM で書き出す\n"
+        "  --text-only     --ppm でグラフィック面を合成せずテキストだけを出す\n"
         "  --dump-text     終了時にテキスト画面を ASCII で標準出力へ出す\n"
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
+        "  --mouse SCRIPT  マウスを動かす。CYCLE:DX:DY[:LR] をカンマ区切りで並べる\n"
+        "                  (例: 400000000:10:0:L,401000000:0:0:)\n"
+        "                  DX/DY は相対量。X68000 のマウスは絶対座標を持たない\n"
         "  --watch ADDR    そのアドレスへの書き込みを報告する (16 進)\n"
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
@@ -279,6 +390,8 @@ int main(int argc, char** argv)
     std::string hddPath;
     std::string ppmPath;
     bool dumpText = false;
+    bool textOnly = false;
+    std::vector<MouseEvent> mouseScript;
     // サイクル数は 64bit で持つ。
     //
     // X68000 は 10MHz なので 32bit では 7 分ぶんしか数えられない。
@@ -335,6 +448,20 @@ int main(int argc, char** argv)
         else if (arg == "--keys" && hasNext)
         {
             keys = argv[++i];
+        }
+        else if (arg == "--text-only")
+        {
+            textOnly = true;
+        }
+        else if (arg == "--mouse" && hasNext)
+        {
+            const std::string script = argv[++i];
+            if (!parseMouseScript(script, &mouseScript))
+            {
+                std::fprintf(stderr, "--mouse の書式が不正です: %s\n", script.c_str());
+                std::fprintf(stderr, "  CYCLE:DX:DY[:LR] をカンマ区切りで並べてください\n");
+                return 1;
+            }
         }
         else if (arg == "--watch" && hasNext)
         {
@@ -475,6 +602,9 @@ int main(int argc, char** argv)
     x68k::u64 nextKeyCycle = kKeyStartCycle;
     bool keyReleased = true;
 
+    // 台本のどこまで送ったか。
+    std::size_t mouseIndex = 0;
+
     while (spent < cycleLimit)
     {
         const auto& s = machine.cpu().state();
@@ -505,6 +635,23 @@ int main(int argc, char** argv)
         }
         spent += used;
         ++instructions;
+
+        // 台本の時刻に達したマウスイベントを送る。
+        //
+        // 1 ステップで複数件が期限を迎えることがある (同じサイクルに
+        // 並べた場合や、1 命令で数十サイクル進んだ場合) ので while で回す。
+        while (mouseIndex < mouseScript.size() && spent >= mouseScript[mouseIndex].atCycle)
+        {
+            const MouseEvent& event = mouseScript[mouseIndex];
+            machine.moveMouse(event.dx, event.dy, event.leftButton, event.rightButton);
+            if (traceDisk)
+            {
+                std::printf("[mouse] %zu/%zu dx=%d dy=%d L=%d R=%d (有効=%d)\n", mouseIndex + 1,
+                            mouseScript.size(), event.dx, event.dy, event.leftButton ? 1 : 0,
+                            event.rightButton ? 1 : 0, machine.scc().isMouseEnabled() ? 1 : 0);
+            }
+            ++mouseIndex;
+        }
 
         // キーを 1 つずつ打つ。押下と解放を交互に送る。
         //
@@ -622,11 +769,32 @@ int main(int argc, char** argv)
         constexpr x68k::u32 kWidth = 768;
         constexpr x68k::u32 kHeight = 512;
         std::vector<x68k::u16> pixels(static_cast<std::size_t>(kWidth) * kHeight, 0);
-        x68k::TextRaster::render(textVram.data(), machine.video(), 0, 0, kWidth, kHeight,
-                                 pixels.data(), kWidth);
+
+        // 既定で合成する。
+        //
+        // Why not テキストだけを出し続けないか: G-VRAM に描いた絵は
+        // テキスト画面のどこにも現れない。合成しないと、SX-Window が
+        // 正しく描けているのか描けていないのかをホストで判別できず、
+        // 実機に焼くまで分からなくなる。実機に焼かずにデバッグできることが
+        // このランナーの存在理由 (ファイル冒頭)。
+        //
+        // --text-only を残すのは切り分けのため。合成した絵が乱れたとき、
+        // グラフィック面の問題かテキスト面の問題かを分けられる。
+        if (textOnly)
+        {
+            x68k::TextRaster::render(textVram.data(), machine.video(), 0, 0, kWidth, kHeight,
+                                     pixels.data(), kWidth);
+        }
+        else
+        {
+            x68k::GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0,
+                                           0, kWidth, kHeight, pixels.data(), kWidth);
+        }
+
         if (writePpm(ppmPath, pixels.data(), kWidth, kHeight))
         {
-            std::printf("[ppm] %s に書き出しました (%ux%u)\n", ppmPath.c_str(), kWidth, kHeight);
+            std::printf("[ppm] %s に書き出しました (%ux%u, %s)\n", ppmPath.c_str(), kWidth, kHeight,
+                        textOnly ? "テキストのみ" : "テキスト+グラフィック合成");
         }
         else
         {

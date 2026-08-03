@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "sram_persist.h"
 
 namespace x68k_platform
 {
@@ -105,48 +106,74 @@ std::size_t loadFile(const char* path, std::uint8_t* buffer, std::size_t bufferS
     return read == static_cast<std::size_t>(size) ? read : 0;
 }
 
+namespace
+{
+
+// SramFileOps を FATFS で実装したもの。方針は sram_persist.h が持ち、
+// ここは「実際にカードを触る」部分だけを引き受ける。
+//
+// Why not 方針もここに書くか: FATFS を直に叩く関数は電源断のタイミングを
+// 再現できず、ホストのテストに載らない。壊れ方が「利用者の設定が全部消える」
+// である以上、検査できない場所に判断を置きたくない。
+class FatFileOps final : public SramFileOps
+{
+public:
+    std::size_t read(const char* path, std::uint8_t* buffer, std::size_t bufferSize) override
+    {
+        return loadFile(path, buffer, bufferSize);
+    }
+
+    bool write(const char* path, const std::uint8_t* buffer, std::size_t size) override
+    {
+        std::FILE* f = std::fopen(path, "wb");
+        if (f == nullptr)
+        {
+            return false;
+        }
+
+        const std::size_t written = std::fwrite(buffer, 1, size, f);
+        // fflush だけでは足りない。FATFS は fclose で FAT とディレクトリエントリを
+        // 確定させるので、閉じずに電源が切れると長さ 0 のファイルが残る。
+        const bool isFlushed = std::fflush(f) == 0;
+        const bool isClosed = std::fclose(f) == 0;
+        if (written != size || !isFlushed || !isClosed)
+        {
+            // 半端なファイルを残さないのが SramFileOps::write の契約。
+            std::remove(path);
+            return false;
+        }
+        return true;
+    }
+
+    bool remove(const char* path) override
+    {
+        // 元から無い場合も成功として扱う。呼び出し側は区別しない。
+        return std::remove(path) == 0 || !exists(path);
+    }
+
+    bool rename(const char* from, const char* to) override
+    {
+        return std::rename(from, to) == 0;
+    }
+
+    [[nodiscard]] bool exists(const char* path) override
+    {
+        std::FILE* f = std::fopen(path, "rb");
+        if (f == nullptr)
+        {
+            return false;
+        }
+        std::fclose(f);
+        return true;
+    }
+};
+
+}  // namespace
+
 bool saveFile(const char* path, const std::uint8_t* buffer, std::size_t size)
 {
-    // いったん一時ファイルへ書き切ってから rename で置き換える。
-    //
-    // Why not 目的のファイルを直接 "wb" で開くか: fopen した時点で既存の
-    // sram.dat が長さ 0 に切り詰められる。書いている途中で電源が落ちると
-    // 半端な長さのファイルだけが残り、次回起動では大きさ検査に落ちて
-    // 工場出荷値になる。つまり「保存しようとしたせいで、それまで正しく
-    // 保存できていた設定まで失う」。バッテリバックアップの代替としては
-    // 最悪の壊れ方で、保存しない方がまだましになってしまう。
-    //
-    // rename は FAT でもディレクトリエントリの書き換えだけで済み、
-    // 「古い内容」か「新しい内容」のどちらかが残る。中間状態にならない。
-    std::string tempPath(path);
-    tempPath += ".tmp";
-
-    std::FILE* f = std::fopen(tempPath.c_str(), "wb");
-    if (f == nullptr)
-    {
-        return false;
-    }
-
-    const std::size_t written = std::fwrite(buffer, 1, size, f);
-    // fflush だけでは足りない。FATFS は fclose で FAT とディレクトリエントリを
-    // 確定させるので、閉じずに電源が切れると長さ 0 のファイルが残る。
-    const bool isFlushed = std::fflush(f) == 0;
-    const bool isClosed = std::fclose(f) == 0;
-    if (written != size || !isFlushed || !isClosed)
-    {
-        std::remove(tempPath.c_str());
-        return false;
-    }
-
-    // FATFS の rename は既存の宛先があると失敗するので、先に消す。
-    // ここで電源が落ちると sram.dat は消えるが .tmp に完全な内容が残る。
-    std::remove(path);
-    if (std::rename(tempPath.c_str(), path) != 0)
-    {
-        std::remove(tempPath.c_str());
-        return false;
-    }
-    return true;
+    FatFileOps ops;
+    return saveSramImage(ops, path, buffer, size);
 }
 
 // --- SRAM --------------------------------------------------------------------
@@ -160,15 +187,19 @@ bool loadSram(x68k::Machine& machine)
     // 呼ばれるのは起動時の 1 回だけなので、常駐しても惜しくない大きさでもない。
     static std::uint8_t image[x68k::kSramSize];
 
-    const std::size_t size = loadFile(kSramPath, image, sizeof(image));
-    if (size == 0)
-    {
-        // ファイルが無い (初回起動) か、16KB を超えている。
-        return false;
-    }
+    // 本体が無い/壊れているときは .tmp からの復旧まで面倒を見る。
+    // 保存は remove(本体) → rename(.tmp) の順に進むので、その隙間で電源が
+    // 落ちると完全な .tmp だけが残る。ここで拾わないと、原子的に書いた意味が
+    // 無くなって工場出荷値へ落ちる。並び順の根拠は sram_persist.h に書いた。
+    FatFileOps ops;
+    const SramLoadResult result =
+        loadSramImage(ops, kSramPath, machine.sram(), image, sizeof(image));
 
-    // 長さとマジックの検査は core 側が行う。拒否されたら SRAM は変わらない。
-    return machine.sram().loadImage(image, size);
+    if (result == SramLoadResult::kRecovered)
+    {
+        ESP_LOGW(kTag, "本体が失われていたため %s%s から復旧しました", kSramPath, kTempSuffix);
+    }
+    return result != SramLoadResult::kNone;
 }
 
 bool saveSramIfDirty(x68k::Machine& machine)

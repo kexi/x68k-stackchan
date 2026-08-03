@@ -91,12 +91,20 @@ public:
 
     // WR5 bit1 = RTS。X68000 はこれをマウスへの「データを寄越せ」信号に使う。
     //
-    // $FF146C がマウス有効化で $62 (RTS=1)、$FF1444 が無効化で $60 (RTS=0)
+    // $FF1486 がマウス有効化で $62 (RTS=1)、$FF1452 が無効化で $60 (RTS=0)
     // を WR5 へ書く。実機のマウスは RTS がアクティブな間だけレポートを返す。
     static constexpr u8 kWr5Rts = 0x02;
 
     // WR9 (マスタ割り込み制御) のビット。
+    //
+    // WR9 は Z8530 に 1 つしかないチップ共通レジスタで、A/B どちらの
+    // 制御ポートから書いても同じ実体に入る。X68000 の初期化はこれに
+    // 依存している: マスタ割り込み許可 (MIE) を最後に立てるのは
+    // チャネル B の表の末尾 ($FF0E6E の WR9=$09) だけで、チャネル A の表は
+    // WR9=$01 で終わる ($FF0E32)。A/B 別々の実体にすると、B が立てた MIE が
+    // A から見えず「実 ROM の初期化後にマウス割り込みが一度も上がらない」。
     static constexpr u8 kWr9Mie = 0x08;         // 割り込み全体の許可
+    static constexpr u8 kWr9Vis = 0x01;         // ベクタに status を埋め込む
     static constexpr u8 kWr9StatusHigh = 0x10;  // ベクタの status を上位に入れる
 
     // WR0 のコマンド (bit5-3)。
@@ -172,6 +180,10 @@ private:
     // 落ちる」形になり、ボタンと移動量の対応がずれてカーソルが暴れる。
     static constexpr u32 kRxFifoSize = 8;
 
+    // 1 レポートのバイト数。IPL-ROM $FF153A が残りバイト数を 3 で初期化し、
+    // $FF1554 で MOVE.B を 3 回展開してワークへ写す。
+    static constexpr u32 kMouseReportBytes = 3;
+
     struct ChannelState
     {
         // WR0-WR15。RR は多くが WR と別実体なので、必要なものだけ個別に持つ。
@@ -190,13 +202,34 @@ private:
         return channel < kChannelCount;
     }
 
-    // FIFO へ 1 バイト積む。溢れたら捨てる。
+    // チップ共通レジスタか。WR2 (割り込みベクタ) と WR9 (マスタ割り込み制御)
+    // は Z8530 に 1 つしかなく、A/B どちらから書いても同じ実体に入る。
+    [[nodiscard]] static bool isSharedReg(u32 reg)
+    {
+        return reg == 2 || reg == 9;
+    }
+
+    // FIFO へ 1 バイト積む。溢れたら捨てる。呼び出し側は空きを確認済みの前提。
     void pushRxByte(u32 channel, u8 value);
+
+    // 受信割り込みを上げてよい状態か (WR1 の受信割り込みモード + WR9 の MIE)。
+    [[nodiscard]] bool wantsRxInterrupt(u32 channel) const;
+
+    // FIFO の残りに応じて受信割り込みの保留を張り直す。
+    void refreshRxInterrupt(u32 channel);
 
     // 受信状態から RR0 を組み立てる。
     [[nodiscard]] u8 buildRr0(u32 channel) const;
 
     std::array<ChannelState, kChannelCount> ch_{};
+
+    // チップ共通レジスタの実体。WR2 と WR9 だけをここに置く。
+    //
+    // Why not ChannelState に持たせたまま「A 側を正」とする運用にしないか:
+    // 実 ROM は WR2 をチャネル A の表からしか書かず ($FF0E2C の $50)、
+    // MIE はチャネル B の表の末尾でしか立てない ($FF0E6E の $09)。
+    // どちらか一方のチャネルを正にすると、必ずもう片方の設定が落ちる。
+    std::array<u8, kRegCount> sharedWr_{};
 };
 
 }  // namespace x68k

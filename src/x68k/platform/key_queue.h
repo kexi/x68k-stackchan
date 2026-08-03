@@ -69,6 +69,62 @@ private:
     x68k::u8 pendingRelease_ = 0;
 };
 
+// マウスの動きをエミュレーションコアへ渡す。
+//
+// KeyQueue と分けてあるのは、届け先も溢れたときの扱いも違うため。
+// キーは MFP のシリアルへ 1 バイトずつ流れ、取りこぼすと打った文字が消える。
+// マウスは SCC の受信 FIFO へ 3 バイトのレポートとして積まれ、移動量は
+// 相対値なので「溜まったぶんを足し合わせる」ことができる。
+//
+// Why not KeyQueue と同じく 1 イベントずつ間隔を空けて送らないか:
+// SCC の受信 FIFO は 8 段あり (scc.h の kRxFifoSize)、1 レポート 3 バイトを
+// 2 つぶん保持できる。間隔を空けるより、溜まった移動量を 1 レポートに
+// まとめて送る方がカーソルの追従が良い。指を速く滑らせたときに
+// 移動量が目減りしない。
+//
+// Why not 表示コアから Machine::moveMouse を直接呼ばないか: KeyQueue と
+// 同じ理由。SCC の受信 FIFO と割り込み保留はエミュレーションコアが
+// 割り込み処理で触るので、表示コアから書くとデータ競合になる。
+class MouseQueue
+{
+public:
+    bool begin();
+
+    // --- どのコアからでも呼べる ---
+
+    // 移動量とボタンの状態を積む。dx/dy は前回からの相対量。
+    //
+    // 溜まっているぶんへ足し込む。押しっぱなしで指を滑らせると
+    // 毎ループ呼ばれるので、1 件ずつキューに積むと溢れる。
+    void push(int dx, int dy, bool leftButton, bool rightButton);
+
+    // --- エミュレーションコアから呼ぶ ---
+
+    // 溜まった動きを SCC へ流す。スライスごとに呼ぶ。
+    //
+    // 動きもボタンの変化も無ければ何もしない。X68000 の IOCS は
+    // 受け取ったレポートをそのままカーソル位置へ足すので、中身の無い
+    // レポートを送っても実害は無いが、割り込みを無駄に上げることになる。
+    void drain(x68k::Machine& machine);
+
+private:
+    // 溜まった移動量とボタンの状態を守る。
+    //
+    // Why not FreeRTOS の queue を使わないか: KeyQueue と違って
+    // 「溜まったぶんを足し合わせる」ため、積む側が既存の値を読んで
+    // 書き戻す必要がある。queue では中身を覗いて書き換えられない。
+    SemaphoreHandle_t mutex_ = nullptr;
+
+    int pendingDx_ = 0;
+    int pendingDy_ = 0;
+    bool leftButton_ = false;
+    bool rightButton_ = false;
+
+    // 前回 SCC へ送ったボタンの状態。変化の検出に使う。
+    bool sentLeftButton_ = false;
+    bool sentRightButton_ = false;
+};
+
 }  // namespace x68k_platform
 
 #endif  // X68K_PLATFORM_KEY_QUEUE_H

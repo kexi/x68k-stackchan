@@ -131,9 +131,29 @@ public:
 
     // --- $E82500: プライオリティ (R1) ---
     //
-    // bit1-0 がスプライト、bit3-2 がテキスト、bit5-4 がグラフィックの
-    // 表示順位。値が小さいほど手前。同値のときの実機の挙動は
-    // スプライト > テキスト > グラフィックの順。
+    // 上位バイトが「面」の並び、下位バイトが「グラフィックの 4 ページ」の並び。
+    //
+    //   bit13-12: スプライト面 (SP)
+    //   bit11-10: テキスト面   (TX)
+    //   bit9-8  : グラフィック面 (GR)
+    //   bit7-6 / bit5-4 / bit3-2 / bit1-0: GP3 / GP2 / GP1 / GP0
+    //
+    // どちらも 2bit で、値が小さいほど手前。GP3-GP0 は「ページ n を何番目に
+    // 置くか」ではなく「n 番目の位置にどのページを置くか」でもなく、
+    // ページ n 自身の順位を GPn が持つ形 (下の graphicPagePriority() 参照)。
+    //
+    // 根拠: IPL-ROM の起動処理が $FF6436 で `move.w #$06E4, $E82500` を書く
+    // (生ワード列 $FF642E: 33fc 0020 00e8 2600 33fc 06e4 00e8 2500)。
+    // $06E4 = 0000_01_10_11_10_01_00 なので SP=0, TX=1, GR=2、
+    // GP3=3, GP2=2, GP1=1, GP0=0 となり、面はスプライト→テキスト→グラフィック、
+    // ページは 0,1,2,3 の順という実機の既定値にちょうど一致する。
+    //
+    // Why not 低位 6bit を SP/TX/GR とする読み方にしないか: その読み方でも
+    // $06E4 からは偶然 SP=0/TX=1/GR=2 が得られてしまう ($E4 の低 6bit が
+    // 100100b で同じ並びになるため) が、それは GP フィールドを面の順位と
+    // 誤読しているだけで、GP3-GP0 が消える。SX-Window は 16 色 4 ページを
+    // 個別に重ねてウィンドウを描くので、ページの前後関係を失うと
+    // 表示順がページ番号順に固定され、実機と違う絵になる。
     [[nodiscard]] u16 priority() const
     {
         return priority_;
@@ -141,32 +161,74 @@ public:
 
     [[nodiscard]] u8 spritePriority() const
     {
-        return static_cast<u8>(priority_ & 0x03u);
+        return static_cast<u8>((priority_ >> 12) & 0x03u);
     }
 
     [[nodiscard]] u8 textPriority() const
     {
-        return static_cast<u8>((priority_ >> 2) & 0x03u);
+        return static_cast<u8>((priority_ >> 10) & 0x03u);
     }
 
     [[nodiscard]] u8 graphicPriority() const
     {
-        return static_cast<u8>((priority_ >> 4) & 0x03u);
+        return static_cast<u8>((priority_ >> 8) & 0x03u);
+    }
+
+    // グラフィックページ page (0-3) の、4 ページ内での表示順位。
+    // 値が小さいほど手前。GP0 が bit1-0、GP3 が bit7-6。
+    [[nodiscard]] u8 graphicPagePriority(u32 page) const
+    {
+        if (page >= 4)
+        {
+            return 0;
+        }
+        return static_cast<u8>((priority_ >> (page * 2u)) & 0x03u);
     }
 
     // --- $E82600: 表示制御 (R2) ---
     //
-    // bit4 がグラフィック画面、bit5 がテキスト画面、bit6 がスプライト画面の
-    // 表示許可。bit3-0 は 16 色モードでのページ単位の表示許可
-    // (bit0 がページ 0 …… bit3 がページ 3)。
+    // bit5 がテキスト画面、bit6 がスプライト画面の表示許可。
+    // グラフィックは bit4 (GS4) と bit3-0 (GS3-GS0) の 2 段構えで、
+    // GS4 は 1024x1024 のとき、GS3-GS0 は 512x512 のときに効く。
     [[nodiscard]] u16 displayControl() const
     {
         return displayControl_;
     }
 
+    // グラフィック画面全体が表示されるか。
+    //
+    // 1024x1024 モードでは GS4 (bit4) が唯一の表示許可。512x512 モードでは
+    // GS3-GS0 (bit3-0) がページ単位の許可を兼ねていて、1 つでも立っていれば
+    // グラフィック面は出る。
+    //
+    // 根拠: IPL-ROM の IOCS グラフィックページ表示制御 ($FFB2C8 付近) は
+    // ページ指定 d1 (bit3-0) から $E82600 を組み立てる際、
+    //   $FFB2D2: tst.b d1 / beq → 非 0 なら or.b #$10,d1   (GS4 を足す)
+    //   $FFB2DA: move.w $E82600,d0 / and.w #$FFE0,d0 / or.w d1,d0 / 書き戻し
+    // という手順を踏む (生ワード列 $FFB2D2: 4a01 6704 823c 0010 3039 00e8
+    // 2600 c07c ffe0 8041 33c0 00e8)。マスクが $FFE0 = 下位 5bit をまとめて
+    // 差し替える形であること、そして GS4 が「ページが 1 つでも有効なら
+    // 立てる」従属ビットとして扱われていることから、512x512 では GS3-GS0 が
+    // 実体で GS4 は連動する印にすぎないと読める。
+    // さらに $FFB2F2 以降は色数で GS3-GS0 の意味が変わることを示す:
+    // 2 ページ (256 色) では指定 bit1 → $0C (bit3-2)、bit0 → $03 (bit1-0) へ
+    // 展開し、1 ページ (65536 色) では $FFB30C で moveq #$F,d1 と 4bit すべてを
+    // 立てる。ページ数は $93D にあり、CRTC モードテーブル ($FF65E0、1 件 32
+    // バイト) の該当ワードが 16 色=4 / 256 色=2 / 65536 色・1024x1024=1 を持つ。
+    //
+    // Why not 常に bit4 だけを見ないか: 512x512 でページビットだけを立てる
+    // プログラム (IOCS を通さず $E82600 を直接書くものは珍しくない) が
+    // グラフィック面ごと消える。ROM 自身も $FF6466 で `and.w #$1F,d0` と
+    // 下位 5bit をまとめて「グラフィックが出ているか」の判定に使っており
+    // (生ワード列 $FF6454: 3f39 00e8 2600 33fc 0000 00e8 2600 6128 3017 c07c
+    // 001f 6704)、bit4 単独では判定していない。
     [[nodiscard]] bool graphicEnabled() const
     {
-        return (displayControl_ & 0x0010u) != 0;
+        if (isGraphic1024())
+        {
+            return (displayControl_ & 0x0010u) != 0;
+        }
+        return (displayControl_ & 0x000Fu) != 0;
     }
 
     [[nodiscard]] bool textEnabled() const
@@ -179,15 +241,33 @@ public:
         return (displayControl_ & 0x0040u) != 0;
     }
 
-    // 16 色モードでページ page が表示対象か。
+    // 512x512 モードでページ page が表示対象か。
     //
-    // Why not 256 色 / 65536 色でもこのビットを見ないか: bit3-0 は
-    // 4 プレーン構成を前提にしたビットで、実機でも 16 色モード以外では
-    // ページ選択に使われない。256 色モードのページ選択は
-    // 「どちらのページを描くか」をラスタ側が引数で受け取る形にしてある。
+    // GS3-GS0 は色数によって「1 ページあたり何ビット」かが変わる。
+    // 16 色は 4 ページで 1bit ずつ、256 色は 2 ページで 2bit ずつ
+    // (ページ 0 が bit1-0、ページ 1 が bit3-2)、65536 色は 1 ページで 4bit
+    // すべて。ROM が $FFB2F2 以降で行う展開 (bit1 → $0C、bit0 → $03、
+    // 65536 色なら moveq #$F) の逆変換にあたる。
+    //
+    // Why not 常に 1bit = 1 ページとして読まないか: 256 色モードで
+    // ページ 1 を表示するプログラムは IOCS 経由だと $0C が書かれる。
+    // 1bit = 1 ページで読むと「ページ 2 と 3 が有効」に化けて、
+    // 存在しないページを描こうとする。
     [[nodiscard]] bool graphicPageEnabled(u32 page) const
     {
-        return page < 4 && (displayControl_ & (1u << page)) != 0;
+        switch (graphicColorMode())
+        {
+            case GraphicColorMode::k16Color:
+                return page < 4 && (displayControl_ & (1u << page)) != 0;
+
+            case GraphicColorMode::k256Color:
+                return page < 2 && (displayControl_ & (0x03u << (page * 2u))) != 0;
+
+            case GraphicColorMode::kReserved:
+            case GraphicColorMode::k65536Color:
+            default:
+                return page == 0 && (displayControl_ & 0x000Fu) != 0;
+        }
     }
 
     // X68000 の色形式を RGB565 に変換する。

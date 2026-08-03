@@ -278,6 +278,38 @@ TEST_CASE("16 色モードでは表示が許可された最も手前のページ
     CHECK(out[0] == VideoController::toRgb565(blue));
 }
 
+TEST_CASE("複数ページが許可されているときは GP3-GP0 が手前を決める")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+
+    const x68k::u16 red = static_cast<x68k::u16>(31u << 6);
+    const x68k::u16 blue = static_cast<x68k::u16>(31u << 1);
+    video.write(kGraphicPaletteOffset + 1 * 2, red);
+    video.write(kGraphicPaletteOffset + 2 * 2, blue);
+
+    // ページ 0 に色 1 (赤)、ページ 1 に色 2 (青)。どちらも表示を許可する。
+    writeWord(vram, 0, 0, 0x0021);
+    video.write(kDisplayCtrlOffset, 0x0003);
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0);
+
+    // 既定の並び (GP0=0, GP1=1) ではページ 0 が手前 → 赤。
+    video.write(kPriorityOffset, 0x06E4);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+    CHECK(out[0] == VideoController::toRgb565(red));
+
+    // GP を入れ替えてページ 1 を手前にすると、VRAM を触らずに青へ変わる。
+    // ページ番号順の決め打ちだとここが赤のままになる。
+    out[0] = 0;
+    video.write(kPriorityOffset, 0x0601);  // GP0=1, GP1=0
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+    CHECK(out[0] == VideoController::toRgb565(blue));
+}
+
 TEST_CASE("どのページも許可されていなければ何も描かれない")
 {
     auto vram = makeGvram();
@@ -324,17 +356,55 @@ TEST_CASE("プライオリティレジスタから各面の表示順位が読め
     VideoController video;
     video.reset();
 
-    // グラフィック = 2 (bit5-4)、テキスト = 1 (bit3-2)、スプライト = 0 (bit1-0)。
-    video.write(kPriorityOffset, 0x0024);
-    CHECK(video.graphicPriority() == 2);
-    CHECK(video.textPriority() == 1);
+    // IPL-ROM が起動時に書く既定値 ($FF6436 の move.w #$06E4,$E82500)。
+    // スプライト = 0 (bit13-12)、テキスト = 1 (bit11-10)、
+    // グラフィック = 2 (bit9-8)。
+    video.write(kPriorityOffset, 0x06E4);
     CHECK(video.spritePriority() == 0);
+    CHECK(video.textPriority() == 1);
+    CHECK(video.graphicPriority() == 2);
+
+    // 面の順位は上位バイトだけで決まり、下位バイト (GP3-GP0) には影響されない。
+    video.write(kPriorityOffset, 0x0900);
+    CHECK(video.spritePriority() == 0);
+    CHECK(video.textPriority() == 2);
+    CHECK(video.graphicPriority() == 1);
+
+    video.write(kPriorityOffset, 0x1000);
+    CHECK(video.spritePriority() == 1);
+    CHECK(video.textPriority() == 0);
+    CHECK(video.graphicPriority() == 0);
+}
+
+TEST_CASE("プライオリティレジスタからグラフィック 4 ページの順位が読める")
+{
+    VideoController video;
+    video.reset();
+
+    // 既定値 $06E4 の下位バイト $E4 = 11_10_01_00。
+    // GP3 = 3、GP2 = 2、GP1 = 1、GP0 = 0 でページ番号順。
+    video.write(kPriorityOffset, 0x06E4);
+    CHECK(video.graphicPagePriority(0) == 0);
+    CHECK(video.graphicPagePriority(1) == 1);
+    CHECK(video.graphicPagePriority(2) == 2);
+    CHECK(video.graphicPagePriority(3) == 3);
+
+    // 並びを逆にすると、ページ 3 が最も手前になる。
+    video.write(kPriorityOffset, 0x001B);  // GP3=0, GP2=1, GP1=2, GP0=3
+    CHECK(video.graphicPagePriority(0) == 3);
+    CHECK(video.graphicPagePriority(1) == 2);
+    CHECK(video.graphicPagePriority(2) == 1);
+    CHECK(video.graphicPagePriority(3) == 0);
+
+    // 範囲外のページは 0 を返す (落ちない)。
+    CHECK(video.graphicPagePriority(4) == 0);
 }
 
 TEST_CASE("表示制御レジスタから各面の表示許可が読める")
 {
     VideoController video;
     video.reset();
+    video.write(kScreenModeOffset, 0x0000);  // 16 色 512x512
 
     video.write(kDisplayCtrlOffset, 0x0000);
     CHECK(video.graphicEnabled() == false);
@@ -342,7 +412,6 @@ TEST_CASE("表示制御レジスタから各面の表示許可が読める")
     CHECK(video.spriteEnabled() == false);
 
     video.write(kDisplayCtrlOffset, 0x0070);
-    CHECK(video.graphicEnabled() == true);
     CHECK(video.textEnabled() == true);
     CHECK(video.spriteEnabled() == true);
 
@@ -352,6 +421,65 @@ TEST_CASE("表示制御レジスタから各面の表示許可が読める")
     CHECK(video.graphicPageEnabled(1) == true);
     CHECK(video.graphicPageEnabled(2) == false);
     CHECK(video.graphicPageEnabled(3) == true);
+}
+
+TEST_CASE("512x512 ではページビットだけでグラフィック面が有効になる")
+{
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);  // 16 色 512x512
+
+    // GS4 (bit4) が無くても、GS3-GS0 が 1 つでも立っていれば表示される。
+    // IOCS を通さず $E82600 を直接書くプログラムがこの形を作る。
+    video.write(kDisplayCtrlOffset, 0x0001);
+    CHECK(video.graphicEnabled() == true);
+
+    video.write(kDisplayCtrlOffset, 0x0008);
+    CHECK(video.graphicEnabled() == true);
+
+    // ページビットが全部落ちていれば、GS4 があっても表示されない。
+    video.write(kDisplayCtrlOffset, 0x0010);
+    CHECK(video.graphicEnabled() == false);
+
+    // IOCS が組み立てる形 (GS4 + ページ 0)。
+    video.write(kDisplayCtrlOffset, 0x0011);
+    CHECK(video.graphicEnabled() == true);
+}
+
+TEST_CASE("1024x1024 では GS4 がグラフィック面の表示許可になる")
+{
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0004);  // 16 色 1024x1024
+    REQUIRE(video.isGraphic1024());
+
+    // 4 ページを 1 枚として使うので、ページビットではなく GS4 が効く。
+    video.write(kDisplayCtrlOffset, 0x0010);
+    CHECK(video.graphicEnabled() == true);
+
+    video.write(kDisplayCtrlOffset, 0x000F);
+    CHECK(video.graphicEnabled() == false);
+}
+
+TEST_CASE("256 色モードのページ許可は 2bit ずつで読む")
+{
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0001);  // 256 色
+
+    // IOCS はページ 0 を $03、ページ 1 を $0C に展開する ($FFB2F2 以降)。
+    video.write(kDisplayCtrlOffset, 0x0003);
+    CHECK(video.graphicPageEnabled(0) == true);
+    CHECK(video.graphicPageEnabled(1) == false);
+
+    video.write(kDisplayCtrlOffset, 0x000C);
+    CHECK(video.graphicPageEnabled(0) == false);
+    CHECK(video.graphicPageEnabled(1) == true);
+
+    // 256 色モードにページ 2 以降は存在しない。
+    video.write(kDisplayCtrlOffset, 0x000F);
+    CHECK(video.graphicPageEnabled(2) == false);
+    CHECK(video.graphicPageEnabled(3) == false);
 }
 
 // --- 重ね合わせ -------------------------------------------------------------
@@ -394,13 +522,13 @@ TEST_CASE("プライオリティに従ってテキストとグラフィックが
     std::vector<x68k::u16> out(kW, 0);
 
     // テキストを手前 (値が小さいほど手前)。
-    f.video.write(kPriorityOffset, 0x0020);  // graphic=2, text=0
+    f.video.write(kPriorityOffset, 0x02E4);  // graphic=2, text=0
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == VideoController::toRgb565(CompositeFixture::kBlue));
 
     // グラフィックを手前。
     out[0] = 0;
-    f.video.write(kPriorityOffset, 0x0008);  // graphic=0, text=2
+    f.video.write(kPriorityOffset, 0x08E4);  // graphic=0, text=2
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == VideoController::toRgb565(CompositeFixture::kRed));
 }
@@ -416,7 +544,7 @@ TEST_CASE("手前の面が透明なら背後の面が見える")
     std::vector<x68k::u16> out(kW, 0);
 
     // テキストを手前にしても、そこが透明ならグラフィックが透ける。
-    f.video.write(kPriorityOffset, 0x0020);  // graphic=2, text=0
+    f.video.write(kPriorityOffset, 0x02E4);  // graphic=2, text=0
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == VideoController::toRgb565(CompositeFixture::kRed));
 }
@@ -428,13 +556,14 @@ TEST_CASE("表示が禁止された面は重ね合わせに出ない")
     writeWord(f.gvram, 0, 0, 0x0001);
     setTextPixel(f.tvram, 0, 0, 1);
     // グラフィックを手前に置いたうえで、グラフィックを禁止する。
-    f.video.write(kPriorityOffset, 0x0008);  // graphic=0, text=2
+    f.video.write(kPriorityOffset, 0x08E4);  // graphic=0, text=2
 
     constexpr x68k::u32 kW = 2;
     std::vector<x68k::u16> out(kW, 0);
 
-    // グラフィック禁止 (bit4 を落とす) → テキストだけが出る。
-    f.video.write(kDisplayCtrlOffset, 0x0021);
+    // グラフィック禁止 → テキストだけが出る。
+    // 512x512 では GS4 だけでなく GS3-GS0 も落とさないと消えない。
+    f.video.write(kDisplayCtrlOffset, 0x0020);
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == VideoController::toRgb565(CompositeFixture::kBlue));
 
@@ -446,7 +575,7 @@ TEST_CASE("表示が禁止された面は重ね合わせに出ない")
 
     // 両方禁止 → 黒。
     out[0] = 0x7777;
-    f.video.write(kDisplayCtrlOffset, 0x0001);
+    f.video.write(kDisplayCtrlOffset, 0x0000);
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == 0);
 }
@@ -454,7 +583,7 @@ TEST_CASE("表示が禁止された面は重ね合わせに出ない")
 TEST_CASE("どちらの面も出ない位置は黒で埋まる")
 {
     CompositeFixture f;
-    f.video.write(kPriorityOffset, 0x0020);
+    f.video.write(kPriorityOffset, 0x02E4);
 
     constexpr x68k::u32 kW = 4;
     constexpr x68k::u32 kH = 2;
@@ -471,7 +600,7 @@ TEST_CASE("どちらの面も出ない位置は黒で埋まる")
 TEST_CASE("outStride を指定すると行ごとに飛ばして書ける")
 {
     CompositeFixture f;
-    f.video.write(kPriorityOffset, 0x0020);
+    f.video.write(kPriorityOffset, 0x02E4);
     writeWord(f.gvram, 0, 1, 0x0001);
 
     constexpr x68k::u32 kW = 2;
@@ -511,7 +640,7 @@ TEST_CASE("G-VRAM が null でも落ちない")
 TEST_CASE("重ね合わせで片方の VRAM が null でも残る面は描かれる")
 {
     CompositeFixture f;
-    f.video.write(kPriorityOffset, 0x0020);  // graphic=2, text=0
+    f.video.write(kPriorityOffset, 0x02E4);  // graphic=2, text=0
     setTextPixel(f.tvram, 0, 0, 1);
 
     constexpr x68k::u32 kW = 2;

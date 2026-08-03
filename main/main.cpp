@@ -65,6 +65,7 @@ x68k_platform::DisplayLcd g_display;
 x68k_platform::TouchKeyboard g_keyboard;
 x68k_platform::FrameChannel g_frames;
 x68k_platform::KeyQueue g_keys;
+x68k_platform::MouseQueue g_mouse;
 
 void reportMemory(const char* phase)
 {
@@ -128,8 +129,9 @@ bool reserveMemory()
 
     // グラフィック VRAM は最後。取れなくても起動する。
     //
-    // 今の表示はテキスト VRAM しか使わず、バスにも null チェックがある。
-    // グラフィック画面 (#7) を実装したら必須へ移す。
+    // 取れれば SX-Window のようにグラフィック面を使うソフトが動く。
+    // 取れなくてもバスに null チェックがあり (読むと 0、書きは捨てる)、
+    // 表示側も nullptr ならテキストだけを描くので、コンソールは使える。
     g_graphicVram = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kGraphicVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (g_graphicVram == nullptr)
@@ -141,9 +143,9 @@ bool reserveMemory()
 
     // 確保できたかを確かめる。
     //
-    // グラフィック VRAM は外してある。今の表示はテキスト VRAM しか使わず、
-    // バスに null チェックがあるので (読むと 0、書きは捨てる)、取れなくても
-    // コンソールは出せる。グラフィック画面を実装したら必須に加える。
+    // グラフィック VRAM は外してある。バスに null チェックがあり
+    // (読むと 0、書きは捨てる)、表示側も nullptr ならテキストだけを
+    // 描くので、取れなくてもコンソールは出せる。
     //
     // CGROM は必須にする。バスの null チェックで落ちはしないが、字形が
     // 1 つも無ければ画面が真っ黒のままで、起動しても何もできない。
@@ -313,6 +315,12 @@ void emulatorTask(void* /*arg*/)
 
         // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
         g_keys.drain(g_machine);
+
+        // 溜まったマウスの動きを SCC へ流す。
+        //
+        // キーと同じくこのコアから送る。SCC の受信 FIFO と割り込み保留は
+        // 割り込み処理がここで触るので、表示コアから書くと競合する。
+        g_mouse.drain(g_machine);
 
         // シリアルから画面ダンプを求められていたらここで出す。
         // テキスト VRAM の所有者はこのコア。
@@ -598,6 +606,17 @@ extern "C" void app_main(void)
         x68k_platform::DisplayLcd::showMessage("INIT ERROR", "key queue");
         return;
     }
+    if (!g_mouse.begin())
+    {
+        ESP_LOGE(kTag, "マウスのキューを用意できません");
+        x68k_platform::DisplayLcd::showMessage("INIT ERROR", "mouse queue");
+        return;
+    }
+
+    // グラフィック面を表示に加える。
+    //
+    // nullptr でも構わない (確保に失敗した場合)。そのときはテキストだけを描く。
+    g_display.setGraphicVram(g_graphicVram);
 
     // Human68k のコンソールは 768x512。左上から映す。
     //
@@ -610,6 +629,10 @@ extern "C" void app_main(void)
     // 見えないのに触ると反応する状態は、意図しない文字が入るだけで害しかない。
     // 使うなら、フレームの下部を空けて描くか、キーボード領域だけ別に
     // 転送する仕組みが要る。今はシリアルから打てるので急がない。
+    //
+    // マウスはこの設定と無関係に効く。キーボードを出していない間は
+    // 画面全体がマウス領域になる (input_touch.cpp の poll を見よ)。
+    // SX-Window はマウスが無いと何も操作できないので、ここを塞げない。
     g_keyboard.setVisible(false);
     g_keyboard.begin();
 
@@ -649,7 +672,7 @@ extern "C" void app_main(void)
     while (true)
     {
         M5.update();
-        g_keyboard.poll(g_keys);
+        g_keyboard.poll(g_keys, g_mouse);
         g_console.poll();
 
         // エミュレーションが止まったらメッセージを出して、以後は

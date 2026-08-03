@@ -26,6 +26,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/dev/video.cpp"
         "${X68K_ROOT}/src/x68k/core/io/ascii_keymap.cpp"
         "${X68K_ROOT}/src/x68k/core/video/text_raster.cpp"
+        "${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp"
         "${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp"
         "${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp"
         # --- platform: ESP32 専用 ---
