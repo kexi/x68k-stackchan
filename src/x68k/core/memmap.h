@@ -111,8 +111,14 @@ inline constexpr std::uint32_t kResetSsp = 0x002000u;
 // CGROM はシャープの無償公開の対象外 (漢字フォントのベンダ権利のため) で
 // 入手できないことがあるが、6x12 の ANK フォントは IPLROM 内にある。
 // これを使えば CGROM 無しでも英数字コンソールを表示できる。
+// 実際の代替経路は video/cgrom_fallback.h にある。
+//
+// アドレスは rom/iplrom.dat (EXPERT 用 v1.0) を読んで確かめた実測値。
+// 資料でよく挙がる $FFCFF6 には 68000 の命令列があり、フォントはその
+// $22 バイト後ろから始まる。$FFD018 から 254 文字 x 12 バイトが連続し、
+// $FFDC00 でちょうど終わる。添字は文字コードそのもの。
 // 注意: 文字数は 256 ではなく 254。
-inline constexpr std::uint32_t kIplromAnk6x12Addr = 0xFFCFF6u;
+inline constexpr std::uint32_t kIplromAnk6x12Addr = 0xFFD018u;
 inline constexpr std::uint32_t kIplromAnk6x12Count = 254u;
 
 }  // namespace x68k

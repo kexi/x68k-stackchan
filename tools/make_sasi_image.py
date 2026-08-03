@@ -168,12 +168,12 @@ def build_id_sector(total_sectors: int, partition_start: int, partition_sectors:
         $08 総セクタ数。$FF920A で読み、$9FD9 / $13D1D と比べて
             ディスクの諸元テーブル ($FF99B2 から $14 刻み) を選ぶ
 
-    Human68k が見るもの (HUMAN.SYS の +$1848 以降):
-        $00 "X68K" (+$188E)
-        $10 からパーティションテーブル。16 バイト単位で並ぶ (+$189C)
-            +$0 "Human68k" (+$18A0 / +$18A8)
-            +$8 開始セクタ (+$18FC)。上位バイトはフラグ
-            +$C セクタ数 (+$1936)
+    Human68k が見るもの (HUMAN.SYS をメモリ $6800 へ置いたときの $8008 以降):
+        $00 "X68K" ($804E の CMPI.L)
+        $10 からパーティションテーブル。16 バイト単位で並ぶ ($805C の LEA)
+            +$0 "Human68k" ($8060 / $8068 の CMPI.L)
+            +$8 開始セクタ ($80BC)。最上位バイトはフラグ
+            +$C セクタ数 ($80F6)
 
     IPL-ROM 側だけ満たしても Human68k はパーティションを見つけられず、
     CONFIG.SYS も COMMAND.X も読みに行かない。両方が要る。
@@ -184,10 +184,21 @@ def build_id_sector(total_sectors: int, partition_start: int, partition_sectors:
 
     # パーティションテーブルの 1 件目。
     #
-    # 開始セクタの bit24 は「起動可能」の印。Human68k は +$1900 の
-    # BTST #24 でこれを見て、立っていない領域は読み飛ばす。
+    # 開始セクタの最上位バイトはフラグで、ここは 0 でなければならない。
+    # HUMAN.SYS は $80C0 の BTST #24 が「立っていたら」$80B4 の
+    # DBRA へ戻る (BNE)。つまり bit24 は「起動可能」ではなく
+    # 「ドライブとして登録しない」の意味で、立てると登録数が 0 になる。
+    #
+    # Why not 立てたままにするか:
+    #   登録数が 0 だとドライブ A: が SASI ではなく FD へ落ちる。
+    #   ブートコードは IOCS $46 で直接読むので HUMAN.SYS は起動できてしまい、
+    #   その後の COMMAND.X だけが「ファイルが見つからない」(-2) で失敗する。
+    #   起動したのにコマンドが動かない、という分かりにくい壊れ方をする。
+    #
+    # $80C6 の TST.B $8(A0) も同じバイトを見ており、0 以外だと
+    # $80CC の IOCS $8E (起動デバイス問い合わせ) と突き合わせる経路へ入る。
     sector[0x10:0x18] = b"Human68k"
-    struct.pack_into(">I", sector, 0x18, partition_start | 0x01000000)
+    struct.pack_into(">I", sector, 0x18, partition_start)
     struct.pack_into(">I", sector, 0x1C, partition_sectors)
 
     return bytes(sector)

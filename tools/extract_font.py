@@ -32,7 +32,10 @@ from PIL import Image
 # src/x68k/core/memmap.h と同じ値。ここを変えるならあちらも直すこと。
 IPLROM_BASE = 0xFE0000
 IPLROM_SIZE = 0x20000
-ANK_6X12_ADDR = 0xFFCFF6
+# 実測値。資料でよく挙がる $FFCFF6 には 68000 の命令列があり、フォントは
+# その $22 バイト後ろから始まる。$FFD018 から 254 文字 x 12 バイトが並び
+# $FFDC00 でちょうど終わる。
+ANK_6X12_ADDR = 0xFFD018
 ANK_6X12_COUNT = 254
 
 GLYPH_WIDTH = 6

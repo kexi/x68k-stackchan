@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "machine.h"
+#include "video/cgrom_fallback.h"
 #include "video/text_raster.h"
 
 namespace
@@ -192,7 +193,7 @@ void printUsage()
         "使い方: x68k-run --iplrom PATH [オプション]\n"
         "\n"
         "  --iplrom PATH   IPL-ROM (128KB)。必須\n"
-        "  --cgrom PATH    CGROM (768KB)。省略可\n"
+        "  --cgrom PATH    CGROM (768KB)。省略時は IPL-ROM 内蔵 6x12 ANK で代替\n"
         "  --hdd PATH      SASI ハードディスクイメージ\n"
         "  --cycles N      実行する CPU サイクル数 (既定 20000000)\n"
         "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
@@ -430,6 +431,17 @@ int main(int argc, char** argv)
             return 1;
         }
         cgrom.resize(x68k::kCgromSize, 0);
+    }
+    else
+    {
+        // CGROM が無いときは IPL-ROM 内蔵の 6x12 ANK フォントで代替する。
+        //
+        // 何もしないと IOCS は字形として 0 以外を読み、画面がベタ塗りの矩形に
+        // なって Human68k の出力が読めない。英数字だけでも読めるほうが
+        // デバッグの手掛かりになる。
+        cgrom.assign(x68k::kCgromSize, 0);
+        x68k::buildCgromFromIplRom(iplrom.data(), cgrom.data());
+        std::printf("[cgrom] CGROM が指定されていないので IPL-ROM 内蔵 6x12 ANK フォントで代替\n");
     }
 
     FileDisk disk;
