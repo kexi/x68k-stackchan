@@ -1,0 +1,498 @@
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Kei Nakayama
+//
+// 0100 グループ。CLR/NEG/NOT/TST/LEA/JMP/JSR/RTS/RTE/MOVEM/SWAP/EXT/LINK/UNLK など、
+// 系統の異なる命令が同じ上位 4bit に詰め込まれている。
+
+#include "m68k.h"
+#include "m68k_alu.h"
+
+namespace x68k
+{
+namespace
+{
+
+using alu::kByte;
+using alu::kLong;
+using alu::kWord;
+
+constexpr u32 kAddrMask = 0x00FFFFFFu;
+
+constexpr u32 sizeFromField(u32 field)
+{
+    if (field == 0)
+    {
+        return kByte;
+    }
+    if (field == 1)
+    {
+        return kWord;
+    }
+    return kLong;
+}
+
+}  // namespace
+
+u32 M68k::groupMisc(u16 op)
+{
+    const u32 mode = (op >> 3) & 7u;
+    const u32 reg = op & 7u;
+
+    // --- 固定パターンの命令から先に判定する ---------------------------------
+
+    if (op == 0x4E71u)  // NOP
+    {
+        return 4;
+    }
+
+    if (op == 0x4E75u)  // RTS
+    {
+        const u32 addr = read32(st_.a[7]);
+        st_.a[7] = st_.a[7] + 4;
+        refillPrefetch(addr);
+        return 16;
+    }
+
+    if (op == 0x4E73u)  // RTE: 特権命令
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        const u16 sr = read16(st_.a[7]);
+        st_.a[7] = st_.a[7] + 2;
+        const u32 pc = read32(st_.a[7]);
+        st_.a[7] = st_.a[7] + 4;
+        setSr(sr);
+        refillPrefetch(pc);
+        return 20;
+    }
+
+    if (op == 0x4E77u)  // RTR: CCR と PC を戻す
+    {
+        const u16 ccr = read16(st_.a[7]);
+        st_.a[7] = st_.a[7] + 2;
+        const u32 pc = read32(st_.a[7]);
+        st_.a[7] = st_.a[7] + 4;
+        st_.sr = static_cast<u16>((st_.sr & ~sr_bit::kCcrMask) | (ccr & sr_bit::kCcrMask));
+        refillPrefetch(pc);
+        return 20;
+    }
+
+    if (op == 0x4E70u)  // RESET: 周辺をリセットする信号を出すだけ
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        return 132;
+    }
+
+    if (op == 0x4E72u)  // STOP #<data>
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        const u16 value = fetch();
+        setSr(value);
+        st_.stopped = true;
+        return 4;
+    }
+
+    if (op == 0x4E76u)  // TRAPV
+    {
+        if ((st_.sr & sr_bit::kOverflow) != 0)
+        {
+            takeException(vector::kTrapv);
+            return 34;
+        }
+        return 4;
+    }
+
+    if ((op & 0xFFF0u) == 0x4E40u)  // TRAP #n
+    {
+        takeException(vector::kTrapBase + (op & 0xFu));
+        return 38;
+    }
+
+    if ((op & 0xFFF8u) == 0x4E50u)  // LINK An,#<disp>
+    {
+        const s16 disp = static_cast<s16>(fetch());
+        st_.a[7] = st_.a[7] - 4;
+        write32(st_.a[7], st_.a[reg]);
+        st_.a[reg] = st_.a[7];
+        st_.a[7] = (st_.a[7] + static_cast<u32>(static_cast<s32>(disp)));
+        return 16;
+    }
+
+    if ((op & 0xFFF8u) == 0x4E58u)  // UNLK An
+    {
+        st_.a[7] = st_.a[reg];
+        st_.a[reg] = read32(st_.a[7]);
+        st_.a[7] = st_.a[7] + 4;
+        return 12;
+    }
+
+    if ((op & 0xFFF8u) == 0x4E60u)  // MOVE An,USP
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        st_.usp = st_.a[reg];
+        return 4;
+    }
+
+    if ((op & 0xFFF8u) == 0x4E68u)  // MOVE USP,An
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        st_.a[reg] = st_.usp;
+        return 4;
+    }
+
+    if ((op & 0xFFF8u) == 0x4840u)  // SWAP Dn
+    {
+        const u32 value = (st_.d[reg] >> 16) | (st_.d[reg] << 16);
+        st_.d[reg] = value;
+        setLogicFlags(value, kLong);
+        return 4;
+    }
+
+    if ((op & 0xFFF8u) == 0x4880u)  // EXT.W Dn: バイト → ワード
+    {
+        const u32 value = static_cast<u32>(static_cast<s32>(static_cast<s8>(st_.d[reg] & 0xFFu)));
+        st_.d[reg] = (st_.d[reg] & 0xFFFF0000u) | (value & 0xFFFFu);
+        setLogicFlags(value, kWord);
+        return 4;
+    }
+
+    if ((op & 0xFFF8u) == 0x48C0u)  // EXT.L Dn: ワード → ロング
+    {
+        const u32 value =
+            static_cast<u32>(static_cast<s32>(static_cast<s16>(st_.d[reg] & 0xFFFFu)));
+        st_.d[reg] = value;
+        setLogicFlags(value, kLong);
+        return 4;
+    }
+
+    if ((op & 0xFFF8u) == 0x4880u || (op & 0xFFC0u) == 0x4800u)  // NBCD は後回し
+    {
+        // 上の EXT で拾われなかった 0x4800 系。
+        if ((op & 0xFFC0u) == 0x4800u)
+        {
+            return unimplemented(op);
+        }
+    }
+
+    // --- パターンで分ける命令 -----------------------------------------------
+
+    const u32 opField = (op >> 8) & 0xFu;
+
+    // LEA <ea>,An : op = 0100 rrr 111 mmm rrr
+    if ((op & 0x01C0u) == 0x01C0u)
+    {
+        const u32 dstReg = (op >> 9) & 7u;
+        // LEA はアドレスそのものを取る。読み出しは発生しない。
+        const u32 addr = effectiveAddress(mode, reg, kLong);
+        if (st_.halted)
+        {
+            return 0;
+        }
+        st_.a[dstReg] = addr;
+        return 4;
+    }
+
+    // CHK <ea>,Dn : op = 0100 rrr 110 mmm rrr
+    if ((op & 0x01C0u) == 0x0180u)
+    {
+        const u32 dstReg = (op >> 9) & 7u;
+        const s16 bound = static_cast<s16>(readEa(mode, reg, kWord));
+        const s16 value = static_cast<s16>(st_.d[dstReg] & 0xFFFFu);
+        if (value < 0 || value > bound)
+        {
+            takeException(vector::kChk);
+            return 40;
+        }
+        return 10;
+    }
+
+    // JMP / JSR : 0100 1110 1 x mmm rrr
+    if ((op & 0xFFC0u) == 0x4EC0u)  // JMP
+    {
+        const u32 addr = effectiveAddress(mode, reg, kLong);
+        if (st_.halted)
+        {
+            return 0;
+        }
+        refillPrefetch(addr);
+        return 8;
+    }
+
+    if ((op & 0xFFC0u) == 0x4E80u)  // JSR
+    {
+        const u32 addr = effectiveAddress(mode, reg, kLong);
+        if (st_.halted)
+        {
+            return 0;
+        }
+        // 戻り先は「この命令の次のアドレス」。
+        //
+        // PC の位置関係: プリフェッチにより PC は常に「読み込み済みの最後のワードの
+        // 次」を指す。effectiveAddress が拡張ワードを消費した後もこの関係は保たれ、
+        // 命令の終端は pc - 4 になる (プリフェッチ 2 ワードぶん先を見ているため)。
+        const u32 returnAddr = st_.pc - 4;
+        st_.a[7] = st_.a[7] - 4;
+        write32(st_.a[7], returnAddr);
+        refillPrefetch(addr);
+        return 16;
+    }
+
+    // PEA <ea> : 0100 1000 01 mmm rrr
+    if ((op & 0xFFC0u) == 0x4840u)
+    {
+        const u32 addr = effectiveAddress(mode, reg, kLong);
+        if (st_.halted)
+        {
+            return 0;
+        }
+        st_.a[7] = st_.a[7] - 4;
+        write32(st_.a[7], addr);
+        return 12;
+    }
+
+    // MOVEM : 0100 1d00 1s mmm rrr
+    if ((op & 0xFB80u) == 0x4880u)
+    {
+        const bool memoryToRegister = (op & 0x0400u) != 0;
+        const u32 size = (op & 0x0040u) != 0 ? kLong : kWord;
+        const u16 mask = fetch();
+
+        u32 count = 0;
+
+        if (!memoryToRegister && mode == 4)
+        {
+            // -(An) 形式はレジスタ順が逆 (A7 から D0 へ) になる。
+            // ここを間違えるとスタックフレームが壊れ、原因が非常に追いにくい。
+            u32 addr = st_.a[reg];
+            for (u32 i = 0; i < 16; ++i)
+            {
+                if ((mask & (1u << i)) == 0)
+                {
+                    continue;
+                }
+                // ビット i は「A7 から数えて i 番目」に対応する。
+                const u32 regIndex = 15u - i;
+                const u32 value = regIndex < 8 ? st_.d[regIndex] : st_.a[regIndex - 8];
+                addr = addr - size;
+                if (size == kWord)
+                {
+                    write16(addr, static_cast<u16>(value));
+                }
+                else
+                {
+                    write32(addr, value);
+                }
+                ++count;
+            }
+            st_.a[reg] = addr;
+            return 8 + count * (size == kWord ? 4 : 8);
+        }
+
+        u32 addr = 0;
+        if (memoryToRegister && mode == 3)
+        {
+            addr = st_.a[reg];
+        }
+        else
+        {
+            addr = effectiveAddress(mode, reg, size);
+            if (st_.halted)
+            {
+                return 0;
+            }
+        }
+
+        for (u32 i = 0; i < 16; ++i)
+        {
+            if ((mask & (1u << i)) == 0)
+            {
+                continue;
+            }
+            if (memoryToRegister)
+            {
+                const u32 value =
+                    size == kWord
+                        ? static_cast<u32>(static_cast<s32>(static_cast<s16>(read16(addr))))
+                        : read32(addr);
+                if (i < 8)
+                {
+                    st_.d[i] = value;
+                }
+                else
+                {
+                    st_.a[i - 8] = value;
+                }
+            }
+            else
+            {
+                const u32 value = i < 8 ? st_.d[i] : st_.a[i - 8];
+                if (size == kWord)
+                {
+                    write16(addr, static_cast<u16>(value));
+                }
+                else
+                {
+                    write32(addr, value);
+                }
+            }
+            addr = addr + size;
+            ++count;
+        }
+
+        if (memoryToRegister && mode == 3)
+        {
+            // (An)+ 形式は読み終わった位置までポインタを進める。
+            st_.a[reg] = addr;
+        }
+        return 12 + count * (size == kWord ? 4 : 8);
+    }
+
+    // MOVE from SR : 0100 0000 11 mmm rrr
+    if ((op & 0xFFC0u) == 0x40C0u)
+    {
+        u32 addr = 0;
+        readEaForModify(mode, reg, kWord, addr);
+        writeEaToAddr(mode, reg, kWord, addr, st_.sr);
+        return 6;
+    }
+
+    // MOVE to CCR : 0100 0100 11 mmm rrr
+    if ((op & 0xFFC0u) == 0x44C0u)
+    {
+        const u32 value = readEa(mode, reg, kWord);
+        st_.sr =
+            static_cast<u16>((st_.sr & clearMask(sr_bit::kCcrMask)) | (value & sr_bit::kCcrMask));
+        return 12;
+    }
+
+    // MOVE to SR : 0100 0110 11 mmm rrr (特権)
+    if ((op & 0xFFC0u) == 0x46C0u)
+    {
+        if (!requirePrivilege())
+        {
+            return 34;
+        }
+        const u32 value = readEa(mode, reg, kWord);
+        setSr(static_cast<u16>(value));
+        return 12;
+    }
+
+    // 単項演算: NEGX/CLR/NEG/NOT/TST : 0100 ooo 0 ss mmm rrr
+    const u32 sizeField = (op >> 6) & 3u;
+    if (sizeField != 3)
+    {
+        const u32 size = sizeFromField(sizeField);
+
+        switch (opField)
+        {
+            case 0x0:  // NEGX
+            {
+                u32 addr = 0;
+                const u32 dst = readEaForModify(mode, reg, size, addr);
+                const u32 x = (st_.sr & sr_bit::kExtend) != 0 ? 1u : 0u;
+                const alu::Result first = alu::sub(0, dst, size);
+                const alu::Result second = alu::sub(first.value, x, size);
+                u16 sr = static_cast<u16>(st_.sr & ~(sr_bit::kNegative | sr_bit::kOverflow |
+                                                     sr_bit::kCarry | sr_bit::kExtend));
+                if (alu::isNegative(second.value, size))
+                {
+                    sr |= sr_bit::kNegative;
+                }
+                if (first.v || second.v)
+                {
+                    sr |= sr_bit::kOverflow;
+                }
+                if (first.c || second.c)
+                {
+                    sr |= sr_bit::kCarry | sr_bit::kExtend;
+                }
+                // Z は累積 (ADDX/SUBX と同じ規則)。
+                if (second.value != 0)
+                {
+                    sr = static_cast<u16>(sr & ~sr_bit::kZero);
+                }
+                st_.sr = sr;
+                writeEaToAddr(mode, reg, size, addr, second.value);
+                return 8;
+            }
+
+            case 0x2:  // CLR: 0 を書く。読み出しは行われる (RMW)
+            {
+                u32 addr = 0;
+                readEaForModify(mode, reg, size, addr);
+                writeEaToAddr(mode, reg, size, addr, 0);
+                st_.sr = static_cast<u16>(
+                    (st_.sr & ~(sr_bit::kNegative | sr_bit::kOverflow | sr_bit::kCarry)) |
+                    sr_bit::kZero);
+                return 6;
+            }
+
+            case 0x4:  // NEG
+            {
+                u32 addr = 0;
+                const u32 dst = readEaForModify(mode, reg, size, addr);
+                const alu::Result r = alu::sub(0, dst, size);
+                u16 sr = static_cast<u16>(st_.sr &
+                                          ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow |
+                                            sr_bit::kCarry | sr_bit::kExtend));
+                if (r.n)
+                {
+                    sr |= sr_bit::kNegative;
+                }
+                if (r.z)
+                {
+                    sr |= sr_bit::kZero;
+                }
+                if (r.v)
+                {
+                    sr |= sr_bit::kOverflow;
+                }
+                if (r.c)
+                {
+                    sr |= sr_bit::kCarry | sr_bit::kExtend;
+                }
+                st_.sr = sr;
+                writeEaToAddr(mode, reg, size, addr, r.value);
+                return 6;
+            }
+
+            case 0x6:  // NOT
+            {
+                u32 addr = 0;
+                const u32 dst = readEaForModify(mode, reg, size, addr);
+                const u32 value = alu::truncate(~dst, size);
+                setLogicFlags(value, size);
+                writeEaToAddr(mode, reg, size, addr, value);
+                return 6;
+            }
+
+            case 0xA:  // TST
+            {
+                const u32 value = readEa(mode, reg, size);
+                setLogicFlags(value, size);
+                return 4;
+            }
+
+            default:
+                break;
+        }
+    }
+
+    return unimplemented(op);
+}
+
+}  // namespace x68k

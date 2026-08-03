@@ -36,9 +36,17 @@ endif()
 set(X68K_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 # --- core: ESP32 非依存のエミュレータ本体 -----------------------------------
-# M0 時点ではヘッダのみ。実装が増えたらここに .cpp を足す。
-add_library(x68k_core INTERFACE)
-target_include_directories(x68k_core INTERFACE ${X68K_ROOT}/src/x68k/core)
+add_library(x68k_core STATIC
+  ${X68K_ROOT}/src/x68k/core/cpu/m68k.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_move.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_alu.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_misc.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_group4.cpp
+)
+target_include_directories(x68k_core PUBLIC
+  ${X68K_ROOT}/src/x68k/core
+  ${X68K_ROOT}/src/x68k/core/cpu
+)
 
 # --- doctest (vendored) -----------------------------------------------------
 add_library(doctest INTERFACE)
@@ -49,6 +57,7 @@ enable_testing()
 add_executable(x68k_tests
   test_main.cpp
   test_memmap.cpp
+  test_m68k_vectors.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 add_test(NAME x68k_tests COMMAND x68k_tests)
