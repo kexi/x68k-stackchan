@@ -78,7 +78,8 @@ constexpr x68k::u32 kSasiSelect = x68k::kSasiBase + 7;
 // ステータスレジスタが返すフェーズの値。IPL-ROM はこの値との一致を待つので、
 // ビットの意味ではなく値そのものが仕様になる。
 constexpr x68k::u8 kPhaseValueBusFree = 0x00;
-constexpr x68k::u8 kPhaseValueData = 0x0B;     // コマンド送出とセクタ授受
+constexpr x68k::u8 kPhaseValueDataOut = 0x0B;  // CPU からターゲットへ送る
+constexpr x68k::u8 kPhaseValueDataIn = 0x07;   // ターゲットから CPU へ返す
 constexpr x68k::u8 kPhaseValueStatus = 0x0F;   // 終了ステータスを読む
 constexpr x68k::u8 kPhaseValueMessage = 0x1F;  // メッセージを読む
 
@@ -120,8 +121,8 @@ TEST_CASE("READ コマンドで指定セクタが読める")
 
     sendCommand(m, 0x08 /* READ */, 0, 1);
 
-    // データ転送フェーズになる。
-    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueData);
+    // ターゲットから CPU へ返す向きのデータフェーズになる。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
 
     // セクタ 0 の中身が読める。
     CHECK(m.ioRead8(kSasiData) == 0x00);  // セクタ番号
@@ -246,4 +247,101 @@ TEST_CASE("未対応コマンドはエラーを返して固まらない")
     m.ioRead8(kSasiData);  // メッセージフェーズを消化
     sendCommand(m, 0x08, 1, 1);
     CHECK(m.ioRead8(kSasiData) == 0x01);
+}
+
+TEST_CASE("READ は要求されたぶんのセクタをまとめて返す")
+{
+    // IPL-ROM はブートセクタを 4 セクタ (1024 バイト) まとめて要求する。
+    // 1 セクタずつしか返さないと DMA が 256 バイトで止まり、
+    // $002000 に読み込まれるブートコードが尻切れになる。
+    x68k::Machine m;
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 0, 4);
+
+    for (x68k::u32 sector = 0; sector < 4; ++sector)
+    {
+        CHECK(m.ioRead8(kSasiData) == static_cast<x68k::u8>(sector));
+        CHECK(m.ioRead8(kSasiData) == 0xA5);
+        // このセクタの残りを読み飛ばす。
+        for (int i = 2; i < 256; ++i)
+        {
+            m.ioRead8(kSasiData);
+        }
+    }
+
+    // 4 セクタ読み切ったのでステータスフェーズへ移る。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+}
+
+TEST_CASE("DMAC がセクタをメモリへ転送する")
+{
+    // X68000 の SASI はデータ転送を DMAC 経由で行う。IPL-ROM は
+    // READ を発行した後 DMAC のチャネル 1 を起動し、転送が終わるのを待つ。
+    // DMAC が無いとブートセクタがメモリへ届かない。
+    x68k::Machine m;
+    std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+    x68k::MemoryMap memory;
+    memory.mainRam = ram.data();
+    m.setMemory(memory);
+
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 3, 1);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
+
+    // DMAC チャネル 1 のレジスタ。転送先は使っていないメインメモリの適当な場所。
+    constexpr x68k::u32 kDmaChannel1 = x68k::kDmacBase + 0x40;
+    constexpr x68k::u32 kDest = 0x00010000;
+
+    m.ioWrite8(kDmaChannel1 + 0x00, 0xFF);  // CSR をクリア
+    m.ioWrite8(kDmaChannel1 + 0x05, 0xB2);  // OCR: デバイス → メモリ
+    // MAR (転送先アドレス、4 バイト)
+    m.ioWrite8(kDmaChannel1 + 0x0C, static_cast<x68k::u8>(kDest >> 24));
+    m.ioWrite8(kDmaChannel1 + 0x0D, static_cast<x68k::u8>(kDest >> 16));
+    m.ioWrite8(kDmaChannel1 + 0x0E, static_cast<x68k::u8>(kDest >> 8));
+    m.ioWrite8(kDmaChannel1 + 0x0F, static_cast<x68k::u8>(kDest));
+    // MTC (転送バイト数、2 バイト)
+    m.ioWrite8(kDmaChannel1 + 0x0A, 0x01);
+    m.ioWrite8(kDmaChannel1 + 0x0B, 0x00);
+    // CCR bit7 で起動。
+    m.ioWrite8(kDmaChannel1 + 0x07, 0x80);
+
+    // セクタ 3 の中身がメモリへ届いている。
+    CHECK(m.bus().read8(kDest) == 0x03);
+    CHECK(m.bus().read8(kDest + 1) == 0xA5);
+
+    // 転送し切ったので DMAC は完了を知らせ、SASI はステータスフェーズへ移る。
+    CHECK((m.ioRead8(kDmaChannel1 + 0x00) & 0x80) != 0);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+}
+
+TEST_CASE("DMAC の転送方向は OCR の bit7 で決まる")
+{
+    // bit7 が立っていれば「デバイス → メモリ」。逆に取ると 1 バイトも
+    // 転送されず、IPL-ROM の "X68K" 検査で必ず失敗する。
+    x68k::Machine m;
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x08, 1, 1);
+
+    constexpr x68k::u32 kDmaChannel1 = x68k::kDmacBase + 0x40;
+    constexpr x68k::u32 kDest = 0x00010000;
+
+    m.ioWrite8(kDmaChannel1 + 0x00, 0xFF);
+    // bit7 を落とす = メモリ → デバイス。READ 中なので転送は起きない。
+    m.ioWrite8(kDmaChannel1 + 0x05, 0x32);
+    m.ioWrite8(kDmaChannel1 + 0x0C, static_cast<x68k::u8>(kDest >> 24));
+    m.ioWrite8(kDmaChannel1 + 0x0D, static_cast<x68k::u8>(kDest >> 16));
+    m.ioWrite8(kDmaChannel1 + 0x0E, static_cast<x68k::u8>(kDest >> 8));
+    m.ioWrite8(kDmaChannel1 + 0x0F, static_cast<x68k::u8>(kDest));
+    m.ioWrite8(kDmaChannel1 + 0x0A, 0x01);
+    m.ioWrite8(kDmaChannel1 + 0x0B, 0x00);
+    m.ioWrite8(kDmaChannel1 + 0x07, 0x80);
+
+    // 転送されていないので、データフェーズのまま。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataIn);
 }

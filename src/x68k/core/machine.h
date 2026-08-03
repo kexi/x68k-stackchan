@@ -14,6 +14,7 @@
 
 #include "bus.h"
 #include "cpu/m68k.h"
+#include "dev/dmac.h"
 #include "dev/fdc.h"
 #include "dev/mfp.h"
 #include "dev/rtc.h"
@@ -37,7 +38,7 @@ public:
     [[nodiscard]] virtual bool isPresent() const = 0;
 };
 
-class Machine final : public IoHandler
+class Machine final : public IoHandler, public DmaDevice, public DmaMemory
 {
 public:
     Machine();
@@ -74,6 +75,14 @@ public:
     {
         return bus_;
     }
+    // DMAC がデータを取りに来る口。SASI のデータインフェーズから 1 バイト渡す。
+    bool dmaRead(u8* value) override;
+    bool dmaWrite(u8 value) override;
+
+    // DMAC がメモリを触る口。バスへそのまま流す。
+    u8 dmaMemRead(u32 addr) override;
+    void dmaMemWrite(u32 addr, u8 value) override;
+
     [[nodiscard]] Sram& sram()
     {
         return sram_;
@@ -133,6 +142,7 @@ private:
     Mfp mfp_;
     Rtc rtc_;
     Fdc fdc_;
+    Dmac dmac_;
     DiskImage* disk_ = nullptr;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
@@ -141,7 +151,11 @@ private:
         u8 phase = 0;  // 0=バスフリー 1=コマンド 2=データ転送 3=ステータス
         u8 command[6] = {};
         u32 commandLength = 0;
-        u8 buffer[256] = {};
+        // IPL-ROM はブートセクタを 1024 バイト (4 セクタ) まとめて読む。
+        // 1 セクタずつ返すと DMA が途中で止まるので、要求ぶんを一度に持てる
+        // 大きさにしておく。
+        static constexpr u32 kMaxSectorsPerCommand = 4;
+        u8 buffer[256 * kMaxSectorsPerCommand] = {};
         u32 bufferPos = 0;
         u32 bufferLength = 0;
         u8 status = 0;

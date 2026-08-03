@@ -33,8 +33,10 @@ constexpr u32 kSasiSectorSize = 256;
 // この値と比較して待つ ($FF97BA / $FF9842 / $FF991C)。
 // IPL-ROM が待つ値は 2 つだけ。ビットの意味を推測して組み立てるより、
 // 実際に比較されている値をそのまま名前にする方が間違えない。
-//   $0B コマンド・データフェーズ ($FF9842 / $FF9890 / $FF98BC)
-//       — コマンド 6 バイトの送出とセクタの授受の両方でこの値を待つ
+//   $0B コマンド送出フェーズ ($FF9842 / $FF9890 / $FF98BC)
+//       — CPU からターゲットへ送る側。コマンド 6 バイトとパラメータ。
+//   $07 データインフェーズ ($FF97BE)
+//       — ターゲットから CPU へ返す側。READ したセクタはここで渡す。
 //   $03 $C2 のパラメータ送出待ち ($FF991C)
 //   $0F ステータスフェーズ       ($FF970A で D6=$0F、$FF97E8 で一致を待つ)
 //       — 終了ステータス 1 バイトを $E96001 から読む
@@ -49,7 +51,8 @@ constexpr u32 kSasiSectorSize = 256;
 // セレクションを受け付けた直後にいきなり $07 を返すと待ちを抜けられない。
 // 「セレクション成立」を表す中間状態を挟む。
 constexpr u8 kSasiStatusCommand = 0x0B;
-constexpr u8 kSasiStatusData = 0x0B;
+constexpr u8 kSasiStatusDataOut = 0x0B;
+constexpr u8 kSasiStatusDataIn = 0x07;
 constexpr u8 kSasiStatusSpecifyParam = 0x03;
 constexpr u8 kSasiStatusStatus = 0x0F;
 constexpr u8 kSasiStatusMessage = 0x1F;
@@ -73,6 +76,11 @@ constexpr u32 kMfpInterruptLevel = 6;
 
 Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
 {
+    // SASI のデータ転送は DMAC 経由で行われる。DMAC からはデータの出どころが
+    // SASI、転送先がバスに見える。
+    dmac_.setDevice(this);
+    dmac_.setMemory(this);
+
     // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
     // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
     // Machine が受け取って処理する。
@@ -99,6 +107,7 @@ void Machine::reset()
     rtc_.reset();
     fdc_.reset();
     sasi_ = SasiState{};
+    dmac_.reset();
 
     // リセット直後は IPL-ROM が $000000 に写像されている。
     // これがないとリセットベクタが読めない。
@@ -243,10 +252,12 @@ u8 Machine::ioRead8(u32 addr)
             }
             return 0u;
 
+        case kDmacBase:
+            return dmac_.read(addr - kDmacBase);
+
         case kAdpcmBase:
         case kSccBase:
         case kPpiBase:
-        case kDmacBase:
         case kIoScBase:
         case kPrinterBase:
             // スタブ。読み出しは 0。
@@ -293,6 +304,10 @@ void Machine::ioWrite8(u32 addr, u8 value)
 
         case kSasiBase:
             sasiWrite(addr, value);
+            return;
+
+        case kDmacBase:
+            dmac_.write(addr - kDmacBase, value);
             return;
 
         case kFdcBase:
@@ -356,6 +371,56 @@ void Machine::ioWrite16(u32 addr, u16 value)
     ioWrite8(addr + 1, static_cast<u8>(value & 0xFFu));
 }
 
+// --- DMA ---------------------------------------------------------------------
+//
+// DMAC は「デバイスから 1 バイト取ってメモリへ書く」を繰り返すだけなので、
+// SASI 側はデータインフェーズのバッファを 1 バイトずつ差し出せばよい。
+
+bool Machine::dmaRead(u8* value)
+{
+    if (sasi_.phase != kPhaseDataIn || sasi_.bufferPos >= sasi_.bufferLength)
+    {
+        return false;
+    }
+    *value = sasi_.buffer[sasi_.bufferPos++];
+    if (sasi_.bufferPos >= sasi_.bufferLength)
+    {
+        sasi_.phase = kPhaseStatus;
+    }
+    return true;
+}
+
+bool Machine::dmaWrite(u8 value)
+{
+    if (sasi_.phase != kPhaseDataOut || sasi_.bufferPos >= sasi_.bufferLength)
+    {
+        return false;
+    }
+    sasi_.buffer[sasi_.bufferPos++] = value;
+    if (sasi_.bufferPos >= sasi_.bufferLength)
+    {
+        if (sasi_.command[0] == kSasiWrite && disk_ != nullptr && disk_->isPresent())
+        {
+            const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
+                            (static_cast<u32>(sasi_.command[2]) << 8) |
+                            static_cast<u32>(sasi_.command[3]);
+            disk_->writeSector(lba, sasi_.buffer, 1);
+        }
+        sasi_.phase = kPhaseStatus;
+    }
+    return true;
+}
+
+u8 Machine::dmaMemRead(u32 addr)
+{
+    return bus_.read8(addr);
+}
+
+void Machine::dmaMemWrite(u32 addr, u8 value)
+{
+    bus_.write8(addr, value);
+}
+
 // --- SASI --------------------------------------------------------------------
 //
 // X68000 の SASI インタフェースは $E96000 から数バイトのレジスタを持つ。
@@ -408,8 +473,10 @@ u8 Machine::sasiRead(u32 addr)
             case kPhaseCommand:
                 return kSasiStatusCommand;
             case kPhaseDataIn:
+                return kSasiStatusDataIn;
+
             case kPhaseDataOut:
-                return kSasiStatusData;
+                return kSasiStatusDataOut;
             case kPhaseStatus:
                 return kSasiStatusStatus;
 
@@ -501,21 +568,24 @@ void Machine::sasiWrite(u32 addr, u8 value)
 
                 case kSasiRead:
                 {
-                    const u32 sectors = count == 0 ? 1u : count;
-                    // バッファは 1 セクタぶんしかないので 1 セクタずつ返す。
-                    // IPL-ROM は 1024 バイト (4 セクタ) を読むが、
-                    // セクタごとにコマンドを発行する。
+                    // count = 0 は 1 セクタの意味。IPL-ROM はブートセクタを
+                    // 4 セクタまとめて要求するので、一度に読んで載せる。
+                    // 1 セクタずつ返すと DMA が 256 バイトで止まる。
+                    u32 sectors = count == 0 ? 1u : count;
+                    if (sectors > SasiState::kMaxSectorsPerCommand)
+                    {
+                        sectors = SasiState::kMaxSectorsPerCommand;
+                    }
                     const bool ok = disk_ != nullptr && disk_->isPresent() &&
-                                    disk_->readSector(lba, sasi_.buffer, 1);
+                                    disk_->readSector(lba, sasi_.buffer, sectors);
                     if (!ok)
                     {
                         sasi_.status = 0x02;
                         sasi_.phase = kPhaseStatus;
                         return;
                     }
-                    sasi_.bufferLength = kSasiSectorSize;
+                    sasi_.bufferLength = kSasiSectorSize * sectors;
                     sasi_.phase = kPhaseDataIn;
-                    (void)sectors;
                     return;
                 }
 
