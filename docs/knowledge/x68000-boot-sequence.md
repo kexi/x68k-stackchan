@@ -10,7 +10,7 @@ sources:
   - https://zenn.dev/morian/articles/ab313ec56c4c4f
   - https://tyfkda.github.io/blog/2015/03/01/x68k-emu.html
   - http://retropc.net/x68000/software/system/sram/
-updated: 2026-08-03
+updated: 2026-08-04
 ---
 
 # X68000 のブートシーケンス
@@ -115,8 +115,17 @@ IPL-ROM 1.6 の標準優先順位:
 
 ## Phase 5: ブートセクタによる HUMAN.SYS のロード
 
-以下は **FD 起動を前提とした資料ベースの記述**で、本プロジェクトの
-SASI 経路では未検証。SASI 経路で実測できているのは Phase 4 まで。
+以下は **FD 起動を前提とした資料ベースの記述**として書き起こしたもの。
+
+> **追記 (2026-08-04)**: 当初「SASI 経路では未検証。実測できているのは
+> Phase 4 まで」と書いていたが、**現在は SASI 経路で Phase 6 の `A>`
+> プロンプトまで到達している**（実機の CoreS3 とホストの `x68k-run`
+> の両方で確認。`--dump-text` に `A>` が出る）。したがって以下の流れは
+> SASI 経路でも通ることが実測で裏付けられた。
+>
+> ただし各ステップの番地レベルまで 1 行ずつ追ったわけではないので、
+> 「資料ベース」という但し書き自体は残す。SASI 経路で逆アセンブルまで
+> 確かめた事実は [SASI 起動経路](x68000-sasi-boot.md) にある。
 
 1. `IOCS _BOOTINF` で起動ドライブ情報を取得
 2. `IOCS $46` (B_READ) で FAT のルートディレクトリ先頭セクタを読む

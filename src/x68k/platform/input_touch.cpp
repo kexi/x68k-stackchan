@@ -11,7 +11,15 @@ namespace
 {
 
 // キーボードの配列。Human68k のコマンドを打つのに要る範囲。
-// 空白は「キー無し」。
+// 4 行 x 10 列をすべて埋めてあり、「キー無し」のマスは無い。
+//
+// 4 行目の ' ' は空きマスではなく Space キーそのもの ("SP" と描く)。
+// 最後の '\n' が Enter ("RET")。BS は入っていないので、打ち間違えたら
+// Enter で確定してやり直す。
+//
+// Why not BS を入れないか: 10 列に収める都合で 1 つ落とす必要があり、
+// `dir` を打つのに要らない BS を落とした。列を増やすとキーが細くなって
+// 指で押し分けられない (320px / 10 で 1 キー 32px)。
 constexpr char kLayout[TouchKeyboard::kKeyRows][TouchKeyboard::kKeyCols + 1] = {
     "1234567890",
     "qwertyuiop",

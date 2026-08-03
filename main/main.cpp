@@ -126,15 +126,20 @@ bool reserveMemory()
 
     reportMemory("after reserve");
 
-    // グラフィック VRAM も確かめる。
+    // 確保できたかを全て確かめる。
     //
-    // これを外していたせいで、確保に失敗しても起動へ進んでいた。
-    // バスは null をベースアドレスとして受け取り、ゲストが初めて
-    // グラフィック VRAM の範囲を触った瞬間に落ちる。原因が分からない
-    // クラッシュになるので、ここで止める。
+    // グラフィック VRAM を外していたせいで、確保に失敗しても起動へ進んで
+    // いた。バスは null をベースアドレスとして受け取り、ゲストが初めて
+    // その範囲を触った瞬間に落ちる。原因が分からないクラッシュになる。
+    //
+    // CGROM だけは事情が違う。バスに null チェックがあり (bus.cpp の
+    // kCgromBase の分岐)、読むと 0 が返るのでクラッシュはしない。
+    // それでも止めるのは、字形が 1 つも無ければ画面が真っ黒のままで、
+    // 起動しても何もできないため。768KB が取れない時点で PSRAM の
+    // 断片化が起きており、そのまま進んでも先で別の失敗を招く。
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_graphicVram != nullptr &&
-                    g_iplRom != nullptr && g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
-                    g_sasiBuffer != nullptr;
+                    g_iplRom != nullptr && g_cgRom != nullptr && g_frameBufferA != nullptr &&
+                    g_frameBufferB != nullptr && g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
@@ -163,38 +168,33 @@ bool loadRoms()
     }
     ESP_LOGI(kTag, "IPL-ROM: %u バイト", static_cast<unsigned>(iplSize));
 
-    // CGROM は無くても英数字は出せる (IPL-ROM 内の 6x12 ANK フォントを使う)。
+    // CGROM のファイルは無くてもよい。IPL-ROM 内の 6x12 ANK フォントで
+    // 代替すれば英数字は出せる。
     //
     // 代替を組み立てずに nullptr のまま進めると、IOCS は字形として 0 以外の
     // 「読めた値」を使い、画面がベタ塗りの矩形になって Human68k の出力が
     // 一切読めなくなる。ホスト側 (host/main.cpp) と同じ扱いに揃える。
-    const bool hasCgromBuffer = g_cgRom != nullptr;
+    //
+    // バッファ自体は reserveMemory で確保済み (取れなければそこで止まる)。
     const std::size_t cgSize =
-        hasCgromBuffer ? x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes)
-                       : 0;
-    // CGROM も長さを見る。短いものを受け入れると大半の字形が欠け、
-    // 「表示は出るが読めない」という切り分けにくい状態になる。
-    // 長さが合わなければ CGROM 無しと同じ扱いにして代替へ落とす。
+        x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes);
+
+    // 長さも見る。短いものを受け入れると大半の字形が欠け、「表示は出るが
+    // 読めない」という切り分けにくい状態になる。合わなければ代替へ落とす。
     const bool isCgromComplete = cgSize == kCgromBytes;
     if (cgSize > 0 && !isCgromComplete)
     {
         ESP_LOGW(kTag, "CGROM が %u バイトです (%u バイト必要)。代替を使います",
                  static_cast<unsigned>(cgSize), static_cast<unsigned>(kCgromBytes));
     }
-    bool cgromReady = isCgromComplete;
-    if (cgromReady)
+    if (isCgromComplete)
     {
         ESP_LOGI(kTag, "CGROM: %u バイト", static_cast<unsigned>(cgSize));
     }
-    else if (hasCgromBuffer)
-    {
-        x68k::buildCgromFromIplRom(g_iplRom, g_cgRom);
-        cgromReady = true;
-        ESP_LOGW(kTag, "CGROM がありません。IPL-ROM 内蔵 6x12 ANK フォントで代替します");
-    }
     else
     {
-        ESP_LOGE(kTag, "CGROM 用の PSRAM を確保できませんでした。文字は表示できません");
+        x68k::buildCgromFromIplRom(g_iplRom, g_cgRom);
+        ESP_LOGW(kTag, "CGROM がありません。IPL-ROM 内蔵 6x12 ANK フォントで代替します");
     }
 
     if (!g_disk.open(x68k_platform::kHddPath))
@@ -207,7 +207,7 @@ bool loadRoms()
     memory.textVram = g_textVram;
     memory.graphicVram = g_graphicVram;
     memory.iplRom = g_iplRom;
-    memory.cgRom = cgromReady ? g_cgRom : nullptr;
+    memory.cgRom = g_cgRom;
     g_machine.setMemory(memory);
     g_machine.setSasiBuffer(g_sasiBuffer);
     g_machine.setDisk(&g_disk);
