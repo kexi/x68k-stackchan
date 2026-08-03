@@ -38,6 +38,16 @@ pre-commit:
 
     # pre-commit の gitleaks はあくまで tripwire。全履歴を見る CI 側が
     # authoritative なゲート。
+    # justfile の構文検証。
+    #
+    # [doc(...)] 属性とレシピの間にコメントを挟むと just が解釈できず、
+    # 全レシピが動かなくなる。ビルドも CI も一斉に落ちるのに、
+    # 編集した本人は気付きにくい (実際に 2 度やった)。
+    # --list は構文エラーを非ゼロで返すので、これで止まる。
+    justfile:
+      glob: "justfile"
+      run: nix develop -c just --list
+
     gitleaks:
       run: nix develop -c gitleaks git --staged --no-banner --redact
 

@@ -73,6 +73,12 @@ jobs:
       - name: Lint workflows
         run: nix develop -c just actionlint
 
+      # justfile の構文検証。pre-commit にも同じものを置いてあるが、
+      # --no-verify で飛ばせるので CI でも見る。壊れると全レシピが
+      # 動かなくなり、他のジョブが軒並み落ちる。
+      - name: Check justfile
+        run: nix develop -c just --list
+
   host-tests:
     name: host tests and lint
     runs-on: ubuntu-latest
