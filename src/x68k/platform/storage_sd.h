@@ -41,6 +41,27 @@ bool mountSd();
 // 原因の分からない暴走になるため。
 std::size_t loadFile(const char* path, std::uint8_t* buffer, std::size_t bufferSize);
 
+// buffer の内容を path へ丸ごと書き出す。成功したら true。
+//
+// Why not 差分だけ書くか: SRAM は 16KB しかなく、FAT のクラスタ単位で見れば
+// 数クラスタでしかない。どこが変わったかを追う仕組みを持つ方が、書き込み量の
+// 削減より確実に高く付く。書き込み回数の間引きは呼び出し側 (dirty) で行う。
+bool saveFile(const char* path, const std::uint8_t* buffer, std::size_t size);
+
+// SD の sram.dat から SRAM を復元する。取り込めたら true。
+//
+// 大きさが kSramSize ちょうどで、マジックが正しいときだけ受け入れる。
+// 拒否した場合 machine の SRAM は触らない (呼び出し前の内容が残る)。
+// ファイルが無い初回起動も false になるが、これは異常ではない。
+bool loadSram(x68k::Machine& machine);
+
+// SRAM に変更があれば SD へ書き戻す。書いたら true。
+//
+// 変更が無ければ何もしない。SD の書き込み寿命を守るため、呼び出し側は
+// さらに時間で間引くこと (毎スライス呼んでも Sram::isDirty() で止まるが、
+// 1 バイト書かれるたびに 16KB を書くのは避けたい)。
+bool saveSramIfDirty(x68k::Machine& machine);
+
 // SD 上の HDD イメージをセクタ単位で読むディスク。
 //
 // イメージ全体をメモリに載せない (数十 MB あり PSRAM に収まらないため)。

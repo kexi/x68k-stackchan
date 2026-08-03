@@ -72,6 +72,13 @@ constexpr u8 kPhaseMessage = 5;
 // MFP の割り込みレベル。X68000 では MFP がレベル 6 に繋がっている。
 constexpr u32 kMfpInterruptLevel = 6;
 
+// SCC の割り込みレベル。X68000 では SCC (マウス / RS-232C) がレベル 5。
+//
+// MFP (6) より低いので、キーボードやタイマの処理中はマウスが待たされる。
+// これは実機と同じ順序。ここを 6 以上にすると、マウスを動かし続けている間
+// システムタイマが取りこぼされて時計が遅れる。
+constexpr u32 kSccInterruptLevel = 5;
+
 }  // namespace
 
 Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
@@ -100,12 +107,27 @@ void Machine::setMemory(const MemoryMap& memory)
 
 void Machine::reset()
 {
-    sram_.formatDefaults();
+    // SRAM はリセットで消さない。実機はバッテリバックアップなので、
+    // リセットしても電源を切っても内容が残る。
+    //
+    // Why not 無条件に formatDefaults を呼ぶか: 以前はそうしていたが、
+    // Human68k が起動デバイスや画面モードを書き換えた直後にリセットすると
+    // 工場出荷値へ戻ってしまう。実機と挙動が違ううえ、SD へ保存しても
+    // 次の起動で必ず上書きされるので保存する意味が無くなる。
+    //
+    // ただしマジックが壊れているときだけは初期化する。IPL-ROM は不正な
+    // SRAM を見つけると自分で書き戻しにかかるが、その経路を通す前に
+    // 途中の読み出しでゴミの設定を使ってしまう。ここで先回りしておく。
+    if (!sram_.hasValidMagic())
+    {
+        sram_.formatDefaults();
+    }
     crtc_.reset();
     video_.reset();
     mfp_.reset();
     rtc_.reset();
     fdc_.reset();
+    scc_.reset();
     // 転送バッファは外から与えられた設定なので、リセットで消さない。
     // ここを丸ごと初期化すると nullptr に戻り、SASI が 1 バイトも
     // 受け取れなくなる。
@@ -159,9 +181,23 @@ u32 Machine::run(u32 cycles)
 
 void Machine::serviceInterrupts()
 {
+    // MFP (レベル 6) を先に見る。SCC (レベル 5) より優先度が高いので、
+    // 両方保留していたら MFP が勝つ。
+    //
+    // Why not SCC を先に見るか: 68000 は 1 回の割り込み受理で 1 つしか
+    // 処理しない。低い方を先に渡すと、高い方が待たされるどころか
+    // 「マウスを動かし続けている間キー入力が通らない」形で逆転する。
+    if (!serviceMfpInterrupt())
+    {
+        serviceSccInterrupt();
+    }
+}
+
+bool Machine::serviceMfpInterrupt()
+{
     if (!mfp_.hasPendingInterrupt())
     {
-        return;
+        return false;
     }
 
     // CPU が今この割り込みを受け付けられるか先に確かめる。
@@ -177,7 +213,7 @@ void Machine::serviceInterrupts()
     const bool isMasked = kMfpInterruptLevel <= mask;
     if (isMasked)
     {
-        return;
+        return false;
     }
 
     // MFP は自分のベクタ番号を返すデバイス (自動ベクタではない)。
@@ -189,14 +225,50 @@ void Machine::serviceInterrupts()
     const u32 vectorNumber = mfp_.acknowledgeInterrupt();
     if (vectorNumber == 0)
     {
-        return;
+        return false;
     }
     cpu_.requestInterrupt(kMfpInterruptLevel, vectorNumber);
+    return true;
+}
+
+bool Machine::serviceSccInterrupt()
+{
+    if (!scc_.hasPendingInterrupt())
+    {
+        return false;
+    }
+
+    // MFP と同じ理由で、受理できるか先に確かめてから acknowledge する。
+    //
+    // acknowledgeInterrupt() は保留を落とす破壊的な操作なので、CPU が
+    // マスクしている間に呼ぶとマウスのレポートが握りつぶされる。実機の
+    // バスは IACK サイクルが走って初めてこの遷移が起きる。
+    const u32 mask = cpu_.state().interruptMask();
+    const bool isMasked = kSccInterruptLevel <= mask;
+    if (isMasked)
+    {
+        return false;
+    }
+
+    // SCC も自分のベクタ番号を返すデバイス (WR2 に書かれた値が基になる)。
+    // 自動ベクタにすると IOCS が張ったマウス用ハンドラへ届かない。
+    const u32 vectorNumber = scc_.acknowledgeInterrupt();
+    if (vectorNumber == 0)
+    {
+        return false;
+    }
+    cpu_.requestInterrupt(kSccInterruptLevel, vectorNumber);
+    return true;
 }
 
 void Machine::pressKey(u8 scanCode)
 {
     mfp_.receiveKeyboardByte(scanCode);
+}
+
+void Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
+{
+    scc_.moveMouse(dx, dy, leftButton, rightButton);
 }
 
 // --- I/O ディスパッチ --------------------------------------------------------
@@ -288,8 +360,10 @@ u8 Machine::ioRead8(u32 addr)
         case kDmacBase:
             return dmac_.read(addr - kDmacBase);
 
-        case kAdpcmBase:
         case kSccBase:
+            return sccRead(addr);
+
+        case kAdpcmBase:
         case kPpiBase:
         case kIoScBase:
         case kPrinterBase:
@@ -349,6 +423,10 @@ void Machine::ioWrite8(u32 addr, u8 value)
 
         case kDmacBase:
             dmac_.write(addr - kDmacBase, value);
+            return;
+
+        case kSccBase:
+            sccWrite(addr, value);
             return;
 
         case kFdcBase:
@@ -483,6 +561,62 @@ u8 Machine::dmaMemRead(u32 addr)
 void Machine::dmaMemWrite(u32 addr, u8 value)
 {
     bus_.write8(addr, value);
+}
+
+// --- SCC ---------------------------------------------------------------------
+//
+// Z8530 は 8bit デバイスで、16bit バスの下位バイト側に繋がっている。
+// レジスタは奇数アドレスにのみ現れる (MFP と同じ理由)。
+//
+//   $E98001 ch B 制御 / $E98003 ch B データ   ← マウス
+//   $E98005 ch A 制御 / $E98007 ch A データ   ← RS-232C
+//
+// IPL-ROM は MOVE.W で $E98000 のような偶数アドレスへ書くが、実際に
+// デバイスへ届くのは下位バイト = 奇数アドレス側。
+// 例: MOVE.W #$0062,$E98000 は $E98000 に $00、$E98001 に $62 を書く。
+// この $62 が WR5 への値になる。
+//
+// Why not 偶数アドレスも同じレジスタへ割り当てるか: MFP で同じことをして
+// 壊れた。Z8530 は制御ポートを「読むとレジスタポインタが 0 に戻る」ので、
+// 偶数側の読みでもポインタが戻ると、MOVE.W で読んだときに上位バイトの
+// アクセスがポインタを潰し、下位バイトが必ず RR0 を読むことになる。
+
+u8 Machine::sccRead(u32 addr)
+{
+    // 偶数側は実体が無い。0 を返す。
+    const bool isOddAddress = (addr & 1) != 0;
+    if (!isOddAddress)
+    {
+        return 0u;
+    }
+
+    // $E98001/$E98003 が ch B、$E98005/$E98007 が ch A。
+    // bit2 でチャネル、bit1 で制御/データを選ぶ。
+    const u32 offset = addr & 0x07u;
+    const u32 channel = (offset & 0x04u) != 0 ? Scc::kChannelA : Scc::kChannelB;
+    const bool isDataPort = (offset & 0x02u) != 0;
+
+    return isDataPort ? scc_.readData(channel) : scc_.readControl(channel);
+}
+
+void Machine::sccWrite(u32 addr, u8 value)
+{
+    const bool isOddAddress = (addr & 1) != 0;
+    if (!isOddAddress)
+    {
+        return;
+    }
+
+    const u32 offset = addr & 0x07u;
+    const u32 channel = (offset & 0x04u) != 0 ? Scc::kChannelA : Scc::kChannelB;
+    const bool isDataPort = (offset & 0x02u) != 0;
+
+    if (isDataPort)
+    {
+        scc_.writeData(channel, value);
+        return;
+    }
+    scc_.writeControl(channel, value);
 }
 
 // --- SASI --------------------------------------------------------------------

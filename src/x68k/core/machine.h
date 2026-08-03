@@ -18,6 +18,7 @@
 #include "dev/fdc.h"
 #include "dev/mfp.h"
 #include "dev/rtc.h"
+#include "dev/scc.h"
 #include "dev/sram.h"
 #include "dev/video.h"
 
@@ -131,9 +132,21 @@ public:
     {
         return fdc_;
     }
+    [[nodiscard]] Scc& scc()
+    {
+        return scc_;
+    }
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
+
+    // マウスが動いた / ボタンの状態が変わった。
+    //
+    // pressKey と同じく、ホストや platform 層が外から入力を注入する口。
+    // dx/dy は前回からの相対移動量 (X68000 のマウスは絶対座標を持たない)。
+    //
+    // IOCS がマウスを有効化していない間の呼び出しは捨てられる。
+    void moveMouse(int dx, int dy, bool leftButton, bool rightButton);
 
     // CPU が停止しているか (未実装命令に当たった等)。
     [[nodiscard]] bool isHalted() const
@@ -155,8 +168,14 @@ public:
 
 private:
     void serviceInterrupts();
+    // 保留していた割り込みを CPU へ渡せたら true。
+    // 優先度の高い方から順に試し、1 つ通ったらそこで止めるために戻り値を使う。
+    bool serviceMfpInterrupt();
+    bool serviceSccInterrupt();
     u8 sasiRead(u32 addr);
     void sasiWrite(u32 addr, u8 value);
+    u8 sccRead(u32 addr);
+    void sccWrite(u32 addr, u8 value);
 
     Sram sram_;
     SystemBus bus_;
@@ -166,6 +185,7 @@ private:
     Mfp mfp_;
     Rtc rtc_;
     Fdc fdc_;
+    Scc scc_;
     Dmac dmac_;
     DiskImage* disk_ = nullptr;
 

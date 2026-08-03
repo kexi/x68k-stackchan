@@ -421,19 +421,9 @@ const std::set<std::string>& unverifiedUpstream()
 // 落ちるようにしておけば、リストの更新漏れも捕まえられる。
 const std::set<std::string>& knownFailures()
 {
-    static const std::set<std::string> names = {
-        // 除算のオーバーフロー時の N/Z。
-        //
-        // 商が 16bit に収まらないとき、68000 は筆算を途中まで進めた内部状態を
-        // N/Z に残す。Motorola の資料でも「未定義」とされる部分で、
-        // 被除数・除数から単純な式では再現できない (被除数の符号・上位ワード・
-        // 1bit シフト後の値など、素直な候補はいずれも 50-85% しか一致しない)。
-        // 忠実に合わせるには除算マイクロコードをサイクル単位で実装する必要がある。
-        //
-        // 通常の除算 (オーバーフローしない場合) とゼロ除算は全件通っている。
-        "DIVS",
-        "DIVU",
-    };
+    // 現在は空。DIVS/DIVU のオーバーフロー時 N/Z は除算を筆算 (シフト減算) で
+    // 実装し直して解消した (m68k_alu.h の divideUnsigned/divideSigned)。
+    static const std::set<std::string> names = {};
 
     return names;
 }

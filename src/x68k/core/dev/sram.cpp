@@ -43,6 +43,38 @@ bool Sram::hasValidMagic() const
     return data_[kOffsetMagic + 7] == kMagicTail;
 }
 
+bool Sram::loadImage(const std::uint8_t* image, std::size_t length)
+{
+    if (image == nullptr || length != data_.size())
+    {
+        return false;
+    }
+
+    // マジックの検査は取り込む前に、渡されたバイト列に対して行う。
+    //
+    // Why not いったん data_ へ写してから hasValidMagic を見るか: 拒否したとき
+    // 元の内容が既に壊れている。呼び出し側は「拒否されたら工場出荷値へ」と
+    // 判断するので実害は無いように見えるが、ゴミを一度でも SRAM に載せると
+    // 「拒否したのに保存されて次回も同じゴミを読む」経路ができる。
+    for (std::uint32_t i = 0; i < 7; ++i)
+    {
+        if (image[kOffsetMagic + i] != kMagicText[i])
+        {
+            return false;
+        }
+    }
+    if (image[kOffsetMagic + 7] != kMagicTail)
+    {
+        return false;
+    }
+
+    std::memcpy(data_.data(), image, data_.size());
+
+    // 読み込んだ直後は SD の内容と一致している。書き戻す必要は無い。
+    dirty_ = false;
+    return true;
+}
+
 void Sram::formatDefaults()
 {
     data_.fill(0);

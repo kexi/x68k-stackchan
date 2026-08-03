@@ -4,6 +4,7 @@
 #include "storage_sd.h"
 
 #include <cstdio>
+#include <string>
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
@@ -102,6 +103,100 @@ std::size_t loadFile(const char* path, std::uint8_t* buffer, std::size_t bufferS
     const std::size_t read = std::fread(buffer, 1, static_cast<std::size_t>(size), f);
     std::fclose(f);
     return read == static_cast<std::size_t>(size) ? read : 0;
+}
+
+bool saveFile(const char* path, const std::uint8_t* buffer, std::size_t size)
+{
+    // いったん一時ファイルへ書き切ってから rename で置き換える。
+    //
+    // Why not 目的のファイルを直接 "wb" で開くか: fopen した時点で既存の
+    // sram.dat が長さ 0 に切り詰められる。書いている途中で電源が落ちると
+    // 半端な長さのファイルだけが残り、次回起動では大きさ検査に落ちて
+    // 工場出荷値になる。つまり「保存しようとしたせいで、それまで正しく
+    // 保存できていた設定まで失う」。バッテリバックアップの代替としては
+    // 最悪の壊れ方で、保存しない方がまだましになってしまう。
+    //
+    // rename は FAT でもディレクトリエントリの書き換えだけで済み、
+    // 「古い内容」か「新しい内容」のどちらかが残る。中間状態にならない。
+    std::string tempPath(path);
+    tempPath += ".tmp";
+
+    std::FILE* f = std::fopen(tempPath.c_str(), "wb");
+    if (f == nullptr)
+    {
+        return false;
+    }
+
+    const std::size_t written = std::fwrite(buffer, 1, size, f);
+    // fflush だけでは足りない。FATFS は fclose で FAT とディレクトリエントリを
+    // 確定させるので、閉じずに電源が切れると長さ 0 のファイルが残る。
+    const bool isFlushed = std::fflush(f) == 0;
+    const bool isClosed = std::fclose(f) == 0;
+    if (written != size || !isFlushed || !isClosed)
+    {
+        std::remove(tempPath.c_str());
+        return false;
+    }
+
+    // FATFS の rename は既存の宛先があると失敗するので、先に消す。
+    // ここで電源が落ちると sram.dat は消えるが .tmp に完全な内容が残る。
+    std::remove(path);
+    if (std::rename(tempPath.c_str(), path) != 0)
+    {
+        std::remove(tempPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+// --- SRAM --------------------------------------------------------------------
+
+bool loadSram(x68k::Machine& machine)
+{
+    // 16KB なのでスタックには置かず static にする。
+    //
+    // Why not スタックに置くか: この関数はエミュレーションタスク (スタック 8KB)
+    // からも呼べる位置にあり、16KB の配列を積むとその場でオーバーフローする。
+    // 呼ばれるのは起動時の 1 回だけなので、常駐しても惜しくない大きさでもない。
+    static std::uint8_t image[x68k::kSramSize];
+
+    const std::size_t size = loadFile(kSramPath, image, sizeof(image));
+    if (size == 0)
+    {
+        // ファイルが無い (初回起動) か、16KB を超えている。
+        return false;
+    }
+
+    // 長さとマジックの検査は core 側が行う。拒否されたら SRAM は変わらない。
+    return machine.sram().loadImage(image, size);
+}
+
+bool saveSramIfDirty(x68k::Machine& machine)
+{
+    if (!machine.sram().isDirty())
+    {
+        return false;
+    }
+
+    // dirty は書き込みに成功したときだけ落とす。
+    //
+    // Why not 先に落として失敗を握り潰さないか: 「次に SRAM が書かれれば
+    // また dirty が立つ」は、その書き込みが最後の設定変更だった場合に
+    // 成立しない。SD の一時的な I/O エラーで 1 回失敗しただけで、以降
+    // 誰も SRAM を書かなければ変更は永久に保存されない。設定を変えて
+    // すぐ電源を切る使い方はまさにこれに当たる。
+    //
+    // 呼び出し側が 10 秒間隔で間引いているので、失敗しても再試行は
+    // 10 秒に 1 回で済む。毎スライス 16KB を書き続けることにはならない。
+
+    const bool ok = saveFile(kSramPath, machine.sram().data(), x68k::kSramSize);
+    if (!ok)
+    {
+        ESP_LOGW(kTag, "SRAM を保存できません: %s", kSramPath);
+        return false;
+    }
+    machine.sram().clearDirty();
+    return true;
 }
 
 // --- SdDisk ------------------------------------------------------------------

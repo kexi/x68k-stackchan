@@ -23,10 +23,19 @@ inline constexpr std::uint32_t kAddressMask = 0x00FFFFFFu;
 
 // --- メインメモリ ---------------------------------------------------------
 // 実装容量は SRAM $ED0008 の値と一致させる必要がある (IPLROM がそこを見る)。
-// 本エミュレータは 1MB で始める。Human68k のプロンプト到達に 2MB は要らず、
-// PSRAM の消費を抑えられるため。増やす場合は kSramDefaultRamSize も変えること。
+// Sram::kDefaultRamSize がこの定数を参照しているので、ここを変えれば
+// SRAM の申告値も追随する。両方に数値を直書きしてはいけない。
+//
+// 2MB にしてある。SX-Window (Human68k の純正 GUI) が 1MB では起動せず、
+// 最低 2MB を要求するため。Human68k のプロンプトに到達するだけなら 1MB で
+// 足りるが、GUI を動かすのが目的なので上げる。
+//
+// Why not 4MB 以上にしないか: 実機 (ACE/EXPERT) の標準構成が 2MB で、
+// これを超えると増設メモリ扱いになりアドレスデコードの前提が変わる。
+// ESP32 側の PSRAM は 8MB しかなく、VRAM・CGROM・フレームバッファと
+// 合わせると 4MB では余裕が無い。
 inline constexpr std::uint32_t kMainRamBase = 0x000000u;
-inline constexpr std::uint32_t kMainRamSize = 0x100000u;  // 1MB
+inline constexpr std::uint32_t kMainRamSize = 0x200000u;  // 2MB
 
 // --- ベクタ / ワーク領域の主要アドレス ------------------------------------
 // ブート時に IPLROM とブートセクタが使う固定アドレス。

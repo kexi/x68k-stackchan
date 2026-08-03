@@ -384,60 +384,40 @@ u32 M68k::groupOrDiv(u16 op)
         const bool isSigned = opmode == 7;
         const u32 dividend = st_.d[reg];
 
-        // Why not s32 のまま割るか: D0=0x80000000 を -1 で割ると商が s32 に
-        // 収まらず、C++ の符号付き除算オーバーフロー (未定義動作) になる。
-        // 商が 16bit に収まるかを判定するのは除算の後なので、判定前に UB へ
-        // 落ちてしまう。両オペランドを先に s64 へ広げれば除算自体が必ず成立し、
-        // オーバーフロー判定を安全に後段で行える。
-        s64 quotient = 0;
-        s64 remainder = 0;
-        if (isSigned)
-        {
-            const s64 n = static_cast<s64>(static_cast<s32>(dividend));
-            const s64 d = static_cast<s64>(static_cast<s16>(divisor16));
-            quotient = n / d;
-            remainder = n % d;
-        }
-        else
-        {
-            const s64 n = static_cast<s64>(dividend);
-            const s64 d = static_cast<s64>(divisor16);
-            quotient = n / d;
-            remainder = n % d;
-        }
-
-        // C は除算では常にクリアされる (オーバーフロー時も含む)。
-        st_.sr = static_cast<u16>(st_.sr & ~sr_bit::kCarry);
-
-        // 商が 16bit に収まらない場合は V を立てて結果を書かない。
+        // 商・余り・フラグはまとめて筆算側 (m68k_alu.h) が返す。
         //
-        // このとき N/Z は Motorola の資料でも「未定義」で、実機は筆算を途中まで
-        // 進めた内部状態を残す。被除数から単純な式では再現できないため
-        // (素直な候補はいずれも適合性ベクタの 50-85% しか一致しない)、
-        // ここでは触らずに元の値を残す。忠実に合わせるには除算マイクロコードを
-        // サイクル単位で実装する必要がある。
-        const bool isOverflow =
-            isSigned ? (quotient > 32767 || quotient < -32768) : (quotient > 65535);
-        if (isOverflow)
-        {
-            st_.sr |= sr_bit::kOverflow;
-            return 70;
-        }
+        // Why not ここで C++ の / と % を使うか: それだと商がオーバーフローした
+        // ときの N/Z が作れない。実機はマイクロコードの筆算を途中で打ち切り、
+        // その時点の内部状態を N/Z に残す。C++ の除算には「途中」が無いので、
+        // 打ち切った瞬間の状態を再現できない (被除数の符号・上位ワードなどから
+        // 推測する式はいずれも適合性ベクタの 50-85% しか一致しなかった)。
+        // 筆算そのものを実装すれば、オーバーフローも通常の除算も同じ経路から
+        // 自然に出る。ついでに 0x80000000 ÷ -1 の符号付き除算オーバーフロー
+        // (C++ では未定義動作) も、符号なしで絶対値を取る過程で回避される。
+        const alu::DivResult div = isSigned ? alu::divideSigned(dividend, divisor16)
+                                            : alu::divideUnsigned(dividend, divisor16);
 
-        const u32 q = static_cast<u32>(quotient) & 0xFFFFu;
-        const u32 r = static_cast<u32>(remainder) & 0xFFFFu;
-        st_.d[reg] = (r << 16) | q;
-
+        // C は除算では常にクリアされる (オーバーフロー時も含む)。X は不変。
         u16 sr = static_cast<u16>(
             st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
-        if (q == 0)
-        {
-            sr |= sr_bit::kZero;
-        }
-        if ((q & 0x8000u) != 0)
+        if (div.n)
         {
             sr |= sr_bit::kNegative;
         }
+        if (div.z)
+        {
+            sr |= sr_bit::kZero;
+        }
+
+        // オーバーフロー時は V を立て、商も余りも書き戻さない。
+        if (div.overflow)
+        {
+            sr |= sr_bit::kOverflow;
+            st_.sr = sr;
+            return 70;
+        }
+
+        st_.d[reg] = (div.remainder << 16) | div.quotient;
         st_.sr = sr;
         return 140;
     }

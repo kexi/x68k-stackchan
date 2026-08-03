@@ -7,6 +7,7 @@
 // CPU コアのバグと区別しにくい。領域が重ならないこと・サイズが仕様どおりであること
 // を機械的に押さえておくと、M2 以降の切り分けが楽になる。
 
+#include "dev/sram.h"
 #include "doctest.h"
 #include "memmap.h"
 
@@ -112,6 +113,54 @@ TEST_CASE("ブートの固定アドレスがメインメモリの中にある")
     CHECK(x68k::kHumanLoadAddr < x68k::kMainRamSize);
     // 実行ファイルヘッダ ($40 バイト) の分だけ読み込み開始が手前にある。
     CHECK(x68k::kHumanLoadAddr - x68k::kHumanLoadReadAddr == 0x40u);
+}
+
+TEST_CASE("メインメモリは 2MB で $000000 から始まる")
+{
+    // 保証すること: SX-Window が要求する 2MB が実装されていること。
+    //
+    // SX-Window (Human68k の純正 GUI) は 1MB では起動しない。Human68k の
+    // プロンプトに到達するだけなら 1MB で足りるので、容量が足りないことは
+    // 「コンソールは出るが SX-Window だけ起動しない」という形で現れる。
+    CHECK(x68k::kMainRamBase == 0x000000u);
+    CHECK(x68k::kMainRamSize == 2u * 1024u * 1024u);
+    CHECK(x68k::kMainRamSize == 0x200000u);
+}
+
+TEST_CASE("SRAM が申告する実装容量がメインメモリの実サイズと一致する")
+{
+    // 保証すること: SRAM $ED0008 の値と実際に確保する容量がずれないこと。
+    //
+    // IPL-ROM は $ED0008 を読んでメモリ容量を決め、Human68k はその値を
+    // 信じて空き領域を管理する。実サイズより大きく申告すると、存在しない
+    // アドレスへ書き込んで静かにデータが消える。小さく申告すると 2MB を
+    // 確保していても Human68k は 1MB しか使わず、SX-Window が起動しない。
+    //
+    // kDefaultRamSize は kMainRamSize を参照しているので本来ずれないが、
+    // どちらかに数値を直書きされた瞬間に破綻する。機械的に押さえておく。
+    CHECK(x68k::Sram::kDefaultRamSize == x68k::kMainRamSize);
+}
+
+TEST_CASE("メインメモリの終端がグラフィック VRAM に届かない")
+{
+    // 保証すること: 容量を増やしても他の領域を侵さないこと。
+    //
+    // メインメモリの直上は長い空き領域で、$C00000 のグラフィック VRAM まで
+    // 何も無い。ここを越えると VRAM が RAM として読めてしまい、
+    // 画面がメモリの内容で埋まる。
+    CHECK(x68k::kMainRamBase + x68k::kMainRamSize <= x68k::kGvramBase);
+}
+
+TEST_CASE("2MB のメインメモリ全域が 24bit アドレス空間に収まる")
+{
+    // 保証すること: バスが折り返さずにデコードできる範囲であること。
+    //
+    // 末尾のワードアクセス (アドレス + 1) まで含めて確かめる。バスの
+    // 高速路は「2 バイトとも同じ領域に収まるか」で判定するので、
+    // 境界の 1 バイトを見落とすと配列の外を読む。
+    constexpr std::uint32_t kLastByte = x68k::kMainRamSize - 1u;
+    CHECK((kLastByte & x68k::kAddressMask) == kLastByte);
+    CHECK(kLastByte < 0x01000000u);
 }
 
 TEST_CASE("アドレスマスクが 24bit である")

@@ -40,7 +40,7 @@ namespace
 constexpr char kTag[] = "x68k";
 
 // エミュレータが必要とするメモリ。
-constexpr std::size_t kMainRamBytes = x68k::kMainRamSize;    // 1MB
+constexpr std::size_t kMainRamBytes = x68k::kMainRamSize;    // 2MB
 constexpr std::size_t kTextVramBytes = x68k::kTvramSize;     // 512KB
 constexpr std::size_t kGraphicVramBytes = x68k::kTvramSize;  // 512KB
 constexpr std::size_t kIplromBytes = x68k::kIplromSize;      // 128KB
@@ -275,15 +275,32 @@ void emulatorTask(void* /*arg*/)
     constexpr x68k::u32 kSliceCycles = 20000;
     constexpr std::uint32_t kReportIntervalMs = 5000;
 
+    // SRAM を SD へ書き戻す間隔。
+    //
+    // Why not 書き込みのたびに保存するか: Human68k は設定を数バイトずつ書くので、
+    // 1 バイトごとに 16KB を書くと SD の同じセクタを何百回も潰す。
+    // Why not 終了時にまとめて保存するか: 組み込みに「終了」は無い。
+    // 利用者は電源を切るだけなので、書き戻す機会がそこにしかないと必ず失われる。
+    // 10 秒なら、間引きとしては十分で、失うのは直前の 1 回ぶんの設定変更で済む。
+    constexpr std::uint32_t kSramSaveIntervalMs = 10000;
+
     std::uint64_t totalCycles = 0;
     std::uint64_t lastReportCycles = 0;
     std::uint32_t lastReportMs = 0;
+    std::uint32_t lastSramSaveMs = 0;
 
     while (true)
     {
         if (g_machine.isHalted())
         {
             ESP_LOGE(kTag, "停止しました。未実装命令 %04X", g_machine.haltedOpcode());
+            // 止まる前に SRAM を書き戻す。
+            //
+            // Why not 定期保存だけに任せるか: 保存は 10 秒間隔で間引いている。
+            // 設定を書き換えた直後に未実装命令を踏むと、ここでタスクごと
+            // 消えるので次の保存機会が永久に来ない。エミュレータが止まる
+            // 原因は未実装命令であって SD ではないから、書き戻しは通る。
+            x68k_platform::saveSramIfDirty(g_machine);
             // 表示は所有者に任せる。ここで M5.Display を触ると
             // 表示コアの転送とぶつかる。
             g_halted = true;
@@ -345,6 +362,20 @@ void emulatorTask(void* /*arg*/)
                      static_cast<unsigned long long>(totalCycles), khz);
             lastReportMs = now;
             lastReportCycles = totalCycles;
+        }
+
+        // 変更された SRAM を SD へ書き戻す。
+        //
+        // ここで行うのは、SRAM を触ってよいのがこのコアだけだから。表示コアから
+        // 呼ぶと、エミュレーションが書いている最中の 16KB を読むことになる。
+        const bool isSramSaveDue = now - lastSramSaveMs >= kSramSaveIntervalMs;
+        if (isSramSaveDue)
+        {
+            lastSramSaveMs = now;
+            if (x68k_platform::saveSramIfDirty(g_machine))
+            {
+                ESP_LOGI(kTag, "SRAM を保存しました: %s", x68k_platform::kSramPath);
+            }
         }
 
         // ウォッチドッグに殺されないよう必ず譲る。
@@ -527,6 +558,23 @@ extern "C" void app_main(void)
     {
         x68k_platform::DisplayLcd::showMessage("NO IPL-ROM", "/x68k/iplrom.dat is required");
         return;
+    }
+
+    // 前回の SRAM を復元する。reset() より先に行う。
+    //
+    // 実機の SRAM はバッテリバックアップで電源を切っても残る。起動デバイスや
+    // 画面モードの設定はここにあるので、復元しないと毎回工場出荷値で立ち上がる。
+    //
+    // 初回起動では sram.dat が無いので false になるが、これは異常ではない。
+    // Sram の構築時に工場出荷値が入っており、10 秒後の書き戻しで生成される。
+    if (x68k_platform::loadSram(g_machine))
+    {
+        ESP_LOGI(kTag, "SRAM を復元しました: %s", x68k_platform::kSramPath);
+    }
+    else
+    {
+        ESP_LOGI(kTag, "SRAM を復元できません。工場出荷値で起動します: %s",
+                 x68k_platform::kSramPath);
     }
 
     g_machine.reset();

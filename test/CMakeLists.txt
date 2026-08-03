@@ -29,8 +29,43 @@ add_compile_options(-Wall -Wextra -Wshadow -Wconversion -Wsign-conversion)
 if(ENABLE_SANITIZERS)
   # ASan は EA 計算ミスによる配列外アクセスを、UBSan は符号付きオーバーフローや
   # 不正なシフト量を捕まえる。どちらも 68000 コアで踏みやすい種類のバグ。
-  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
-  add_link_options(-fsanitize=address,undefined)
+  #
+  # ただし macOS (Darwin) では ASan を外し、UBSan だけにする。
+  #
+  # Why not macOS でも ASan を有効にするか:
+  #   macOS 26 (Darwin 25) の dyld と ASan ランタイムが初期化中にデッドロックする。
+  #   ASan の InitializeShadowMemory() が get_dyld_hdr() 経由で
+  #   dyld_shared_cache_iterate_text_swift() を呼び、その内部の _Block_copy が
+  #   malloc する。その malloc を ASan 自身の interceptor が捕まえて
+  #   AsanInitFromRtl() へ再入し、初期化用の StaticSpinMutex を二重に取ろうとして
+  #   sched_yield を回し続ける。main に入る前に固まるので --version すら返らない。
+  #   Nix の clang 固有ではなく Apple 供給の /usr/bin/clang でも同一に再現するため、
+  #   ツールチェーンの差し替え (clangUseLLVM 等) では解決しない。OS 側の問題。
+  #
+  # Why not サニタイザ自体を諦めるか:
+  #   UBSan は単独なら macOS でも正常に動く (shadow memory を張らないので
+  #   上記の初期化経路を通らない)。符号付きオーバーフローや不正シフト量の検出は
+  #   68000 コアで最も価値が高い部分なので、手元でもここまでは回せるようにする。
+  #   ASan の配列外アクセス検出は Linux の CI が担保する。
+  #
+  # Why not -lubsan が無いから UBSan も無理、としないか:
+  #   あのリンクエラーは g++ の話。Nix の gcc は macOS 向けのサニタイザランタイムを
+  #   同梱していない。clang は compiler-rt の
+  #   libclang_rt.ubsan_osx_dynamic.dylib を持っているので問題なくリンクできる。
+  #   test-san が clang++ を明示しているのはこのため。
+  if(APPLE)
+    set(X68K_SAN_FLAGS -fsanitize=undefined)
+  else()
+    set(X68K_SAN_FLAGS -fsanitize=address,undefined)
+  endif()
+
+  # Why -fno-sanitize-recover=all が要るか:
+  #   UBSan は既定では検出しても報告を出して実行を続け、終了コードは 0 のまま。
+  #   ctest は終了コードしか見ないので、UB を踏んでいるのにテストが緑になる。
+  #   ASan は検出時に abort するのでこの差が出るのは UBSan 側だけだが、
+  #   Linux/macOS で判定を揃えるため両方に付ける。
+  add_compile_options(${X68K_SAN_FLAGS} -fno-sanitize-recover=all -fno-omit-frame-pointer -g)
+  add_link_options(${X68K_SAN_FLAGS})
 endif()
 
 set(X68K_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -49,9 +84,11 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/dev/rtc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/dmac.cpp
   ${X68K_ROOT}/src/x68k/core/dev/fdc.cpp
+  ${X68K_ROOT}/src/x68k/core/dev/scc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/video.cpp
   ${X68K_ROOT}/src/x68k/core/io/ascii_keymap.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
@@ -70,9 +107,11 @@ add_executable(x68k_tests
   test_main.cpp
   test_memmap.cpp
   test_m68k_vectors.cpp
+  test_m68k_alu.cpp
   test_sram.cpp
   test_bus.cpp
   test_text_raster.cpp
+  test_graphic_raster.cpp
   test_text_scrape.cpp
   test_cgrom_fallback.cpp
   test_boot.cpp
@@ -81,6 +120,7 @@ add_executable(x68k_tests
   test_dmac.cpp
   test_mfp.cpp
   test_fdc.cpp
+  test_scc.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 add_test(NAME x68k_tests COMMAND x68k_tests)
