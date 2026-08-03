@@ -612,9 +612,22 @@ void Machine::sasiWrite(u32 addr, u8 value)
                 }
 
                 case kSasiWrite:
-                    sasi_.bufferLength = kSasiSectorSize;
+                {
+                    // READ と同じ数え方をする。ここを 1 セクタ固定にすると、
+                    // 複数セクタの書き込みで最初の 1 つしか書かれないまま
+                    // 成功を返し、ファイルシステムが静かに壊れる。
+                    const u32 sectors = count == 0 ? 1u : count;
+                    const bool fits = sectors <= kSasiMaxSectorsPerCommand;
+                    if (!fits || sasi_.buffer == nullptr)
+                    {
+                        sasi_.status = 0x02;
+                        sasi_.phase = kPhaseStatus;
+                        return;
+                    }
+                    sasi_.bufferLength = kSasiSectorSize * sectors;
                     sasi_.phase = kPhaseDataOut;
                     return;
+                }
 
                 default:
                     // 未対応コマンド。エラーを返す。
@@ -633,12 +646,24 @@ void Machine::sasiWrite(u32 addr, u8 value)
             if (sasi_.bufferPos >= sasi_.bufferLength)
             {
                 // WRITE ならディスクへ書く。$C2 のパラメータは捨てる。
-                if (sasi_.command[0] == kSasiWrite && disk_ != nullptr && disk_->isPresent())
+                if (sasi_.command[0] == kSasiWrite)
                 {
                     const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
                                     (static_cast<u32>(sasi_.command[2]) << 8) |
                                     static_cast<u32>(sasi_.command[3]);
-                    disk_->writeSector(lba, sasi_.buffer, 1);
+                    // 受け取った分だけ書く。bufferLength はコマンドの
+                    // セクタ数から決めてある。
+                    const u32 sectors = sasi_.bufferLength / kSasiSectorSize;
+
+                    // 書けなかったらエラーを返す。戻り値を捨てると、
+                    // 読み取り専用のイメージや I/O エラーでも成功に見え、
+                    // Human68k は書けたつもりで先へ進んでしまう。
+                    const bool ok = disk_ != nullptr && disk_->isPresent() &&
+                                    disk_->writeSector(lba, sasi_.buffer, sectors);
+                    if (!ok)
+                    {
+                        sasi_.status = 0x02;
+                    }
                 }
                 sasi_.phase = kPhaseStatus;
             }

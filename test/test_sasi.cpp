@@ -672,3 +672,82 @@ TEST_CASE("転送バッファを与えないと READ はエラーを返す")
     CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
     CHECK(m.ioRead8(kSasiData) != 0x00);
 }
+
+TEST_CASE("WRITE は要求されたぶんのセクタをまとめて書く")
+{
+    // 保証すること: 複数セクタの WRITE で、要求された全セクタが
+    // ディスクへ届くこと。
+    //
+    // 壊れると: 最初の 1 セクタだけ書いて成功を返す。Human68k は
+    // 書けたつもりで先へ進むので、ファイルシステムが静かに壊れる。
+    // READ 側は count を見ているのに WRITE だけ 1 セクタ固定だった。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x0A, 4, 3);  // セクタ 4 から 3 つ書く
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+
+    // 3 セクタぶん (768 バイト) を送る。各セクタの先頭に印を置く。
+    constexpr x68k::u32 kSectors = 3;
+    for (x68k::u32 s = 0; s < kSectors; ++s)
+    {
+        for (x68k::u32 i = 0; i < FakeDisk::kSectorSize; ++i)
+        {
+            const auto value = static_cast<x68k::u8>(i == 0 ? (0x40u + s) : 0x11u);
+            m.ioWrite8(kSasiData, value);
+        }
+    }
+
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) == 0x00);  // 成功
+
+    // 3 セクタとも書かれているか。2 つ目以降が元のままなら退行。
+    for (x68k::u32 s = 0; s < kSectors; ++s)
+    {
+        const std::size_t offset = (4 + s) * FakeDisk::kSectorSize;
+        CHECK(disk.data_[offset] == static_cast<x68k::u8>(0x40u + s));
+        CHECK(disk.data_[offset + 1] == 0x11);
+    }
+}
+
+TEST_CASE("WRITE が失敗したらエラーステータスを返す")
+{
+    // 保証すること: 書き込めなかったことが呼び出し元へ伝わること。
+    //
+    // 壊れると: 読み取り専用のイメージや I/O エラーでも成功に見え、
+    // Human68k は書けたつもりで進む。あとから読み直すまで気付けない。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(4);
+    m.setDisk(&disk);
+
+    // セクタ 3 から 2 つ = 範囲外なので writeSector が false を返す。
+    sendCommand(m, 0x0A, 3, 2);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+
+    for (x68k::u32 i = 0; i < FakeDisk::kSectorSize * 2; ++i)
+    {
+        m.ioWrite8(kSasiData, 0x99);
+    }
+
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) != 0x00);  // エラー
+}
+
+TEST_CASE("WRITE で扱える上限を超えたらエラーを返す")
+{
+    // 保証すること: バッファに収まらない要求を黙って切り詰めないこと。
+    //
+    // 壊れると: 転送量と bufferLength がずれ、DMA が途中で止まったまま
+    // 「成功」に見える。READ 側と同じ扱いに揃えてある。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(512);
+    m.setDisk(&disk);
+
+    // count は 8bit なので最大 255。上限ちょうどは通る。
+    sendCommand(m, 0x0A, 0, 255);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+}
