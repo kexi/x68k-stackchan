@@ -15,6 +15,13 @@ constexpr u32 kAddrMask = 0x00FFFFFFu;
 constexpr u32 kIoBase = 0xE80000u;
 constexpr u32 kIoEnd = 0xEC0000u;
 
+// リセット直後に $000000 へ写像される ROM の位置と大きさ。
+//
+// 写像元は $FF0000 側 (IPL-ROM 128KB の後半 64KB)。リセットベクタと
+// 起動コードはここに置かれており、実行は $FF0010 から始まる。
+constexpr u32 kRomAtZeroOffset = 0xFF0000u - kIplromBase;  // ROM 内オフセット
+constexpr u32 kRomAtZeroSize = kIplromSize - kRomAtZeroOffset;
+
 }  // namespace
 
 void SystemBus::markTextDirty(u32 offsetInPlane)
@@ -38,9 +45,14 @@ u8 SystemBus::read8(u32 addr)
     {
         // リセット直後は IPL-ROM が $000000 に写像されている。
         // IPL-ROM がエリアセットに書き込むまでこの状態が続く。
-        if (romAtZero_ && a < kIplromSize && mem_.iplRom != nullptr)
+        //
+        // 写像されるのは ROM の先頭 ($FE0000) ではなく $FF0000 の側。
+        // リセットベクタ (SSP と PC) はそこに置かれており、実機の
+        // 起動は PC=$FF0010 から始まる。ここを取り違えると
+        // ベクタが読めず即座に暴走する。
+        if (romAtZero_ && a < kRomAtZeroSize && mem_.iplRom != nullptr)
         {
-            return mem_.iplRom[a];
+            return mem_.iplRom[kRomAtZeroOffset + a];
         }
         return mem_.mainRam != nullptr ? mem_.mainRam[a] : 0u;
     }
@@ -100,18 +112,14 @@ u16 SystemBus::read16(u32 addr)
     // 命令フェッチが必ずここを通るので効果が大きい。
     if (a < kMainRamSize)
     {
-        const u8* base = nullptr;
-        if (romAtZero_ && a + 1 < kIplromSize && mem_.iplRom != nullptr)
+        if (romAtZero_ && a + 1 < kRomAtZeroSize && mem_.iplRom != nullptr)
         {
-            base = mem_.iplRom;
+            const u8* rom = mem_.iplRom + kRomAtZeroOffset;
+            return static_cast<u16>((rom[a] << 8) | rom[a + 1]);
         }
-        else if (mem_.mainRam != nullptr)
+        if (mem_.mainRam != nullptr)
         {
-            base = mem_.mainRam;
-        }
-        if (base != nullptr)
-        {
-            return static_cast<u16>((base[a] << 8) | base[a + 1]);
+            return static_cast<u16>((mem_.mainRam[a] << 8) | mem_.mainRam[a + 1]);
         }
         return 0u;
     }

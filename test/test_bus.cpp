@@ -79,20 +79,27 @@ struct Fixture
 
 }  // namespace
 
-TEST_CASE("リセット直後は IPL-ROM が $000000 に見える")
+TEST_CASE("リセット直後は $FF0000 の内容が $000000 に見える")
 {
     Fixture f;
-    // リセットベクタが読めないと CPU が起動できない。
-    f.iplRom[0] = 0x00;
-    f.iplRom[1] = 0x00;
-    f.iplRom[2] = 0x20;
-    f.iplRom[3] = 0x00;
+    // 写像されるのは ROM の先頭 ($FE0000) ではなく $FF0000 側。
+    // リセットベクタはそこにあり、実行は $FF0010 から始まる。
+    // ここを取り違えるとベクタが読めず即座に暴走する。
+    constexpr std::size_t kRomOffsetOfFF0000 = 0xFF0000u - x68k::kIplromBase;
+    f.iplRom[kRomOffsetOfFF0000 + 0] = 0x00;
+    f.iplRom[kRomOffsetOfFF0000 + 1] = 0x00;
+    f.iplRom[kRomOffsetOfFF0000 + 2] = 0x20;
+    f.iplRom[kRomOffsetOfFF0000 + 3] = 0x00;
+    // ROM 先頭 ($FE0000) には別の値を置き、そちらが読まれないことを確かめる。
+    f.iplRom[0] = 0xEE;
     f.mainRam[0] = 0xFF;
 
     f.bus.setRomMappedAtZero(true);
     CHECK(f.bus.read8(0x000000) == 0x00);
     CHECK(f.bus.read8(0x000002) == 0x20);
     CHECK(f.bus.read16(0x000002) == 0x2000);
+    // 32bit のリセットベクタとして読める。
+    CHECK(f.bus.read16(0x000000) == 0x0000);
 }
 
 TEST_CASE("エリアセット後は $000000 が RAM を指す")

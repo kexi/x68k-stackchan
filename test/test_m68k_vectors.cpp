@@ -361,7 +361,7 @@ void checkSuite(const char* name)
     FILE* probe = std::fopen(path.c_str(), "rb");
     if (probe == nullptr)
     {
-        MESSAGE("no test vectors for " << name);
+        MESSAGE("no test vectors for " << std::string(name));
         return;
     }
     std::fclose(probe);
