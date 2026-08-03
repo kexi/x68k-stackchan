@@ -65,8 +65,14 @@ run *ARGS: build-host
 fetch-tests:
     ./tools/fetch_processor_tests.sh
 
+# Why not build-host に依存させるか: build-host は x68k-run だけを作る。
+# ここで要るのは x68k_tests なので、自分でビルドする。手元では以前の
+# ビルドが残っていて気付かず、CI の fresh checkout で初めて
+# 「No such file or directory」で落ちた。
 [doc('68000 適合性テストをフル実行する (fetch-tests 済みが前提)')]
-test-vectors: build-host
+test-vectors:
+    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build {{host_build}} --target x68k_tests
     # X68K_TEST_VECTOR_LIMIT=0 で件数の上限を外し、全ケースを回す。
     # 既定の 200 件は「手元でさっと確かめる」ための数。
     #
