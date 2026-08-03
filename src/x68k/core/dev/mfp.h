@@ -114,6 +114,10 @@ public:
 private:
     void raise(bool groupA, u8 bit);
     [[nodiscard]] u32 timerPrescale(u8 control) const;
+
+    // タイマのデータレジスタへの書き込みを、停止中だけカウンタへ写す。
+    // 動作中はリロードのときに reg_ から読まれる。
+    void loadTimerIfStopped(int index, u8 control, u8 value);
     void tickTimer(int index, u8 control, u32 cycles);
 
     std::array<u8, kRegCount> reg_{};

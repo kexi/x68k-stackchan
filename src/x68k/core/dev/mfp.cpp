@@ -101,21 +101,32 @@ void Mfp::write(u32 regIndex, u8 value)
             reg_[regIndex] &= value;
             return;
 
+        // タイマのデータレジスタ。
+        //
+        // 動作中に書いた値は、カウンタが 0 まで下りてリロードされるときに
+        // 初めて効く (MC68901 の仕様)。ここで timerValue_ を直接書くと、
+        // 動いているタイマが即座に再スタートして割り込みの間隔が変わる。
+        // 停止中なら実機もすぐ反映するので、そのときだけ写す。
+        //
+        // リロードは tickTimer が reg_ から読むので、書き込み側は reg_ を
+        // 更新するだけでよい。
         case kTadr:
             reg_[kTadr] = value;
-            timerValue_[0] = value;
+            loadTimerIfStopped(0, reg_[kTacr], value);
             return;
         case kTbdr:
             reg_[kTbdr] = value;
-            timerValue_[1] = value;
+            loadTimerIfStopped(1, reg_[kTbcr], value);
             return;
         case kTcdr:
             reg_[kTcdr] = value;
-            timerValue_[2] = value;
+            // タイマ C は TCDCR の上位 3bit。
+            loadTimerIfStopped(2, static_cast<u8>((reg_[kTcdcr] >> 4) & 7u), value);
             return;
         case kTddr:
             reg_[kTddr] = value;
-            timerValue_[3] = value;
+            // タイマ D は TCDCR の下位 3bit。
+            loadTimerIfStopped(3, static_cast<u8>(reg_[kTcdcr] & 7u), value);
             return;
 
         case kGpip:
@@ -144,6 +155,16 @@ void Mfp::write(u32 regIndex, u8 value)
 u32 Mfp::timerPrescale(u8 control) const
 {
     return kPrescaleTable[control & 7u];
+}
+
+void Mfp::loadTimerIfStopped(int index, u8 control, u8 value)
+{
+    // プリスケーラが 0 なら停止中。動作中は次のリロードまで待つ。
+    const bool isStopped = timerPrescale(control) == 0;
+    if (isStopped)
+    {
+        timerValue_[static_cast<std::size_t>(index)] = value;
+    }
 }
 
 void Mfp::raise(bool groupA, u8 bit)
