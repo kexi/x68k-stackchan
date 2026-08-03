@@ -26,11 +26,11 @@ bool FrameChannel::begin(x68k::u16* bufferA, x68k::u16* bufferB)
     return true;
 }
 
-void FrameChannel::publish()
+bool FrameChannel::publish()
 {
     if (mutex_ == nullptr)
     {
-        return;
+        return false;
     }
 
     xSemaphoreTake(mutex_, portMAX_DELAY);
@@ -47,7 +47,7 @@ void FrameChannel::publish()
     if (isFrontInUse_)
     {
         xSemaphoreGive(mutex_);
-        return;
+        return false;
     }
 
     x68k::u16* const justWritten = writeBuffer_;
@@ -56,6 +56,7 @@ void FrameChannel::publish()
     hasNewFrame_ = true;
 
     xSemaphoreGive(mutex_);
+    return true;
 }
 
 x68k::u16* FrameChannel::take()

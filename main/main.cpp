@@ -223,6 +223,23 @@ void dumpScreen();
 // で済むが、未定義動作は避けたい。
 std::atomic<bool> g_dumpRequested{false};
 
+// 拡大率を変える要求。+1 で拡大、-1 で縮小、0 で要求なし。
+//
+// Why not 表示コアから直接 setZoom を呼ぶか: zoom_ は変換中に何度も
+// 読まれる。renderZoomed は zoom_ から srcHeight を決めた後、書き込み先の
+// 行を y * zoom_ で計算する。途中で zoom_ が増えるとバッファの外へ書く
+// (240 行のバッファに対し、2 倍→4 倍の変化で 476 行目まで届く)。
+// 変換の所有者に変えさせれば、変換中に動かない。
+std::atomic<int> g_zoomRequest{0};
+
+// エミュレーションが停止した。表示コアがメッセージを出す。
+//
+// Why not エミュレーションコアから showMessage を呼ぶか: M5.Display を
+// 両コアから触ることになる。表示コアは同時に pushFrame を走らせているので、
+// SPI の操作が競合するうえ、公開済みの古いフレームがエラー表示を
+// 上書きしてしまう。
+std::atomic<bool> g_halted{false};
+
 // エミュレーションを回すタスク。
 //
 // Core1 に固定するのは、システムタスク (Wi-Fi/lwIP など) が Core0 寄りに
@@ -243,7 +260,9 @@ void emulatorTask(void* /*arg*/)
         if (g_machine.isHalted())
         {
             ESP_LOGE(kTag, "停止しました。未実装命令 %04X", g_machine.haltedOpcode());
-            x68k_platform::DisplayLcd::showMessage("HALTED", "unimplemented opcode");
+            // 表示は所有者に任せる。ここで M5.Display を触ると
+            // 表示コアの転送とぶつかる。
+            g_halted = true;
             vTaskDelete(nullptr);
             return;
         }
@@ -261,15 +280,34 @@ void emulatorTask(void* /*arg*/)
             dumpScreen();
         }
 
+        // 拡大率の変更要求があれば、変換の前に反映する。
+        if (const int request = g_zoomRequest.exchange(0); request != 0)
+        {
+            const x68k::u32 current = g_display.zoom();
+            const x68k::u32 next = request > 0 ? current + 1 : (current > 1 ? current - 1 : 1);
+            g_display.setZoom(next);
+            ESP_LOGI(kTag, "拡大率 %u 倍 (%u 桁 x %u 行)", static_cast<unsigned>(g_display.zoom()),
+                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenWidth /
+                                           g_display.zoom() / 8),
+                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenHeight /
+                                           g_display.zoom() / 16));
+        }
+
         // 表示位置をカーソルへ追わせてから、変化があれば変換する。
         //
         // Machine を読むのはこのコアだけ。表示コアへは完成した RGB565 を
         // 渡すので、テキスト VRAM やダーティフラグを両コアで奪い合わない。
         followCursor();
         const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
-        if (rendered)
+        if (rendered && !g_frames.publish())
         {
-            g_frames.publish();
+            // 表示コアがまだ前のフレームを転送中で渡せなかった。
+            //
+            // renderTo はダーティフラグを消した後なので、このままだと
+            // 次に VRAM が変わるまで画面が更新されない。作ったフレームは
+            // 捨てられたのに「描いた」ことになってしまう。
+            // 次のスライスで描き直させる。
+            g_display.invalidateAll();
         }
 
         // 生きていることと実効クロックを定期的に出す。実機は画面を直接
@@ -338,19 +376,13 @@ private:
         // '<' '>' で拡大率を変える。読みやすさと見える範囲は
         // 引き換えなので、実機を見ながら選べるようにする。
         //
-        // DisplayLcd の設定は表示コアからしか変えないので、
-        // ここで直接呼んでよい。
+        // 要求を立てるだけ。実際に変えるのはエミュレーションコア。
+        // 変換の途中で拡大率が動くとバッファの外へ書きうる。
         const bool isZoomOut = c == '<';
         const bool isZoomIn = c == '>';
         if (isZoomOut || isZoomIn)
         {
-            const x68k::u32 next = isZoomIn ? g_display.zoom() + 1 : g_display.zoom() - 1;
-            g_display.setZoom(next);
-            ESP_LOGI(kTag, "拡大率 %u 倍 (%u 桁 x %u 行)", static_cast<unsigned>(g_display.zoom()),
-                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenWidth /
-                                           g_display.zoom() / 8),
-                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenHeight /
-                                           g_display.zoom() / 16));
+            g_zoomRequest = isZoomIn ? 1 : -1;
             return;
         }
 
@@ -520,11 +552,26 @@ extern "C" void app_main(void)
     }
 
     // Core0 は画面と入力を担当する。
+    bool isHalted = false;
     while (true)
     {
         M5.update();
         g_keyboard.poll(g_keys);
         g_console.poll();
+
+        // エミュレーションが止まったらメッセージを出して、以後は
+        // フレームを送らない。送ると公開済みの古い画面でエラー表示を
+        // 上書きしてしまう。
+        if (g_halted.exchange(false))
+        {
+            x68k_platform::DisplayLcd::showMessage("HALTED", "unimplemented opcode");
+            isHalted = true;
+        }
+        if (isHalted)
+        {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         // 変換済みのフレームがあれば LCD へ送る。
         //
