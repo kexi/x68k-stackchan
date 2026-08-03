@@ -419,13 +419,12 @@ TEST_CASE("SASI からメモリへの転送で SASI がステータスフェー�
     CHECK(m.ioRead8(x68k::kSasiBase + 3) == 0x0F);
 }
 
-// --- 実装の問題を再現するテスト ----------------------------------------------
+// --- 転送が完走しなかったときの扱い -------------------------------------------
 //
-// 以下 2 つは現状の実装では失敗する。どちらも「DMA が途中で止まったまま
-// 成功に見える」という、過去に退行として起きたのと同じ形の問題。
-// 直すまで DOCTEST_MAY_FAIL で印を付けておく。
+// 以下は「DMA が途中で止まったまま成功に見える」という、過去に退行として
+// 起きたのと同じ形の問題を押さえる。
 
-TEST_CASE("1 バイトも転送できなかったとき完了ビットを立てない" * doctest::may_fail(true))
+TEST_CASE("1 バイトも転送できなかったとき完了ビットを立てない")
 {
     // 保証したいこと: デバイスが 1 バイトも渡せなかったとき、
     // CSR の完了ビット (COC) を立てないこと。
@@ -434,8 +433,6 @@ TEST_CASE("1 バイトも転送できなかったとき完了ビットを立て�
     // 転送前のメモリの中身をブートセクタとして扱う。DMA が全く動いて
     // いないのに成功に見えるので、原因の切り分けが極めて難しくなる。
     //
-    // 現状: 転送量が 0 でも無条件に COC を立てている
-    // (dmac.cpp の runTransfer() 末尾)。
     DmacFixture f;
     f.device.readable.clear();  // デバイスは何も渡せない
     f.setAddress(0x1000);
@@ -446,7 +443,7 @@ TEST_CASE("1 バイトも転送できなかったとき完了ビットを立て�
     CHECK((f.csr() & x68k::Dmac::kCsrChannelOperationComplete) == 0);
 }
 
-TEST_CASE("要求量に届かなかったとき完了ビットを立てない" * doctest::may_fail(true))
+TEST_CASE("要求量に届かなかったとき完了ビットを立てない")
 {
     // 保証したいこと: MTC で要求したバイト数に届かないまま打ち切ったとき、
     // 完了ではなくエラーとして扱うこと。
@@ -455,7 +452,6 @@ TEST_CASE("要求量に届かなかったとき完了ビットを立てない" *
     // これは「READ のセクタ数を黙って切り詰めていた」退行と同じ症状で、
     // 転送量と残量がずれたまま成功に見える。
     //
-    // 現状: 途中で break しても COC を立てている。
     DmacFixture f;
     f.device.readable.assign(256, 0xAA);  // 256 バイトしかない
     f.setAddress(0x1000);
@@ -464,16 +460,17 @@ TEST_CASE("要求量に届かなかったとき完了ビットを立てない" *
 
     CHECK(f.count() == 1024 - 256);  // 768 バイト残っている
     CHECK((f.csr() & x68k::Dmac::kCsrChannelOperationComplete) == 0);
+    // 完了しなかったことをエラーとして残す。
+    CHECK((f.csr() & x68k::Dmac::kCsrError) != 0);
 }
 
-TEST_CASE("MTC=0 は 65536 バイトを意味する" * doctest::may_fail(true))
+TEST_CASE("MTC=0 は 65536 バイトを意味する")
 {
     // 保証したいこと: HD63450 の MTC は 0 を 65536 として扱うこと。
     //
     // 壊れると: 65536 バイトの転送要求が 0 バイトの転送として完了し、
     // 大きな読み出しが黙って何もしないまま成功する。
     //
-    // 現状: count = 0 でループに入らず、そのまま COC を立てている。
     DmacFixture f;
     f.device.readable.assign(4, 0x5A);
     f.setAddress(0x1000);
@@ -482,4 +479,8 @@ TEST_CASE("MTC=0 は 65536 バイトを意味する" * doctest::may_fail(true))
 
     // 65536 バイトのつもりなので、4 バイトだけ転送して残りが残る。
     CHECK(f.memory.bytes[0x1000] == 0x5A);
+    CHECK(f.address() == 0x1000 + 4);
+    // 残量 65532 が MTC に残る (16bit なので下位だけが見える)。
+    CHECK(f.count() == ((0x10000 - 4) & 0xFFFF));
+    CHECK((f.csr() & x68k::Dmac::kCsrChannelOperationComplete) == 0);
 }

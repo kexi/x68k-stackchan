@@ -64,6 +64,15 @@ public:
     // CSR のビット。IPL-ROM は転送完了を待つのに使う。
     static constexpr u8 kCsrChannelOperationComplete = 0x80;  // COC
     static constexpr u8 kCsrChannelActive = 0x08;             // ACT
+    static constexpr u8 kCsrError = 0x10;                     // ERR
+
+    // CER のエラーコード。要求量に届かないまま打ち切ったときに立てる。
+    //
+    // 実機の CER は原因ごとに細かいコードを持つが、本エミュレータでは
+    // デバイスがデータを出せなくなった場合しか中断が起きないので、
+    // バス由来の中断を表す 0x09 (bus error / メモリ側) ではなく
+    // 0x0A (デバイス側のバスエラー) をひとつだけ使う。
+    static constexpr u8 kCerBusErrorDevice = 0x0A;
 
     // OCR bit7 (DIR): 1 = デバイス → メモリ、0 = メモリ → デバイス。
     //

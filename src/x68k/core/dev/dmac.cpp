@@ -76,6 +76,15 @@ void Dmac::runTransfer()
     u32 count =
         (static_cast<u32>(channel_[kRegMtc]) << 8) | static_cast<u32>(channel_[kRegMtc + 1]);
 
+    // HD63450 の MTC は 0 を 65536 と解釈する (16bit で表せる最大長を
+    // 表現するため)。0 を「転送なし」と読むと最大サイズの要求が黙って
+    // 何もしないまま完了扱いになる。
+    const bool isMaxCount = count == 0;
+    if (isMaxCount)
+    {
+        count = 0x10000;
+    }
+
     const bool isToDevice = (channel_[kRegOcr] & kOcrDirectionToMemory) == 0;
 
     while (count > 0)
@@ -109,8 +118,24 @@ void Dmac::runTransfer()
     channel_[kRegMtc] = static_cast<u8>(count >> 8);
     channel_[kRegMtc + 1] = static_cast<u8>(count);
 
-    // 完了を知らせる。IPL-ROM はこのビットが立つのを待つ。
-    channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] | kCsrChannelOperationComplete);
+    // 要求量を転送し切れたときだけ完了 (COC) を立てる。IPL-ROM は COC だけを
+    // 見て転送の成否を判断するので、途中で止まったのに COC を立てると
+    // 転送前のメモリをブートセクタとして扱ってしまう。
+    //
+    // 「1 バイトでも進んだら成功」にはしない。尻切れのブートコードを
+    // 完全なものとして実行するのが、まさに避けたい失敗の形。
+    const bool isComplete = count == 0;
+    if (isComplete)
+    {
+        channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] | kCsrChannelOperationComplete);
+    }
+    else
+    {
+        // 打ち切りはエラーとして残す。CER にも理由を書いておかないと
+        // CSR の ERR だけでは後から原因を追えない。
+        channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] | kCsrError);
+        channel_[kRegCer] = kCerBusErrorDevice;
+    }
     channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] & ~kCsrChannelActive);
 }
 
