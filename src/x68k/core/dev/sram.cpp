@@ -80,7 +80,7 @@ void Sram::formatDefaults()
     // 実際 TVRAM には字形が入っているのに PPM が全黒だった。
     //
     // 色は GGGGG RRRRR BBBBB I。色 0 は背景 (黒)、色 1 は通常文字。
-    // 起動画面が「色 1 = シアン、色 2 = 黄、色 3 = 白」になるよう並べる
+    // 並びは「色 1 = 白、色 2 = 黄、色 3 = シアン」。
     // (docs/knowledge/x68000-boot-sequence.md)。
     //
     // Why not 全色を白にする: 色番号は文字属性として意味を持つ。

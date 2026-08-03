@@ -403,3 +403,33 @@ TEST_CASE("ROM 写像中でも書き込みは RAM 側へ行く")
     f.bus.setRomMappedAtZero(false);
     CHECK(f.bus.read8(0x2000) == 0x55);
 }
+
+TEST_CASE("領域の末尾へのワードアクセスが範囲外を触らない")
+{
+    // 保証すること: メインメモリの最後のバイトへワードアクセスしても、
+    // 確保した配列の外を読み書きしないこと。
+    //
+    // 壊れると: 高速路が「アドレス + 1」を無条件に触るので 1 バイト外へ出る。
+    // 実機の ASan なら捕まるが、macOS ではサニタイザが動かない
+    // (justfile の test-san を参照) ので明示的に押さえておく。
+    //
+    // 配列の直後に番兵を置き、それが書き換わらないことで確かめる。
+    std::vector<x68k::u8> ram(x68k::kMainRamSize + 1, 0x00);
+    ram[x68k::kMainRamSize] = 0x5A;  // 番兵
+
+    x68k::Sram sram;
+    RecordingIo io;
+    x68k::SystemBus bus(x68k::MemoryMap{}, sram, io);
+
+    x68k::MemoryMap memory;
+    memory.mainRam = ram.data();
+    bus.setMemory(memory);
+
+    const x68k::u32 lastByte = x68k::kMainRamSize - 1;
+
+    bus.write16(lastByte, 0x1234);
+    CHECK(ram[x68k::kMainRamSize] == 0x5A);  // 番兵が無事
+
+    (void)bus.read16(lastByte);
+    CHECK(ram[x68k::kMainRamSize] == 0x5A);
+}

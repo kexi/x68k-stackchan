@@ -119,7 +119,13 @@ u16 SystemBus::read16(u32 addr)
 
     // ワード単位でまとめて読める領域は 2 回の read8 を避ける。
     // 命令フェッチが必ずここを通るので効果が大きい。
-    if (a < kMainRamSize)
+    // 高速路は「2 バイトとも同じ領域に収まる」ときだけ通す。
+    //
+    // a だけを見て通すと、領域の最後のバイトへのワードアクセスで
+    // 配列の 1 バイト外を読む。収まらないものは下の read8 を 2 回呼ぶ
+    // 経路へ落とせば、そちらが境界を正しく判定する。
+    const bool fitsInMainRam = a + 1 < kMainRamSize;
+    if (fitsInMainRam)
     {
         if (romAtZero_ && a + 1 < kRomAtZeroSize && mem_.iplRom != nullptr)
         {
@@ -133,7 +139,8 @@ u16 SystemBus::read16(u32 addr)
         return 0u;
     }
 
-    if (a >= kIplromBase && mem_.iplRom != nullptr)
+    const bool fitsInIplrom = a >= kIplromBase && a + 1 < kIplromBase + kIplromSize;
+    if (fitsInIplrom && mem_.iplRom != nullptr)
     {
         const u32 off = a - kIplromBase;
         return static_cast<u16>((mem_.iplRom[off] << 8) | mem_.iplRom[off + 1]);
@@ -209,7 +216,9 @@ void SystemBus::write16(u32 addr, u16 value)
     const u32 a = addr & kAddrMask;
     notifyWatch(a, value, 2);
 
-    if (a < kMainRamSize && mem_.mainRam != nullptr)
+    // read16 と同じく、2 バイトとも収まるときだけ高速路を通す。
+    const bool fitsInMainRam = a + 1 < kMainRamSize;
+    if (fitsInMainRam && mem_.mainRam != nullptr)
     {
         mem_.mainRam[a] = static_cast<u8>(value >> 8);
         mem_.mainRam[a + 1] = static_cast<u8>(value & 0xFFu);

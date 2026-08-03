@@ -38,7 +38,14 @@ void Crtc::write(u32 regIndex, u16 value)
 
 u32 Crtc::rasterNumber() const
 {
-    return frameCycles_ / kCyclesPerRaster;
+    // 範囲に収める。
+    //
+    // kCyclesPerRaster は kCyclesPerFrame / 568 の整数除算なので切り捨てが
+    // 起きる。frameCycles_ がフレーム終端に近いと商が 568 以上になり、
+    // 実機には存在しないラスタ番号を返す。ラスタ割り込みの比較や
+    // 「今どの行を描いているか」の判定で 1 フレームぶんずれる。
+    const u32 raster = frameCycles_ / kCyclesPerRaster;
+    return raster < kRasterCount ? raster : kRasterCount - 1;
 }
 
 bool Crtc::tick(u32 cycles)

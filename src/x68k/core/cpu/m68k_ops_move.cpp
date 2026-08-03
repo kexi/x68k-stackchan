@@ -32,6 +32,26 @@ u32 M68k::groupMove(u16 op, u32 size)
 
     if (dstMode == 1)
     {
+        // MOVEA にバイトサイズは無い。
+        //
+        // 転送先がアドレスレジスタ直接のとき、命令は MOVEA になる。
+        // 68000 の MOVEA はワードとロングだけで、MOVEA.B は定義されていない。
+        // この符号は不当命令として例外を出すのが実機の振る舞い。
+        //
+        // Why not 黙って通すか: アドレスレジスタに 8bit だけ書くという
+        // 動作は 68000 に存在しないので、通すと実機と違う結果になる。
+        // 適合性ベクタにこの組み合わせが無いため、テストでは捕まらない。
+        //
+        // Why not unimplemented を使うか: あれはエミュレータを停止させる
+        // 開発用の仕掛けで、実機には無い状態。ここは実機が本当に例外を
+        // 出す場面なので、MOVEQ の禁則と同じく例外へ落とす。
+        const bool isMoveaByte = size == kByte;
+        if (isMoveaByte)
+        {
+            takeException(vector::kIllegalInstruction, true);
+            return 34;
+        }
+
         // MOVEA はフラグを変えない。ワードサイズなら符号拡張して 32bit で入る。
         st_.a[dstReg] =
             size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
