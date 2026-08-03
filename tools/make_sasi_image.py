@@ -362,10 +362,20 @@ class Fat12:
         return bytes(image)
 
 
+# 最小構成の CONFIG.SYS。
+#
+# 配布の config.sys は SYS/ 以下のデバイスドライバを 10 個近く読み込むが、
+# それらが揃っていないと Human68k は起動の途中で止まる。起動を見るだけ
+# なら COMMAND.X の場所さえ分かればよい。
+MINIMAL_CONFIG_SYS = b"SHELL = \\COMMAND.X\r\n"
+
+
 def collect_files(source: Path) -> list[tuple[str, bytes]]:
     """イメージへ入れるファイルを集める。
 
-    Human68k の起動に要るのは HUMAN.SYS と COMMAND.X。
+    Human68k の起動に要るのは HUMAN.SYS と COMMAND.X。CONFIG.SYS は
+    配布のものをそのまま入れるとデバイスドライバを探しに行って止まるので、
+    最小構成のものを生成して置く。
     """
     wanted = ["human.sys", "command.x"]
     files: list[tuple[str, bytes]] = []
@@ -375,6 +385,8 @@ def collect_files(source: Path) -> list[tuple[str, bytes]]:
         if not path.exists():
             raise FileNotFoundError(f"{name} が {source} にありません")
         files.append((name.upper(), path.read_bytes()))
+
+    files.append(("CONFIG.SYS", MINIMAL_CONFIG_SYS))
 
     return files
 
