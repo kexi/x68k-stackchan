@@ -77,6 +77,20 @@ public:
         return faulted_;
     }
 
+    // 指定アドレスへの書き込みを見張る。
+    //
+    // 「あるワークが 0 のままで先へ進まない」ときに、誰がそこを書くはず
+    // だったのかを追うのに使う。命令列を静的に走査しても、間接
+    // アドレッシングで書かれていると見つからない。
+    //
+    // 0 を渡すと解除。
+    void setWriteWatch(u32 addr, void (*callback)(u32 addr, u32 value, void* user), void* user)
+    {
+        watchAddr_ = addr;
+        watchCallback_ = callback;
+        watchUser_ = user;
+    }
+
     // テキスト VRAM への書き込みがあった矩形を追跡する。
     //
     // 画面全体を毎フレーム転送すると SPI 接続の LCD では間に合わないので、
@@ -136,6 +150,25 @@ private:
     // IPL-ROM は SCSI ROM ($FC0000) の有無をバスエラーで調べるので、
     // 「何も無い」ことを 0 ではなくエラーで返す必要がある。
     bool faulted_ = false;
+
+    // 書き込みウォッチ。設定されていなければ何もしない。
+    u32 watchAddr_ = 0;
+    void (*watchCallback_)(u32 addr, u32 value, void* user) = nullptr;
+    void* watchUser_ = nullptr;
+
+    // ウォッチ対象なら通知する。write8 / write16 の両方から呼ぶ。
+    void notifyWatch(u32 addr, u32 value, u32 size)
+    {
+        if (watchCallback_ == nullptr)
+        {
+            return;
+        }
+        const bool hits = addr <= watchAddr_ && watchAddr_ < addr + size;
+        if (hits)
+        {
+            watchCallback_(addr, value, watchUser_);
+        }
+    }
     bool textDirty_[kDirtyTileRows] = {};
 };
 

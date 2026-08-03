@@ -195,6 +195,7 @@ void printUsage()
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
+        "  --watch ADDR    そのアドレスへの書き込みを報告する (16 進)\n"
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
         "  --stats         実行した命令の内訳を最後に出す\n"
@@ -320,6 +321,7 @@ int main(int argc, char** argv)
     bool trace = false;
     bool traceDisk = false;
     std::string keys;
+    x68k::u32 watchAddr = 0;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
     std::size_t traceLast = 0;
@@ -361,6 +363,10 @@ int main(int argc, char** argv)
         else if (arg == "--keys" && hasNext)
         {
             keys = argv[++i];
+        }
+        else if (arg == "--watch" && hasNext)
+        {
+            watchAddr = static_cast<x68k::u32>(std::strtoul(argv[++i], nullptr, 16));
         }
         else if (arg == "--trace-from" && hasNext)
         {
@@ -442,6 +448,20 @@ int main(int argc, char** argv)
     memory.iplRom = iplrom.data();
     memory.cgRom = cgrom.empty() ? nullptr : cgrom.data();
     machine.setMemory(memory);
+    // 書き込みウォッチ。誰がそのワークを書くのかを追う。
+    if (watchAddr != 0)
+    {
+        machine.bus().setWriteWatch(
+            watchAddr,
+            [](x68k::u32 addr, x68k::u32 value, void* user)
+            {
+                const auto* m = static_cast<const x68k::Machine*>(user);
+                std::printf("[watch] $%06X <- %X  (PC=$%06X)\n", addr, value,
+                            m->cpu().state().pc - 4);
+            },
+            &machine);
+    }
+
     disk.setTrace(traceDisk);
     machine.setDisk(&disk);
 

@@ -157,6 +157,7 @@ u16 SystemBus::read16(u32 addr)
 void SystemBus::write8(u32 addr, u8 value)
 {
     const u32 a = addr & kAddrMask;
+    notifyWatch(a, value, 1);
 
     if (a < kMainRamSize)
     {
@@ -206,6 +207,7 @@ void SystemBus::write8(u32 addr, u8 value)
 void SystemBus::write16(u32 addr, u16 value)
 {
     const u32 a = addr & kAddrMask;
+    notifyWatch(a, value, 2);
 
     if (a < kMainRamSize && mem_.mainRam != nullptr)
     {
