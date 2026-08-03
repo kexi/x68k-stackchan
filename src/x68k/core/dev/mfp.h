@@ -90,6 +90,16 @@ public:
     // キーボードから 1 バイト受信した。受信バッファに積んで割り込みを上げる。
     void receiveKeyboardByte(u8 value);
 
+    // レジスタの現在値を副作用なしで見る。
+    //
+    // read() は読み出しで状態が変わるレジスタがあるため、状態を調べる用途には
+    // 使えない。「キー入力が届かない」ような不具合は、割り込みがマスクされて
+    // いるのか上がっていないのかで原因が全く違うので、覗く手段が要る。
+    [[nodiscard]] u8 peek(u32 reg) const
+    {
+        return reg < reg_.size() ? reg_[reg] : 0u;
+    }
+
     // 保留中で、マスクされていない割り込みがあるか。
     [[nodiscard]] bool hasPendingInterrupt() const;
 

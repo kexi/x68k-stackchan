@@ -138,6 +138,50 @@ bool writePpm(const std::string& path, const x68k::u16* pixels, x68k::u32 width,
     return true;
 }
 
+// ASCII から X68000 のキーボードスキャンコードへの対応。
+//
+// 起動確認に要るのは英数字と改行だけなので、その範囲に絞る。
+// X68000 のキーボードは押下でスキャンコード、離すと bit7 を立てた値を送る。
+x68k::u8 scanCodeFor(char c)
+{
+    // 数字列とアルファベットは並びが連続していないので表で持つ。
+    static const char* kRow1 = "1234567890-^\\";
+    static const char* kRow2 = "qwertyuiop@[";
+    static const char* kRow3 = "asdfghjkl;:]";
+    static const char* kRow4 = "zxcvbnm,./";
+
+    if (c >= 'A' && c <= 'Z')
+    {
+        c = static_cast<char>(c - 'A' + 'a');
+    }
+
+    if (const char* p = std::strchr(kRow1, c); p != nullptr && c != '\0')
+    {
+        return static_cast<x68k::u8>(0x02 + (p - kRow1));
+    }
+    if (const char* p = std::strchr(kRow2, c); p != nullptr && c != '\0')
+    {
+        return static_cast<x68k::u8>(0x10 + (p - kRow2));
+    }
+    if (const char* p = std::strchr(kRow3, c); p != nullptr && c != '\0')
+    {
+        return static_cast<x68k::u8>(0x1E + (p - kRow3));
+    }
+    if (const char* p = std::strchr(kRow4, c); p != nullptr && c != '\0')
+    {
+        return static_cast<x68k::u8>(0x2A + (p - kRow4));
+    }
+    if (c == ' ')
+    {
+        return 0x35;
+    }
+    if (c == '\n' || c == '\r')
+    {
+        return 0x1D;  // CR
+    }
+    return 0;
+}
+
 void printUsage()
 {
     std::printf(
@@ -150,6 +194,7 @@ void printUsage()
         "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
+        "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
         "  --stats         実行した命令の内訳を最後に出す\n"
@@ -268,6 +313,7 @@ int main(int argc, char** argv)
     x68k::u32 cycleLimit = 20000000;
     bool trace = false;
     bool traceDisk = false;
+    std::string keys;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
     std::size_t traceLast = 0;
@@ -305,6 +351,10 @@ int main(int argc, char** argv)
         else if (arg == "--trace-disk")
         {
             traceDisk = true;
+        }
+        else if (arg == "--keys" && hasNext)
+        {
+            keys = argv[++i];
         }
         else if (arg == "--trace-from" && hasNext)
         {
@@ -401,6 +451,17 @@ int main(int argc, char** argv)
     TraceRing ring(traceLast);
     OpcodeStats stats;
 
+    // キー入力の進み具合。
+    //
+    // 打ち込みを始めるのは起動が落ち着いてから。IPL-ROM のウェイトループ中に
+    // 送っても取りこぼされる。間隔を空けるのは、Human68k が 1 文字ずつ
+    // 処理し終わるのを待つため。
+    constexpr x68k::u32 kKeyStartCycle = 250000000;
+    constexpr x68k::u32 kKeyIntervalCycles = 2000000;
+    std::size_t keyIndex = 0;
+    x68k::u32 nextKeyCycle = kKeyStartCycle;
+    bool keyReleased = true;
+
     while (spent < cycleLimit)
     {
         const auto& s = machine.cpu().state();
@@ -431,6 +492,33 @@ int main(int argc, char** argv)
         }
         spent += used;
         ++instructions;
+
+        // キーを 1 つずつ打つ。押下と解放を交互に送る。
+        const bool hasKeyLeft = keyIndex < keys.size();
+        if (hasKeyLeft && spent >= nextKeyCycle)
+        {
+            const x68k::u8 code = scanCodeFor(keys[keyIndex]);
+            if (code == 0)
+            {
+                ++keyIndex;  // 対応していない文字は飛ばす
+            }
+            else if (keyReleased)
+            {
+                machine.pressKey(code);
+                keyReleased = false;
+            }
+            else
+            {
+                machine.pressKey(static_cast<x68k::u8>(code | 0x80u));
+                keyReleased = true;
+                ++keyIndex;
+            }
+            nextKeyCycle = spent + kKeyIntervalCycles;
+            if (traceDisk)
+            {
+                std::printf("[key] %zu/%zu code=%02X\n", keyIndex, keys.size(), code);
+            }
+        }
     }
 
     std::printf("[done] %llu 命令 / %u サイクル実行\n",
@@ -488,6 +576,10 @@ int main(int argc, char** argv)
             }
             std::printf("[tvram] plane%u: %zu バイト 最初の行 %zu\n", plane, count, firstLine);
         }
+        std::printf("[mfp] IERA=%02X IPRA=%02X IMRA=%02X RSR=%02X UDR=%02X SR=%04X\n",
+                    machine.mfp().peek(0x03), machine.mfp().peek(0x05), machine.mfp().peek(0x09),
+                    machine.mfp().peek(0x15), machine.mfp().peek(0x17), machine.cpu().state().sr);
+
         // テキストパレット。全部黒だと、描かれていても PPM は真っ黒になる。
         for (x68k::u32 i = 0; i < x68k::VideoController::kTextPaletteCount; ++i)
         {
