@@ -118,6 +118,10 @@ private:
     // タイマのデータレジスタへの書き込みを、停止中だけカウンタへ写す。
     // 動作中はリロードのときに reg_ から読まれる。
     void loadTimerIfStopped(int index, u8 control, u8 value);
+
+    // タイマを停止させたら、プリスケーラの端数を捨てる。
+    // 実機はメインカウンタを保つ一方、プリスケーラの残量は失う。
+    void clearPrescalerIfStopped(int index, u8 control);
     void tickTimer(int index, u8 control, u32 cycles);
 
     std::array<u8, kRegCount> reg_{};

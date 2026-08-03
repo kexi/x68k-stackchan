@@ -64,6 +64,21 @@ u8 Mfp::read(u32 regIndex)
         return 0u;
     }
 
+    // タイマのデータレジスタは、読むとメインカウンタの現在値が返る
+    // (MC68901 の仕様)。reg_ が持つのは次のリロード値で、動作中に
+    // 書き換えられると現在値と食い違う。
+    //
+    // Why not reg_ をそのまま返すか: 経過時間を測るためにカウンタを
+    // ポーリングするコードが、いつ読んでも同じ値を見ることになる。
+    static constexpr u32 kTimerDataRegs[4] = {kTadr, kTbdr, kTcdr, kTddr};
+    for (std::size_t i = 0; i < 4; ++i)
+    {
+        if (regIndex == kTimerDataRegs[i])
+        {
+            return timerValue_[i];
+        }
+    }
+
     const u8 value = reg_[regIndex];
 
     // 受信データを読んだら「受信バッファフル」を落とす。
@@ -146,9 +161,38 @@ void Mfp::write(u32 regIndex, u8 value)
             reg_[kTsr] = static_cast<u8>(value | kTsrBufferEmpty);
             return;
 
+        // タイマ制御レジスタ。停止させたらプリスケーラの端数を捨てる。
+        //
+        // 実機は停止するとメインカウンタは保つがプリスケーラの残量は失う。
+        // 残したままだと、停止して設定し直して再開したとき、最初の 1 周期
+        // だけ最大 1 プリスケールぶん早く割り込みが出る。
+        case kTacr:
+            reg_[kTacr] = value;
+            clearPrescalerIfStopped(0, value);
+            return;
+        case kTbcr:
+            reg_[kTbcr] = value;
+            clearPrescalerIfStopped(1, value);
+            return;
+        case kTcdcr:
+            reg_[kTcdcr] = value;
+            // C は上位 3bit、D は下位 3bit。別々に見る。
+            clearPrescalerIfStopped(2, static_cast<u8>((value >> 4) & 7u));
+            clearPrescalerIfStopped(3, static_cast<u8>(value & 7u));
+            return;
+
         default:
             reg_[regIndex] = value;
             return;
+    }
+}
+
+void Mfp::clearPrescalerIfStopped(int index, u8 control)
+{
+    const bool isStopped = (control & 0x0Fu) == 0;
+    if (isStopped)
+    {
+        prescaleCounter_[static_cast<std::size_t>(index)] = 0;
     }
 }
 
@@ -159,8 +203,16 @@ u32 Mfp::timerPrescale(u8 control) const
 
 void Mfp::loadTimerIfStopped(int index, u8 control, u8 value)
 {
-    // プリスケーラが 0 なら停止中。動作中は次のリロードまで待つ。
-    const bool isStopped = timerPrescale(control) == 0;
+    // 停止中だけカウンタへ写す。動作中は次のリロードまで待つ。
+    //
+    // Why not timerPrescale(control) == 0 で判定しないか: あれは下位 3bit しか
+    // 見ない。制御値 $08 (イベントカウントモード) でも 0 を返すが、これは
+    // 停止ではなく外部入力で動く状態。$00 だけが停止。
+    //
+    // 本エミュレータはイベントカウントとパルス幅測定を実装しておらず、
+    // tickTimer もそれらを進めない。それでも「停止」と一緒くたにしないのは、
+    // 実装したときにここが誤ったままになるのを避けるため。
+    const bool isStopped = (control & 0x0Fu) == 0;
     if (isStopped)
     {
         timerValue_[static_cast<std::size_t>(index)] = value;

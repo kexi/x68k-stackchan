@@ -404,3 +404,50 @@ TEST_CASE("Machine の reset() で MFP が初期状態へ戻る")
     CHECK((m.mfp().peek(x68k::Mfp::kTsr) & 0x80u) != 0);
     CHECK(m.mfp().peek(x68k::Mfp::kIera) == 0);
 }
+
+TEST_CASE("動作中にデータレジスタへ書いても現在の周期は変わらない")
+{
+    // 保証すること: MC68901 は動作中のタイマに書いた値を、カウンタが
+    // 0 まで下りてリロードするときに初めて反映すること。停止中なら即座。
+    //
+    // 壊れると: 書いた瞬間にカウンタが再スタートし、割り込みの間隔が
+    // 変わる。時計が狂う形の不具合になり、原因を追いにくい。
+    x68k::Mfp mfp = makeMfp();
+    enableGroupA(mfp, x68k::Mfp::kIntTimerA);
+
+    // 分周比 1 (4 分周)、データ 4 で動かす。
+    mfp.write(x68k::Mfp::kTadr, 4);
+    mfp.write(x68k::Mfp::kTacr, 0x01);
+
+    // 1 カウントぶん進める。CPU サイクルは MFP サイクルの 2 倍で数える。
+    mfp.tick(4 * 2);
+    // read はライブカウンタを返す。peek は生のレジスタ (次のリロード値) を
+    // 返すテスト用の窓口なので、ここでは read を使う。
+    const x68k::u8 afterOneCount = mfp.read(x68k::Mfp::kTadr);
+    CHECK(afterOneCount == 3);
+
+    // 動作中に大きな値を書く。カウンタは動かないはず。
+    mfp.write(x68k::Mfp::kTadr, 200);
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 3);
+
+    // 残り 3 カウントで最初のタイムアウト。書いた 200 ではない。
+    mfp.tick(4 * 2 * 3);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
+
+    // リロードされた値は書いた 200。
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 200);
+}
+
+TEST_CASE("停止中のデータレジスタへの書き込みは即座に効く")
+{
+    // 保証すること: 停止中 (制御レジスタが 0) なら、書いた値がそのまま
+    // カウンタへ入ること。
+    //
+    // 壊れると: 初期化のために「止めて値を入れて動かす」手順が効かず、
+    // 前の値のまま動き出す。
+    x68k::Mfp mfp = makeMfp();
+
+    mfp.write(x68k::Mfp::kTacr, 0x00);  // 停止
+    mfp.write(x68k::Mfp::kTadr, 42);
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 42);
+}
