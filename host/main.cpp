@@ -17,9 +17,11 @@
 #include <string>
 #include <vector>
 
+#include "io/ascii_keymap.h"
 #include "machine.h"
 #include "video/cgrom_fallback.h"
 #include "video/text_raster.h"
+#include "video/text_scrape.h"
 
 namespace
 {
@@ -139,54 +141,6 @@ bool writePpm(const std::string& path, const x68k::u16* pixels, x68k::u32 width,
     return true;
 }
 
-// ASCII から X68000 のキーボードスキャンコードへの対応。
-//
-// 起動確認に要るのは英数字と改行だけなので、その範囲に絞る。
-// X68000 のキーボードは押下でスキャンコード、離すと bit7 を立てた値を送る。
-x68k::u8 scanCodeFor(char c)
-{
-    // 数字列とアルファベットは並びが連続していないので表で持つ。
-    //
-    // 各行の先頭スキャンコードは IPL-ROM 内の変換表から読み出して確かめた。
-    // 非シフト面は $FF199C + スキャンコード、シフト面は $FF1A1C + スキャンコード。
-    // そこで '1'=$02, 'Q'=$11, 'A'=$1E, 'Z'=$2A, 空白=$35, CR=$1D と読める。
-    static const char* kRow1 = "1234567890-^\\";
-    static const char* kRow2 = "qwertyuiop@[";
-    static const char* kRow3 = "asdfghjkl;:]";
-    static const char* kRow4 = "zxcvbnm,./";
-
-    if (c >= 'A' && c <= 'Z')
-    {
-        c = static_cast<char>(c - 'A' + 'a');
-    }
-
-    if (const char* p = std::strchr(kRow1, c); p != nullptr && c != '\0')
-    {
-        return static_cast<x68k::u8>(0x02 + (p - kRow1));
-    }
-    if (const char* p = std::strchr(kRow2, c); p != nullptr && c != '\0')
-    {
-        return static_cast<x68k::u8>(0x11 + (p - kRow2));
-    }
-    if (const char* p = std::strchr(kRow3, c); p != nullptr && c != '\0')
-    {
-        return static_cast<x68k::u8>(0x1E + (p - kRow3));
-    }
-    if (const char* p = std::strchr(kRow4, c); p != nullptr && c != '\0')
-    {
-        return static_cast<x68k::u8>(0x2A + (p - kRow4));
-    }
-    if (c == ' ')
-    {
-        return 0x35;
-    }
-    if (c == '\n' || c == '\r')
-    {
-        return 0x1D;  // CR
-    }
-    return 0;
-}
-
 void printUsage()
 {
     std::printf(
@@ -197,6 +151,7 @@ void printUsage()
         "  --hdd PATH      SASI ハードディスクイメージ\n"
         "  --cycles N      実行する CPU サイクル数 (既定 20000000)\n"
         "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
+        "  --dump-text     終了時にテキスト画面を ASCII で標準出力へ出す\n"
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
@@ -316,6 +271,7 @@ int main(int argc, char** argv)
     std::string cgromPath;
     std::string hddPath;
     std::string ppmPath;
+    bool dumpText = false;
     // サイクル数は 64bit で持つ。
     //
     // X68000 は 10MHz なので 32bit では 7 分ぶんしか数えられない。
@@ -348,6 +304,10 @@ int main(int argc, char** argv)
         else if (arg == "--hdd" && hasNext)
         {
             hddPath = argv[++i];
+        }
+        else if (arg == "--dump-text")
+        {
+            dumpText = true;
         }
         else if (arg == "--ppm" && hasNext)
         {
@@ -544,7 +504,7 @@ int main(int argc, char** argv)
         const bool hasKeyLeft = keyIndex < keys.size();
         if (hasKeyLeft && spent >= nextKeyCycle)
         {
-            const x68k::u8 code = scanCodeFor(keys[keyIndex]);
+            const x68k::u8 code = x68k::asciiToScanCode(keys[keyIndex]);
             if (code == 0)
             {
                 ++keyIndex;  // 対応していない文字は飛ばす
@@ -633,6 +593,20 @@ int main(int argc, char** argv)
         {
             std::printf("[pal] %2u: %04X\n", i, machine.video().textPalette(i));
         }
+    }
+
+    if (dumpText)
+    {
+        // 実機はシリアルへ同じものを出す。ホストで先に確かめておくと、
+        // 実機で読めなかったときに逆引き側の問題を切り分けられる。
+        std::printf("---- テキスト画面 ----\n");
+        char line[x68k::TextScrape::kColumns + 1];
+        for (x68k::u32 row = 0; row < x68k::TextScrape::kRows; ++row)
+        {
+            x68k::TextScrape::readRow(textVram.data(), cgrom.data(), row, line);
+            std::printf("%2u|%s\n", row, line);
+        }
+        std::printf("----------------------\n");
     }
 
     if (!ppmPath.empty())

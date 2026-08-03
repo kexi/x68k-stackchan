@@ -50,7 +50,9 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/dev/dmac.cpp
   ${X68K_ROOT}/src/x68k/core/dev/fdc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/video.cpp
+  ${X68K_ROOT}/src/x68k/core/io/ascii_keymap.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
 target_include_directories(x68k_core PUBLIC
@@ -71,6 +73,7 @@ add_executable(x68k_tests
   test_sram.cpp
   test_bus.cpp
   test_text_raster.cpp
+  test_text_scrape.cpp
   test_cgrom_fallback.cpp
   test_boot.cpp
   test_sasi.cpp
