@@ -177,10 +177,10 @@ TEST_CASE("マスクされている間は保留のまま受理されない")
     CHECK(mfp.hasPendingInterrupt());
 }
 
-TEST_CASE("受理すると IPR から ISR へ移る")
+TEST_CASE("受理すると保留が落ちる")
 {
-    // 保証すること: acknowledgeInterrupt() が保留を落としてサービス中へ
-    // 移すこと。同じ割り込みが二重に受理されない。
+    // 保証すること: acknowledgeInterrupt() が IPR を落とすこと。
+    // 同じ割り込みが二重に受理されない。
     //
     // 壊れると: 同じ割り込みを延々と受理し続け、ハンドラから戻れなくなる。
     x68k::Mfp mfp = makeMfp();
@@ -191,8 +191,82 @@ TEST_CASE("受理すると IPR から ISR へ移る")
     mfp.acknowledgeInterrupt();
 
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) == 0);
-    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
     CHECK_FALSE(mfp.hasPendingInterrupt());
+}
+
+TEST_CASE("Automatic EOI では ISR が立たない")
+{
+    // 保証すること: VR bit3 (S) が 0 のとき、受理しても ISR は 0 のままで
+    // あること。S=0 は受理と同時にサービス完了として扱う方式。
+    //
+    // 壊れると: 実機では常に 0 のはずの ISR が埋まっていく。X68000 の
+    // IOCS は VR に $40 を書く (S=0) ので、実機で使われるのはこちら。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x40);  // S=0
+    enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+    mfp.receiveKeyboardByte(0x41);
+
+    mfp.acknowledgeInterrupt();
+
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) == 0);
+}
+
+TEST_CASE("Software EOI では ISR が立つ")
+{
+    // 保証すること: VR bit3 (S) が 1 のとき、受理で ISR が立つこと。
+    // ハンドラが明示的に落とすまでサービス中として残る。
+    //
+    // 壊れると: S=1 を使うプログラムがサービス中かどうかを判断できない。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+    mfp.receiveKeyboardByte(0x41);
+
+    mfp.acknowledgeInterrupt();
+
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+}
+
+TEST_CASE("割り込みを禁止すると保留も落ちる")
+{
+    // 保証すること: IER のビットを 0 にすると、対応する IPR のビットも
+    // 同時に落ちること (MC68901 の仕様)。
+    //
+    // 壊れると: 割り込みを止めた後も保留が残り、ハンドラを外した後で
+    // 受理されて不正なベクタへ飛ぶ。
+    x68k::Mfp mfp = makeMfp();
+    enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+    mfp.receiveKeyboardByte(0x41);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) != 0);
+
+    mfp.write(x68k::Mfp::kIera, 0x00);
+
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) == 0);
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+}
+
+TEST_CASE("割り込みの禁止は他のチャネルの保留を巻き込まない")
+{
+    // 保証すること: IER への書き込みが、禁止したビット以外の保留を
+    // 落とさないこと。
+    //
+    // 壊れると: 1 つのチャネルを止めるたびに、動いている他の割り込みが
+    // 取りこぼされる。
+    x68k::Mfp mfp = makeMfp();
+    enableGroupA(mfp, static_cast<x68k::u8>(x68k::Mfp::kIntRecvFull | x68k::Mfp::kIntTimerA));
+
+    // 両方を保留にする。
+    mfp.receiveKeyboardByte(0x41);
+    mfp.write(x68k::Mfp::kTadr, 1);
+    mfp.write(x68k::Mfp::kTacr, 0x01);
+    mfp.tick(4 * 2);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
+
+    // 受信だけ禁止する。タイマ A の保留は残るはず。
+    mfp.write(x68k::Mfp::kIera, x68k::Mfp::kIntTimerA);
+
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) == 0);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
 }
 
 TEST_CASE("ベクタ番号は VR の上位 4bit と割り込み番号から作られる")
@@ -452,11 +526,12 @@ TEST_CASE("停止中のデータレジスタへの書き込みは即座に効く
     CHECK(mfp.read(x68k::Mfp::kTadr) == 42);
 }
 
-TEST_CASE("外部入力モードのタイマは内部クロックで進まない")
+TEST_CASE("TAI/TBI を要するモードのタイマは経過サイクルで進まない")
 {
     // 保証すること: 制御値 $08 (イベントカウント) と $09-$0F (パルス幅測定) の
-    // タイマが、内部クロックでは減らないこと。これらは外部入力 TAI/TBI で
-    // 駆動される。
+    // タイマが、tick() では減らないこと。$08 は入力の有効エッジがカウント源、
+    // $09-$0F は入力が有効な間だけ内部クロックで動く。本エミュレータは
+    // TAI/TBI を実装していないので、どちらも進めようがない。
     //
     // 壊れると: 下位 3bit が分周比として拾われ、入力に関係なくカウンタが
     // 減り続ける。$0C なら 64 分周のタイマとして勝手に割り込みを上げる。

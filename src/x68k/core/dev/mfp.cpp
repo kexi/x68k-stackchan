@@ -181,6 +181,20 @@ void Mfp::write(u32 regIndex, u8 value)
             clearPrescalerIfStopped(3, static_cast<u8>(value & 7u));
             return;
 
+        // 割り込み許可レジスタ。禁止したチャネルの保留を落とす。
+        //
+        // MC68901 は IER のビットを 0 にすると、対応する IPR のビットも
+        // 同時に落とす。代入だけだと、割り込みを禁止した後も保留が残り、
+        // ハンドラを外した後に受理されて不正なベクタへ飛ぶ。
+        case kIera:
+            reg_[kIera] = value;
+            reg_[kIpra] = static_cast<u8>(reg_[kIpra] & value);
+            return;
+        case kIerb:
+            reg_[kIerb] = value;
+            reg_[kIprb] = static_cast<u8>(reg_[kIprb] & value);
+            return;
+
         default:
             reg_[regIndex] = value;
             return;
@@ -212,8 +226,8 @@ u32 Mfp::timerPrescale(u8 control) const
     //
     // タイマ C/D は 3bit しか無く、呼び出し側が既に 7 でマスクしている
     // ため bit3 は立たない。この判定は素通りする。
-    const bool isInternallyClocked = (control & 0x08u) == 0;
-    if (!isInternallyClocked)
+    const bool needsExternalInput = (control & 0x08u) != 0;
+    if (needsExternalInput)
     {
         return 0;
     }
@@ -259,7 +273,8 @@ void Mfp::tickTimer(int index, u8 control, u32 cycles)
     const u32 prescale = timerPrescale(control);
     if (prescale == 0)
     {
-        // 停止中か、外部入力で駆動されるモード。どちらも内部クロックでは進まない。
+        // 停止中か、TAI/TBI を要するモード。後者は入力を実装していないので、
+        // 経過サイクルだけでは進めようがない。
         return;
     }
 
@@ -370,13 +385,27 @@ u32 Mfp::acknowledgeInterrupt()
     const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra]);
     const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb]);
 
+    // VR bit3 (S) が EOI の方式を選ぶ。
+    //
+    // S=0 (Automatic EOI) では受理と同時にサービスが終わったものとして扱い、
+    // ISR は常に 0 のまま。S=1 (Software EOI) のときだけ ISR が立ち、
+    // ハンドラが明示的に落とすまでサービス中として残る。
+    //
+    // X68000 の IOCS は VR に $40 を書く (S=0) ので、実機で使われるのは
+    // Automatic EOI の側。無条件に ISR を立てると、実機では 0 のはずの
+    // レジスタが埋まっていく。
+    const bool isSoftwareEoi = (reg_[kVr] & kVrSoftwareEoi) != 0;
+
     for (int bit = 7; bit >= 0; --bit)
     {
         const u8 mask = static_cast<u8>(1u << bit);
         if ((pendingA & mask) != 0)
         {
             reg_[kIpra] = static_cast<u8>(reg_[kIpra] & ~mask);
-            reg_[kIsra] |= mask;
+            if (isSoftwareEoi)
+            {
+                reg_[kIsra] |= mask;
+            }
             const u32 number = static_cast<u32>(bit) + 8u;
             return (static_cast<u32>(reg_[kVr] & 0xF0u)) | number;
         }
@@ -387,7 +416,10 @@ u32 Mfp::acknowledgeInterrupt()
         if ((pendingB & mask) != 0)
         {
             reg_[kIprb] = static_cast<u8>(reg_[kIprb] & ~mask);
-            reg_[kIsrb] |= mask;
+            if (isSoftwareEoi)
+            {
+                reg_[kIsrb] |= mask;
+            }
             const u32 number = static_cast<u32>(bit);
             return (static_cast<u32>(reg_[kVr] & 0xF0u)) | number;
         }

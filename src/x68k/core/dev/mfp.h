@@ -8,7 +8,12 @@
 //
 // 実装範囲: レジスタの読み書き、タイマ A-D、割り込みコントローラ (IERA/B,
 // IPRA/B, ISRA/B, IMRA/B)、GPIP (垂直帰線の状態)、シリアル受信 (キーボード)。
-// 実機の非同期な細部 (タイマの分周器の途中経過など) は追わない。
+// 実機の非同期な細部 (クロックの位相など、MFP サイクル未満の粒度) は追わない。
+// 分周器の途中経過は保持する。停止と再開で端数の扱いが変わり、割り込みの
+// 間隔に効くため。
+//
+// 外部入力 TAI/TBI は実装していない。これに依存するタイマのモード
+// (イベントカウント / パルス幅測定) は動かない。
 
 #ifndef X68K_CORE_DEV_MFP_H
 #define X68K_CORE_DEV_MFP_H
@@ -54,6 +59,10 @@ public:
         kUdr = 0x17,  // USART データ
         kRegCount = 0x18,
     };
+
+    // VR bit3 (S)。1 で Software EOI、0 で Automatic EOI。
+    // X68000 の IOCS は $40 を書くので 0 側を使う。
+    static constexpr u8 kVrSoftwareEoi = 0x08;
 
     // IERA/IPRA のビット。X68000 での割り当て。
     static constexpr u8 kIntGpip7 = 0x80;  // 未使用
