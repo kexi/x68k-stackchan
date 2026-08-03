@@ -32,6 +32,41 @@ constexpr u8 kPhaseMessage = 5;
 // MFP の割り込みレベル。X68000 では MFP がレベル 6 に繋がっている。
 constexpr u32 kMfpInterruptLevel = 6;
 
+// uPD72065 のコマンドに続くパラメータのバイト数。
+//
+// コマンドコードは 1 バイト目の下位 5bit。上位 3bit は MT/MF/SK の修飾ビット
+// なので落として判定する。ドライブ未接続として振る舞うだけなので実行はしないが、
+// 「何バイト受け取ったらコマンドが揃うか」は知っている必要がある。
+int fdcParameterCount(u8 commandByte)
+{
+    switch (commandByte & 0x1Fu)
+    {
+        case 0x03:  // SPECIFY
+            return 2;
+        case 0x04:  // SENSE DRIVE STATUS
+        case 0x07:  // RECALIBRATE
+            return 1;
+        case 0x08:  // SENSE INTERRUPT STATUS
+            return 0;
+        case 0x0F:  // SEEK
+            return 2;
+        case 0x02:  // READ TRACK
+        case 0x05:  // WRITE DATA
+        case 0x06:  // READ DATA
+        case 0x09:  // WRITE DELETED DATA
+        case 0x0C:  // READ DELETED DATA
+        case 0x11:  // SCAN EQUAL
+            return 8;
+        case 0x0A:  // READ ID
+            return 1;
+        case 0x0D:  // WRITE ID (FORMAT)
+            return 5;
+        default:
+            // 未知のコマンド。パラメータ無しとして扱い、結果フェーズへ進める。
+            return 0;
+    }
+}
+
 }  // namespace
 
 Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
@@ -192,49 +227,19 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kFdcBase:
-            // FDC (uPD72065) のスタブ。ドライブ未接続として振る舞う。
+            // FDC (uPD72065) は未実装。
             //
-            // レジスタ:
-            //   $E94001 ステータス (bit7 RQM / bit6 DIO / bit4 CB)
-            //   $E94003 データ
+            // 中途半端に応答すると IPL-ROM のポーリングループ
+            // ($FF904C の CB 待ち / $FF9054 の RQM 待ち / $FF89DE の結果待ち)
+            // のどれかで必ず止まる。これらはタイムアウトを持たないため、
+            // 「正しく応答する」か「そもそも触らせない」かの二択になる。
             //
-            // IPL-ROM は FDC の応答を 2 段階で待ち、どちらもタイムアウトを
-            // 持たない:
-            //   $FF9054: RQM が立つのを待つ
-            //   $FF89DE: RQM|DIO|CB ($D0) が揃うのを待つ
-            // 0 を返し続けると永久に抜けられないので、両方を満たす値を返す。
+            // 本エミュレータは SASI 起動を前提にしており、SRAM の起動デバイス
+            // 設定 ($ED0018) を SASI 最優先にすることで FD の探索自体を
+            // 回避している。ここは 0 を返すだけでよい。
             //
-            // その先ではデータレジスタから結果ステータスを読む ($FF89F0)。
-            // ここに「ドライブ未接続」を示す値を返せば、IPL-ROM は FD からの
-            // 起動を諦めて次の起動デバイス (SASI) へ移る。
-            if ((addr & 0x0Fu) == 0x01)
-            {
-                constexpr u8 kFdcRqm = 0x80;  // データ転送要求
-                constexpr u8 kFdcDio = 0x40;  // 転送方向 (FDC → CPU)
-                constexpr u8 kFdcCb = 0x10;   // コマンド実行中
-
-                // 結果バイトを返し切るまでは DIO|CB を立てて「結果フェーズ」を
-                // 示し、返し切ったら RQM だけにしてコマンド待ちへ戻す。
-                // 常に $D0 を返し続けると IPL-ROM が結果を読み終えたことに
-                // 気づかず、次のコマンドへ進めない。
-                if (fdcResultRemaining_ > 0)
-                {
-                    return static_cast<u8>(kFdcRqm | kFdcDio | kFdcCb);
-                }
-                return kFdcRqm;
-            }
-            if ((addr & 0x0Fu) == 0x03)
-            {
-                // 結果ステータス。ST0 の bit7-6 = 11 が「異常終了」で、
-                // ドライブ未接続はこれで表す。IPL-ROM はこれを見て FD からの
-                // 起動を諦め、次の起動デバイス (SASI) へ移る。
-                constexpr u8 kSt0AbnormalTermination = 0xC0;
-                if (fdcResultRemaining_ > 0)
-                {
-                    --fdcResultRemaining_;
-                }
-                return kSt0AbnormalTermination;
-            }
+            // FD からの起動に対応するときは、コマンド/実行/結果の 3 フェーズを
+            // 持つ状態機械として作り直す必要がある。
             return 0u;
 
         case kAdpcmBase:
@@ -291,13 +296,36 @@ void Machine::ioWrite8(u32 addr, u8 value)
 
         case kFdcBase:
             // データレジスタへの書き込みはコマンドの送出。
-            // ドライブ未接続なので実行はせず、結果フェーズだけを用意する。
-            // uPD72065 の SENSE INTERRUPT STATUS は結果 2 バイトなので
-            // それに合わせておく。
+            //
+            // uPD72065 のコマンドは 1〜9 バイトから成る。1 バイト目で結果
+            // フェーズに移ってしまうと、残りのパラメータを送ろうとした
+            // IPL-ROM が「コマンド待ち (RQM=1, DIO=0)」を待って止まる。
+            // コマンド全体を受け取ってから結果へ移す必要がある。
+            //
+            // ドライブ未接続なので実行はせず、パラメータ数だけ数える。
             if ((addr & 0x0Fu) == 0x03)
             {
-                constexpr int kResultBytes = 2;
-                fdcResultRemaining_ = kResultBytes;
+                if (fdcCommandRemaining_ > 0)
+                {
+                    // パラメータの途中。
+                    --fdcCommandRemaining_;
+                    if (fdcCommandRemaining_ == 0)
+                    {
+                        // 揃ったので結果フェーズへ。SENSE INTERRUPT STATUS の
+                        // 結果は 2 バイト。
+                        constexpr int kResultBytes = 2;
+                        fdcResultRemaining_ = kResultBytes;
+                    }
+                    return;
+                }
+                // コマンドの 1 バイト目。下位 5bit がコマンドコードで、
+                // 種類ごとに続くパラメータ数が決まっている。
+                fdcCommandRemaining_ = fdcParameterCount(value);
+                if (fdcCommandRemaining_ == 0)
+                {
+                    constexpr int kResultBytes = 2;
+                    fdcResultRemaining_ = kResultBytes;
+                }
             }
             return;
 
