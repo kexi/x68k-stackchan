@@ -159,6 +159,22 @@ void Machine::serviceInterrupts()
         return;
     }
 
+    // CPU が今この割り込みを受け付けられるか先に確かめる。
+    //
+    // acknowledgeInterrupt() は MFP の IPR を落として ISR へ移す破壊的な
+    // 操作なので、CPU がマスクしている間に呼ぶと割り込みが握りつぶされる。
+    // 実機のバスは IACK サイクルが走って初めてこの遷移が起きるので、
+    // 受理できないときは触らないのが正しい。
+    //
+    // ここを見落とすと、割り込みが上がり続けるのに一度も処理されず、
+    // 原因の分かりにくい暴走になる。
+    const u32 mask = cpu_.state().interruptMask();
+    const bool isMasked = kMfpInterruptLevel <= mask;
+    if (isMasked)
+    {
+        return;
+    }
+
     // MFP は自分のベクタ番号を返すデバイス (自動ベクタではない)。
     // VR レジスタの上位 4bit と割り込み番号を組み合わせた値になる。
     //
