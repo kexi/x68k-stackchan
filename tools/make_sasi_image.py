@@ -87,11 +87,29 @@ HUMAN_LOAD_ADDR = 0x006800
 # 転送は完走しているように見えるので原因が分かりにくい。
 FAT_START_LBA = 512
 
-FAT_BYTES_PER_SECTOR = SASI_SECTOR_SIZE
-FAT_SECTORS_PER_CLUSTER = 4
+# ファイルシステム側の 1 セクタ。SASI の 256 バイトではなく 1024 バイト。
+#
+# Human68k の SASI ドライバ ($11012 / $10FA2) は、要求された論理セクタ番号を
+# 必ず ASL.L #2 してからパーティション開始 LBA に足す。転送バイト数も
+# ASL.L #2 / ASL.L #8 で 1024 倍する。つまり Human68k から見た 1 セクタは
+# SASI の 4 セクタ = 1024 バイトで固定されている。
+#
+# Why not 256 バイトのまま組むか:
+#   BPB に 256 と書いても、ドライバの ASL.L #2 は変わらない。ルート
+#   ディレクトリを論理セクタ 241 だと思って要求すると LBA 512+964 を
+#   読みに行き、FAT でもディレクトリでもない場所が返る。先頭バイトが
+#   たまたま 0 でなければディレクトリの終端とも判定されず、
+#   COMMAND.X が「ファイルが見つからない」(-2) で失敗する。
+FAT_BYTES_PER_SECTOR = SASI_SECTOR_SIZE * 4
+FAT_SECTORS_PER_CLUSTER = 1
 FAT_RESERVED_SECTORS = 1
 FAT_COPIES = 2
-FAT_ROOT_ENTRIES = 128
+# ルートディレクトリのエントリ数。ここも自由に選べない。
+#
+# Human68k の SASI ドライバは BPB をディスクから読まず、$10E4C から並ぶ
+# 16 バイトのテーブルをそのまま返す。その +$6 が 512 で固定されており、
+# HUMAN.SYS の $D37E はその値でルートディレクトリの大きさを決める。
+FAT_ROOT_ENTRIES = 512
 FAT_MEDIA_DESCRIPTOR = 0xF8  # 固定ディスク
 
 # ディレクトリエントリ 1 件の大きさ。
@@ -264,20 +282,39 @@ class XFile:
         return bytes(image)
 
 
-class Fat12:
-    """FAT12 のファイルシステムを組み立てる。
+class HumanFat:
+    """Human68k が読める FAT を組み立てる。
 
-    Human68k の FAT は PC の FAT12 とほぼ同じ。違うのはセクタ長が 256 バイト
-    であることと、ディレクトリエントリの日付形式くらいで、起動に要る範囲では
-    同じ構造で通る。
+    PC の FAT とほぼ同じ構造だが、寸法は自由に選べない。**Human68k は
+    ディスク上の BPB を読まず、パーティションの大きさから FAT の
+    セクタ数を自分で計算する**（HUMAN.SYS の $80F6-$8138）。こちらが
+    別の寸法で組むと、ルートディレクトリの位置が食い違って
+    「ファイルが見つからない」になる。
+
+    そのため寸法は Human68k と同じ式で決める。式は次のとおり:
+
+        論理セクタ数 = パーティションのセクタ数 / 4      ($80FA)
+        エントリ数   = 論理セクタ数 / クラスタサイズ + 2 ($810E-$8112)
+        FAT バイト数 = エントリ数 * (3 or 4)             ($8116-$8120)
+                       エントリ数 < $FF7 なら 3 (12bit)、以上なら 4 (16bit)
+        FAT セクタ数 = (FAT バイト数 + $7FF) / $800      ($8122-$812A)
+
+    最後の除数が $800 (2048) で、セクタ長 1024 の 2 倍になっている点に注意。
+    12bit のときの「3」も 1.5 バイト x 2 で、どちらも 2 倍で数えている。
     """
+
+    # FAT が 12bit から 16bit へ切り替わる境界。$8118 の CMPI.W と同じ値。
+    FAT16_THRESHOLD = 0xFF7
 
     def __init__(self, total_sectors: int):
         self.total_sectors = total_sectors
-        # FAT のエントリ数はクラスタ数で決まる。12bit なので 1.5 バイト/個。
         self.cluster_count = total_sectors // FAT_SECTORS_PER_CLUSTER
-        fat_bytes = (self.cluster_count + 2) * 3 // 2
-        self.sectors_per_fat = (fat_bytes + FAT_BYTES_PER_SECTOR - 1) // FAT_BYTES_PER_SECTOR
+
+        # Human68k が数えるエントリ数。先頭 2 つの予約分を含む。
+        entry_count = self.cluster_count + 2
+        self.fat_bits = 12 if entry_count < self.FAT16_THRESHOLD else 16
+        half_bytes_per_entry = 3 if self.fat_bits == 12 else 4
+        self.sectors_per_fat = (entry_count * half_bytes_per_entry + 0x7FF) // 0x800
 
         root_bytes = FAT_ROOT_ENTRIES * DIR_ENTRY_SIZE
         self.root_sectors = (root_bytes + FAT_BYTES_PER_SECTOR - 1) // FAT_BYTES_PER_SECTOR
@@ -293,11 +330,33 @@ class Fat12:
         self.entry_count = 0
 
         # FAT の先頭 2 エントリは予約。メディア記述子と終端を入れる。
-        self.set_fat_entry(0, 0xF00 | FAT_MEDIA_DESCRIPTOR)
-        self.set_fat_entry(1, 0xFFF)
+        # 上位ビットは全部立てる決まりなので、幅に合わせて桁数を変える。
+        fill = self.end_of_chain & ~0xFF
+        self.set_fat_entry(0, fill | FAT_MEDIA_DESCRIPTOR)
+        self.set_fat_entry(1, self.end_of_chain)
+
+    @property
+    def end_of_chain(self) -> int:
+        """チェーンの終端を表す値。FAT の幅で桁数が変わる。"""
+        return 0xFFF if self.fat_bits == 12 else 0xFFFF
 
     def set_fat_entry(self, index: int, value: int) -> None:
-        """12bit のエントリを書く。2 個で 3 バイトを分け合う。"""
+        """エントリを 1 つ書く。12bit なら 2 個で 3 バイトを分け合う。
+
+        16bit のときのバイト順は **ビッグエンディアン**。12bit 側は PC と
+        同じリトルエンディアン風の詰め方のままで、幅によって順序が変わる。
+
+        Why not 16bit もリトルエンディアンにするか:
+            Human68k は 68000 のワード読みでそのまま拾うので、
+            リトルエンディアンで置くとクラスタ 60 の次が 61 ($003D) ではなく
+            $3D00 = 15616 と読まれる。その番号の FAT セクタは 0 で埋まって
+            いるため、チェーンが 1 クラスタで途切れる。COMMAND.X は
+            先頭 1024 バイトだけ読まれて残りが 0 のまま実行される。
+        """
+        if self.fat_bits == 16:
+            struct.pack_into(">H", self.fat, index * 2, value & 0xFFFF)
+            return
+
         offset = index * 3 // 2
         if index % 2 == 0:
             self.fat[offset] = value & 0xFF
@@ -319,7 +378,7 @@ class Fat12:
         for i in range(cluster_count):
             current = first_cluster + i
             is_last = i == cluster_count - 1
-            self.set_fat_entry(current, 0xFFF if is_last else current + 1)
+            self.set_fat_entry(current, self.end_of_chain if is_last else current + 1)
         self.next_cluster += cluster_count
 
         # データ領域へ書く。クラスタ境界まで 0 で埋める。
@@ -439,7 +498,10 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     #
     # HUMAN.SYS も FAT 側へ入れておく。ブートコードが読む生のコピーとは
     # 別に、ファイルとしても見えている必要がある。
-    fat = Fat12(total_sectors - FAT_START_LBA)
+    # HumanFat が数えるのは 1024 バイトの論理セクタ。SASI のセクタ数を
+    # そのまま渡すと 4 倍の広さがあることになり、FAT がディスクの外を指す。
+    partition_sasi_sectors = total_sectors - FAT_START_LBA
+    fat = HumanFat(partition_sasi_sectors * SASI_SECTOR_SIZE // FAT_BYTES_PER_SECTOR)
     fat.add_file("HUMAN.SYS", human_raw)
     for name, data in files[1:]:
         fat.add_file(name, data)
@@ -471,7 +533,7 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     for name, lba, size in placed:
         print(f"  {name}: LBA {lba} / {size} バイト (ブートコードが直接読む)")
     print(f"  ファイルシステム: LBA {FAT_START_LBA} / {len(fat_image)} バイト")
-    print(f"    FAT {fat.sectors_per_fat} セクタ x {FAT_COPIES}")
+    print(f"    FAT{fat.fat_bits} {fat.sectors_per_fat} セクタ x {FAT_COPIES}")
     print(f"    ルートディレクトリ {fat.entry_count} エントリ")
 
 
