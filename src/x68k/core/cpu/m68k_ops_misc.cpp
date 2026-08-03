@@ -148,6 +148,20 @@ u32 M68k::groupImmediate(u16 op)
     }
     const u32 size = sizeFromField(sizeField);
 
+    // ORI/ANDI/EORI to SR は特権命令。即値を取る「前」に特権を判定する。
+    //
+    // Why not 即値を取ってから判定するか: 特権違反の例外フレームには「例外を
+    // 起こした命令の先頭」を積む必要がある。takeException(faulting=true) は
+    // 命令語 1 ワードぶんしか戻さないので、先に fetch() で即値を読んで PC を
+    // 進めてしまうと、積まれる PC が 2 バイト先へずれる。
+    // 実機も特権違反は即値を読む前に検出する。
+    const bool isImmediateToSr =
+        mode == 7 && reg == 4 && sizeField == 1 && (opType == 0 || opType == 1 || opType == 5);
+    if (isImmediateToSr && !requirePrivilege())
+    {
+        return 34;
+    }
+
     // 即値を先に取る。命令語の直後に置かれている。
     u32 immediate = 0;
     if (size == kLong)
@@ -174,11 +188,7 @@ u32 M68k::groupImmediate(u16 op)
             st_.sr = static_cast<u16>((st_.sr & ~sr_bit::kCcrMask) | next);
             return 20;
         }
-        // to SR は特権命令。
-        if (!requirePrivilege())
-        {
-            return 34;
-        }
+        // to SR の特権判定は即値を読む前に済ませてある (この関数の冒頭を参照)。
         setSr(applyLogicalOp(opType, st_.sr, static_cast<u16>(immediate)));
         return 20;
     }

@@ -104,8 +104,19 @@ u32 M68k::groupMisc(u16 op)
         {
             return 34;
         }
-        const u16 value = fetch();
-        setSr(value);
+        // 即値は step() の fetch() で既に ir へ流れ込んでいる。これを SR に入れ、
+        // プリフェッチを命令語の位置へ巻き戻して停止する。
+        //
+        // Why not ここで fetch() を呼ばないか: 実機の STOP は停止と同時に
+        // プリフェッチも止めるので、PC・ir・irc は STOP の命令語を指したまま
+        // 動かない (テストベクタの最終状態が初期状態と同一なのはこのため)。
+        // fetch() を足すと PC がさらに 2 バイト進み、ir/irc も先の内容で潰れる。
+        //
+        // 巻き戻し先は「STOP の命令語」。step() の fetch() を通った直後の pc は
+        // 命令語 + 6 (命令語 + 即値 + 先読み 2 ワード) なので、6 引くと戻る。
+        const u16 immediate = st_.ir;
+        refillPrefetch(st_.pc - 6);
+        setSr(immediate);
         st_.stopped = true;
         return 4;
     }

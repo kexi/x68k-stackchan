@@ -654,7 +654,23 @@ u32 M68k::step()
             pendingVector_ != 0 ? pendingVector_ : (vector::kAutoVectorBase + level);
         pendingIrq_ = 0;
         pendingVector_ = 0;
+
+        // STOP で止まっていた場合は、例外を積む前にプリフェッチを STOP の次の
+        // 命令へ進める。
+        //
+        // Why これが要るか: STOP はプリフェッチを命令語の位置に巻き戻して
+        // 停止する (実機がそうなので、テストベクタもそれを期待する)。その状態の
+        // まま takeException に入ると framePc = pc - 4 が STOP の命令語自身を
+        // 指し、ハンドラから RTE で戻ると STOP を再実行して永久に止まる。
+        // st_.pc は「命令語 + 4」= 即値の次のワード、つまり STOP の次の命令を
+        // 指しているので、そこから読み直せば戻り先が正しくなる。
+        const bool wasStopped = st_.stopped;
         st_.stopped = false;
+        if (wasStopped)
+        {
+            refillPrefetch(st_.pc);
+        }
+
         // ベクタ番号を自分で返すデバイス (X68000 の MFP など) は
         // requestInterrupt でその番号を渡してくる。渡されなければ自動ベクタ。
         takeException(vectorNumber);

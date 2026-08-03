@@ -426,11 +426,6 @@ const std::set<std::string>& knownFailures()
         "ABCD",
         "SBCD",
         "NBCD",
-        // SR を直接触る命令。
-        "ANDItoSR",
-        "EORItoSR",
-        "ORItoSR",
-        "STOP",
         // 除算と範囲検査。
         "DIVS",
         "DIVU",
