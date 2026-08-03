@@ -1,0 +1,27 @@
+# M5Stack CoreS3 (16MB Flash) のパーティションテーブル。
+#
+# 構成: app 4MB + 予備の app スロット無し + データ領域。
+#
+# Why データ領域を大きく残すか:
+#   X68000 の ROM (IPLROM 128KB / CGROM 768KB) とディスクイメージは
+#   ライセンス上リポジトリに同梱できず、実行時にユーザーが用意する
+#   (NOTICE.md 参照)。現在の設計ではこれらを microSD から読む想定なので
+#   flash 上のデータ領域は必須ではないが、
+#     - ROM を SD ではなく flash に焼きたくなった場合
+#     - セーブ用の SRAM イメージ (16KB) を置く場合
+#   に備えて確保しておく。パーティション表の変更は焼き直しを伴うので、
+#   後から広げるより最初に取っておく方が安い。
+#
+# Why factory を 0x10000 に置くか:
+#   ESP-IDF のブートローダは 0x8000 のパーティション表を読んでから app を探すが、
+#   ツール側 (idf.py flash) の既定オフセットと食い違うと
+#   "Factory app partition is not bootable" でブートループする。
+#   0x10000 は ESP-IDF/Arduino 双方の慣例値なのでこれに合わせる。
+#
+# Name,     Type, SubType,  Offset,    Size,      Flags
+nvs,        data, nvs,      0x9000,    0x5000,
+otadata,    data, ota,      0xe000,    0x2000,
+factory,    app,  factory,  0x10000,   0x400000,
+# storage の SubType=spiffs は LittleFS でフォーマットしても使える互換値
+# (ESP-IDF のパーティション種別に "littlefs" は無い)。
+storage,    data, spiffs,   0x410000,  0xBF0000,

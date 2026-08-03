@@ -1,0 +1,100 @@
+# x68k-stackchan CI — 実機不要のホスト側検査とファームビルド。
+#
+# 方針: 実行するコマンドは justfile に集約してあるので、CI は
+# `nix develop -c just <task>` を呼ぶだけ。CI とローカルで同じループを回す
+# (コマンド文字列の二重管理をしない)。ESP-IDF も Nix 供給なので、
+# 実機ファームのビルドも devShell だけで再現できる。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # core/ が ESP32 非依存であることは本プロジェクトの開発速度の前提。
+  # core/ がホストで動くから Mac 上で 68000 を走らせて Human68k をデバッグできる。
+  # Nix のセットアップが要らない grep だけの検査なので、単独ジョブで速く落とす。
+  core-guard:
+    name: core/ has no ESP32 dependency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Grep guard
+        run: |
+          set -euo pipefail
+          if [ ! -d src/x68k/core ]; then
+            echo "src/x68k/core/ does not exist yet; nothing to guard"
+            exit 0
+          fi
+          if grep -rEn '^[[:space:]]*#[[:space:]]*include.*(Arduino\.h|M5Unified|M5GFX|LovyanGFX|lgfx|esp_|freertos/|driver/|soc/|sdkconfig\.h|hal/)' src/x68k/core/; then
+            echo "::error::ESP32-only #include found in src/x68k/core/ (must stay ESP32-independent)"
+            exit 1
+          fi
+          echo "core/ is ESP32-independent: OK"
+
+  host-tests:
+    name: host tests and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      # nix store を GitHub Actions cache に載せる。
+      # Why not DeterminateSystems/magic-nix-cache-action: FlakeHub Cache は
+      # 有料プラン前提で、無料だと認証だけ通って読み出しが 401 になり、
+      # それでもストアパスごとに書き込むためキャッシュ枠を食い潰す。
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6.1.3
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          # PR ブランチが main 用のキャッシュを汚染する経路を断つ。
+          purge: false
+          save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format check
+        run: nix develop -c just fmt-check
+
+      - name: Lint (ruff)
+        run: nix develop -c just lint
+
+      - name: Host unit tests
+        run: nix develop -c just test-host
+
+      # ASan/UBSan は 68000 コアのメモリ破壊 (EA 計算ミスによる配列外アクセス、
+      # 符号付きオーバーフロー) を捕まえる。エミュレータでは通常テストより効く。
+      - name: Host tests with sanitizers
+        run: nix develop -c just test-san
+
+  firmware-build:
+    name: ESP-IDF firmware build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6.1.3
+        with:
+          primary-key: nix-idf-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-idf-${{ runner.os }}-
+          purge: false
+          save: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build firmware
+        run: nix develop -c just build
+
+      # .iram0 / .dram0 の overflow はリンク時にしか分からず、しかも「あと少しで
+      # 溢れる」状態は気付きにくい。68000 のホット命令を IRAM_ATTR に足すたびに
+      # ここで残量を確認できるようにする。
+      - name: Size report
+        run: nix develop -c just size

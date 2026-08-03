@@ -1,0 +1,12 @@
+# IDF Component Manager の依存宣言。
+#
+# 取得した実体 (managed_components/) は commit せず、dependencies.lock で
+# バージョンを固定して再現性を担保する。
+#
+# M5Unified は M5Stack CoreS3 の LCD / タッチ / 電源管理 (AXP2101) / スピーカーを
+# まとめて面倒を見る。ESP-IDF 単体 (Arduino なし) で動作し、CoreS3 は公式サポート対象。
+dependencies:
+  idf:
+    version: ">=5.0"
+  m5stack/m5unified:
+    version: "^0.2.7"

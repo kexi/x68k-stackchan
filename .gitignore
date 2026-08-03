@@ -1,0 +1,50 @@
+# Nix / direnv
+# .direnv/ は nix-direnv のキャッシュで再生成可能。flake.nix / flake.lock / .envrc は commit する。
+.direnv/
+result
+result-*
+
+# ESP-IDF ビルド成果物
+/build/
+sdkconfig
+sdkconfig.old
+# 手書きの sdkconfig.defaults のみ追跡する。idf.py が生成する派生物は無視。
+sdkconfig.*
+!sdkconfig.defaults
+# IDF Component Manager がダウンロードするコンポーネント (バイナリ blob を含む)。
+# 再現性は dependencies.lock が担保するので、実体は commit しない。
+managed_components/
+
+# ホストビルド (core/ の doctest と host/ のエミュレータランナー)
+/build-host/
+/build-san/
+/cmake-build-*/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.a
+
+# ROM / ディスクイメージ。
+# X68000 の IPLROM / CGROM / Human68k はライセンス上リポジトリに同梱しない
+# (詳細は NOTICE.md)。ユーザーが自分で取得して rom/ に置くか、microSD へ入れる。
+/rom/
+*.dat
+*.hdf
+*.xdf
+*.dim
+
+# 68000 テストベクタ (SingleStepTests/m68000)。数 GB あるので同梱しない。
+# `just fetch-tests` で取得する。
+/third_party/ProcessorTests/
+
+# Python
+__pycache__/
+*.pyc
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

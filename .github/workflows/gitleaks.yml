@@ -1,0 +1,23 @@
+# シークレットスキャン。
+# lefthook の pre-commit にも gitleaks を置いているが、あちらは staged だけを
+# 見る tripwire。全履歴を見るこちらが authoritative なゲート。
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # ブランチ上の全コミットを走査するため履歴を全部取る。
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml

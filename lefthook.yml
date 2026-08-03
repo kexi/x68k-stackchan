@@ -1,0 +1,54 @@
+# x68k-stackchan の git hook 定義 (lefthook)。
+# hook の登録は flake.nix の shellHook が `lefthook install` で行うので、
+# clone 後に手動セットアップは不要 (devShell に入れば有効になる)。
+#
+# 方針: pre-commit は「速い検査」だけに絞る。clang-tidy のように
+# compile_commands.json の生成 (= CMake configure) が要るものは CI と
+# `just tidy` に置く。コミットのたびに数十秒待たされると hook を外したくなる。
+#
+# 各コマンドを `nix develop -c` で包んでいるのは、git hook が devShell の外の
+# シェル (エディタの Git 統合や、direnv を通していない端末) から起動されても
+# 動くようにするため。包まないと clang-format / ruff が PATH に無く
+# "command not found" で落ちる。devShell に入っている場合は既に評価済みの
+# 環境が再利用されるので、追加のコストはほとんどない。
+
+pre-commit:
+  parallel: true
+  commands:
+    # core/ が ESP32 非依存であることは本プロジェクトの開発速度の前提
+    # (Mac 上で 68000 を走らせて Human68k をデバッグする)。CI でも見るが、
+    # 手元で即座に気付けるようコミット時にも検査する。
+    core-guard:
+      glob: "src/x68k/core/**/*.{c,h,cpp,hpp}"
+      run: nix develop -c just core-guard
+
+    clang-format:
+      glob: "*.{c,h,cpp,hpp}"
+      exclude:
+        - "test/doctest/*"
+      run: nix develop -c clang-format --dry-run --Werror {staged_files}
+
+    ruff-format:
+      glob: "*.py"
+      run: nix develop -c ruff format --check {staged_files}
+
+    ruff-check:
+      glob: "*.py"
+      run: nix develop -c ruff check {staged_files}
+
+    # pre-commit の gitleaks はあくまで tripwire。全履歴を見る CI 側が
+    # authoritative なゲート。
+    gitleaks:
+      run: nix develop -c gitleaks git --staged --no-banner --redact
+
+    actionlint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: nix develop -c actionlint {staged_files}
+
+    # `-fix=false -no-api` は pinact のオフライン形。uses: が 40 桁 SHA かだけを
+    # 見て GitHub API を叩かないので、ネットワーク無しでも速く動く。
+    # 注意: SHA の「形式」しか見ないので、実在しない SHA は素通りする。
+    # 新しい SHA の解決は `just pin`。
+    pinact:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: nix develop -c pinact run -fix=false -no-api {staged_files}
