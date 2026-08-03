@@ -96,6 +96,25 @@ void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, 
             }
         }
     }
+
+    // 割り切れないぶんの余白を消す。
+    //
+    // 3 倍だと 320 / 3 = 106 なので 106 * 3 = 318 列しか書かない。
+    // 残る 2 列には前のフレームの画素が残り、倍率を変えたときに
+    // 右端へ古い縦線が出る。下端も同じ理由で埋める (240 は 1/2/4 では
+    // 割り切れるが、将来ほかの倍率を足したときに効く)。
+    const x68k::u32 filledWidth = srcWidth * zoom_;
+    const x68k::u32 filledHeight = srcHeight * zoom_;
+    for (x68k::u32 y = 0; y < kScreenHeight; ++y)
+    {
+        x68k::u16* row = out + static_cast<std::size_t>(y) * kScreenWidth;
+        const bool isBelowContent = y >= filledHeight;
+        const x68k::u32 from = isBelowContent ? 0 : filledWidth;
+        for (x68k::u32 x = from; x < kScreenWidth; ++x)
+        {
+            row[x] = 0;
+        }
+    }
 }
 
 bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out)
