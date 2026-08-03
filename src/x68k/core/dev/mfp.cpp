@@ -32,8 +32,20 @@ void Mfp::reset()
     reg_.fill(0);
     prescaleCounter_.fill(0);
     timerValue_.fill(0);
-    // GPIP は入力がすべて H の状態で始まる。
-    reg_[kGpip] = 0xFF;
+    // GPIP の初期値。
+    //
+    // X68000 での割り当て:
+    //   bit0 (未使用) / bit1 EXPON (拡張ボード) / bit2 POWER (電源スイッチ)
+    //   bit3 OPMIRQ (FM音源) / bit4 V-DISP (垂直帰線) / bit5 (未使用)
+    //   bit6 CIRQ (RTC アラーム) / bit7 HSYNC (水平同期)
+    //
+    // IPL-ROM は起動時に bit1/bit2 が 0 になるのを待つループを持つ
+    // ($FF103C)。拡張ボードも電源スイッチの押下も無い状態を表すため、
+    // これらは L (0) にしておく。全ビットを H にするとタイムアウトするまで
+    // 無駄に回り続ける。
+    constexpr u8 kGpipExpansion = 0x02;  // EXPON
+    constexpr u8 kGpipPower = 0x04;      // POWER
+    reg_[kGpip] = static_cast<u8>(0xFF & ~(kGpipExpansion | kGpipPower));
 
     // 送信バッファは空の状態で始める。
     //

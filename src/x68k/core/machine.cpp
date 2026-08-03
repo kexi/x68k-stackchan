@@ -191,11 +191,35 @@ u8 Machine::ioRead8(u32 addr)
             // 終わらない。
             return 0u;
 
+        case kFdcBase:
+            // FDC (uPD72065) のスタブ。
+            //
+            // $E94001 がステータスレジスタで、bit7 = RQM (データ転送要求)、
+            // bit6 = DIO (転送方向)、bit4 = CB (コマンド実行中)。
+            // IPL-ROM は FDC を初期化する前に RQM が立つのを待つループを持つ
+            // ($FF9054)。0 を返し続けると永久に抜けられない。
+            //
+            // ドライブは接続されていない扱いにする。
+            //
+            // IPL-ROM は FDC の応答を 2 段階で待つ:
+            //   $FF9054: RQM (bit7) が立つのを待つ
+            //   $FF89DE: RQM|DIO|CB ($D0) が揃うのを待つ
+            //
+            // ここで $D0 をそのまま返すと「FDC が応答した」と誤認され、
+            // 続きのコマンド処理へ進んでエラー停止する。RQM だけを立てて
+            // 「コマンドは受け付けるが結果が返らない」状態にしておくと、
+            // IPL-ROM はタイムアウトして次の起動デバイス (SASI) へ移る。
+            if ((addr & 0x0Fu) == 0x01 || (addr & 0x0Fu) == 0x03)
+            {
+                constexpr u8 kFdcRqm = 0x80;  // データ転送要求
+                return kFdcRqm;
+            }
+            return 0u;
+
         case kAdpcmBase:
         case kSccBase:
         case kPpiBase:
         case kDmacBase:
-        case kFdcBase:
         case kIoScBase:
         case kPrinterBase:
             // スタブ。読み出しは 0。
