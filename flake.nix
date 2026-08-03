@@ -112,7 +112,13 @@
           shellHook = ''
             # lefthook.yml の git hook を登録する。冪等なので毎回実行してよい。
             # tarball checkout など .git が無い場合に落ちないようガードする。
-            if [ -d .git ]; then
+            # git のフックから nix develop が呼ばれている最中は install しない。
+            #
+            # lefthook の各コマンドは nix develop -c で走る。その shellHook が
+            # install を試みると「今まさに実行しているフックを置き換える」ことに
+            # なり、lefthook が「could not replace the hook」で失敗する。
+            # GIT_INDEX_FILE は git がフックへ渡す変数なので、これで見分ける。
+            if [ -d .git ] && [ -z "''${GIT_INDEX_FILE:-}" ]; then
               # 失敗しても devShell には入れる。フックが無くても作業自体は
               # できるので、ここで止めると不便なだけ。ただし黙って進むと
               # 「pre-commit が動いていないことに誰も気付かない」状態になるので、
