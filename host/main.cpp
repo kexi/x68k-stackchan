@@ -462,7 +462,7 @@ int main(int argc, char** argv)
     // 打ち込みを始めるのは起動が落ち着いてから。IPL-ROM のウェイトループ中に
     // 送っても取りこぼされる。間隔を空けるのは、Human68k が 1 文字ずつ
     // 処理し終わるのを待つため。
-    constexpr x68k::u32 kKeyStartCycle = 250000000;
+    constexpr x68k::u32 kKeyStartCycle = 320000000;
     constexpr x68k::u32 kKeyIntervalCycles = 2000000;
     std::size_t keyIndex = 0;
     x68k::u64 nextKeyCycle = kKeyStartCycle;
@@ -586,6 +586,10 @@ int main(int argc, char** argv)
         std::printf("[mfp] IERA=%02X IPRA=%02X IMRA=%02X RSR=%02X UDR=%02X SR=%04X\n",
                     machine.mfp().peek(0x03), machine.mfp().peek(0x05), machine.mfp().peek(0x09),
                     machine.mfp().peek(0x15), machine.mfp().peek(0x17), machine.cpu().state().sr);
+
+        std::printf("[key] $000BC2=%02X $000BC4=%02X $000ADE=%04X 残数 $000BCA=%u\n",
+                    machine.bus().read8(0x0BC2), machine.bus().read8(0x0BC4),
+                    machine.bus().read16(0x0ADE), machine.bus().read8(0x0BCB));
 
         // テキストパレット。全部黒だと、描かれていても PPM は真っ黒になる。
         for (x68k::u32 i = 0; i < x68k::VideoController::kTextPaletteCount; ++i)
