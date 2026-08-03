@@ -47,6 +47,7 @@ void Machine::reset()
     crtc_.reset();
     video_.reset();
     mfp_.reset();
+    rtc_.reset();
     sasi_ = SasiState{};
 
     // リセット直後は IPL-ROM が $000000 に写像されている。
@@ -68,6 +69,7 @@ u32 Machine::step()
     }
 
     mfp_.tick(cycles);
+    rtc_.tick(cycles);
     if (crtc_.tick(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
@@ -145,19 +147,26 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kRtcBase:
-            // RTC (RP5C15) のスタブ。時計は固定値を返す。
-            // 未実装だと Human68k の日付表示で止まることがあるため、
-            // 「読める」ことだけ保証する。
-            return 0u;
+            // RTC (RP5C15)。レジスタは 4bit 幅で 2 バイトおきに並ぶ。
+            // Human68k は起動時に日付を読むので、妥当な値を返す必要がある。
+            return rtc_.read((addr - kRtcBase) / 2);
 
         case kSysPortBase:
             // システムポート。コントラストや CPU 種別。
-            // bit3-0 が CPU 種別で、0 は 68000。
+            //
+            // $E8E00B の bit3-0 が CPU 種別で、$DC が 68000 を表す
+            // (上位ニブルは常に $D)。ここを間違えると IOCS が 68030 向けの
+            // 初期化をしようとして失敗する。
+            if ((addr & 0x0Fu) == 0x0B)
+            {
+                return 0xDCu;
+            }
             return 0u;
 
         case kOpmBase:
             // YM2151。ステータスレジスタは bit7 = BUSY。
-            // 常に「準備完了」を返さないと IOCS の初期化ループが終わらない。
+            // 常に「準備完了」(bit7 = 0) を返さないと IOCS の初期化ループが
+            // 終わらない。
             return 0u;
 
         case kAdpcmBase:
@@ -203,6 +212,10 @@ void Machine::ioWrite8(u32 addr, u8 value)
 
         case kMfpBase:
             mfp_.write((addr - kMfpBase) / 2, value);
+            return;
+
+        case kRtcBase:
+            rtc_.write((addr - kRtcBase) / 2, value);
             return;
 
         case kSasiBase:

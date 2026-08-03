@@ -15,6 +15,7 @@
 #include "bus.h"
 #include "cpu/m68k.h"
 #include "dev/mfp.h"
+#include "dev/rtc.h"
 #include "dev/sram.h"
 #include "dev/video.h"
 
@@ -88,6 +89,10 @@ public:
     {
         return mfp_;
     }
+    [[nodiscard]] Rtc& rtc()
+    {
+        return rtc_;
+    }
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
@@ -121,6 +126,7 @@ private:
     Crtc crtc_;
     VideoController video_;
     Mfp mfp_;
+    Rtc rtc_;
     DiskImage* disk_ = nullptr;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
