@@ -20,11 +20,14 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 
 #include "display_lcd.h"
+#include "frame_channel.h"
 #include "input_touch.h"
+#include "key_queue.h"
 #include "io/ascii_keymap.h"
 #include "machine.h"
 #include "storage_sd.h"
@@ -51,12 +54,17 @@ x68k::u8* g_textVram = nullptr;
 x68k::u8* g_graphicVram = nullptr;
 x68k::u8* g_iplRom = nullptr;
 x68k::u8* g_cgRom = nullptr;
-x68k::u16* g_frameBuffer = nullptr;
+// フレームバッファは 2 枚。エミュレーションコアが片方へ変換している間に、
+// 表示コアがもう片方を LCD へ送る。
+x68k::u16* g_frameBufferA = nullptr;
+x68k::u16* g_frameBufferB = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
 x68k_platform::DisplayLcd g_display;
 x68k_platform::TouchKeyboard g_keyboard;
+x68k_platform::FrameChannel g_frames;
+x68k_platform::KeyQueue g_keys;
 
 void reportMemory(const char* phase)
 {
@@ -88,7 +96,9 @@ bool reserveMemory()
         heap_caps_calloc(1, kGraphicVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_cgRom = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kCgromBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    g_frameBuffer = static_cast<x68k::u16*>(
+    g_frameBufferA = static_cast<x68k::u16*>(
+        heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    g_frameBufferB = static_cast<x68k::u16*>(
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     // SASI の転送バッファ (64KB 弱)。
@@ -117,7 +127,8 @@ bool reserveMemory()
     reportMemory("after reserve");
 
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
-                    g_frameBuffer != nullptr && g_sasiBuffer != nullptr;
+                    g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
+                    g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
@@ -198,6 +209,20 @@ bool loadRoms()
     return true;
 }
 
+// エミュレーションコアから使うが、定義は下にある。
+void followCursor();
+void dumpScreen();
+
+// シリアルから画面ダンプを求められたら立つ。
+//
+// Why not SerialConsole の中に持たせるか: そうすると SerialConsole を
+// エミュレーションタスクより前に定義する必要が出て、宣言順が窮屈になる。
+// フラグ 1 つなら外に置いた方が読みやすい。
+//
+// 複数コアから触るので atomic にする。取りこぼしは「もう一度打てばよい」
+// で済むが、未定義動作は避けたい。
+std::atomic<bool> g_dumpRequested{false};
+
 // エミュレーションを回すタスク。
 //
 // Core1 に固定するのは、システムタスク (Wi-Fi/lwIP など) が Core0 寄りに
@@ -226,6 +251,27 @@ void emulatorTask(void* /*arg*/)
         g_machine.run(kSliceCycles);
         totalCycles += kSliceCycles;
 
+        // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
+        g_keys.drain(g_machine);
+
+        // シリアルから画面ダンプを求められていたらここで出す。
+        // テキスト VRAM の所有者はこのコア。
+        if (g_dumpRequested.exchange(false))
+        {
+            dumpScreen();
+        }
+
+        // 表示位置をカーソルへ追わせてから、変化があれば変換する。
+        //
+        // Machine を読むのはこのコアだけ。表示コアへは完成した RGB565 を
+        // 渡すので、テキスト VRAM やダーティフラグを両コアで奪い合わない。
+        followCursor();
+        const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
+        if (rendered)
+        {
+            g_frames.publish();
+        }
+
         // 生きていることと実効クロックを定期的に出す。実機は画面を直接
         // 見られないので、止まったのか遅いだけなのかがログでしか分からない。
         const std::uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -253,13 +299,12 @@ void emulatorTask(void* /*arg*/)
 // 「実機で何が出ているか」「打った文字が通るか」を手元で確かめる術がない。
 // USB シリアルを口にすればホストの --keys / --dump-text と同じことができる。
 //
-// Why not LCD の内容を画像で送るか: 768x512 のビットマップはシリアルには
-// 大きすぎる。ASCII に逆引きすれば 1 行 96 バイトで済む。
+// このクラスは表示コアで動く。Machine には触らず、打たれた文字は
+// KeyQueue へ積むだけ。画面のダンプもテキスト VRAM を読む必要があるので、
+// 要求を立ててエミュレーションコアに実行させる。
 class SerialConsole
 {
 public:
-    // 打った文字は押下と解放を分けて送る。X68000 のキーボードは
-    // 離した通知が来ないと押しっぱなしと見なす。
     void poll()
     {
         // USB Serial JTAG から直接読む。
@@ -272,100 +317,29 @@ public:
         const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), 0);
         for (int i = 0; i < n; ++i)
         {
-            enqueue(static_cast<char>(buf[i]));
+            handleChar(static_cast<char>(buf[i]));
         }
-
-        drainQueue();
     }
 
 private:
-    // 打つ文字を溜めておく。
-    //
-    // 押下と解放を続けざまに送ると Human68k が取りこぼす。MFP のキーボード
-    // 受信は 1 バイトずつしか保持できず、CPU が読み出す前に次を書くと
-    // 前のものが消える。実効 3.8MHz では 1 バイト読むのに数フレームかかる。
-    static constexpr std::size_t kQueueSize = 64;
-    char queue_[kQueueSize] = {};
-    std::size_t head_ = 0;
-    std::size_t tail_ = 0;
-
-    // 押下を送ってから解放を送るまでに空ける回数。poll は約 16ms 周期。
-    static constexpr int kFramesPerStep = 4;
-    int framesLeft_ = 0;
-    x68k::u8 pendingRelease_ = 0;
-
-    void enqueue(char c)
+    void handleChar(char c)
     {
-        const std::size_t next = (tail_ + 1) % kQueueSize;
-        const bool isFull = next == head_;
-        if (isFull)
-        {
-            return;
-        }
-        queue_[tail_] = c;
-        tail_ = next;
-    }
-
-    void drainQueue()
-    {
-        if (framesLeft_ > 0)
-        {
-            --framesLeft_;
-            return;
-        }
-
-        // 押下だけ送ってあるなら、先に解放を送る。
-        const bool hasPendingRelease = pendingRelease_ != 0;
-        if (hasPendingRelease)
-        {
-            g_machine.pressKey(static_cast<x68k::u8>(pendingRelease_ | 0x80u));
-            pendingRelease_ = 0;
-            framesLeft_ = kFramesPerStep;
-            return;
-        }
-
-        const bool isEmpty = head_ == tail_;
-        if (isEmpty)
-        {
-            return;
-        }
-
-        const char c = queue_[head_];
-        head_ = (head_ + 1) % kQueueSize;
-
         // '~' で画面を出す。Human68k に渡す文字と衝突しないものを選んだ。
+        // Why not ここで出さないか: テキスト VRAM を読むので、
+        // エミュレーションコアが書いている最中に読むとデータ競合になる。
+        // 要求だけ立てて、読むのは所有者に任せる。
         const bool isDumpRequest = c == '~';
         if (isDumpRequest)
         {
-            dumpScreen();
-            return;
-        }
-
-        // '%' で LCD へ送っている画素をそのまま吸い出す。
-        //
-        // テキスト画面の逆引き ('~') は VRAM の中身しか見ないので、
-        // 「VRAM は正しいのに LCD がおかしい」形の不具合を見つけられない。
-        // ラスタライズ後の画素を見れば、パレット・拡大・転送のどこで
-        // 崩れているかまで分かる。
-        const bool isFrameDumpRequest = c == '%';
-        if (isFrameDumpRequest)
-        {
-            dumpFrameBuffer();
-            return;
-        }
-
-        // '!' で画面を消して描き直す。表示が崩れたときに、崩れが
-        // 描画側に残っているのか LCD 側に残っているのかを切り分ける。
-        const bool isRefreshRequest = c == '!';
-        if (isRefreshRequest)
-        {
-            g_display.forceClear();
-            ESP_LOGI(kTag, "画面を消去して描き直します");
+            g_dumpRequested = true;
             return;
         }
 
         // '<' '>' で拡大率を変える。読みやすさと見える範囲は
         // 引き換えなので、実機を見ながら選べるようにする。
+        //
+        // DisplayLcd の設定は表示コアからしか変えないので、
+        // ここで直接呼んでよい。
         const bool isZoomOut = c == '<';
         const bool isZoomIn = c == '>';
         if (isZoomOut || isZoomIn)
@@ -380,98 +354,33 @@ private:
             return;
         }
 
-        const x68k::u8 code = x68k::asciiToScanCode(c);
-        const bool isTypable = code != 0;
-        if (!isTypable)
-        {
-            return;
-        }
-
-        g_machine.pressKey(code);
-        pendingRelease_ = code;
-        framesLeft_ = kFramesPerStep;
-    }
-
-    // LCD へ送っている RGB565 の画素をそのまま吐く。
-    //
-    // base64 で送る。生のバイナリだと ESP_LOG の行が混ざったときに
-    // 区切りが分からなくなり、0x0A を含む画素が改行と区別できない。
-    // 4/3 に膨らむが、150KB が 200KB になるだけで実用上は困らない。
-    static void dumpFrameBuffer()
-    {
-        if (g_frameBuffer == nullptr)
-        {
-            return;
-        }
-
-        constexpr x68k::u32 kWidth = x68k_platform::DisplayLcd::kScreenWidth;
-        constexpr x68k::u32 kHeight = x68k_platform::DisplayLcd::kScreenHeight;
-
-        std::printf("---- フレームバッファ %ux%u RGB565 base64 ----\n",
-                    static_cast<unsigned>(kWidth), static_cast<unsigned>(kHeight));
-
-        static const char kBase64[] =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(g_frameBuffer);
-        const std::size_t total = static_cast<std::size_t>(kWidth) * kHeight * 2;
-
-        // 3 バイトを 4 文字へ。行が長すぎると受け側の取りこぼしが増えるので
-        // 76 文字で折る。
-        char line[80];
-        std::size_t col = 0;
-        for (std::size_t i = 0; i < total; i += 3)
-        {
-            const std::uint32_t b0 = bytes[i];
-            const std::uint32_t b1 = (i + 1 < total) ? bytes[i + 1] : 0;
-            const std::uint32_t b2 = (i + 2 < total) ? bytes[i + 2] : 0;
-            const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
-
-            line[col++] = kBase64[(triple >> 18) & 0x3F];
-            line[col++] = kBase64[(triple >> 12) & 0x3F];
-            line[col++] = (i + 1 < total) ? kBase64[(triple >> 6) & 0x3F] : '=';
-            line[col++] = (i + 2 < total) ? kBase64[triple & 0x3F] : '=';
-
-            if (col >= 76)
-            {
-                line[col] = '\0';
-                std::printf("%s\n", line);
-                col = 0;
-                // USB CDC の送信バッファを詰まらせない。詰まると
-                // 画面更新のループごと止まる。
-                vTaskDelay(1);
-            }
-        }
-        if (col > 0)
-        {
-            line[col] = '\0';
-            std::printf("%s\n", line);
-        }
-
-        std::printf("---- フレームバッファここまで ----\n");
-        std::fflush(stdout);
-    }
-
-    static void dumpScreen()
-    {
-        if (g_textVram == nullptr || g_cgRom == nullptr)
-        {
-            return;
-        }
-
-        // ESP_LOG ではなく printf を使う。ログはタイムスタンプとタグが
-        // 行頭に付いて画面の形が崩れる。
-        std::printf("---- テキスト画面 ----\n");
-        char line[x68k::TextScrape::kColumns + 1];
-        for (x68k::u32 row = 0; row < x68k::TextScrape::kRows; ++row)
-        {
-            x68k::TextScrape::readRow(g_textVram, g_cgRom, row, line);
-            std::printf("%2u|%s\n", static_cast<unsigned>(row), line);
-        }
-        std::printf("----------------------\n");
-        std::fflush(stdout);
+        // 残りは X68000 へ。押下と解放に分ける仕事は KeyQueue が持つ。
+        g_keys.push(c);
     }
 };
+
+// テキスト画面を ASCII に逆引きしてシリアルへ出す。
+//
+// テキスト VRAM を読むので、エミュレーションコアから呼ぶ。
+void dumpScreen()
+{
+    if (g_textVram == nullptr || g_cgRom == nullptr)
+    {
+        return;
+    }
+
+    // ESP_LOG ではなく printf を使う。ログはタイムスタンプとタグが
+    // 行頭に付いて画面の形が崩れる。
+    std::printf("---- テキスト画面 ----\n");
+    char line[x68k::TextScrape::kColumns + 1];
+    for (x68k::u32 row = 0; row < x68k::TextScrape::kRows; ++row)
+    {
+        x68k::TextScrape::readRow(g_textVram, g_cgRom, row, line);
+        std::printf("%2u|%s\n", static_cast<unsigned>(row), line);
+    }
+    std::printf("----------------------\n");
+    std::fflush(stdout);
+}
 
 SerialConsole g_console;
 
@@ -553,7 +462,25 @@ extern "C" void app_main(void)
     g_machine.reset();
     ESP_LOGI(kTag, "リセット完了 PC=%08X", g_machine.cpu().state().pc - 4);
 
-    g_display.begin(g_frameBuffer);
+    g_display.begin();
+
+    // フレームの受け渡しとキューを用意する。
+    //
+    // これが無いと、エミュレーションコアが画面を作れずキーも届かない。
+    // 起動できないので、失敗したらここで止める。
+    if (!g_frames.begin(g_frameBufferA, g_frameBufferB))
+    {
+        ESP_LOGE(kTag, "フレームの受け渡しを用意できません");
+        x68k_platform::DisplayLcd::showMessage("INIT ERROR", "frame channel");
+        return;
+    }
+    if (!g_keys.begin())
+    {
+        ESP_LOGE(kTag, "キューを用意できません");
+        x68k_platform::DisplayLcd::showMessage("INIT ERROR", "key queue");
+        return;
+    }
+
     // Human68k のコンソールは 768x512。左上から映す。
     //
     // 等倍だと 8x16 の文字が 2 インチの画面にそのまま出て読み取れない。
@@ -596,10 +523,19 @@ extern "C" void app_main(void)
     while (true)
     {
         M5.update();
-        g_keyboard.poll(g_machine);
+        g_keyboard.poll(g_keys);
         g_console.poll();
-        followCursor();
-        g_display.present(g_machine, g_textVram);
+
+        // 変換済みのフレームがあれば LCD へ送る。
+        //
+        // Machine には一切触らない。触るのはエミュレーションコアだけで、
+        // ここへは完成した RGB565 が渡ってくる。
+        if (x68k::u16* frame = g_frames.take(); frame != nullptr)
+        {
+            g_display.pushFrame(frame);
+            g_frames.done();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(16));  // 約 60Hz
     }
 }

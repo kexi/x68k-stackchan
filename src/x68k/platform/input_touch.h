@@ -16,6 +16,7 @@
 
 #include <cstdint>
 
+#include "key_queue.h"
 #include "machine.h"
 
 namespace x68k_platform
@@ -31,9 +32,14 @@ public:
 
     void begin();
 
-    // タッチを読んで、押されたキーがあれば machine へ送る。
-    // 毎ループ呼ぶ。
-    void poll(x68k::Machine& machine);
+    // タッチを読んで、押されたキーがあれば queue へ積む。毎ループ呼ぶ。
+    //
+    // Why not Machine へ直接送るか: Machine の状態はエミュレーション
+    // コアが所有する。表示コアから触るとデータ競合になるうえ、MFP の
+    // 受信レジスタは 1 バイトしか保持しないので、押下と解放を続けて
+    // 書くと入力が消える。queue に積んでおけば、エミュレーションコアが
+    // 自分のペースで間隔を空けて送れる。
+    void poll(KeyQueue& keys);
 
     // キーボードを描画する。表示が上書きされた後に呼び直す。
     void draw();
@@ -45,10 +51,6 @@ public:
     {
         return visible_;
     }
-
-    // ASCII 文字を X68000 のスキャンコードへ変換する。
-    // 対応しない文字は 0 を返す。
-    [[nodiscard]] static x68k::u8 asciiToScanCode(char ascii);
 
 private:
     // 押しっぱなしで連打にならないよう、離すまで次を送らない。

@@ -30,6 +30,8 @@ idf_component_register(
         # --- platform: ESP32 専用 ---
         "${X68K_ROOT}/src/x68k/platform/storage_sd.cpp"
         "${X68K_ROOT}/src/x68k/platform/display_lcd.cpp"
+        "${X68K_ROOT}/src/x68k/platform/frame_channel.cpp"
+        "${X68K_ROOT}/src/x68k/platform/key_queue.cpp"
         "${X68K_ROOT}/src/x68k/platform/input_touch.cpp"
     INCLUDE_DIRS
         "."

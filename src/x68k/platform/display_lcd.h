@@ -7,10 +7,14 @@
 // そのまま縮小すると 8x16 のフォントが 3.3x7.5 ドットになって読めないので、
 // 等倍で一部を切り出し、カーソルを追うようにスクロールさせる。
 //
-// 転送量について:
-//   SPI 接続の ILI9342C に全画面 (150KB) を毎フレーム送ると間に合わない。
-//   テキスト VRAM への書き込みで立てたダーティ行を見て、変化した帯だけを送る。
-//   プロンプトが点滅しているだけの状態なら転送は数 KB で済む。
+// 役割を 2 つに分けてある:
+//   renderTo()  — テキスト VRAM を RGB565 へ変換する。Machine を読むので
+//                 エミュレーションコア (Core1) から呼ぶ。
+//   pushFrame() — できあがった RGB565 を LCD へ送る。Machine を触らないので
+//                 表示コア (Core0) から呼べる。
+//
+// なぜ分けるか: Machine の状態を両コアから触るとデータ競合になる。
+// 変換を Core1 に寄せ、Core0 へは完成したフレームだけを渡す。
 
 #ifndef X68K_PLATFORM_DISPLAY_LCD_H
 #define X68K_PLATFORM_DISPLAY_LCD_H
@@ -29,10 +33,8 @@ public:
     static constexpr x68k::u32 kScreenWidth = 320;
     static constexpr x68k::u32 kScreenHeight = 240;
 
-    // 変換バッファを受け取る。実体の確保は呼び出し側の責務
-    // (PSRAM の断片化を避けるため起動直後に一括確保したい)。
-    // buffer は kScreenWidth * kScreenHeight 個の u16 が要る。
-    void begin(x68k::u16* buffer);
+    // LCD を初期化する。表示コアから 1 度だけ呼ぶ。
+    void begin();
 
     // 表示位置を設定する。768x512 の中のどこを映すか。
     void setViewport(x68k::u32 x, x68k::u32 y);
@@ -58,37 +60,32 @@ public:
         return viewY_;
     }
 
-    // 変化した部分だけを LCD へ送る。
-    // 送るものが無ければ何もしない。
-    void present(x68k::Machine& machine, const x68k::u8* textVram);
+    // --- エミュレーションコア (Core1) から呼ぶ ---
 
-    // 次のフレームで全体を送り直す。表示位置を変えた後などに呼ぶ。
+    // テキスト VRAM を RGB565 へ変換して out へ書く。
+    //
+    // 変化が無く、全体の描き直しも要らなければ false を返して何もしない。
+    // その場合は転送も要らない。
+    bool renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out);
+
+    // 次のフレームで全体を描き直させる。表示位置を変えた後などに呼ぶ。
     void invalidateAll()
     {
         forceFullRedraw_ = true;
     }
 
-    // LCD を黒で塗ってから描き直させる。表示が崩れたときの切り分けに使う。
-    void forceClear();
+    // --- 表示コア (Core0) から呼ぶ ---
+
+    // できあがった RGB565 を LCD へ送る。
+    void pushFrame(const x68k::u16* frame);
 
     // 起動時のメッセージを出す。ROM が見つからないときなどに使う。
     static void showMessage(const char* line1, const char* line2 = nullptr);
 
 private:
-    // LCD を黒で塗り潰し、次のフレームで全体を描き直させる。
-    //
-    // 拡大率や表示位置が変わると同じ画素に別の内容が来る。消さずに
-    // 描き直すと、前の設定で描いた文字が下に残って層になる。
-    void clearScreen();
+    // 拡大表示。全画面を作り直す。
+    void renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out);
 
-    // ダーティ行だけを送る実装。切り出し位置が動くと古い描画が残るため
-    // 現在は使っていない。表示位置を固定する運用に戻すときのために残す。
-    void presentDirtyRowsOnly(x68k::Machine& machine, const x68k::u8* textVram);
-
-    // 拡大表示。全画面を作り直して送る。
-    void renderZoomed(x68k::Machine& machine, const x68k::u8* textVram);
-
-    x68k::u16* buffer_ = nullptr;
     x68k::u32 viewX_ = 0;
     x68k::u32 viewY_ = 0;
     x68k::u32 zoom_ = 1;
