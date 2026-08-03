@@ -155,17 +155,36 @@ def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
     return bytes(code)
 
 
-def build_id_sector(total_sectors: int) -> bytes:
-    """IPL-ROM が最初に読む識別セクタを組む。
+def build_id_sector(total_sectors: int, partition_start: int, partition_sectors: int) -> bytes:
+    """LBA 4 に置くセクタを組む。IPL-ROM と Human68k の両方がここを読む。
 
-    総セクタ数はオフセット 8。IPL-ROM は $FF920A で 8(SP) を読み、
-    $9FD9 / $13D1D と比べてディスクの諸元テーブル ($FF99B2 から $14 刻み)
-    を選ぶ。位置を間違えると容量 0 とみなされ、小容量向けの諸元が
-    使われる。
+    IPL-ROM が見るもの:
+        $00 "X68K" ($FF91FA の CMPI.L)
+        $08 総セクタ数。$FF920A で読み、$9FD9 / $13D1D と比べて
+            ディスクの諸元テーブル ($FF99B2 から $14 刻み) を選ぶ
+
+    Human68k が見るもの (HUMAN.SYS の +$1848 以降):
+        $00 "X68K" (+$188E)
+        $10 からパーティションテーブル。16 バイト単位で並ぶ (+$189C)
+            +$0 "Human68k" (+$18A0 / +$18A8)
+            +$8 開始セクタ (+$18FC)。上位バイトはフラグ
+            +$C セクタ数 (+$1936)
+
+    IPL-ROM 側だけ満たしても Human68k はパーティションを見つけられず、
+    CONFIG.SYS も COMMAND.X も読みに行かない。両方が要る。
     """
     sector = bytearray(SASI_SECTOR_SIZE)
     sector[0:4] = BOOT_MAGIC
     struct.pack_into(">I", sector, 8, total_sectors)
+
+    # パーティションテーブルの 1 件目。
+    #
+    # 開始セクタの bit24 は「起動可能」の印。Human68k は +$1900 の
+    # BTST #24 でこれを見て、立っていない領域は読み飛ばす。
+    sector[0x10:0x18] = b"Human68k"
+    struct.pack_into(">I", sector, 0x18, partition_start | 0x01000000)
+    struct.pack_into(">I", sector, 0x1C, partition_sectors)
+
     return bytes(sector)
 
 
@@ -409,7 +428,7 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     offset = BOOT_CODE_LBA * SASI_SECTOR_SIZE
     image[offset : offset + len(boot_code)] = boot_code
 
-    id_sector = build_id_sector(total_sectors)
+    id_sector = build_id_sector(total_sectors, FAT_START_LBA, total_sectors - FAT_START_LBA)
     offset = BOOT_ID_LBA * SASI_SECTOR_SIZE
     image[offset : offset + len(id_sector)] = id_sector
 
