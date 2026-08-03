@@ -302,14 +302,133 @@ u32 M68k::groupQuickAlu(u16 op)
 }
 
 // 1110: シフトとローテート
+// メモリに対する 1 ビットシフト / ローテート。
+//
+// レジスタ版と違い、サイズはワード固定、シフト量は 1 固定、対象は実効アドレス。
+// 命令語のビット配置も違う (bit 9-10 がシフトの種類、bit 8 が方向)。
+//
+// Why not groupShift のループを共有するか: 回数が 1 に固定なので
+// ループが要らず、フラグの決まり方もレジスタ版の「回数 0 のときの特例」が
+// 存在しないぶん単純になる。共有すると分岐だらけになって読みにくい。
+u32 M68k::memoryShift(u16 op)
+{
+    const u32 mode = (op >> 3) & 7u;
+    const u32 reg = op & 7u;
+    const bool isLeft = (op & 0x0100u) != 0;
+    const u32 shiftType = (op >> 9) & 3u;  // 0=AS 1=LS 2=ROX 3=RO
+
+    // データレジスタ直接とアドレスレジスタ直接は取れない形式。
+    const bool isRegisterDirect = mode == 0 || mode == 1;
+    if (isRegisterDirect)
+    {
+        return unimplemented(op);
+    }
+
+    constexpr u32 kSize = 2;  // ワード固定
+    const u32 msb = alu::signBit(kSize);
+
+    u32 addr = 0;
+    const u32 before = readEaForModify(mode, reg, kSize, addr);
+    u32 value = before;
+
+    const bool extendIn = (st_.sr & sr_bit::kExtend) != 0;
+    bool carry = false;
+    bool extendOut = extendIn;
+    bool overflow = false;
+
+    if (isLeft)
+    {
+        const bool bitOut = (value & msb) != 0;
+        if (shiftType == 3)
+        {
+            value = alu::truncate((value << 1) | (bitOut ? 1u : 0u), kSize);
+        }
+        else if (shiftType == 2)
+        {
+            value = alu::truncate((value << 1) | (extendIn ? 1u : 0u), kSize);
+            extendOut = bitOut;
+        }
+        else
+        {
+            value = alu::truncate(value << 1, kSize);
+            extendOut = bitOut;
+        }
+        carry = bitOut;
+        // ASL は符号ビットが変われば V を立てる。
+        if (shiftType == 0 && ((before ^ value) & msb) != 0)
+        {
+            overflow = true;
+        }
+    }
+    else
+    {
+        const bool bitOut = (value & 1u) != 0;
+        if (shiftType == 3)
+        {
+            value = alu::truncate((value >> 1) | (bitOut ? msb : 0u), kSize);
+        }
+        else if (shiftType == 2)
+        {
+            value = alu::truncate((value >> 1) | (extendIn ? msb : 0u), kSize);
+            extendOut = bitOut;
+        }
+        else if (shiftType == 0)
+        {
+            // ASR は符号ビットを保つ。
+            const bool sign = (value & msb) != 0;
+            value = alu::truncate((value >> 1) | (sign ? msb : 0u), kSize);
+            extendOut = bitOut;
+        }
+        else
+        {
+            value = alu::truncate(value >> 1, kSize);
+            extendOut = bitOut;
+        }
+        carry = bitOut;
+    }
+
+    writeEaToAddr(mode, reg, kSize, addr, value);
+
+    u16 sr = static_cast<u16>(
+        st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
+    if (value == 0)
+    {
+        sr |= sr_bit::kZero;
+    }
+    if (alu::isNegative(value, kSize))
+    {
+        sr |= sr_bit::kNegative;
+    }
+    if (overflow)
+    {
+        sr |= sr_bit::kOverflow;
+    }
+    if (carry)
+    {
+        sr |= sr_bit::kCarry;
+    }
+
+    // ROL/ROR は X を変えない。
+    if (shiftType != 3)
+    {
+        sr = static_cast<u16>(sr & ~sr_bit::kExtend);
+        if (extendOut)
+        {
+            sr |= sr_bit::kExtend;
+        }
+    }
+
+    st_.sr = sr;
+    return 8;
+}
+
 u32 M68k::groupShift(u16 op)
 {
     const u32 sizeField = (op >> 6) & 3u;
 
     if (sizeField == 3)
     {
-        // メモリに対する 1bit シフト。Human68k の起動には出てこないので後回し。
-        return unimplemented(op);
+        return memoryShift(op);
     }
 
     const u32 size = sizeFromField(sizeField);

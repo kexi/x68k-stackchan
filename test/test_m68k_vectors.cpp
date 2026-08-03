@@ -426,15 +426,6 @@ const std::set<std::string>& knownFailures()
         "ABCD",
         "SBCD",
         "NBCD",
-        // シフト / ローテートのワードサイズ。.b と .l は通る。
-        "ASL.w",
-        "ASR.w",
-        "LSL.w",
-        "LSR.w",
-        "ROL.w",
-        "ROR.w",
-        "ROXL.w",
-        "ROXR.w",
         // SR を直接触る命令。
         "ANDItoSR",
         "EORItoSR",
@@ -451,6 +442,7 @@ const std::set<std::string>& knownFailures()
         "ADDX.b",
         "BTST",
     };
+
     return names;
 }
 

@@ -134,7 +134,9 @@ private:
     u32 groupCmpEor(u16 op);     // 1011: CMP/CMPA/CMPM/EOR
     u32 groupAndMul(u16 op);     // 1100: AND/MULU/MULS/ABCD/EXG
     u32 groupAdd(u16 op);        // 1101: ADD/ADDA/ADDX
-    u32 groupShift(u16 op);      // 1110: ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR
+    u32 groupShift(u16 op);
+    // メモリに対する 1 ビットシフト。命令語の形式がレジスタ版と違う。
+    u32 memoryShift(u16 op);  // 1110: ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR
 
     // 未実装命令に当たったときの共通処理。
     u32 unimplemented(u16 op);
