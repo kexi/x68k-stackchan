@@ -198,6 +198,21 @@ void Mfp::clearPrescalerIfStopped(int index, u8 control)
 
 u32 Mfp::timerPrescale(u8 control) const
 {
+    // ディレイモード ($01-$07) 以外は分周しない。
+    //
+    // タイマ A/B の制御レジスタは 4bit あり、bit3 が立つと
+    // イベントカウント ($08) かパルス幅測定 ($09-$0F) になる。どちらも
+    // 外部入力 TAI/TBI で駆動されるので、内部クロックからは進まない。
+    // ここで 0 を返さないと、下位 3bit がそのまま分周比として拾われ、
+    // 入力に関係なくカウンタが減り続ける。
+    //
+    // タイマ C/D は 3bit しか無く、呼び出し側が既に 7 でマスクしている
+    // ため bit3 は立たない。この判定は素通りする。
+    const bool isInternallyClocked = (control & 0x08u) == 0;
+    if (!isInternallyClocked)
+    {
+        return 0;
+    }
     return kPrescaleTable[control & 7u];
 }
 
@@ -205,13 +220,16 @@ void Mfp::loadTimerIfStopped(int index, u8 control, u8 value)
 {
     // 停止中だけカウンタへ写す。動作中は次のリロードまで待つ。
     //
-    // Why not timerPrescale(control) == 0 で判定しないか: あれは下位 3bit しか
-    // 見ない。制御値 $08 (イベントカウントモード) でも 0 を返すが、これは
-    // 停止ではなく外部入力で動く状態。$00 だけが停止。
+    // Why not timerPrescale(control) == 0 で判定しないか: あれは「内部クロックで
+    // 進むか」を返す。$08 (イベントカウント) と $09-$0F (パルス幅測定) でも 0 に
+    // なるが、これらは停止ではなく外部入力 TAI/TBI で動く状態。$00 だけが停止。
     //
-    // 本エミュレータはイベントカウントとパルス幅測定を実装しておらず、
-    // tickTimer もそれらを進めない。それでも「停止」と一緒くたにしないのは、
-    // 実装したときにここが誤ったままになるのを避けるため。
+    // 本エミュレータは外部入力の 2 モードを実装しておらず、実際にはカウンタが
+    // 動かない。それでも「停止」と一緒くたにしないのは、実装したときにここが
+    // 誤ったままになるのを避けるため。
+    //
+    // なおパルス幅測定は、制御値だけでは停止か動作中かを決められない
+    // (TAI/TBI が非アクティブな間だけ止まる)。実装するときは入力の状態も要る。
     const bool isStopped = (control & 0x0Fu) == 0;
     if (isStopped)
     {

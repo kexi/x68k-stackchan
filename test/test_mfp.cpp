@@ -451,3 +451,84 @@ TEST_CASE("停止中のデータレジスタへの書き込みは即座に効く
     mfp.write(x68k::Mfp::kTadr, 42);
     CHECK(mfp.read(x68k::Mfp::kTadr) == 42);
 }
+
+TEST_CASE("外部入力モードのタイマは内部クロックで進まない")
+{
+    // 保証すること: 制御値 $08 (イベントカウント) と $09-$0F (パルス幅測定) の
+    // タイマが、内部クロックでは減らないこと。これらは外部入力 TAI/TBI で
+    // 駆動される。
+    //
+    // 壊れると: 下位 3bit が分周比として拾われ、入力に関係なくカウンタが
+    // 減り続ける。$0C なら 64 分周のタイマとして勝手に割り込みを上げる。
+    for (const x68k::u8 control : {x68k::u8{0x08}, x68k::u8{0x09}, x68k::u8{0x0C}, x68k::u8{0x0F}})
+    {
+        CAPTURE(control);
+        x68k::Mfp mfp = makeMfp();
+        enableGroupA(mfp, x68k::Mfp::kIntTimerA);
+
+        mfp.write(x68k::Mfp::kTadr, 4);
+        mfp.write(x68k::Mfp::kTacr, control);
+
+        // 最大の分周比 (200) で 4 カウントぶん回しても足りるだけ進める。
+        mfp.tick(200 * 2 * 8);
+
+        CHECK(mfp.read(x68k::Mfp::kTadr) == 4);
+        CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) == 0);
+    }
+}
+
+TEST_CASE("停止するとプリスケーラの端数は捨てられる")
+{
+    // 保証すること: 実機は停止でメインカウンタを保つがプリスケーラの残量は
+    // 失うこと。止めて設定し直して再開したとき、最初の 1 カウントが
+    // 丸ごと必要になる。
+    //
+    // 壊れると: 端数が残ったまま再開し、最初の周期だけ早く減る。
+    // 「止めて設定して動かす」を繰り返すコードで割り込み間隔がずれる。
+    x68k::Mfp mfp = makeMfp();
+
+    mfp.write(x68k::Mfp::kTadr, 10);
+    mfp.write(x68k::Mfp::kTacr, 0x01);  // 4 分周
+
+    // 1 カウントに満たない端数だけ進める。
+    mfp.tick(3 * 2);
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 10);
+
+    // 停止して再開する。端数が残っていれば 1 MFP サイクルで減ってしまう。
+    mfp.write(x68k::Mfp::kTacr, 0x00);
+    mfp.write(x68k::Mfp::kTacr, 0x01);
+
+    mfp.tick(3 * 2);
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 10);
+
+    // 4 サイクル目でようやく減る。
+    mfp.tick(1 * 2);
+    CHECK(mfp.read(x68k::Mfp::kTadr) == 9);
+}
+
+TEST_CASE("TCDCR はタイマ C と D のプリスケーラを別々に捨てる")
+{
+    // 保証すること: TCDCR は 1 バイトで 2 つのタイマを制御する。片方だけを
+    // 止めたとき、もう片方の端数まで捨てないこと。
+    //
+    // 壊れると: タイマ C を止めるたびに動作中のタイマ D の周期が延びる。
+    // Human68k はタイマ C を割り込みに使うため、実害が出る。
+    x68k::Mfp mfp = makeMfp();
+
+    mfp.write(x68k::Mfp::kTcdr, 10);
+    mfp.write(x68k::Mfp::kTddr, 10);
+    // C = 4 分周 (bits 6-4)、D = 4 分周 (bits 2-0)。
+    mfp.write(x68k::Mfp::kTcdcr, 0x11);
+
+    // 両方を 1 カウントに満たない端数だけ進める。
+    mfp.tick(3 * 2);
+
+    // C だけ止めて再開する。D は動かしたまま。
+    mfp.write(x68k::Mfp::kTcdcr, 0x01);
+    mfp.write(x68k::Mfp::kTcdcr, 0x11);
+
+    // 1 サイクル進めると、端数が残っている D は減り、捨てられた C は残る。
+    mfp.tick(1 * 2);
+    CHECK(mfp.read(x68k::Mfp::kTcdr) == 10);
+    CHECK(mfp.read(x68k::Mfp::kTddr) == 9);
+}
