@@ -310,7 +310,13 @@ int main(int argc, char** argv)
     std::string cgromPath;
     std::string hddPath;
     std::string ppmPath;
-    x68k::u32 cycleLimit = 20000000;
+    // サイクル数は 64bit で持つ。
+    //
+    // X68000 は 10MHz なので 32bit では 7 分ぶんしか数えられない。
+    // 起動を追うだけなら足りるが、Human68k がプロンプトを出すまでに
+    // どれだけかかるか分からないうちは上限に余裕が要る。溢れると
+    // 「指定より早く止まった」ように見えて原因が分かりにくい。
+    x68k::u64 cycleLimit = 20000000;
     bool trace = false;
     bool traceDisk = false;
     std::string keys;
@@ -342,7 +348,7 @@ int main(int argc, char** argv)
         }
         else if (arg == "--cycles" && hasNext)
         {
-            cycleLimit = static_cast<x68k::u32>(std::strtoul(argv[++i], nullptr, 0));
+            cycleLimit = std::strtoull(argv[++i], nullptr, 0);
         }
         else if (arg == "--trace")
         {
@@ -445,7 +451,7 @@ int main(int argc, char** argv)
                 machine.cpu().state().pc - 4);
 
     // 実行。
-    x68k::u32 spent = 0;
+    x68k::u64 spent = 0;
     bool tracing = trace && !hasTraceFrom;
     x68k::u64 instructions = 0;
     TraceRing ring(traceLast);
@@ -459,7 +465,7 @@ int main(int argc, char** argv)
     constexpr x68k::u32 kKeyStartCycle = 250000000;
     constexpr x68k::u32 kKeyIntervalCycles = 2000000;
     std::size_t keyIndex = 0;
-    x68k::u32 nextKeyCycle = kKeyStartCycle;
+    x68k::u64 nextKeyCycle = kKeyStartCycle;
     bool keyReleased = true;
 
     while (spent < cycleLimit)
@@ -521,8 +527,9 @@ int main(int argc, char** argv)
         }
     }
 
-    std::printf("[done] %llu 命令 / %u サイクル実行\n",
-                static_cast<unsigned long long>(instructions), spent);
+    std::printf("[done] %llu 命令 / %llu サイクル実行\n",
+                static_cast<unsigned long long>(instructions),
+                static_cast<unsigned long long>(spent));
 
     if (machine.isHalted())
     {
