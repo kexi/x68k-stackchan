@@ -137,9 +137,111 @@ void printUsage()
         "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
+        "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
+        "  --stats         実行した命令の内訳を最後に出す\n"
         "\n"
         "ROM はライセンス上リポジトリに含まれない。NOTICE.md を参照。\n");
 }
+
+// 停止直前の命令を保持する輪状バッファ。
+//
+// トレースを全部出すと数百万行になって使いものにならない。
+// 一方で「なぜ止まったか」を知るには直前の流れが要る。
+// 直近 N 命令だけを覚えておいて、止まったときに吐く。
+class TraceRing
+{
+public:
+    struct Entry
+    {
+        x68k::u32 pc;
+        x68k::u16 opcode;
+        x68k::u32 d0;
+        x68k::u32 a0;
+        x68k::u32 sp;
+        x68k::u16 sr;
+    };
+
+    explicit TraceRing(std::size_t capacity) : entries_(capacity) {}
+
+    void push(const Entry& e)
+    {
+        if (entries_.empty())
+        {
+            return;
+        }
+        entries_[next_] = e;
+        next_ = (next_ + 1) % entries_.size();
+        if (count_ < entries_.size())
+        {
+            ++count_;
+        }
+    }
+
+    void dump() const
+    {
+        if (count_ == 0)
+        {
+            return;
+        }
+        std::printf("\n--- 停止直前の %zu 命令 ---\n", count_);
+        const std::size_t start = (next_ + entries_.size() - count_) % entries_.size();
+        for (std::size_t i = 0; i < count_; ++i)
+        {
+            const Entry& e = entries_[(start + i) % entries_.size()];
+            std::printf("%08X: %04X  D0=%08X A0=%08X SP=%08X SR=%04X\n", e.pc, e.opcode, e.d0, e.a0,
+                        e.sp, e.sr);
+        }
+    }
+
+private:
+    std::vector<Entry> entries_;
+    std::size_t next_ = 0;
+    std::size_t count_ = 0;
+};
+
+// 実行した命令の内訳を数える。
+//
+// IPL-ROM がどの命令を使うかが分かれば、実装の優先順位を決められる。
+// 「未実装命令で止まった」の一歩手前で、何が足りないかの見当がつく。
+class OpcodeStats
+{
+public:
+    void record(x68k::u16 opcode)
+    {
+        // 上位 4bit のグループごとに数える。命令語そのものを数えると
+        // 65536 通りになって傾向が見えない。
+        ++groupCount_[opcode >> 12];
+        ++total_;
+    }
+
+    void dump() const
+    {
+        static const char* kGroupNames[16] = {
+            "0000 即値/ビット操作", "0001 MOVE.b",  "0010 MOVE.l",  "0011 MOVE.w", "0100 misc",
+            "0101 ADDQ等",          "0110 分岐",    "0111 MOVEQ",   "1000 OR/DIV", "1001 SUB",
+            "1010 A-line",          "1011 CMP/EOR", "1100 AND/MUL", "1101 ADD",    "1110 シフト",
+            "1111 F-line",
+        };
+        std::printf("\n--- 実行した命令の内訳 (計 %llu) ---\n",
+                    static_cast<unsigned long long>(total_));
+        for (int g = 0; g < 16; ++g)
+        {
+            if (groupCount_[g] == 0)
+            {
+                continue;
+            }
+            const double percent = total_ > 0 ? 100.0 * static_cast<double>(groupCount_[g]) /
+                                                    static_cast<double>(total_)
+                                              : 0.0;
+            std::printf("  %-22s %10llu (%5.1f%%)\n", kGroupNames[g],
+                        static_cast<unsigned long long>(groupCount_[g]), percent);
+        }
+    }
+
+private:
+    x68k::u64 groupCount_[16] = {};
+    x68k::u64 total_ = 0;
+};
 
 }  // namespace
 
@@ -153,6 +255,8 @@ int main(int argc, char** argv)
     bool trace = false;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
+    std::size_t traceLast = 0;
+    bool showStats = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -188,6 +292,14 @@ int main(int argc, char** argv)
             traceFrom = static_cast<x68k::u32>(std::strtoul(argv[++i], nullptr, 16));
             hasTraceFrom = true;
             trace = true;
+        }
+        else if (arg == "--trace-last" && hasNext)
+        {
+            traceLast = static_cast<std::size_t>(std::strtoul(argv[++i], nullptr, 0));
+        }
+        else if (arg == "--stats")
+        {
+            showStats = true;
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -266,10 +378,13 @@ int main(int argc, char** argv)
     x68k::u32 spent = 0;
     bool tracing = trace && !hasTraceFrom;
     x68k::u64 instructions = 0;
+    TraceRing ring(traceLast);
+    OpcodeStats stats;
 
     while (spent < cycleLimit)
     {
-        const x68k::u32 pc = machine.cpu().state().pc - 4;
+        const auto& s = machine.cpu().state();
+        const x68k::u32 pc = s.pc - 4;
 
         if (hasTraceFrom && !tracing && pc == traceFrom)
         {
@@ -277,9 +392,16 @@ int main(int argc, char** argv)
         }
         if (tracing)
         {
-            const auto& s = machine.cpu().state();
             std::printf("%08X: %04X  D0=%08X A0=%08X A7=%08X SR=%04X\n", pc, s.ir, s.d[0], s.a[0],
                         s.a[7], s.sr);
+        }
+        if (traceLast > 0)
+        {
+            ring.push({pc, s.ir, s.d[0], s.a[0], s.a[7], s.sr});
+        }
+        if (showStats)
+        {
+            stats.record(s.ir);
         }
 
         const x68k::u32 used = machine.step();
@@ -299,6 +421,19 @@ int main(int argc, char** argv)
         const auto& s = machine.cpu().state();
         std::printf("[halt] 未実装命令 %04X @ PC=%08X\n", machine.haltedOpcode(), s.pc - 4);
         std::printf("       この命令を実装してから再実行してください。\n");
+        // 止まった理由を追うには直前の流れが要る。
+        ring.dump();
+    }
+    else if (spent >= cycleLimit)
+    {
+        // 止まらずにサイクル上限へ達した。無限ループの可能性がある。
+        std::printf("[limit] サイクル上限に達しました。--cycles で伸ばせます。\n");
+        ring.dump();
+    }
+
+    if (showStats)
+    {
+        stats.dump();
     }
 
     if (!ppmPath.empty())
