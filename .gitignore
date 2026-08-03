@@ -48,3 +48,7 @@ __pycache__/
 .vscode/
 .idea/
 *.swp
+
+# clang-tidy 用のビルドディレクトリ。just tidy が作る。
+# ローカルの絶対パスと Nix ストアのパスが埋まるので追跡しない。
+build-tidy/

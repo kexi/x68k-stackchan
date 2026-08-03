@@ -94,6 +94,9 @@ public:
     bool dmaRead(u8* value) override;
     bool dmaWrite(u8 value) override;
 
+    // データを受け取り切った後の後始末。DMA 経由と CPU 経由で共有する。
+    void finishSasiWrite();
+
     // DMAC がメモリを触る口。バスへそのまま流す。
     u8 dmaMemRead(u32 addr) override;
     void dmaMemWrite(u32 addr, u8 value) override;

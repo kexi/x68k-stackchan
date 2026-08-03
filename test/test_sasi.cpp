@@ -751,3 +751,41 @@ TEST_CASE("WRITE で扱える上限を超えたらエラーを返す")
     sendCommand(m, 0x0A, 0, 255);
     CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
 }
+
+TEST_CASE("DMA 経由の WRITE も要求されたぶんのセクタを書く")
+{
+    // 保証すること: DMA でデータを送る経路でも、複数セクタの WRITE が
+    // 全セクタ届くこと。
+    //
+    // 壊れると: 最初の 1 セクタだけ書いて成功を返す。CPU が 1 バイトずつ
+    // 書く経路と同じ欠陥だが、コードが二重にあったため片方だけ直っていた。
+    // Human68k は DMA を使うので、実際に踏むのはこちら。
+    x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
+    FakeDisk disk(16);
+    m.setDisk(&disk);
+
+    sendCommand(m, 0x0A, 6, 2);  // セクタ 6 から 2 つ
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
+
+    // DMAC が dmaWrite で 1 バイトずつ流す。
+    constexpr x68k::u32 kSectors = 2;
+    for (x68k::u32 s = 0; s < kSectors; ++s)
+    {
+        for (x68k::u32 i = 0; i < FakeDisk::kSectorSize; ++i)
+        {
+            const auto value = static_cast<x68k::u8>(i == 0 ? (0x70u + s) : 0x22u);
+            CHECK(m.dmaWrite(value));
+        }
+    }
+
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
+    CHECK(m.ioRead8(kSasiData) == 0x00);
+
+    for (x68k::u32 s = 0; s < kSectors; ++s)
+    {
+        const std::size_t offset = (6 + s) * FakeDisk::kSectorSize;
+        CHECK(disk.data_[offset] == static_cast<x68k::u8>(0x70u + s));
+        CHECK(disk.data_[offset + 1] == 0x22);
+    }
+}

@@ -510,6 +510,19 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     offset = FAT_START_LBA * SASI_SECTOR_SIZE
     if offset + len(fat_image) > hdd_bytes:
         raise ValueError("ファイルシステムが HDD の容量を超えています")
+
+    # HUMAN.SYS の生コピーと重なっていないか確かめる。
+    #
+    # 重なると DMA は完走するのに読み込んだ中身が FAT で壊れ、
+    # 「起動はするが Human68k が動かない」という切り分けにくい状態になる。
+    # 実際にこれで時間を使ったので、機械的に止める。
+    human_end_lba = human_lba + human_sectors
+    if human_end_lba > FAT_START_LBA:
+        raise ValueError(
+            f"HUMAN.SYS の生コピー (LBA {human_lba}-{human_end_lba - 1}) が "
+            f"FAT 領域 (LBA {FAT_START_LBA} 以降) と重なります。"
+            f"FAT_START_LBA を {human_end_lba} 以上にしてください"
+        )
     image[offset : offset + len(fat_image)] = fat_image
 
     boot_code = build_boot_code(human_lba, human_sectors, human.entry)

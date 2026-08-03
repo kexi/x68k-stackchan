@@ -411,6 +411,36 @@ bool Machine::dmaRead(u8* value)
     return true;
 }
 
+// データを受け取り切った後の後始末。
+//
+// WRITE ならディスクへ書き、ステータスフェーズへ移る。$C2 のパラメータは捨てる。
+//
+// Why not 呼び出し元それぞれに書くか: DMA 経由 (dmaWrite) と CPU が 1 バイトずつ
+// 書く経路 (ioWrite8) の 2 つがあり、同じ処理を二重に持っていた。片方だけ直した
+// せいで、DMA 経由の複数セクタ書き込みが 1 セクタしか書かないまま残っていた。
+void Machine::finishSasiWrite()
+{
+    if (sasi_.command[0] == kSasiWrite)
+    {
+        const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
+                        (static_cast<u32>(sasi_.command[2]) << 8) |
+                        static_cast<u32>(sasi_.command[3]);
+        // 受け取った分だけ書く。bufferLength はコマンドのセクタ数から決めてある。
+        const u32 sectors = sasi_.bufferLength / kSasiSectorSize;
+
+        // 書けなかったらエラーを返す。戻り値を捨てると、読み取り専用の
+        // イメージや I/O エラーでも成功に見え、Human68k は書けたつもりで
+        // 先へ進んでしまう。
+        const bool ok = disk_ != nullptr && disk_->isPresent() &&
+                        disk_->writeSector(lba, sasi_.buffer, sectors);
+        if (!ok)
+        {
+            sasi_.status = 0x02;
+        }
+    }
+    sasi_.phase = kPhaseStatus;
+}
+
 bool Machine::dmaWrite(u8 value)
 {
     if (sasi_.phase != kPhaseDataOut || sasi_.bufferPos >= sasi_.bufferLength)
@@ -420,14 +450,7 @@ bool Machine::dmaWrite(u8 value)
     sasi_.buffer[sasi_.bufferPos++] = value;
     if (sasi_.bufferPos >= sasi_.bufferLength)
     {
-        if (sasi_.command[0] == kSasiWrite && disk_ != nullptr && disk_->isPresent())
-        {
-            const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
-                            (static_cast<u32>(sasi_.command[2]) << 8) |
-                            static_cast<u32>(sasi_.command[3]);
-            disk_->writeSector(lba, sasi_.buffer, 1);
-        }
-        sasi_.phase = kPhaseStatus;
+        finishSasiWrite();
     }
     return true;
 }
@@ -646,26 +669,7 @@ void Machine::sasiWrite(u32 addr, u8 value)
             if (sasi_.bufferPos >= sasi_.bufferLength)
             {
                 // WRITE ならディスクへ書く。$C2 のパラメータは捨てる。
-                if (sasi_.command[0] == kSasiWrite)
-                {
-                    const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
-                                    (static_cast<u32>(sasi_.command[2]) << 8) |
-                                    static_cast<u32>(sasi_.command[3]);
-                    // 受け取った分だけ書く。bufferLength はコマンドの
-                    // セクタ数から決めてある。
-                    const u32 sectors = sasi_.bufferLength / kSasiSectorSize;
-
-                    // 書けなかったらエラーを返す。戻り値を捨てると、
-                    // 読み取り専用のイメージや I/O エラーでも成功に見え、
-                    // Human68k は書けたつもりで先へ進んでしまう。
-                    const bool ok = disk_ != nullptr && disk_->isPresent() &&
-                                    disk_->writeSector(lba, sasi_.buffer, sectors);
-                    if (!ok)
-                    {
-                        sasi_.status = 0x02;
-                    }
-                }
-                sasi_.phase = kPhaseStatus;
+                finishSasiWrite();
             }
             return;
         }

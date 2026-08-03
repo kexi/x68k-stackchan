@@ -126,8 +126,14 @@ bool reserveMemory()
 
     reportMemory("after reserve");
 
-    const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
-                    g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
+    // グラフィック VRAM も確かめる。
+    //
+    // これを外していたせいで、確保に失敗しても起動へ進んでいた。
+    // バスは null をベースアドレスとして受け取り、ゲストが初めて
+    // グラフィック VRAM の範囲を触った瞬間に落ちる。原因が分からない
+    // クラッシュになるので、ここで止める。
+    const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_graphicVram != nullptr &&
+                    g_iplRom != nullptr && g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
                     g_sasiBuffer != nullptr;
     if (!ok)
     {
@@ -538,6 +544,13 @@ extern "C" void app_main(void)
     // 等倍だと 8x16 の文字が 2 インチの画面にそのまま出て読み取れない。
     // 2 倍にすると 20 桁 x 7 行と狭くなるが、文字として判別できる。
     g_display.setViewport(0, 0);
+    // タッチキーボードは今は出さない。
+    //
+    // Why: 毎フレーム 320x240 の全面を送るので、描いても即座に消える。
+    // 見えないのに触ると反応する状態は、意図しない文字が入るだけで害しかない。
+    // 使うなら、フレームの下部を空けて描くか、キーボード領域だけ別に
+    // 転送する仕組みが要る。今はシリアルから打てるので急がない。
+    g_keyboard.setVisible(false);
     g_keyboard.begin();
 
     // シリアルからキーを拾えるようにする。
