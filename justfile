@@ -211,15 +211,15 @@ gitleaks:
 # ───── ツール ──────────────────────────────────────────────────────────────
 
 # CGROM はシャープの無償公開対象外で入手できないことがある。一方 IPLROM には
-# 6x12 の ANK フォントが入っている ($FFCFF6 付近, 254 文字)。これを抽出できれば
+# 6x12 の ANK フォントが入っている ($FFD018 から, 254 文字)。これを抽出できれば
 # CGROM 無しでも英数字コンソールを出せる。まず目視で確認するためのツール。
 [doc('IPLROM 内の 6x12 ANK フォントを抽出して PNG で確認する')]
 extract-font IPLROM OUT="/tmp/ank6x12.png":
     uv run tools/extract_font.py {{IPLROM}} --out {{OUT}}
 
-[doc('Human68k の FD イメージから SASI HDD イメージを作る')]
-make-hdd FD OUT:
-    uv run tools/make_sasi_image.py --fd {{FD}} --out {{OUT}}
+[doc('Human68k を展開したディレクトリから SASI HDD イメージを作る')]
+make-hdd SOURCE OUT:
+    uv run tools/make_sasi_image.py {{SOURCE}} {{OUT}}
 
 # CGROM はシャープの無償公開の対象外だが、東雲フォント (実質パブリックドメイン、
 # 「他フォーマットへの変換」を明示的に許諾) から相当品を作れる。これで漢字が出る。

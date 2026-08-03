@@ -113,7 +113,14 @@
             # lefthook.yml の git hook を登録する。冪等なので毎回実行してよい。
             # tarball checkout など .git が無い場合に落ちないようガードする。
             if [ -d .git ]; then
-              lefthook install >/dev/null 2>&1 || true
+              # 失敗しても devShell には入れる。フックが無くても作業自体は
+              # できるので、ここで止めると不便なだけ。ただし黙って進むと
+              # 「pre-commit が動いていないことに誰も気付かない」状態になるので、
+              # 出力は捨てずに警告を出す。
+              if ! lefthook install; then
+                echo "[x68k-stackchan] 警告: git hook を登録できませんでした。" >&2
+                echo "[x68k-stackchan] pre-commit の検査が動きません。" >&2
+              fi
             fi
 
             echo "[x68k-stackchan] idf.py $(idf.py --version 2>/dev/null | head -1) / just $(just --version | awk '{print $2}')"

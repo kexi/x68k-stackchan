@@ -33,6 +33,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
       - name: Grep guard
         run: |
           set -euo pipefail
@@ -60,6 +64,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
 
       - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
 
@@ -84,6 +92,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
 
       - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
 
@@ -133,6 +145,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
 
       - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
 
@@ -163,6 +179,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
 
       - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
 
