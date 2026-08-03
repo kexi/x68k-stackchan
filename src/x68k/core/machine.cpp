@@ -34,7 +34,19 @@ constexpr u32 kMfpInterruptLevel = 6;
 
 }  // namespace
 
-Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_) {}
+Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
+{
+    // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
+    // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
+    // Machine が受け取って処理する。
+    cpu_.setResetCallback(
+        [](void* context)
+        {
+            auto* self = static_cast<Machine*>(context);
+            self->bus_.setRomMappedAtZero(false);
+        },
+        this);
+}
 
 void Machine::setMemory(const MemoryMap& memory)
 {

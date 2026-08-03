@@ -21,6 +21,10 @@ constexpr u32 kCpuToMfpShift = 1;
 // GPIP4 (垂直帰線) のビット位置。
 constexpr u8 kGpipVDisp = 0x10;
 
+// TSR (送信状態レジスタ) の bit7 = 送信バッファ空き。
+// IPL-ROM はキーボードへコマンドを送る前にこれを待つ。
+constexpr u8 kTsrBufferEmpty = 0x80;
+
 }  // namespace
 
 void Mfp::reset()
@@ -30,6 +34,15 @@ void Mfp::reset()
     timerValue_.fill(0);
     // GPIP は入力がすべて H の状態で始まる。
     reg_[kGpip] = 0xFF;
+
+    // 送信バッファは空の状態で始める。
+    //
+    // TSR の bit7 (バッファ空き) を 0 のままにすると、IPL-ROM が
+    // キーボードへコマンドを送るところで永久に待ち続ける
+    // ($FF61C8 の「TSR を読んで bit7 を BTST し、0 なら戻る」ループ)。
+    // 本エミュレータは送信を即座に完了したものとして扱うので、
+    // 常に空いていることにする。
+    reg_[kTsr] = kTsrBufferEmpty;
 }
 
 u8 Mfp::read(u32 regIndex) const
@@ -79,6 +92,18 @@ void Mfp::write(u32 regIndex, u8 value)
         case kGpip:
             // GPIP は入力なので書き込みは DDR で出力に設定されたビットのみ有効。
             // X68000 では実質入力専用なので無視する。
+            return;
+
+        case kUdr:
+            // 送信データレジスタ。X68000 ではキーボードへのコマンド送信に使う
+            // (LED の制御など)。本エミュレータは送信先を持たないので捨てるが、
+            // 送信は即座に完了したものとして TSR の空きビットは立てたままにする。
+            // ここを 0 にすると IPL-ROM が次の送信で待ち続ける。
+            return;
+
+        case kTsr:
+            // 送信状態レジスタ。空きビットは常に立てておく (上記と同じ理由)。
+            reg_[kTsr] = static_cast<u8>(value | kTsrBufferEmpty);
             return;
 
         default:

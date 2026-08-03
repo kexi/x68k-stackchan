@@ -42,6 +42,19 @@ public:
     // 実際に受け付けられるかは SR の割り込みマスクによる。
     void requestInterrupt(u32 level);
 
+    // RESET 命令が実行されたときに呼ばれる。
+    //
+    // 68000 の RESET は RESET 信号を外部へ出すだけで CPU 自身は何もしないが、
+    // X68000 ではこれを受けてメモリコントローラが $000000 の ROM 写像を解除する。
+    // IPL-ROM は起動直後にこれを実行して通常のメモリ配置へ切り替える。
+    // 機種固有の反応なので、CPU からは外へ通知するだけにする。
+    using ResetCallback = void (*)(void* context);
+    void setResetCallback(ResetCallback callback, void* context)
+    {
+        resetCallback_ = callback;
+        resetContext_ = context;
+    }
+
     [[nodiscard]] M68kState& state()
     {
         return st_;
@@ -123,6 +136,10 @@ private:
     // ハンドラのベクタ自体が奇数を指す場合など、実機でも入れ子は起きる。
     // 無限に潜ると SP を食い潰すだけなので段数で打ち切る。
     int addressErrorDepth_ = 0;
+
+    // RESET 命令の通知先。
+    ResetCallback resetCallback_ = nullptr;
+    void* resetContext_ = nullptr;
 };
 
 }  // namespace x68k

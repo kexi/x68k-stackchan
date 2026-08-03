@@ -79,11 +79,21 @@ u32 M68k::groupMisc(u16 op)
         return 20;
     }
 
-    if (op == 0x4E70u)  // RESET: 周辺をリセットする信号を出すだけ
+    if (op == 0x4E70u)  // RESET
     {
         if (!requirePrivilege())
         {
             return 34;
+        }
+        // 68000 としては RESET 信号を外へ出すだけで CPU 自身は何もしない。
+        // ただし X68000 ではメモリコントローラがこれを受けて $000000 の
+        // ROM 写像を解除する。IPL-ROM は起動直後 ($FF001A) にこれを実行し、
+        // 通常のメモリ配置へ切り替える。
+        // ここを何もしないままにすると、以降 RAM を読んでも ROM の値が返り、
+        // スタックが読めずサブルーチンから戻れなくなる。
+        if (resetCallback_ != nullptr)
+        {
+            resetCallback_(resetContext_);
         }
         return 132;
     }

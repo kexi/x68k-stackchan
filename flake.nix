@@ -82,6 +82,10 @@
             pkgs.clang-tools
             pkgs.ruff
 
+            # X68000 の ROM と Human68k は LZH で配布されている
+            # (2000 年当時の主流だった圧縮形式)。展開に使う。
+            pkgs.lhasa
+
             # --- tools/ のスクリプト ---
             # uv 自体は Nix で固定し、python の依存は uv が pyproject.toml と
             # uv.lock から解決する。
