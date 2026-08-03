@@ -438,6 +438,14 @@ int main(int argc, char** argv)
 
     if (showStats)
     {
+        std::printf("[sram] $ED0018=%04X $ED0058=%02X $ED0000=%02X%02X%02X%02X\n",
+                    machine.sram().read16(0x18), machine.sram().read8(0x58),
+                    machine.sram().read8(0), machine.sram().read8(1), machine.sram().read8(2),
+                    machine.sram().read8(3));
+    }
+
+    if (showStats)
+    {
         // テキスト VRAM に何か書かれたか。真っ黒な PPM が出たとき、
         // 描画されていないのか、ラスタライザやパレットの側で見えなく
         // なっているのかを分ける手がかりになる。

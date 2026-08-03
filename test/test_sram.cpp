@@ -15,13 +15,16 @@ TEST_CASE("工場出荷状態のマジックが正しい")
     x68k::Sram sram;
     CHECK(sram.hasValidMagic());
 
-    // "X68000" + $00 + $57 の 8 バイト。
-    CHECK(sram.read8(0) == 'X');
-    CHECK(sram.read8(1) == '6');
-    CHECK(sram.read8(2) == '8');
-    CHECK(sram.read8(3) == '0');
+    // 「Ｘ68000」+ $57 の 8 バイト。先頭は半角の 'X' ではなく
+    // Shift_JIS の全角「Ｘ」($82 $77)。実機の IPL-ROM が書く値と一致する
+    // ことが要件で、半角だとマジック不正として SRAM を書き戻される。
+    CHECK(sram.read8(0) == 0x82);
+    CHECK(sram.read8(1) == 0x77);
+    CHECK(sram.read8(2) == '6');
+    CHECK(sram.read8(3) == '8');
     CHECK(sram.read8(4) == '0');
     CHECK(sram.read8(5) == '0');
+    CHECK(sram.read8(6) == '0');
     CHECK(sram.read8(7) == 0x57);
 }
 

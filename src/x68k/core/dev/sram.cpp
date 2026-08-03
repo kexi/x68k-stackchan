@@ -10,9 +10,13 @@ namespace x68k
 namespace
 {
 
-// IPL-ROM がマジックとして検査する 8 バイト。"X68000" の後ろは
-// メモリチェックが完了したことを示す $57。
-constexpr char kMagicText[] = "X68000";
+// IPL-ROM がマジックとして検査する 8 バイト。
+//
+// 先頭は半角の 'X' ではなく Shift_JIS の全角「Ｘ」($82 $77)。実機の
+// IPL-ROM が書く値を読み出して確かめた。半角で置くとマジック不正と
+// 判断され、SRAM 全体を工場出荷状態へ書き戻される。そのとき起動デバイスも
+// $0000 (標準優先順位) に戻るため、SASI 起動の設定が消えてしまう。
+constexpr std::uint8_t kMagicText[] = {0x82, 0x77, '6', '8', '0', '0', '0'};
 constexpr std::uint8_t kMagicTail = 0x57;
 constexpr std::uint32_t kMagicLength = 8;
 
@@ -28,14 +32,14 @@ void Sram::write32(std::uint32_t offset, std::uint32_t value)
 
 bool Sram::hasValidMagic() const
 {
-    for (std::uint32_t i = 0; i < 6; ++i)
+    for (std::uint32_t i = 0; i < 7; ++i)
     {
-        if (data_[kOffsetMagic + i] != static_cast<std::uint8_t>(kMagicText[i]))
+        if (data_[kOffsetMagic + i] != kMagicText[i])
         {
             return false;
         }
     }
-    // 7 バイト目は $00、8 バイト目が $57。
+    // 8 バイト目はメモリチェック完了を示す $57。
     return data_[kOffsetMagic + 7] == kMagicTail;
 }
 
@@ -44,8 +48,7 @@ void Sram::formatDefaults()
     data_.fill(0);
 
     // マジック。IPL-ROM はこれを見て「初期化済みの SRAM」と判断する。
-    std::memcpy(data_.data() + kOffsetMagic, kMagicText, 6);
-    data_[kOffsetMagic + 6] = 0x00;
+    std::memcpy(data_.data() + kOffsetMagic, kMagicText, sizeof(kMagicText));
     data_[kOffsetMagic + 7] = kMagicTail;
     static_assert(kMagicLength == 8, "magic layout assumes 8 bytes");
 

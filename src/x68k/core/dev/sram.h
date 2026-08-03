@@ -36,7 +36,9 @@ public:
 
     // 工場出荷状態の値。
     static constexpr std::uint32_t kDefaultRamSize = kMainRamSize;
-    static constexpr std::uint32_t kDefaultRomBootAddr = 0x00FC0000;
+    // ROM 起動アドレス。実機の IPL-ROM が書く値を読み出して確かめた。
+    // $FC0000 (SCSI ROM の先頭) ではなく $BFFFFC を指す。
+    static constexpr std::uint32_t kDefaultRomBootAddr = 0x00BFFFFC;
     static constexpr std::uint32_t kDefaultSramBootAddr = 0x00ED0100;
     // 起動デバイスの指定。
     //   $0000 = 標準優先順位 (FD → SASI → ROM → RAM)

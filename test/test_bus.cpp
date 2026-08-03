@@ -135,8 +135,8 @@ TEST_CASE("ROM 領域への書き込みは無視される")
 TEST_CASE("SRAM は $ED0000 から読み書きできる")
 {
     Fixture f;
-    // 工場出荷状態のマジックがバス経由でも見える。
-    CHECK(f.bus.read8(x68k::kSramBase) == 'X');
+    // 工場出荷状態のマジックがバス経由でも見える (先頭は全角「Ｘ」の 1 バイト目)。
+    CHECK(f.bus.read8(x68k::kSramBase) == 0x82);
 
     f.bus.write8(x68k::kSramBase + 0x100, 0x42);
     CHECK(f.bus.read8(x68k::kSramBase + 0x100) == 0x42);
