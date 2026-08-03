@@ -200,6 +200,14 @@ extract-font IPLROM OUT="/tmp/ank6x12.png":
 make-hdd FD OUT:
     uv run tools/make_sasi_image.py --fd {{FD}} --out {{OUT}}
 
+# CGROM はシャープの無償公開の対象外だが、東雲フォント (実質パブリックドメイン、
+# 「他フォーマットへの変換」を明示的に許諾) から相当品を作れる。これで漢字が出る。
+# BDF は同梱していないので、openlab.ring.gr.jp から取得して bdf/ を指定する。
+#   curl -O http://openlab.ring.gr.jp/efont/dist/shinonome/shinonome-0.9.11p1.tar.bz2
+[doc('東雲フォント (BDF) から CGROM 相当のイメージを作る')]
+make-cgrom BDF_DIR OUT="/tmp/cgrom.dat":
+    uv run tools/make_cgrom.py {{BDF_DIR}} {{OUT}}
+
 [doc('ビルド成果物を消す')]
 clean:
     rm -rf {{host_build}} {{san_build}} build-tidy build
