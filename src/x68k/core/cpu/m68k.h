@@ -95,6 +95,10 @@ private:
     // --- 例外 ----------------------------------------------------------------
     void takeException(u32 vectorNumber);
     void takeAddressError(u32 addr, bool isRead);
+    void takeBusError(u32 addr, bool isRead);
+    // アドレスエラーとバスエラーは同じ 14 バイトフレームを積む。
+    // 違うのはベクタ番号だけなので共通化する。
+    void takeGroup0Exception(u32 vectorNumber, u32 addr, bool isRead);
     [[nodiscard]] bool requirePrivilege();
 
     // --- 実効アドレス --------------------------------------------------------

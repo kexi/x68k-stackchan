@@ -39,6 +39,7 @@ void SystemBus::markTextDirty(u32 offsetInPlane)
 u8 SystemBus::read8(u32 addr)
 {
     const u32 a = addr & kAddrMask;
+    faulted_ = false;
 
     // --- メインメモリ (最頻) ---
     if (a < kMainRamSize)
@@ -98,15 +99,23 @@ u8 SystemBus::read8(u32 addr)
         return mem_.graphicVram[(a - kGvramBase) & (kTvramSize - 1)];
     }
 
-    // 未実装領域。バスエラーにはせず 0 を返す。
-    // IPL-ROM や IOCS は存在しないデバイスも初期化しに来るため、
-    // ここでバスエラーにすると起動が進まない。
+    // ここまでのどれにも当たらない領域。
+    //
+    // X68000 の IPL-ROM は「バスエラーベクタを差し替えてから読みに行き、
+    // エラーが起きれば装置が無い」という方法で SCSI ROM ($FC0000) の有無を
+    // 調べる ($FF0236)。0 を返してしまうと「ROM がある」ことになり、
+    // その先頭を JSR で呼んで暴走する。
+    //
+    // I/O 空間 ($E80000-$EBFFFF) は上で処理済みなので、ここへ来るのは
+    // 本当に何も繋がっていないアドレス。バスエラーにしてよい。
+    faulted_ = true;
     return 0u;
 }
 
 u16 SystemBus::read16(u32 addr)
 {
     const u32 a = addr & kAddrMask;
+    faulted_ = false;
 
     // ワード単位でまとめて読める領域は 2 回の read8 を避ける。
     // 命令フェッチが必ずここを通るので効果が大きい。
@@ -135,7 +144,14 @@ u16 SystemBus::read16(u32 addr)
         return io_.ioRead16(a);
     }
 
-    return static_cast<u16>((read8(a) << 8) | read8(a + 1));
+    // 上のどれにも当たらない領域は read8 を 2 回に分ける。
+    // read8 が faulted_ を書き換えるので、どちらかが失敗したら
+    // ワード全体を失敗として扱う。
+    const u8 hi = read8(a);
+    const bool hiFaulted = faulted_;
+    const u8 lo = read8(a + 1);
+    faulted_ = faulted_ || hiFaulted;
+    return static_cast<u16>((hi << 8) | lo);
 }
 
 void SystemBus::write8(u32 addr, u8 value)

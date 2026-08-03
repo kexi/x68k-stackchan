@@ -155,7 +155,15 @@ u16 M68k::read16(u32 addr)
         takeAddressError(a, true);
         return 0;
     }
-    return bus_.read16(a);
+    const u16 value = bus_.read16(a);
+    if (bus_.lastAccessFaulted())
+    {
+        // 応答しない領域へのアクセス。X68000 の IPL-ROM はこれを使って
+        // 装置の有無を調べる。
+        takeBusError(a, true);
+        return 0;
+    }
+    return value;
 }
 
 u32 M68k::read32(u32 addr)
@@ -168,7 +176,13 @@ u32 M68k::read32(u32 addr)
     }
     // 68000 のバスは 16bit なのでロングは 2 回に分かれる。上位が先。
     const u32 hi = bus_.read16(a);
+    const bool hiFaulted = bus_.lastAccessFaulted();
     const u32 lo = bus_.read16((a + 2) & kAddrMask);
+    if (hiFaulted || bus_.lastAccessFaulted())
+    {
+        takeBusError(a, true);
+        return 0;
+    }
     return (hi << 16) | lo;
 }
 
@@ -235,7 +249,19 @@ void M68k::takeException(u32 vectorNumber)
     refillPrefetch(handler);
 }
 
+void M68k::takeBusError(u32 addr, bool isRead)
+{
+    // バスエラーもアドレスエラーと同じグループ 0 例外で、
+    // 14 バイトの拡張スタックフレームを積む。違いはベクタ番号だけ。
+    takeGroup0Exception(vector::kBusError, addr, isRead);
+}
+
 void M68k::takeAddressError(u32 addr, bool isRead)
+{
+    takeGroup0Exception(vector::kAddressError, addr, isRead);
+}
+
+void M68k::takeGroup0Exception(u32 vectorNumber, u32 addr, bool isRead)
 {
     // アドレスエラーの入れ子は実機でも起きる (ハンドラのベクタ自体が奇数を指す等)。
     // ただし無限に潜ると SP を食い潰すだけなので、段数で打ち切る。
@@ -279,7 +305,7 @@ void M68k::takeAddressError(u32 addr, bool isRead)
     // ベクタの読み出しは bus_ を直に叩く (read32 を使うと奇数判定でここへ再入する)。
     // ハンドラへの分岐は refillPrefetch を通す。分岐先が奇数なら入れ子の
     // アドレスエラーになるのが実機の挙動で、上の段数ガードが打ち切る。
-    const u32 vectorAddr = vector::kAddressError * 4;
+    const u32 vectorAddr = vectorNumber * 4;
     const u32 handler =
         (static_cast<u32>(bus_.read16(vectorAddr)) << 16) | bus_.read16(vectorAddr + 2);
     refillPrefetch(handler);

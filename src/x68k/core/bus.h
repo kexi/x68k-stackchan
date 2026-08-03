@@ -72,6 +72,11 @@ public:
     void write8(u32 addr, u8 value) override;
     void write16(u32 addr, u16 value) override;
 
+    [[nodiscard]] bool lastAccessFaulted() const override
+    {
+        return faulted_;
+    }
+
     // テキスト VRAM への書き込みがあった矩形を追跡する。
     //
     // 画面全体を毎フレーム転送すると SPI 接続の LCD では間に合わないので、
@@ -127,6 +132,10 @@ private:
     Sram& sram_;
     IoHandler& io_;
     bool romAtZero_ = true;
+    // 直前のアクセスが応答しない領域だったか。
+    // IPL-ROM は SCSI ROM ($FC0000) の有無をバスエラーで調べるので、
+    // 「何も無い」ことを 0 ではなくエラーで返す必要がある。
+    bool faulted_ = false;
     bool textDirty_[kDirtyTileRows] = {};
 };
 

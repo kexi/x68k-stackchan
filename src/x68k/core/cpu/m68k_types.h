@@ -85,6 +85,20 @@ public:
     virtual void write16(u32 addr, u16 value) = 0;
     virtual u8 read8(u32 addr) = 0;
     virtual void write8(u32 addr, u8 value) = 0;
+
+    // 直前のアクセスがバスエラーだったか。
+    //
+    // X68000 の IPL-ROM は「バスエラーベクタを差し替えてから読みに行き、
+    // エラーが起きれば装置が無い」という方法で SCSI ROM の有無を調べる
+    // ($FF0236)。応答しない領域を 0 で埋めてしまうと、無いはずの ROM が
+    // 「ある」ことになって暴走する。
+    //
+    // 既定では常に false (バスエラーを起こさない)。テスト用の単純な
+    // バス実装が実装し忘れても壊れないようにするため。
+    [[nodiscard]] virtual bool lastAccessFaulted() const
+    {
+        return false;
+    }
 };
 
 // 68000 の実行状態。
