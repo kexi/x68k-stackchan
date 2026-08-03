@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 Kei Nakayama
 
+#include <cstdint>
+
 #include "video.h"
 
 namespace x68k
@@ -38,14 +40,18 @@ void Crtc::write(u32 regIndex, u16 value)
 
 u32 Crtc::rasterNumber() const
 {
-    // 範囲に収める。
+    // フレーム内の位置から比例で求める。
     //
-    // kCyclesPerRaster は kCyclesPerFrame / 568 の整数除算なので切り捨てが
-    // 起きる。frameCycles_ がフレーム終端に近いと商が 568 以上になり、
-    // 実機には存在しないラスタ番号を返す。ラスタ割り込みの比較や
-    // 「今どの行を描いているか」の判定で 1 フレームぶんずれる。
-    const u32 raster = frameCycles_ / kCyclesPerRaster;
-    return raster < kRasterCount ? raster : kRasterCount - 1;
+    // Why not frameCycles_ / kCyclesPerRaster とするか: kCyclesPerRaster は
+    // kCyclesPerFrame / 568 の整数除算なので端数が出る。180342 / 568 = 317
+    // だと 568 ラスタで 180056 サイクルにしかならず、余りの 286 サイクルが
+    // 最終ラスタへ集中する。ラスタ 0-566 は 317 サイクル、567 だけ 603
+    // サイクルという不均等な刻みになり、ラスタ割り込みが後半ほど早く出る。
+    //
+    // 先に掛けてから割れば端数がフレーム全体へ散り、商が 568 に達することも
+    // ない (frameCycles_ < kCyclesPerFrame が保たれる限り)。
+    return static_cast<u32>(static_cast<std::uint64_t>(frameCycles_) * kRasterCount /
+                            kCyclesPerFrame);
 }
 
 bool Crtc::tick(u32 cycles)

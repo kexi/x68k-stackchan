@@ -49,9 +49,15 @@ public:
 
     // SASI が 1 コマンドで扱えるセクタ数と、それに要るバッファの大きさ。
     //
-    // 上限が 255 なのはコマンドの長さフィールドが 1 バイトだから
-    // ($FF9678 で 256 で割った値が 4(A4) へ入る)。
-    static constexpr u32 kSasiMaxSectorsPerCommand = 255;
+    // 長さフィールドは 1 バイトだが、上限は 255 ではなく 256。
+    // SASI の 6 バイトコマンドでは 0 が「256 ブロック」を意味する
+    // (SASI Design Specifications Rev. F の 6.2.5)。1 と読むと、
+    // 256 セクタの要求で最初の 1 つだけ処理して成功を返してしまう。
+    // WRITE では静かなディスク破損になる。
+    //
+    // IPL-ROM は 0 を使わない (実測では 1 / 4 / 221) が、Human68k や
+    // アプリケーションが使う可能性がある。
+    static constexpr u32 kSasiMaxSectorsPerCommand = 256;
     static constexpr u32 kSasiBufferBytes = 256 * kSasiMaxSectorsPerCommand;
 
     // SASI の転送バッファを与える。kSasiBufferBytes 以上が要る。

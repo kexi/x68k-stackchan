@@ -658,4 +658,62 @@ TEST_CASE("DIVS が INT32_MIN / -1 で未定義動作に落ちない")
     CHECK(out.d[0] == 0x80000000u);
 }
 
+TEST_CASE("MOVE.B はアドレスレジスタ直接を弾き、副作用も残さない")
+{
+    // 保証すること: バイトサイズでアドレスレジスタ直接を使う符号を
+    // 不当命令として弾き、そのとき実効アドレスの副作用が起きないこと。
+    //
+    // 68000 はアドレスレジスタへのバイト単位のアクセスを持たない。
+    // 転送元・転送先のどちらに An が来ても不当命令。
+    //
+    // Why not 適合性ベクタに任せるか: upstream のベクタにこの組み合わせが
+    // 入っていない。127,514 件が通っていても捕まらない経路。
+    //
+    // 判定が readEa の後ろにあると、(An)+ で An が進んでから例外に入る。
+    // 実機は実効アドレスを読む前に符号で弾くので、レジスタは動かない。
+
+    SUBCASE("転送元がアドレスレジスタ直接")
+    {
+        VectorBus bus;
+        x68k::M68k cpu(bus);
+
+        x68k::M68kState st{};
+        st.a[0] = 0x12345678u;
+        st.sr = x68k::sr_bit::kSupervisor;
+        st.a[7] = 0x00001000u;
+        st.ssp = 0x00001000u;
+        st.pc = 0x00002004u;
+        st.ir = 0x1008u;  // MOVE.B A0,D0 — 定義されていない符号
+        st.irc = 0x4E71u;
+        cpu.loadStateForTest(st);
+
+        cpu.step();
+
+        // 不当命令ベクタ (4) へ飛ぶ。D0 は書き換わらない。
+        CHECK(cpu.state().d[0] == 0u);
+    }
+
+    SUBCASE("転送元が (An)+ で転送先がアドレスレジスタ直接")
+    {
+        VectorBus bus;
+        x68k::M68k cpu(bus);
+
+        x68k::M68kState st{};
+        st.a[1] = 0x00003000u;
+        st.sr = x68k::sr_bit::kSupervisor;
+        st.a[7] = 0x00001000u;
+        st.ssp = 0x00001000u;
+        st.pc = 0x00002004u;
+        st.ir = 0x1259u;  // MOVE.B (A1)+,A1 — MOVEA.B は存在しない
+        st.irc = 0x4E71u;
+        cpu.loadStateForTest(st);
+
+        cpu.step();
+
+        // 弾かれるので A1 は進まない。readEa の後ろで判定していると
+        // ここが 0x00003001 になる。
+        CHECK(cpu.state().a[1] == 0x00003000u);
+    }
+}
+
 TEST_SUITE_END();

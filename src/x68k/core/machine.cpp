@@ -222,8 +222,20 @@ u8 Machine::ioRead8(u32 addr)
         }
 
         case kMfpBase:
+        {
             // MFP のレジスタは奇数アドレスにのみ現れる。
+            //
+            // 偶数側は実体が無いので 0 を返す。以前は / 2 で偶数も同じ
+            // レジスタへ割り当てていたが、UDR の読み出しに「受信バッファフルを
+            // 落とす」副作用を足したため、UDR ではない偶数アドレスを読んだ
+            // だけでフラグが落ちるようになってしまった。
+            const bool isOddAddress = (addr & 1) != 0;
+            if (!isOddAddress)
+            {
+                return 0u;
+            }
             return mfp_.read((addr - kMfpBase) / 2);
+        }
 
         case kSasiBase:
             return sasiRead(addr);
@@ -316,8 +328,16 @@ void Machine::ioWrite8(u32 addr, u8 value)
         }
 
         case kMfpBase:
-            mfp_.write((addr - kMfpBase) / 2, value);
+        {
+            // 読み出しと同じく、レジスタは奇数アドレスにのみ現れる。
+            // 偶数側への書き込みは捨てる。
+            const bool isOddAddress = (addr & 1) != 0;
+            if (isOddAddress)
+            {
+                mfp_.write((addr - kMfpBase) / 2, value);
+            }
             return;
+        }
 
         case kRtcBase:
             rtc_.write((addr - kRtcBase) / 2, value);
@@ -612,10 +632,9 @@ void Machine::sasiWrite(u32 addr, u8 value)
 
                 case kSasiRead:
                 {
-                    // count = 0 は 1 セクタの意味。IPL-ROM はブートセクタを
-                    // 4 セクタまとめて要求するので、一度に読んで載せる。
-                    // 1 セクタずつ返すと DMA が 256 バイトで止まる。
-                    const u32 sectors = count == 0 ? 1u : count;
+                    // count = 0 は 256 セクタの意味 (SASI の 6 バイトコマンド)。
+                    // 1 と読むと 256 セクタの要求で最初の 1 つしか読まない。
+                    const u32 sectors = count == 0 ? 256u : count;
                     // 要求がバッファに収まらないなら、黙って切り詰めずに
                     // エラーを返す。切り詰めると転送量と bufferLength が
                     // ずれ、DMA が途中で止まったまま「成功」に見えてしまう。
@@ -639,7 +658,7 @@ void Machine::sasiWrite(u32 addr, u8 value)
                     // READ と同じ数え方をする。ここを 1 セクタ固定にすると、
                     // 複数セクタの書き込みで最初の 1 つしか書かれないまま
                     // 成功を返し、ファイルシステムが静かに壊れる。
-                    const u32 sectors = count == 0 ? 1u : count;
+                    const u32 sectors = count == 0 ? 256u : count;
                     const bool fits = sectors <= kSasiMaxSectorsPerCommand;
                     if (!fits || sasi_.buffer == nullptr)
                     {

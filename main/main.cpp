@@ -128,15 +128,14 @@ bool reserveMemory()
 
     // 確保できたかを全て確かめる。
     //
-    // グラフィック VRAM を外していたせいで、確保に失敗しても起動へ進んで
-    // いた。バスは null をベースアドレスとして受け取り、ゲストが初めて
-    // その範囲を触った瞬間に落ちる。原因が分からないクラッシュになる。
+    // グラフィック VRAM と CGROM は、バスに null チェックがあるので
+    // 確保に失敗してもクラッシュはしない (読むと 0 が返る)。それでも
+    // 止めるのは、どちらも「画面に何も出せない」状態を招くため。
+    // 起動しても使えないものを起動させる意味がない。
     //
-    // CGROM だけは事情が違う。バスに null チェックがあり (bus.cpp の
-    // kCgromBase の分岐)、読むと 0 が返るのでクラッシュはしない。
-    // それでも止めるのは、字形が 1 つも無ければ画面が真っ黒のままで、
-    // 起動しても何もできないため。768KB が取れない時点で PSRAM の
-    // 断片化が起きており、そのまま進んでも先で別の失敗を招く。
+    // 512KB や 768KB が取れない時点で PSRAM の断片化が起きており、
+    // そのまま進んでも先で別の失敗を招く。ここで理由付きで止める方が、
+    // あとから原因を探すより早い。
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_graphicVram != nullptr &&
                     g_iplRom != nullptr && g_cgRom != nullptr && g_frameBufferA != nullptr &&
                     g_frameBufferB != nullptr && g_sasiBuffer != nullptr;
