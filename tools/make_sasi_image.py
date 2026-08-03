@@ -106,7 +106,7 @@ def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
     # IOCS B_READ ($47) は次のレジスタを取る。
     #   D1.L = デバイス番号 ($8000 + SASI の ID)
     #   D2.L = 開始レコード番号
-    #   D3.L = 読み込むバイト数
+    #   D3.L = 読み込むバイト数 ($FF9676 で 256 で割ってセクタ数にされる)
     #   A1   = 読み込み先アドレス
     emit(b"\x22\x3c" + struct.pack(">I", 0x00008000), "MOVE.L #$8000,D1  ; SASI 0")
     emit(b"\x24\x3c" + struct.pack(">I", human_lba), "MOVE.L #human_lba,D2")
