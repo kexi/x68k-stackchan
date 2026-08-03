@@ -45,7 +45,7 @@ void DisplayLcd::begin()
 
 void DisplayLcd::setZoom(x68k::u32 zoom)
 {
-    const x68k::u32 clamped = zoom < 1 ? 1 : (zoom > 4 ? 4 : zoom);
+    const x68k::u32 clamped = zoom < kMinZoom ? kMinZoom : (zoom > kMaxZoom ? kMaxZoom : zoom);
     if (zoom_ == clamped)
     {
         return;

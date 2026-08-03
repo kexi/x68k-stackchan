@@ -223,13 +223,7 @@ void dumpScreen();
 // で済むが、未定義動作は避けたい。
 std::atomic<bool> g_dumpRequested{false};
 
-// 今の拡大率。エミュレーションコアが変えるたびに書き、表示コアが読む。
-//
-// Why not g_display.zoom() を呼ぶか: あれは Core1 が所有する値なので、
-// Core0 から読むとデータ競合になる。値を 1 つ写しておけば足りる。
-std::atomic<x68k::u32> g_currentZoom{1};
-
-// 次に使ってほしい拡大率。0 は要求なし。
+// 使ってほしい拡大率。表示コアが書き、エミュレーションコアが読む。
 //
 // Why not 表示コアから直接 setZoom を呼ぶか: zoom_ は変換中に何度も
 // 読まれる。renderZoomed は zoom_ から srcHeight を決めた後、書き込み先の
@@ -237,10 +231,12 @@ std::atomic<x68k::u32> g_currentZoom{1};
 // (240 行のバッファに対し、2 倍→4 倍の変化で 476 行目まで届く)。
 // 変換の所有者に変えさせれば、変換中に動かない。
 //
-// Why not 「+1 / -1」を渡すか: 表示コアが 1 スライスの間に '>' を
-// 3 回受け取ると、要求が上書きされて 1 段階しか変わらない。
-// 目標値そのものを渡せば、何回打っても打った回数どおりに届く。
-std::atomic<x68k::u32> g_zoomRequest{0};
+// Why not 「要求」として消費する形にするか: 一度そう書いたが、
+// エミュレーションコアが要求を取り出してから現在値を書き戻すまでの間に
+// 表示コアが次の要求を作ると、古い現在値を基準にしてしまい 1 打ぶん消える。
+// 「今どうあってほしいか」を持ち続ける形なら、読む側は現在値と比べるだけで
+// 済み、取り出しと書き戻しの隙間が生まれない。
+std::atomic<x68k::u32> g_desiredZoom{1};
 
 // エミュレーションが停止した。表示コアがメッセージを出す。
 //
@@ -290,11 +286,10 @@ void emulatorTask(void* /*arg*/)
             dumpScreen();
         }
 
-        // 拡大率の変更要求があれば、変換の前に反映する。
-        if (const x68k::u32 next = g_zoomRequest.exchange(0); next != 0)
+        // 希望の拡大率が今と違えば、変換の前に合わせる。
+        if (const x68k::u32 desired = g_desiredZoom.load(); desired != g_display.zoom())
         {
-            g_display.setZoom(next);
-            g_currentZoom = g_display.zoom();
+            g_display.setZoom(desired);
             ESP_LOGI(kTag, "拡大率 %u 倍 (%u 桁 x %u 行)", static_cast<unsigned>(g_display.zoom()),
                      static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenWidth /
                                            g_display.zoom() / 8),
@@ -391,12 +386,23 @@ private:
         const bool isZoomIn = c == '>';
         if (isZoomOut || isZoomIn)
         {
-            // まだ反映されていない要求があればそれを基準にする。
-            // 無ければ今の値。こうすると連打しても 1 打ぶんずつ進む。
-            const x68k::u32 pending = g_zoomRequest.load();
-            const x68k::u32 base = pending != 0 ? pending : g_currentZoom.load();
-            const x68k::u32 next = isZoomIn ? base + 1 : (base > 1 ? base - 1 : 1);
-            g_zoomRequest = next;
+            // 希望値を 1 段階動かす。まだ反映されていなくても、
+            // 希望値そのものを持ち続けているので取りこぼさない。
+            //
+            // ここで上下限に収める。反映側に任せると、4 倍の状態で
+            // '>>><<<' と打ったとき希望値が 7 まで伸びて戻る途中で
+            // 頭打ちになり、打った回数どおりに縮まない。
+            const x68k::u32 base = g_desiredZoom.load();
+            const bool canZoomIn = base < x68k_platform::DisplayLcd::kMaxZoom;
+            const bool canZoomOut = base > x68k_platform::DisplayLcd::kMinZoom;
+            if (isZoomIn && canZoomIn)
+            {
+                g_desiredZoom = base + 1;
+            }
+            else if (isZoomOut && canZoomOut)
+            {
+                g_desiredZoom = base - 1;
+            }
             return;
         }
 
