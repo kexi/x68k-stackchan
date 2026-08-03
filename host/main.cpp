@@ -488,6 +488,11 @@ int main(int argc, char** argv)
             }
             std::printf("[tvram] plane%u: %zu バイト 最初の行 %zu\n", plane, count, firstLine);
         }
+        // テキストパレット。全部黒だと、描かれていても PPM は真っ黒になる。
+        for (x68k::u32 i = 0; i < x68k::VideoController::kTextPaletteCount; ++i)
+        {
+            std::printf("[pal] %2u: %04X\n", i, machine.video().textPalette(i));
+        }
     }
 
     if (!ppmPath.empty())

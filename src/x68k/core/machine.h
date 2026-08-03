@@ -151,10 +151,16 @@ private:
         u8 phase = 0;  // 0=バスフリー 1=コマンド 2=データ転送 3=ステータス
         u8 command[6] = {};
         u32 commandLength = 0;
-        // IPL-ROM はブートセクタを 1024 バイト (4 セクタ) まとめて読む。
-        // 1 セクタずつ返すと DMA が途中で止まるので、要求ぶんを一度に持てる
-        // 大きさにしておく。
-        static constexpr u32 kMaxSectorsPerCommand = 4;
+        // 1 コマンドで扱えるセクタ数。
+        //
+        // IPL-ROM はブートセクタを 4 セクタまとめて読み、Human68k の
+        // ロードではさらに大きな塊を要求する。1 セクタずつ返すと DMA が
+        // 途中で止まるので、要求ぶんを一度に持てる大きさにする。
+        //
+        // 上限が 255 なのは、コマンドの長さフィールドが 1 バイトだから
+        // ($FF9678 で 256 で割った値が 4(A4) へ入る)。IPL-ROM 自身も
+        // $FF9360 で $FF00 バイトを超える要求を分割している。
+        static constexpr u32 kMaxSectorsPerCommand = 255;
         u8 buffer[256 * kMaxSectorsPerCommand] = {};
         u32 bufferPos = 0;
         u32 bufferLength = 0;

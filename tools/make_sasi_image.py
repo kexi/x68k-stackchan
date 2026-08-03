@@ -103,7 +103,16 @@ def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
     # 行きたいので disp = 2。
     emit(b"\x60\x00\x00\x02", "BRA.W *+4")
 
-    # IOCS B_READ ($47) は次のレジスタを取る。
+    # 読み出しは 2 段階。IPL-ROM 自身も $FF02AA でこの順に呼んでいる。
+    #
+    #   $47 — ドライブの準備。REZERO を送って位置決めするだけで、
+    #         データは転送しない。ここだけ呼んで転送先を見ると 0 のまま。
+    #   $46 — 実際の読み出し (B_READ)。
+    #
+    # $47 が「B_READ」という名前で紹介されている資料もあるが、
+    # 実物の ROM ではこの 2 段構えになっている。
+    #
+    # レジスタは両方とも共通:
     #   D1.L = デバイス番号 ($8000 + SASI の ID)
     #   D2.L = 開始レコード番号
     #   D3.L = 読み込むバイト数 ($FF9676 で 256 で割ってセクタ数にされる)
@@ -115,7 +124,9 @@ def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
         "MOVE.L #bytes,D3",
     )
     emit(b"\x22\x7c" + struct.pack(">I", HUMAN_LOAD_ADDR), "MOVEA.L #$6800,A1")
-    emit(b"\x70\x47", "MOVEQ #$47,D0     ; IOCS B_READ")
+    emit(b"\x70\x47", "MOVEQ #$47,D0     ; ドライブの準備")
+    emit(b"\x4e\x4f", "TRAP #15")
+    emit(b"\x70\x46", "MOVEQ #$46,D0     ; B_READ")
     emit(b"\x4e\x4f", "TRAP #15")
 
     # 読み込んだ HUMAN.SYS へ飛ぶ。イメージ生成時にヘッダを外して
