@@ -260,3 +260,8 @@ MIT（[`LICENSE`](LICENSE)）。エミュレータのコードはすべて本プ
 書き起こしたものです。第三者成果物については
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md)、X68000 の ROM と OS の
 扱いについては [`NOTICE.md`](NOTICE.md) を参照してください。
+
+**ビルドしたファームウェアを配布する場合は、[`licenses/`](licenses/) を
+そのまま添付してください。** M5Unified / M5GFX（MIT）、Adafruit GFX のフォント
+（BSD）、ESP-IDF（Apache-2.0）の条文を集めてあります。M5GFX は自身の `LICENSE` に
+書かれていない第三者成果物を内包するので、トップレベルの表示だけでは足りません。
