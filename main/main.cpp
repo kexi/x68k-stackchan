@@ -223,14 +223,24 @@ void dumpScreen();
 // で済むが、未定義動作は避けたい。
 std::atomic<bool> g_dumpRequested{false};
 
-// 拡大率を変える要求。+1 で拡大、-1 で縮小、0 で要求なし。
+// 今の拡大率。エミュレーションコアが変えるたびに書き、表示コアが読む。
+//
+// Why not g_display.zoom() を呼ぶか: あれは Core1 が所有する値なので、
+// Core0 から読むとデータ競合になる。値を 1 つ写しておけば足りる。
+std::atomic<x68k::u32> g_currentZoom{1};
+
+// 次に使ってほしい拡大率。0 は要求なし。
 //
 // Why not 表示コアから直接 setZoom を呼ぶか: zoom_ は変換中に何度も
 // 読まれる。renderZoomed は zoom_ から srcHeight を決めた後、書き込み先の
 // 行を y * zoom_ で計算する。途中で zoom_ が増えるとバッファの外へ書く
 // (240 行のバッファに対し、2 倍→4 倍の変化で 476 行目まで届く)。
 // 変換の所有者に変えさせれば、変換中に動かない。
-std::atomic<int> g_zoomRequest{0};
+//
+// Why not 「+1 / -1」を渡すか: 表示コアが 1 スライスの間に '>' を
+// 3 回受け取ると、要求が上書きされて 1 段階しか変わらない。
+// 目標値そのものを渡せば、何回打っても打った回数どおりに届く。
+std::atomic<x68k::u32> g_zoomRequest{0};
 
 // エミュレーションが停止した。表示コアがメッセージを出す。
 //
@@ -281,11 +291,10 @@ void emulatorTask(void* /*arg*/)
         }
 
         // 拡大率の変更要求があれば、変換の前に反映する。
-        if (const int request = g_zoomRequest.exchange(0); request != 0)
+        if (const x68k::u32 next = g_zoomRequest.exchange(0); next != 0)
         {
-            const x68k::u32 current = g_display.zoom();
-            const x68k::u32 next = request > 0 ? current + 1 : (current > 1 ? current - 1 : 1);
             g_display.setZoom(next);
+            g_currentZoom = g_display.zoom();
             ESP_LOGI(kTag, "拡大率 %u 倍 (%u 桁 x %u 行)", static_cast<unsigned>(g_display.zoom()),
                      static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenWidth /
                                            g_display.zoom() / 8),
@@ -376,13 +385,18 @@ private:
         // '<' '>' で拡大率を変える。読みやすさと見える範囲は
         // 引き換えなので、実機を見ながら選べるようにする。
         //
-        // 要求を立てるだけ。実際に変えるのはエミュレーションコア。
+        // 目標値を立てるだけ。実際に変えるのはエミュレーションコア。
         // 変換の途中で拡大率が動くとバッファの外へ書きうる。
         const bool isZoomOut = c == '<';
         const bool isZoomIn = c == '>';
         if (isZoomOut || isZoomIn)
         {
-            g_zoomRequest = isZoomIn ? 1 : -1;
+            // まだ反映されていない要求があればそれを基準にする。
+            // 無ければ今の値。こうすると連打しても 1 打ぶんずつ進む。
+            const x68k::u32 pending = g_zoomRequest.load();
+            const x68k::u32 base = pending != 0 ? pending : g_currentZoom.load();
+            const x68k::u32 next = isZoomIn ? base + 1 : (base > 1 ? base - 1 : 1);
+            g_zoomRequest = next;
             return;
         }
 
