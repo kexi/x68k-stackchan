@@ -137,8 +137,15 @@ bool writePpm(const std::string& path, const x68k::u16* pixels, x68k::u32 width,
         std::fputc(g, f);
         std::fputc(b, f);
     }
-    std::fclose(f);
-    return true;
+
+    // 書けたか確かめてから閉じる。
+    //
+    // fputc の戻り値を毎回見るのは煩雑なので、ferror でまとめて判定する。
+    // fclose もバッファを吐き出すので失敗しうる。どちらも見ないと、
+    // ディスクが一杯でも「書けました」と報告してしまう。
+    const bool hadError = std::ferror(f) != 0;
+    const bool closeFailed = std::fclose(f) != 0;
+    return !hadError && !closeFailed;
 }
 
 void printUsage()

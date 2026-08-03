@@ -57,13 +57,30 @@ void Mfp::reset()
     reg_[kTsr] = kTsrBufferEmpty;
 }
 
-u8 Mfp::read(u32 regIndex) const
+u8 Mfp::read(u32 regIndex)
 {
     if (regIndex >= kRegCount)
     {
         return 0u;
     }
-    return reg_[regIndex];
+
+    const u8 value = reg_[regIndex];
+
+    // 受信データを読んだら「受信バッファフル」を落とす。
+    //
+    // 実機の MC68901 は UDR を読むと RSR の bit7 が下りる。落とさないと、
+    // ゲストが「まだ読んでいないデータがある」と判断し続ける。
+    //
+    // Why not 読み出しを const のままにするか: フラグの更新は実機の
+    // 副作用そのもので、隠すと「読んだのに状態が変わらない」という
+    // 実機と違う振る舞いになる。
+    const bool isReceiveData = regIndex == kUdr;
+    if (isReceiveData)
+    {
+        reg_[kRsr] = static_cast<u8>(reg_[kRsr] & ~0x80u);
+    }
+
+    return value;
 }
 
 void Mfp::write(u32 regIndex, u8 value)

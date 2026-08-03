@@ -736,18 +736,25 @@ TEST_CASE("WRITE が失敗したらエラーステータスを返す")
     CHECK(m.ioRead8(kSasiData) != 0x00);  // エラー
 }
 
-TEST_CASE("WRITE で扱える上限を超えたらエラーを返す")
+TEST_CASE("WRITE は扱える上限ちょうどの要求を受け付ける")
 {
-    // 保証すること: バッファに収まらない要求を黙って切り詰めないこと。
+    // 保証すること: 255 セクタ (バッファの上限) の要求を弾かないこと。
     //
-    // 壊れると: 転送量と bufferLength がずれ、DMA が途中で止まったまま
-    // 「成功」に見える。READ 側と同じ扱いに揃えてある。
+    // 壊れると: 上限の判定が「以上」と「より大きい」を取り違えていると、
+    // 正当な最大サイズの要求がエラーになる。
+    //
+    // Why not 上限を超えた場合を試さないか: コマンドの count は 8bit で
+    // 最大 255、kSasiMaxSectorsPerCommand も 255 なので、SASI のコマンドから
+    // 上限を超える要求は作れない。上限の検査そのものは READ と揃えるために
+    // 残してあるが、この経路からは到達しない。
+    static_assert(x68k::Machine::kSasiMaxSectorsPerCommand == 255,
+                  "count が 8bit である以上、上限は 255 を超えられない");
+
     x68k::Machine m;
     m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(512);
     m.setDisk(&disk);
 
-    // count は 8bit なので最大 255。上限ちょうどは通る。
     sendCommand(m, 0x0A, 0, 255);
     CHECK(m.ioRead8(kSasiStatus) == kPhaseValueDataOut);
 }

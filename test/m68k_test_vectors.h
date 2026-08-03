@@ -157,6 +157,17 @@ private:
         st.prefetch[1] = static_cast<std::uint16_t>(u32());
 
         const std::uint32_t numRams = u32();
+
+        // 上限を設けてから確保する。
+        //
+        // 壊れたファイルや別形式のファイルを読むと、ここに巨大な値が入って
+        // そのまま reserve する。1 ケースが触るメモリは多くても数十ワードなので、
+        // これを大きく超える値はデータが壊れている印。
+        constexpr std::uint32_t kMaxRamEntries = 4096;
+        if (numRams > kMaxRamEntries)
+        {
+            throw std::runtime_error("test vector has an implausible RAM entry count");
+        }
         st.ram.reserve(numRams * 2);
         for (std::uint32_t i = 0; i < numRams; ++i)
         {

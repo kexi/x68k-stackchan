@@ -83,7 +83,11 @@ public:
     // だったのかを追うのに使う。命令列を静的に走査しても、間接
     // アドレッシングで書かれていると見つからない。
     //
-    // 0 を渡すと解除。
+    // 解除はコールバックに nullptr を渡す。
+    //
+    // Why not アドレス 0 を「解除」に使わないか: $000000 はリセットベクタが
+    // 置かれる番地で、監視したい場面が実際にある。0 を特別扱いすると
+    // そこだけ見られなくなる。
     void setWriteWatch(u32 addr, void (*callback)(u32 addr, u32 value, void* user), void* user)
     {
         watchAddr_ = addr;

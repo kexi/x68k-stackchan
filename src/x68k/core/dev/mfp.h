@@ -77,7 +77,11 @@ public:
 
     void reset();
 
-    [[nodiscard]] u8 read(u32 regIndex) const;
+    // レジスタを読む。
+    //
+    // const にできないのは、UDR (受信データ) を読むと RSR の受信バッファフルが
+    // 落ちるため。実機の MC68901 がそう振る舞う。
+    [[nodiscard]] u8 read(u32 regIndex);
     void write(u32 regIndex, u8 value);
 
     // CPU のサイクル数ぶん時間を進める。タイマのカウントダウンを行う。

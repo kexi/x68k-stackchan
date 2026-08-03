@@ -52,7 +52,12 @@ void Rtc::setDateTime(u32 year, u32 month, u32 day, u32 hour, u32 minute, u32 se
 {
     year_ = year % 100;
     month_ = (month >= 1 && month <= 12) ? month : 1;
-    day_ = (day >= 1 && day <= 31) ? day : 1;
+    // 月の日数に収める。
+    //
+    // 31 で一律に丸めると 2 月 31 日のような日付が通り、Human68k が
+    // 「不正な日付」と判断しうる。daysInMonth は閏年も見る。
+    const u32 maxDay = daysInMonth(month_, year_);
+    day_ = (day >= 1 && day <= maxDay) ? day : 1;
     hour_ = hour % 24;
     minute_ = minute % 60;
     second_ = second % 60;
