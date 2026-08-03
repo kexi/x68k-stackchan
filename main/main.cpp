@@ -16,14 +16,20 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <driver/usb_serial_jtag.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <cstdint>
+#include <cstdio>
+
 #include "display_lcd.h"
 #include "input_touch.h"
+#include "io/ascii_keymap.h"
 #include "machine.h"
 #include "storage_sd.h"
 #include "video/cgrom_fallback.h"
+#include "video/text_scrape.h"
 
 namespace
 {
@@ -183,6 +189,11 @@ void emulatorTask(void* /*arg*/)
     // 1 回の run で進める量。1 フレーム (約 180,000 サイクル) より細かくして、
     // 画面更新と入力の応答が鈍くならないようにする。
     constexpr x68k::u32 kSliceCycles = 20000;
+    constexpr std::uint32_t kReportIntervalMs = 5000;
+
+    std::uint64_t totalCycles = 0;
+    std::uint64_t lastReportCycles = 0;
+    std::uint32_t lastReportMs = 0;
 
     while (true)
     {
@@ -195,11 +206,173 @@ void emulatorTask(void* /*arg*/)
         }
 
         g_machine.run(kSliceCycles);
+        totalCycles += kSliceCycles;
+
+        // 生きていることと実効クロックを定期的に出す。実機は画面を直接
+        // 見られないので、止まったのか遅いだけなのかがログでしか分からない。
+        const std::uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        const bool isReportDue = now - lastReportMs >= kReportIntervalMs;
+        if (isReportDue)
+        {
+            const std::uint32_t elapsed = now - lastReportMs;
+            const unsigned khz =
+                elapsed > 0 ? static_cast<unsigned>((totalCycles - lastReportCycles) / elapsed) : 0;
+            ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
+                     static_cast<unsigned long long>(totalCycles), khz);
+            lastReportMs = now;
+            lastReportCycles = totalCycles;
+        }
 
         // ウォッチドッグに殺されないよう必ず譲る。
         vTaskDelay(1);
     }
 }
+
+// シリアルからキーを受け、画面を ASCII でシリアルへ返すコンソール。
+//
+// 実機の LCD は 320x240 しかなく Human68k のコンソール (768x512) の
+// 左上しか映らない。タッチキーボードも手で触らないと打てないので、
+// 「実機で何が出ているか」「打った文字が通るか」を手元で確かめる術がない。
+// USB シリアルを口にすればホストの --keys / --dump-text と同じことができる。
+//
+// Why not LCD の内容を画像で送るか: 768x512 のビットマップはシリアルには
+// 大きすぎる。ASCII に逆引きすれば 1 行 96 バイトで済む。
+class SerialConsole
+{
+public:
+    // 打った文字は押下と解放を分けて送る。X68000 のキーボードは
+    // 離した通知が来ないと押しっぱなしと見なす。
+    void poll()
+    {
+        // USB Serial JTAG から直接読む。
+        //
+        // Why not getchar を使うか: stdin を非ブロッキングにしないと
+        // 入力待ちで画面更新ごと止まる。fcntl で非ブロッキングにすると
+        // 今度は VFS 側の口が塞がって、ログ出力まで巻き添えで止まった。
+        // ドライバを直接叩けばどちらの問題も起きない。
+        std::uint8_t buf[32];
+        const int n = usb_serial_jtag_read_bytes(buf, sizeof(buf), 0);
+        for (int i = 0; i < n; ++i)
+        {
+            enqueue(static_cast<char>(buf[i]));
+        }
+
+        drainQueue();
+    }
+
+private:
+    // 打つ文字を溜めておく。
+    //
+    // 押下と解放を続けざまに送ると Human68k が取りこぼす。MFP のキーボード
+    // 受信は 1 バイトずつしか保持できず、CPU が読み出す前に次を書くと
+    // 前のものが消える。実効 3.8MHz では 1 バイト読むのに数フレームかかる。
+    static constexpr std::size_t kQueueSize = 64;
+    char queue_[kQueueSize] = {};
+    std::size_t head_ = 0;
+    std::size_t tail_ = 0;
+
+    // 押下を送ってから解放を送るまでに空ける回数。poll は約 16ms 周期。
+    static constexpr int kFramesPerStep = 4;
+    int framesLeft_ = 0;
+    x68k::u8 pendingRelease_ = 0;
+
+    void enqueue(char c)
+    {
+        const std::size_t next = (tail_ + 1) % kQueueSize;
+        const bool isFull = next == head_;
+        if (isFull)
+        {
+            return;
+        }
+        queue_[tail_] = c;
+        tail_ = next;
+    }
+
+    void drainQueue()
+    {
+        if (framesLeft_ > 0)
+        {
+            --framesLeft_;
+            return;
+        }
+
+        // 押下だけ送ってあるなら、先に解放を送る。
+        const bool hasPendingRelease = pendingRelease_ != 0;
+        if (hasPendingRelease)
+        {
+            g_machine.pressKey(static_cast<x68k::u8>(pendingRelease_ | 0x80u));
+            pendingRelease_ = 0;
+            framesLeft_ = kFramesPerStep;
+            return;
+        }
+
+        const bool isEmpty = head_ == tail_;
+        if (isEmpty)
+        {
+            return;
+        }
+
+        const char c = queue_[head_];
+        head_ = (head_ + 1) % kQueueSize;
+
+        // '~' で画面を出す。Human68k に渡す文字と衝突しないものを選んだ。
+        const bool isDumpRequest = c == '~';
+        if (isDumpRequest)
+        {
+            dumpScreen();
+            return;
+        }
+
+        // '<' '>' で拡大率を変える。読みやすさと見える範囲は
+        // 引き換えなので、実機を見ながら選べるようにする。
+        const bool isZoomOut = c == '<';
+        const bool isZoomIn = c == '>';
+        if (isZoomOut || isZoomIn)
+        {
+            const x68k::u32 next = isZoomIn ? g_display.zoom() + 1 : g_display.zoom() - 1;
+            g_display.setZoom(next);
+            ESP_LOGI(kTag, "拡大率 %u 倍 (%u 桁 x %u 行)", static_cast<unsigned>(g_display.zoom()),
+                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenWidth /
+                                           g_display.zoom() / 8),
+                     static_cast<unsigned>(x68k_platform::DisplayLcd::kScreenHeight /
+                                           g_display.zoom() / 16));
+            return;
+        }
+
+        const x68k::u8 code = x68k::asciiToScanCode(c);
+        const bool isTypable = code != 0;
+        if (!isTypable)
+        {
+            return;
+        }
+
+        g_machine.pressKey(code);
+        pendingRelease_ = code;
+        framesLeft_ = kFramesPerStep;
+    }
+
+    static void dumpScreen()
+    {
+        if (g_textVram == nullptr || g_cgRom == nullptr)
+        {
+            return;
+        }
+
+        // ESP_LOG ではなく printf を使う。ログはタイムスタンプとタグが
+        // 行頭に付いて画面の形が崩れる。
+        std::printf("---- テキスト画面 ----\n");
+        char line[x68k::TextScrape::kColumns + 1];
+        for (x68k::u32 row = 0; row < x68k::TextScrape::kRows; ++row)
+        {
+            x68k::TextScrape::readRow(g_textVram, g_cgRom, row, line);
+            std::printf("%2u|%s\n", static_cast<unsigned>(row), line);
+        }
+        std::printf("----------------------\n");
+        std::fflush(stdout);
+    }
+};
+
+SerialConsole g_console;
 
 }  // namespace
 
@@ -236,8 +409,27 @@ extern "C" void app_main(void)
 
     g_display.begin(g_frameBuffer);
     // Human68k のコンソールは 768x512。左上から映す。
+    //
+    // 等倍だと 8x16 の文字が 2 インチの画面にそのまま出て読み取れない。
+    // 2 倍にすると 20 桁 x 7 行と狭くなるが、文字として判別できる。
     g_display.setViewport(0, 0);
+    g_display.setZoom(2);
     g_keyboard.begin();
+
+    // シリアルからキーを拾えるようにする。
+    //
+    // ログ出力は VFS 経由のままにして、入力だけドライバから直接読む。
+    // 両方をドライバに寄せると ESP_LOG の行が混ざって読めなくなる。
+    usb_serial_jtag_driver_config_t usbCfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    const bool isConsoleReady = usb_serial_jtag_driver_install(&usbCfg) == ESP_OK;
+    if (isConsoleReady)
+    {
+        ESP_LOGI(kTag, "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ");
+    }
+    else
+    {
+        ESP_LOGW(kTag, "シリアルコンソールを開けませんでした");
+    }
 
     // エミュレーションは Core1 で回す。
     xTaskCreatePinnedToCore(emulatorTask, "x68k", 8192, nullptr, 5, nullptr, 1);
@@ -247,6 +439,7 @@ extern "C" void app_main(void)
     {
         M5.update();
         g_keyboard.poll(g_machine);
+        g_console.poll();
         g_display.present(g_machine, g_textVram);
         vTaskDelay(pdMS_TO_TICKS(16));  // 約 60Hz
     }

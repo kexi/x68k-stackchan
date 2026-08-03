@@ -26,6 +26,55 @@ void DisplayLcd::begin(x68k::u16* buffer)
     M5.Display.fillScreen(TFT_BLACK);
 }
 
+void DisplayLcd::setZoom(x68k::u32 zoom)
+{
+    const x68k::u32 clamped = zoom < 1 ? 1 : (zoom > 4 ? 4 : zoom);
+    if (zoom_ == clamped)
+    {
+        return;
+    }
+    zoom_ = clamped;
+    forceFullRedraw_ = true;
+}
+
+void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram)
+{
+    // 拡大時は画面全体を作り直す。
+    //
+    // Why not ダーティ行だけ送るか: ダーティ管理はテキスト VRAM の
+    // タイル行を単位にしており、拡大すると 1 タイル行が LCD 上の
+    // 複数行に伸びる。対応を取り直すより、変換元が 1/zoom^2 に減ることを
+    // 使って全画面を作り直す方が単純で、実測でも間に合う。
+    const x68k::u32 srcWidth = kScreenWidth / zoom_;
+    const x68k::u32 srcHeight = kScreenHeight / zoom_;
+
+    // いったん左上の srcWidth x srcHeight に等倍で描いてから、
+    // 右下から引き伸ばす。バッファを 1 枚で済ませるため、
+    // 上書きされる前の画素を先に読む向き (右下→左上) で回す。
+    x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, srcWidth, srcHeight,
+                             buffer_, kScreenWidth);
+
+    for (x68k::u32 y = srcHeight; y-- > 0;)
+    {
+        const x68k::u16* srcRow = buffer_ + static_cast<std::size_t>(y) * kScreenWidth;
+        for (x68k::u32 sy = zoom_; sy-- > 0;)
+        {
+            x68k::u16* destRow = buffer_ + static_cast<std::size_t>(y * zoom_ + sy) * kScreenWidth;
+            for (x68k::u32 x = srcWidth; x-- > 0;)
+            {
+                const x68k::u16 c = srcRow[x];
+                for (x68k::u32 sx = 0; sx < zoom_; ++sx)
+                {
+                    destRow[x * zoom_ + sx] = c;
+                }
+            }
+        }
+    }
+
+    M5.Display.pushImageDMA(0, 0, static_cast<int>(kScreenWidth), static_cast<int>(kScreenHeight),
+                            buffer_);
+}
+
 void DisplayLcd::setViewport(x68k::u32 x, x68k::u32 y)
 {
     if (viewX_ == x && viewY_ == y)
@@ -46,6 +95,20 @@ void DisplayLcd::present(x68k::Machine& machine, const x68k::u8* textVram)
     }
 
     auto& bus = machine.bus();
+
+    const bool isZoomed = zoom_ > 1;
+    if (isZoomed)
+    {
+        // 拡大時はダーティ管理を使わない。変化が無ければ送らない点は同じ。
+        if (!forceFullRedraw_ && !bus.anyTextDirty())
+        {
+            return;
+        }
+        renderZoomed(machine, textVram);
+        bus.clearTextDirty();
+        forceFullRedraw_ = false;
+        return;
+    }
 
     if (forceFullRedraw_)
     {

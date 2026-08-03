@@ -37,6 +37,18 @@ public:
     // 表示位置を設定する。768x512 の中のどこを映すか。
     void setViewport(x68k::u32 x, x68k::u32 y);
 
+    // 拡大率。1 = 等倍 (40 桁 x 15 行)、2 = 2 倍 (20 桁 x 7 行)。
+    //
+    // 等倍は 1 文字が 8x16 ドットのまま 2 インチの画面に出るので、
+    // 桁数は稼げるが実際には読み取れない。2 倍にすると 16x32 になり、
+    // 見える範囲は狭まるが文字として判別できる。
+    void setZoom(x68k::u32 zoom);
+
+    [[nodiscard]] x68k::u32 zoom() const
+    {
+        return zoom_;
+    }
+
     [[nodiscard]] x68k::u32 viewportX() const
     {
         return viewX_;
@@ -60,9 +72,13 @@ public:
     static void showMessage(const char* line1, const char* line2 = nullptr);
 
 private:
+    // 拡大表示。全画面を作り直して送る。
+    void renderZoomed(x68k::Machine& machine, const x68k::u8* textVram);
+
     x68k::u16* buffer_ = nullptr;
     x68k::u32 viewX_ = 0;
     x68k::u32 viewY_ = 0;
+    x68k::u32 zoom_ = 1;
     bool forceFullRedraw_ = true;
 };
 
