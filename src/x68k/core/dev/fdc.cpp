@@ -24,9 +24,11 @@ constexpr u8 kCmdWriteDeleted = 0x09;
 constexpr u8 kCmdReadDeleted = 0x0C;
 
 // 結果ステータス ST0 のビット。
-// bit7-6 = 00 正常終了 / 01 異常終了 / 11 無効なコマンド
+// 終了コードは bit7-6 の 2bit で、00 正常終了 / 01 異常終了 / 11 無効なコマンド。
+// 無効なコマンドは片方だけでなく両方立てる。bit7 だけだと
+// 「ドライブのレディ状態が変化した」(10) の意味になってしまう。
 constexpr u8 kSt0AbnormalTermination = 0x40;
-constexpr u8 kSt0InvalidCommand = 0x80;
+constexpr u8 kSt0InvalidCommand = 0xC0;
 // bit4 = 装置チェック (ドライブが応答しない)。
 constexpr u8 kSt0EquipmentCheck = 0x10;
 // bit5 = シーク終了。
@@ -130,9 +132,29 @@ u8 Fdc::readData()
 
 void Fdc::writeData(u8 value)
 {
+    if (phase_ == Phase::Result)
+    {
+        // 結果を読み切らないまま次のコマンドが来た。溜まった結果を捨てて
+        // 受け付ける。
+        //
+        // IPL-ROM は DMA を使うコマンド (READ/WRITE DATA) の結果フェーズを
+        // インラインでは読まず、FDC 割り込みハンドラ ($FF1130) に任せている。
+        // 本エミュレータは FDC の割り込み線 (実機では IRQ レベル 1 の
+        // オートベクタで、MFP は通さない) を配線していないので、結果は
+        // 誰にも読まれずに残る。残したまま無視すると次のコマンド送出
+        // ($FF9036) が CB の落ちるのを永久に待つ。CB を無条件に落とす手も
+        // あるが、それだと SENSE DRIVE STATUS のように IPL-ROM が
+        // インラインで結果を読むコマンド ($FF89DE) が読めなくなるので、
+        // 「次のコマンドが来た時点で捨てる」形にした。
+        phase_ = Phase::Command;
+        commandLength_ = 0;
+        resultLength_ = 0;
+        resultPos_ = 0;
+    }
+
     if (phase_ != Phase::Command)
     {
-        return;  // 結果を読み切る前の書き込みは無視する
+        return;  // 実行中の書き込みは無視する
     }
 
     if (commandLength_ == 0)
@@ -221,19 +243,24 @@ void Fdc::executeCommand()
         case kCmdReadDeleted:
         case kCmdWriteDeleted:
         case kCmdWriteId:
-            // 読み書き系。ドライブ未接続なので異常終了を返す。
-            // 結果は ST0/ST1/ST2 + C/H/R/N の 7 バイト。
+            // 読み書き系。ドライブ未接続なので実行フェーズに入らず、
+            // 結果フェーズも持たずにコマンド待ちへ戻る。
+            //
+            // 実機ならここは ST0/ST1/ST2 + C/H/R/N の 7 バイトを結果として
+            // 返す。IPL-ROM はそれを FDC 割り込みハンドラ ($FF1130) で
+            // 読み出し、ドライブごとの状態表 $C90 へ積む。本エミュレータは
+            // FDC の割り込み線を配線していないため、結果を積むと誰も読まず、
+            // 次のコマンド送出 ($FF9036 の CB 待ち) がそこで止まる。
+            // ROM 側は割り込み待ちではなく $FF9014 → $FF9006 で
+            // 「メインステータスの下位 5bit が 0 になる」ことを完了条件に
+            // しているので、結果を持たずに即アイドルへ戻すのが
+            // ドライブ未接続の表現として最も近い。
             selectedDrive_ = static_cast<u8>(command_[1] & 0x03u);
-            result_[0] =
-                static_cast<u8>(kSt0AbnormalTermination | kSt0EquipmentCheck | selectedDrive_);
-            result_[1] = 0;  // ST1
-            result_[2] = 0;  // ST2
-            result_[3] = 0;  // C
-            result_[4] = 0;  // H
-            result_[5] = 0;  // R
-            result_[6] = 0;  // N
-            resultLength_ = 7;
-            break;
+            interruptPending_ = true;
+            phase_ = Phase::Command;
+            commandLength_ = 0;
+            resultLength_ = 0;
+            return;
 
         default:
             // 未知のコマンド。

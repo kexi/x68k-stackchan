@@ -75,6 +75,7 @@ add_executable(x68k_tests
   test_rtc.cpp
   test_dmac.cpp
   test_mfp.cpp
+  test_fdc.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 add_test(NAME x68k_tests COMMAND x68k_tests)
