@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = [
+#     "pillow>=11",
+# ]
+# ///
 """IPL-ROM に埋め込まれた 6x12 ドットの ANK フォントを抽出して PNG にする。
 
 CGROM はシャープの無償公開の対象外で入手できないことがあるが、6x12 の ANK
