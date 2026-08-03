@@ -1,0 +1,17 @@
+# gitleaks configuration.
+# https://github.com/gitleaks/gitleaks#configuration
+#
+# バンドル済みルールセットの上に積む。こうすると新しい秘密情報の型に対する
+# upstream の対応を自動的に引き継げる。
+[extend]
+useDefault = true
+
+# Allowlist の方針:
+#   グローバルな regexes / paths の allowlist は「スキャン対象の全ファイル」に効く。
+#   つまりある値やパスを除外すると、後から本物の秘密情報がそのファイルに
+#   貼られてもスキャナが見逃す。将来どうしても誤検知が出た場合は、
+#   その値そのものを狭くスコープした allowlist を足すこと。パス丸ごとの除外はしない。
+#
+# [allowlist]
+#   description = "..."
+#   regexes = ['''...''']

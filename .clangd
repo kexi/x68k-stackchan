@@ -1,0 +1,12 @@
+# エディタ (clangd) 向けの設定。
+# ビルド構成の真実は CMake が出す compile_commands.json (just test-host / just tidy が生成)。
+CompileFlags:
+  CompilationDatabase: build-host
+  Add:
+    - -std=c++17
+    - -Isrc
+
+Diagnostics:
+  # clang-tidy の指摘をエディタ上でも出す。規則は .clang-tidy が持つ。
+  ClangTidy:
+    Add: [bugprone-*, cert-*]

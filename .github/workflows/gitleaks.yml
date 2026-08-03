@@ -1,0 +1,42 @@
+# シークレットスキャン。
+# lefthook の pre-commit にも gitleaks を置いているが、あちらは staged だけを
+# 見る tripwire。全履歴を見るこちらが authoritative なゲート。
+#
+# Why not gitleaks/gitleaks-action を使うか:
+#   v2.3.9 から PR のスキャンに GITHUB_TOKEN を要求するようになった
+#   (PR へ検出結果をコメントするため)。ゲートとして必要なのは
+#   「漏れていたら落ちる」ことだけで、コメント投稿は要らない。
+#   CLI を直接叩けばトークンも権限も要らず、lefthook と同じバイナリ・
+#   同じ設定 (.gitleaks.toml) で走るので、ローカルと CI の判定がずれない。
+name: gitleaks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
+          # ブランチ上の全コミットを走査するため履歴を全部取る。
+          fetch-depth: 0
+
+      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6.1.3
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          purge: false
+          save: false
+
+      - name: Scan for secrets
+        run: nix develop -c just gitleaks

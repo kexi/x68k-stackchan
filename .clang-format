@@ -1,0 +1,32 @@
+# x68k-stackchan のコード整形規則。
+# ベースは既存の kexi 系 CoreS3 プロジェクト (stackchan-doom) の見た目に寄せる:
+# Allman ブレース + 4 スペース + 100 桁。
+---
+Language: Cpp
+BasedOnStyle: Google
+
+# 中括弧は次の行。ネストの深い 68000 のデコード switch で、ブロックの
+# 開始位置が視覚的に揃う方が追いやすい。
+BreakBeforeBraces: Allman
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# 100 桁。エミュレータはビットマスクや定数が並ぶ行が長くなりがちで、
+# 80 桁だと意味のある単位で折り返せない。
+ColumnLimit: 100
+
+AccessModifierOffset: -4
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortCaseLabelsOnASingleLine: false
+PointerAlignment: Left
+DerivePointerAlignment: false
+SortIncludes: false
+IndentCaseLabels: true
+
+# 68000 のオペコード表など、意図的に整列させた初期化子を潰さない。
+# 該当箇所は末尾に // clang-format off/on を置く運用も併用する。
+AlignArrayOfStructures: None

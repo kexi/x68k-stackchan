@@ -1,0 +1,18 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/suzuki-shunsuke/pinact/main/json-schema/pinact.json
+#
+# pinact は GitHub Actions を不変の commit SHA に固定する。
+# https://github.com/suzuki-shunsuke/pinact
+version: 3
+
+# 公開直後の悪意あるリリースを踏まないよう、この日数より新しいバージョンには
+# ピン留めしない。
+#
+# 30 日にしたのは、アクションのリポジトリが乗っ取られた場合、公開から
+# 発覚までに数日〜数週間かかることがあるため。0 (無効) だと公開直後の
+# ものをそのまま掴む。
+min_age:
+  value: 30
+
+files:
+  - pattern: .github/workflows/*.yml
+  - pattern: .github/workflows/*.yaml

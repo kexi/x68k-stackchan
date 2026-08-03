@@ -1,0 +1,103 @@
+# x68k-stackchan sdkconfig defaults — M5Stack CoreS3 / ESP32-S3
+#
+# キー名は ESP-IDF 5.x 系の Kconfig 定義に準拠する。
+# 注意: 未知のキーはエラーにならず警告で無視されるため、IDF のバージョンを
+# 上げ下げしたときはキー名の変更有無を確認すること。
+
+CONFIG_IDF_TARGET="esp32s3"
+
+#
+# --- CPU クロック ---
+# 240MHz は必須。68000 の 10MHz 相当をエミュレートするには 1 コアをほぼ使い切る
+# 見積もり (240MHz / 約180 ホストサイクル per 命令 ≒ 1.33 MIPS) なので、
+# 既定の 160MHz では最初から足りない。
+#
+CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240=y
+
+#
+# --- コンパイラ最適化 ---
+# ESP-IDF の既定は -Os (サイズ優先)。68000 のディスパッチループと
+# バスアクセスはインライン展開の恩恵が大きいので -O2 に変える。
+# 代償として Flash/IRAM が増えるため `just size` で残量を監視すること。
+#
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+#
+# --- 動的周波数スケーリング (DFS) ---
+# DFS が入るとクロックが上下してエミュレーション速度が安定しないうえ、
+# 実測で 12〜22% の性能低下が報告されている。エミュレータでは常に最大クロックで
+# 回したいので明示的に無効化する。
+#
+CONFIG_PM_ENABLE=n
+
+#
+# --- PSRAM ---
+# CoreS3 の PSRAM は Quad SPI 8MB (Octal ではない)。80MHz で使う。
+# Why not 120MHz: ESP-IDF が「電源投入時から ±20℃ 以上変化すると PSRAM/Flash
+#   アクセスがランダムにクラッシュする」と experimental 扱いで警告している。
+#   エミュレータは長時間連続稼働するので温度変化を踏みやすく、割に合わない。
+#
+# ESP-IDF 5.x ではターゲット別の CONFIG_ESP32S3_SPIRAM_SUPPORT がマスターで、
+# ここから CONFIG_SPIRAM が select される (CONFIG_SPIRAM は非プロンプトなので
+# sdkconfig.defaults から直接立てても無視される)。
+#
+CONFIG_ESP32S3_SPIRAM_SUPPORT=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# 小さい確保を内部 SRAM に寄せる閾値。既定より下げる。
+# Why: 本プロジェクトは内部 SRAM を IPLROM (128KB) とメインメモリ低位側の
+#   ミラーに充てたい。小確保が内部を食い潰すと、その先行予約が取れなくなる。
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048
+
+#
+# --- キャッシュ ---
+# ESP-IDF は「32KB のキャッシュを超えるデータ塊にアクセスすると、速度は
+# 外部 RAM の素の速度まで落ちる」と明記している。X68000 のメインメモリは
+# 1〜2MB で確実に超えるため、データキャッシュを最大の 64KB にして
+# 局所性のある領域だけでも救う。
+# 注意: キャッシュは内部 SRAM から取られるので、64KB にすると
+#   ヒープに使える内部 SRAM がその分減る。どちらが得かは実測で決めること
+#   (M4 の測定項目)。
+#
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_LINE_64B=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+
+#
+# --- Flash ---
+# CoreS3 は 16MB。QIO / 80MHz。
+#
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+#
+# --- パーティションテーブル ---
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+#
+# --- FreeRTOS ---
+# 1000Hz (1ms tick)。エミュレーションタスクの譲り粒度をこれに合わせる。
+#
+CONFIG_FREERTOS_HZ=1000
+
+#
+# --- 無線を使わない ---
+# Why: BT controller のバッファは PSRAM に置けず内部 SRAM 固定で、
+#   Wi-Fi スタックも内部 SRAM を大きく握る。本プロジェクトで最も貴重な資源は
+#   内部 SRAM (IPLROM とメインメモリ低位側を置きたい) なので、
+#   PoC の間は無線を一切初期化しない。
+#
+CONFIG_BT_ENABLED=n
+
+#
+# --- コンソール ---
+# ESP32-S3 内蔵の USB-Serial/JTAG をログ出力に使う。
+#
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y

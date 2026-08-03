@@ -1,0 +1,28 @@
+# GitHub Actions が不変の commit SHA に固定されているかを検証する。
+# タグは可変なので、タグ参照のままだと action の乗っ取りが CI に直結する。
+name: pinact
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/**
+      - .pinact.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
+      - uses: suzuki-shunsuke/pinact-action@896d595f299e71d65b9d28349d6956abe144390a # v3.0.0
+        with:
+          # 検証のみ。ファイルを書き換えたり fix コミットを push したりせず、
+          # 未ピンの action があれば PR をブロックする。
+          fix: "false"
+          verify: "true"

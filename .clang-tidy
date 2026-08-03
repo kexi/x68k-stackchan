@@ -1,0 +1,67 @@
+# x68k-stackchan の静的解析規則。
+#
+# 対象は src/x68k/core/ のみ (justfile の tidy レシピ参照)。core/ は ESP32 非依存の
+# 純粋 C++17 なので、ホストビルドの compile_commands.json で解析できる。
+# platform/ と ESP-IDF ビルドは xtensa のヘッダで誤検知が多いため対象外。
+#
+# 重点は bugprone-* と cert-*。68000 エミュレータは
+#   - 符号付き/符号なしの取り違え (SR のフラグ計算、実効アドレスの符号拡張)
+#   - 整数のオーバーフローと未定義動作 (シフト量、符号付きオーバーフロー)
+#   - 配列外アクセス (デコード表の添字)
+# がバグの中心になる。これらは実機で追うと極めて高コストなので、
+# ホスト側の静的解析と ASan/UBSan (just test-san) で先に潰す。
+Checks: >
+  clang-diagnostic-*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  misc-*,
+  -readability-magic-numbers,
+  -readability-identifier-length,
+  -readability-uppercase-literal-suffix,
+  -readability-function-cognitive-complexity,
+  -readability-braces-around-statements,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-branch-clone,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -misc-no-recursion,
+  -misc-non-private-member-variables-in-classes,
+  -cert-err58-cpp
+
+# Why 上記を無効化するか:
+#   readability-magic-numbers      : X68000 のレジスタアドレスやビットマスクは
+#                                    生の定数であることに意味がある ($E88000 等)。
+#   readability-identifier-length  : 68000 の慣習的な短い名前 (pc, sr, ea, d0) を使う。
+#   readability-function-cognitive-complexity
+#                                  : 命令デコードの switch は本質的に巨大になる。
+#   readability-braces-around-statements
+#                                  : 1 行の early return を素直に書きたい。
+#   bugprone-easily-swappable-parameters
+#                                  : read(addr, size) のような API で常時発火する。
+#   bugprone-branch-clone          : ハードウェアのデコード表では「別々の意味を持つが
+#                                    今は同じ挙動」の分岐が正当に並ぶ (未実装デバイスの
+#                                    スタブ read が揃って 0 を返す、MFP の GPIP/UDR など)。
+#                                    まとめると「どのアドレスを意図的に潰したか」が
+#                                    読めなくなり、実装を足すときの差分も追えなくなる。
+#   bugprone-implicit-widening-of-multiplication-result
+#                                  : std::array<u8, kChannelStride * 4> のように
+#                                    コンパイル時定数どうしの積で発火する。
+#                                    実行時のオーバーフロー経路が無いので誤検知。
+#   misc-no-recursion              : 例外処理などで相互再帰が自然な箇所がある。
+#   misc-non-private-member-variables-in-classes
+#                                  : CpuState は 68000 のレジスタファイルそのものを
+#                                    表す集約体で、d[8]/a[8]/pc/sr に直接触るのが
+#                                    命令実装の書き方。全部に getter を生やす意味がない。
+#   readability-uppercase-literal-suffix
+#                                  : アドレス定数 (0xE88000u) が並ぶヘッダで大量に出る。
+#                                    16 進の桁と大文字の U が視覚的に混ざる方が読みにくい。
+
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
+
+# 自分のソースだけを見る (third_party やシステムヘッダの警告は出さない)。
+HeaderFilterRegex: 'src/x68k/core/.*\.(h|hpp)$'
+
+FormatStyle: file

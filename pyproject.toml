@@ -1,0 +1,50 @@
+# tools/ 配下の開発補助スクリプトの定義。
+#
+# ファーム本体は C/C++ で、これは配布物ではない。ここにあるのは
+# フォント抽出・ディスクイメージ生成・テストベクタ変換といった開発用スクリプト。
+#
+# 依存は uv が解決し uv.lock で固定する（uv 自体は flake.nix が Nix で固定する）。
+# 実行は `uv run` 経由なので、just のレシピもそれに合わせている。
+
+[project]
+name = "x68k-stackchan-tools"
+version = "0.0.0"
+description = "Development helper scripts for x68k-stackchan"
+requires-python = ">=3.12"
+dependencies = [
+    # IPL-ROM から抜き出した 6x12 ANK フォントを PNG にして目視確認するのに使う。
+    "pillow>=11",
+]
+
+[dependency-groups]
+dev = []
+
+# tools/ はパッケージとして配布しないので、ビルドバックエンドは設定しない。
+# uv は [project] だけでも依存解決と `uv run` を提供する。
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["tools"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF",
+]
+ignore = [
+    # RUF001-003 は「全角の括弧や記号が半角に似ていて紛らわしい」という指摘だが、
+    # このリポジトリのコメントと docstring は日本語で書く方針なので、
+    # 全角の約物が出るのは正常。指摘を受け入れると日本語が書けなくなる。
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.format]
+quote-style = "double"
