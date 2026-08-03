@@ -111,9 +111,19 @@ void Machine::serviceInterrupts()
     {
         return;
     }
-    // MFP はベクタ番号を自分で返す (自動ベクタではない)。
-    // ここでは CPU にレベルだけ伝え、ベクタは MFP から取る。
-    cpu_.requestInterrupt(kMfpInterruptLevel);
+
+    // MFP は自分のベクタ番号を返すデバイス (自動ベクタではない)。
+    // VR レジスタの上位 4bit と割り込み番号を組み合わせた値になる。
+    //
+    // ここを自動ベクタ (24+6=30) にすると、IOCS が未初期化ベクタ用に
+    // 埋めている「上位バイト = ベクタ番号」の値を PC に読み込んでしまい、
+    // 不正ベクタのハンドラへ飛んで「エラーが発生しました」で止まる。
+    const u32 vectorNumber = mfp_.acknowledgeInterrupt();
+    if (vectorNumber == 0)
+    {
+        return;
+    }
+    cpu_.requestInterrupt(kMfpInterruptLevel, vectorNumber);
 }
 
 void Machine::pressKey(u8 scanCode)

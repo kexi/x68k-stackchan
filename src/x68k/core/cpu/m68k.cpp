@@ -582,11 +582,12 @@ bool M68k::testCondition(u32 cond) const
 
 // --- 割り込み --------------------------------------------------------------
 
-void M68k::requestInterrupt(u32 level)
+void M68k::requestInterrupt(u32 level, u32 vectorNumber)
 {
     if (level > pendingIrq_)
     {
         pendingIrq_ = level;
+        pendingVector_ = vectorNumber;
     }
 }
 
@@ -614,11 +615,14 @@ u32 M68k::step()
     if (irqPending && irqAllowed)
     {
         const u32 level = pendingIrq_;
+        const u32 vectorNumber =
+            pendingVector_ != 0 ? pendingVector_ : (vector::kAutoVectorBase + level);
         pendingIrq_ = 0;
+        pendingVector_ = 0;
         st_.stopped = false;
-        // 自動ベクタで処理する。X68000 の周辺は MFP など固有のベクタを返すが、
-        // それはデバイス側が requestInterrupt の前に設定する想定。
-        takeException(vector::kAutoVectorBase + level);
+        // ベクタ番号を自分で返すデバイス (X68000 の MFP など) は
+        // requestInterrupt でその番号を渡してくる。渡されなければ自動ベクタ。
+        takeException(vectorNumber);
         setSr(static_cast<u16>((st_.sr & clearMask(sr_bit::kIntMask)) | (level << 8)));
         return 44;
     }
