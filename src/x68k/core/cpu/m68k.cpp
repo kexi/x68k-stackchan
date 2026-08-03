@@ -127,7 +127,14 @@ void M68k::refillPrefetch(u32 newPc)
         return;
     }
 
-    // newPc から 2 ワードを先読みし、PC はその次を指す。
+    // PC は 32bit のまま保持し、バスへ出すときだけ 24bit にする。
+    //
+    // X68000 の IOCS は未初期化のベクタに「上位バイト = ベクタ番号」を埋めて
+    // おり ($43FF0540 のような値)、そこへ飛ぶと上位バイトが付いたまま PC に
+    // 入る。実機のアドレスバスは 24bit なのでフェッチ先は $FF0540 になり、
+    // IOCS 側はそこで「不正ベクタ」として処理する仕組み。
+    // PC 自体を丸めてしまうとテストベクタ (32bit の PC を期待する) が
+    // 落ちるので、丸めるのはアクセスの瞬間だけにする。
     st_.ir = bus_.read16(newPc & kAddrMask);
     st_.irc = bus_.read16((newPc + 2) & kAddrMask);
     st_.pc = newPc + 4;
@@ -207,14 +214,20 @@ void M68k::takeException(u32 vectorNumber)
     //
     // 積む PC は「例外を起こした命令の次」。プリフェッチの分だけ手前に戻す
     // (アドレスエラーの framePc と同じ理屈)。
-    // ここも bus_ を直に叩く。例外処理の途中でアドレスエラー判定に入ると
-    // フレームが二重に積まれて SP が壊れる。
+    //
+    // ここは bus_ を直に叩く。write32 経由だと例外処理の途中でアドレスエラー
+    // 判定に入り、フレームが二重に積まれて SP が壊れる。
+    //
+    // 重要: アドレスに 0x00FFFFFE のマスクをかけてはいけない。RTE 側は
+    // read32(a7) で読み戻すので、書き込み位置と読み出し位置が食い違う。
+    // 実際これで戻り先の上位バイトにゴミが乗り、PC が壊れていた。
     const u32 framePc = st_.pc - 4;
     st_.a[7] = st_.a[7] - 4;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, static_cast<u16>(framePc >> 16));
-    bus_.write16((st_.a[7] + 2) & 0x00FFFFFEu, static_cast<u16>(framePc & 0xFFFFu));
+    const u32 pcSlot = st_.a[7] & 0x00FFFFFFu;
+    bus_.write16(pcSlot, static_cast<u16>(framePc >> 16));
+    bus_.write16((pcSlot + 2) & 0x00FFFFFFu, static_cast<u16>(framePc & 0xFFFFu));
     st_.a[7] = st_.a[7] - 2;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, oldSr);
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, oldSr);
 
     const u32 vectorAddr = vectorNumber * 4;
     const u32 handler =
@@ -249,19 +262,19 @@ void M68k::takeAddressError(u32 addr, bool isRead)
     // フレームの書き込みは bus_ を直に叩く。write16 経由だと、SP が奇数のときに
     // 再びアドレスエラー判定へ入って無限に潜る。
     st_.a[7] = st_.a[7] - 4;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, static_cast<u16>(framePc >> 16));
-    bus_.write16((st_.a[7] + 2) & 0x00FFFFFEu, static_cast<u16>(framePc & 0xFFFFu));
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, static_cast<u16>(framePc >> 16));
+    bus_.write16((st_.a[7] + 2) & 0x00FFFFFFu, static_cast<u16>(framePc & 0xFFFFu));
     st_.a[7] = st_.a[7] - 2;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, oldSr);
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, oldSr);
     st_.a[7] = st_.a[7] - 2;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, st_.ir);
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, st_.ir);
     st_.a[7] = st_.a[7] - 4;
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, static_cast<u16>(addr >> 16));
-    bus_.write16((st_.a[7] + 2) & 0x00FFFFFEu, static_cast<u16>(addr & 0xFFFFu));
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, static_cast<u16>(addr >> 16));
+    bus_.write16((st_.a[7] + 2) & 0x00FFFFFFu, static_cast<u16>(addr & 0xFFFFu));
     st_.a[7] = st_.a[7] - 2;
     // 機能コードとアクセス種別。R/W ビットは読み出しで 1。
     const u16 info = static_cast<u16>((isRead ? 0x0010u : 0x0000u) | 0x0005u);
-    bus_.write16(st_.a[7] & 0x00FFFFFEu, info);
+    bus_.write16(st_.a[7] & 0x00FFFFFFu, info);
 
     // ベクタの読み出しは bus_ を直に叩く (read32 を使うと奇数判定でここへ再入する)。
     // ハンドラへの分岐は refillPrefetch を通す。分岐先が奇数なら入れ子の
