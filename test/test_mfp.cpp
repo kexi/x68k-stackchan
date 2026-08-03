@@ -336,37 +336,32 @@ TEST_CASE("Software EOI の優先度基準は最上位のサービス中ビッ�
     // 受理される。ネストしたハンドラの途中で下位が割り込む。
     x68k::Mfp mfp = makeMfp();
     mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
-    // タイマ A ($20) > 受信バッファフル ($10) > 送信バッファ空き ($04)。
+    // タイマ A ($20) > 受信バッファフル ($10) > タイマ B ($01)。
     enableGroupA(mfp, static_cast<x68k::u8>(x68k::Mfp::kIntTimerA | x68k::Mfp::kIntRecvFull |
-                                            x68k::Mfp::kIntSendEmpty));
+                                            x68k::Mfp::kIntTimerB));
 
-    // 先に下位 (受信) をサービス中にし、その上から上位 (タイマ A) を
-    // 受理する。ISR に 2 ビットが立った状態をレジスタ直書きではなく
-    // 実際の受理経路で作る。
-    mfp.receiveKeyboardByte(0x41);
+    // 最下位 (タイマ B) と最上位 (タイマ A) をサービス中にする。間に
+    // 受信バッファフルが挟まる並びを作るのが要点。ISR はレジスタ直書きで
+    // 立てられないので、実際の受理経路を通す。
+    mfp.write(x68k::Mfp::kTbdr, 1);
+    mfp.write(x68k::Mfp::kTbcr, 0x01);
+    mfp.tick(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
     mfp.write(x68k::Mfp::kTadr, 1);
     mfp.write(x68k::Mfp::kTacr, 0x01);
     mfp.tick(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerA) != 0);
-    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerB) != 0);
 
-    // 最上位 (タイマ A) が基準なら、その下の受信は通らない。
-    // 最下位 (受信) を基準にする実装だと、受信自身は抑止されるものの
-    // その 1 つ上の優先度が誤って通る。ここでは受信を使って
-    // 「サービス中の最上位より下は全て止まる」ことを見る。
-    mfp.receiveKeyboardByte(0x42);
+    // 中間の受信バッファフルを保留にする。最上位 (タイマ A) が基準なら
+    // 通らない。最下位 (タイマ B) を基準にする実装だと誤って通る。
+    mfp.receiveKeyboardByte(0x41);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntRecvFull) != 0);
     CHECK_FALSE(mfp.hasPendingInterrupt());
 
-    // タイマ A を落とすと、基準が受信に下がる。受信自身はまだサービス中
-    // なので通らない。
+    // タイマ A を落とすと基準がタイマ B に下がり、受信が通るようになる。
     mfp.write(x68k::Mfp::kIsra, static_cast<x68k::u8>(~x68k::Mfp::kIntTimerA));
-    CHECK_FALSE(mfp.hasPendingInterrupt());
-
-    // 受信も落とせば通る。
-    mfp.write(x68k::Mfp::kIsra, 0x00);
     CHECK(mfp.hasPendingInterrupt());
 }
 
