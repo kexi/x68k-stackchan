@@ -134,6 +134,10 @@ private:
     u32 groupCmpEor(u16 op);     // 1011: CMP/CMPA/CMPM/EOR
     u32 groupAndMul(u16 op);     // 1100: AND/MULU/MULS/ABCD/EXG
     u32 groupAdd(u16 op);        // 1101: ADD/ADDA/ADDX
+    // ABCD と SBCD。命令語の形式が同じで補正の向きだけが違うのでまとめる。
+    // memoryMode は -(Ay),-(Ax) 形式か、isAdd は ABCD か SBCD か。
+    u32 execBcdAddSub(u16 op, bool memoryMode, bool isAdd);
+
     u32 groupShift(u16 op);
     // メモリに対する 1 ビットシフト。命令語の形式がレジスタ版と違う。
     u32 memoryShift(u16 op);  // 1110: ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR

@@ -211,13 +211,38 @@ u32 M68k::groupMisc(u16 op)
         return 4;
     }
 
-    if ((op & 0xFFF8u) == 0x4880u || (op & 0xFFC0u) == 0x4800u)  // NBCD は後回し
+    // NBCD <ea> : 0100 1000 00 mmm rrr。バイト固定の 10 進符号反転 (0 - dst - X)。
+    // EXT.W (0x4880) は上で処理済みなので、ここに来る 0x4800 系は NBCD だけ。
+    if ((op & 0xFFC0u) == 0x4800u)
     {
-        // 上の EXT で拾われなかった 0x4800 系。
-        if ((op & 0xFFC0u) == 0x4800u)
+        u32 addr = 0;
+        const u32 dst = readEaForModify(mode, reg, kByte, addr);
+        const bool extend = (st_.sr & sr_bit::kExtend) != 0;
+        const alu::Result r = alu::bcdSub(0, dst, extend);
+
+        u16 sr = static_cast<u16>(
+            st_.sr & ~(sr_bit::kNegative | sr_bit::kOverflow | sr_bit::kCarry | sr_bit::kExtend));
+        if (r.n)
         {
-            return unimplemented(op);
+            sr |= sr_bit::kNegative;
         }
+        if (r.v)
+        {
+            sr |= sr_bit::kOverflow;
+        }
+        if (r.c)
+        {
+            sr |= sr_bit::kCarry | sr_bit::kExtend;
+        }
+        // Z は累積。結果が非ゼロのときだけ落とし、ゼロなら前の値を保つ。
+        if (r.value != 0)
+        {
+            sr = static_cast<u16>(sr & ~sr_bit::kZero);
+        }
+        st_.sr = sr;
+
+        writeEaToAddr(mode, reg, kByte, addr, r.value);
+        return 6;
     }
 
     // --- パターンで分ける命令 -----------------------------------------------

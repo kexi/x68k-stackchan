@@ -422,10 +422,6 @@ const std::set<std::string>& unverifiedUpstream()
 const std::set<std::string>& knownFailures()
 {
     static const std::set<std::string> names = {
-        // BCD 演算。ほぼ全滅なので未実装に近い。
-        "ABCD",
-        "SBCD",
-        "NBCD",
         // 除算と範囲検査。
         "DIVS",
         "DIVU",

@@ -309,6 +309,50 @@ u32 M68k::groupCmpEor(u16 op)
     return 8;
 }
 
+// ABCD / SBCD の共通処理。
+//
+// どちらも「Dy,Dx」と「-(Ay),-(Ax)」の 2 形式を持ち、命令語のビット配置も
+// 同じ。違うのは 10 進補正の向きだけなので isAdd で切り替える。
+u32 M68k::execBcdAddSub(u16 op, bool memoryMode, bool isAdd)
+{
+    const u32 reg = (op >> 9) & 7u;  // Dx / Ax (書き込み先)
+    const u32 rm = op & 7u;          // Dy / Ay (読み出し元)
+    const bool extend = (st_.sr & sr_bit::kExtend) != 0;
+
+    u32 src = 0;
+    u32 dst = 0;
+    u32 dstAddr = 0;
+    if (memoryMode)
+    {
+        // BCD はバイト演算なので kByte を渡す。ここを kWord などにすると
+        // プリデクリメント量が狂う (A7 のときだけ 2 になる特例も含む)。
+        const u32 srcAddr = effectiveAddress(4, rm, kByte);
+        src = read8(srcAddr);
+        dstAddr = effectiveAddress(4, reg, kByte);
+        dst = read8(dstAddr);
+    }
+    else
+    {
+        src = st_.d[rm] & 0xFFu;
+        dst = st_.d[reg] & 0xFFu;
+    }
+
+    const alu::Result r = isAdd ? alu::bcdAdd(dst, src, extend) : alu::bcdSub(dst, src, extend);
+
+    // Z は累積。結果がゼロでも前の Z が false なら false のまま保つ。
+    alu::Result flags = r;
+    flags.z = alu::accumulateZero((st_.sr & sr_bit::kZero) != 0, r.value == 0);
+    st_.sr = applyFlags(st_.sr, flags, true);
+
+    if (memoryMode)
+    {
+        write8(dstAddr, static_cast<u8>(r.value));
+        return 18;
+    }
+    st_.d[reg] = (st_.d[reg] & 0xFFFFFF00u) | (r.value & 0xFFu);
+    return 6;
+}
+
 // OR / DIVU / DIVS / SBCD (1000)
 u32 M68k::groupOrDiv(u16 op)
 {
@@ -379,8 +423,15 @@ u32 M68k::groupOrDiv(u16 op)
 
     if (toMemory && mode < 2)
     {
-        // SBCD。BCD 演算は Human68k の起動には出てこないので後回し。
-        return unimplemented(op);
+        // SBCD Dy,Dx (mode 0) / SBCD -(Ay),-(Ax) (mode 1)。
+        // opmode 5/6 は OR の word/long だが mode 0/1 は EA として不正なので、
+        // SBCD (opmode 4) だけを引き受けて残りは不当命令に落とす。
+        const bool isSbcd = opmode == 4;
+        if (!isSbcd)
+        {
+            return unimplemented(op);
+        }
+        return execBcdAddSub(op, mode == 1, false);
     }
 
     if (toMemory)
@@ -459,8 +510,15 @@ u32 M68k::groupAndMul(u16 op)
             st_.a[rm] = tmp;
             return 6;
         }
-        // ABCD は後回し。
-        return unimplemented(op);
+        // ABCD Dy,Dx (mode 0) / ABCD -(Ay),-(Ax) (mode 1)。
+        // EXG は上で処理済みなので、ここに残る opmode 4 以外 (opmode 6 の
+        // mode 0 など) は定義されていない組み合わせ。不当命令に落とす。
+        const bool isAbcd = opmode == 4;
+        if (!isAbcd)
+        {
+            return unimplemented(op);
+        }
+        return execBcdAddSub(op, mode == 1, true);
     }
 
     if (toMemory)
