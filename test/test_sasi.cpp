@@ -70,6 +70,16 @@ public:
     bool present = true;
 };
 
+// SASI の転送バッファ。Machine は自前で持たないので、テストでも与える。
+//
+// 実機では PSRAM から渡す。65KB を Machine に埋め込むと ESP32 の
+// 内部 SRAM を圧迫し、IPL-ROM を内部 SRAM へ置けなくなる。
+std::vector<x68k::u8>& sasiBuffer()
+{
+    static std::vector<x68k::u8> buffer(x68k::Machine::kSasiBufferBytes, 0);
+    return buffer;
+}
+
 // SASI のレジスタ。
 constexpr x68k::u32 kSasiData = x68k::kSasiBase + 1;
 constexpr x68k::u32 kSasiStatus = x68k::kSasiBase + 3;
@@ -116,6 +126,7 @@ TEST_CASE("バスフリー状態では何のフェーズも示さない")
 TEST_CASE("READ コマンドで指定セクタが読める")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(16);
     m.setDisk(&disk);
 
@@ -133,6 +144,7 @@ TEST_CASE("READ コマンドで指定セクタが読める")
 TEST_CASE("セクタを読み切るとステータスフェーズへ移る")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(4);
     m.setDisk(&disk);
 
@@ -154,6 +166,7 @@ TEST_CASE("セクタを読み切るとステータスフェーズへ移る")
 TEST_CASE("LBA を指定して別のセクタが読める")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(16);
     m.setDisk(&disk);
 
@@ -165,6 +178,7 @@ TEST_CASE("LBA を指定して別のセクタが読める")
 TEST_CASE("ディスクが無ければエラーステータスを返す")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     // setDisk を呼ばない = ディスクなし。
 
     sendCommand(m, 0x08, 0, 1);
@@ -177,6 +191,7 @@ TEST_CASE("ディスクが無ければエラーステータスを返す")
 TEST_CASE("TEST UNIT READY でディスクの有無が分かる")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(4);
     m.setDisk(&disk);
 
@@ -196,6 +211,7 @@ TEST_CASE("TEST UNIT READY でディスクの有無が分かる")
 TEST_CASE("REQUEST SENSE がセンスデータを返す")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(4);
     m.setDisk(&disk);
 
@@ -213,6 +229,7 @@ TEST_CASE("ブートセクタ 4 つぶん (1024 バイト) を順に読める")
     // IPL-ROM はブートセクタとして 1024 バイトを読む。
     // SASI は 256 バイト/セクタなので 4 回に分かれる。
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(16);
     m.setDisk(&disk);
 
@@ -235,6 +252,7 @@ TEST_CASE("ブートセクタ 4 つぶん (1024 バイト) を順に読める")
 TEST_CASE("未対応コマンドはエラーを返して固まらない")
 {
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(4);
     m.setDisk(&disk);
 
@@ -255,6 +273,7 @@ TEST_CASE("READ は要求されたぶんのセクタをまとめて返す")
     // 1 セクタずつしか返さないと DMA が 256 バイトで止まり、
     // $002000 に読み込まれるブートコードが尻切れになる。
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(16);
     m.setDisk(&disk);
 
@@ -281,6 +300,7 @@ TEST_CASE("DMAC がセクタをメモリへ転送する")
     // READ を発行した後 DMAC のチャネル 1 を起動し、転送が終わるのを待つ。
     // DMAC が無いとブートセクタがメモリへ届かない。
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
     x68k::MemoryMap memory;
     memory.mainRam = ram.data();
@@ -323,6 +343,7 @@ TEST_CASE("DMAC の転送方向は OCR の bit7 で決まる")
     // bit7 が立っていれば「デバイス → メモリ」。逆に取ると 1 バイトも
     // 転送されず、IPL-ROM の "X68K" 検査で必ず失敗する。
     x68k::Machine m;
+    m.setSasiBuffer(sasiBuffer().data());
     FakeDisk disk(16);
     m.setDisk(&disk);
 

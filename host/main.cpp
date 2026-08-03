@@ -462,6 +462,10 @@ int main(int argc, char** argv)
             &machine);
     }
 
+    // SASI の転送バッファ。ホストでは普通に確保してよい。
+    std::vector<x68k::u8> sasiBuffer(x68k::Machine::kSasiBufferBytes, 0);
+    machine.setSasiBuffer(sasiBuffer.data());
+
     disk.setTrace(traceDisk);
     machine.setDisk(&disk);
 

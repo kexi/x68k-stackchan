@@ -66,6 +66,8 @@ void reportMemory(const char* phase)
 // 来るため。PSRAM は内部 SRAM の 1/10 以下の速度しか出ず、しかも 32KB の
 // キャッシュを超えるアクセスは素の速度まで落ちる。取れなければ PSRAM へ
 // フォールバックする (動くが遅くなる)。
+x68k::u8* g_sasiBuffer = nullptr;
+
 bool reserveMemory()
 {
     reportMemory("before reserve");
@@ -81,6 +83,15 @@ bool reserveMemory()
         heap_caps_calloc(1, kCgromBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_frameBuffer = static_cast<x68k::u16*>(
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    // SASI の転送バッファ (64KB 弱)。
+    //
+    // Machine に埋め込むと内部 SRAM の .bss が 88KB まで膨らみ、
+    // すぐ下で IPL-ROM 128KB を内部 SRAM へ置こうとして失敗する。
+    // SASI の転送は DMA の完了待ちで一気に流すだけで遅延に敏感ではない
+    // ので、PSRAM に置いても実害が小さい。
+    g_sasiBuffer = static_cast<x68k::u8*>(
+        heap_caps_calloc(1, x68k::Machine::kSasiBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     // IPL-ROM は内部 SRAM を優先。ブート中のホットパスなので効果が大きい。
     g_iplRom = static_cast<x68k::u8*>(
@@ -99,7 +110,7 @@ bool reserveMemory()
     reportMemory("after reserve");
 
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
-                    g_frameBuffer != nullptr;
+                    g_frameBuffer != nullptr && g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
@@ -145,6 +156,7 @@ bool loadRoms()
     memory.iplRom = g_iplRom;
     memory.cgRom = cgSize > 0 ? g_cgRom : nullptr;
     g_machine.setMemory(memory);
+    g_machine.setSasiBuffer(g_sasiBuffer);
     g_machine.setDisk(&g_disk);
 
     return true;

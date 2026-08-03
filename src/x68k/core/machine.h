@@ -47,6 +47,21 @@ public:
     // (ESP32 では PSRAM の断片化を避けるため起動直後に一括確保したい)。
     void setMemory(const MemoryMap& memory);
 
+    // SASI が 1 コマンドで扱えるセクタ数と、それに要るバッファの大きさ。
+    //
+    // 上限が 255 なのはコマンドの長さフィールドが 1 バイトだから
+    // ($FF9678 で 256 で割った値が 4(A4) へ入る)。
+    static constexpr u32 kSasiMaxSectorsPerCommand = 255;
+    static constexpr u32 kSasiBufferBytes = 256 * kSasiMaxSectorsPerCommand;
+
+    // SASI の転送バッファを与える。kSasiBufferBytes 以上が要る。
+    //
+    // 呼ばないと SASI の READ が失敗する。ホストは new、実機は PSRAM から。
+    void setSasiBuffer(u8* buffer)
+    {
+        sasi_.buffer = buffer;
+    }
+
     // 起動デバイスを設定する。null なら「ディスクなし」として扱う。
     void setDisk(DiskImage* disk)
     {
@@ -151,17 +166,13 @@ private:
         u8 phase = 0;  // 0=バスフリー 1=コマンド 2=データ転送 3=ステータス
         u8 command[6] = {};
         u32 commandLength = 0;
-        // 1 コマンドで扱えるセクタ数。
+        // 転送バッファは外から与える。
         //
-        // IPL-ROM はブートセクタを 4 セクタまとめて読み、Human68k の
-        // ロードではさらに大きな塊を要求する。1 セクタずつ返すと DMA が
-        // 途中で止まるので、要求ぶんを一度に持てる大きさにする。
-        //
-        // 上限が 255 なのは、コマンドの長さフィールドが 1 バイトだから
-        // ($FF9678 で 256 で割った値が 4(A4) へ入る)。IPL-ROM 自身も
-        // $FF9360 で $FF00 バイトを超える要求を分割している。
-        static constexpr u32 kMaxSectorsPerCommand = 255;
-        u8 buffer[256 * kMaxSectorsPerCommand] = {};
+        // 65KB を Machine に埋め込むと、ESP32 の内部 SRAM (512KB) の
+        // 1/8 を静的に食う。実測では .bss が 88KB になり、IPL-ROM 128KB を
+        // 内部 SRAM へ置く余地が無くなった。SASI の転送は DMA の完了待ちで
+        // 一気に流すだけで遅延に敏感ではないので、実機では PSRAM に置く。
+        u8* buffer = nullptr;
         u32 bufferPos = 0;
         u32 bufferLength = 0;
         u8 status = 0;

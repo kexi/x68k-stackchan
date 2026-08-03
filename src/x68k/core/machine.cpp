@@ -587,12 +587,13 @@ void Machine::sasiWrite(u32 addr, u8 value)
                     // count = 0 は 1 セクタの意味。IPL-ROM はブートセクタを
                     // 4 セクタまとめて要求するので、一度に読んで載せる。
                     // 1 セクタずつ返すと DMA が 256 バイトで止まる。
-                    u32 sectors = count == 0 ? 1u : count;
-                    if (sectors > SasiState::kMaxSectorsPerCommand)
-                    {
-                        sectors = SasiState::kMaxSectorsPerCommand;
-                    }
-                    const bool ok = disk_ != nullptr && disk_->isPresent() &&
+                    const u32 sectors = count == 0 ? 1u : count;
+                    // 要求がバッファに収まらないなら、黙って切り詰めずに
+                    // エラーを返す。切り詰めると転送量と bufferLength が
+                    // ずれ、DMA が途中で止まったまま「成功」に見えてしまう。
+                    const bool fits = sectors <= kSasiMaxSectorsPerCommand;
+                    const bool ok = fits && sasi_.buffer != nullptr && disk_ != nullptr &&
+                                    disk_->isPresent() &&
                                     disk_->readSector(lba, sasi_.buffer, sectors);
                     if (!ok)
                     {
@@ -620,7 +621,7 @@ void Machine::sasiWrite(u32 addr, u8 value)
 
         if (sasi_.phase == kPhaseDataOut || sasi_.phase == kPhaseSpecifyParam)
         {
-            if (sasi_.bufferPos < sizeof(sasi_.buffer))
+            if (sasi_.buffer != nullptr && sasi_.bufferPos < kSasiBufferBytes)
             {
                 sasi_.buffer[sasi_.bufferPos++] = value;
             }
