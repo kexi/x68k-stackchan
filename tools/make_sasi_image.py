@@ -80,7 +80,12 @@ HUMAN_LOAD_ADDR = 0x006800
 # ファイルシステムが無いと、Human68k は何も読めずプロンプトを出せない。
 
 # FAT の開始位置。Human68k の領域はここから始まる。
-FAT_START_LBA = 32
+#
+# HUMAN.SYS の生コピー (LBA 8 から 221 セクタ) と重ならないよう十分後ろへ置く。
+# 重なると、ブートコードが読み込む HUMAN.SYS の中身が FAT で上書きされ、
+# 読み込みは成功するのに実行すると 0 埋め領域へ飛んで暴走する。
+# 転送は完走しているように見えるので原因が分かりにくい。
+FAT_START_LBA = 512
 
 FAT_BYTES_PER_SECTOR = SASI_SECTOR_SIZE
 FAT_SECTORS_PER_CLUSTER = 4
