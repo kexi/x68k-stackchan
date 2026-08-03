@@ -500,6 +500,13 @@ int main(int argc, char** argv)
         ++instructions;
 
         // キーを 1 つずつ打つ。押下と解放を交互に送る。
+        //
+        // 打ち切ったら先頭へ戻す。Human68k は起動の途中で何度もキーを
+        // 待つので、1 巡だけでは次の待ちで止まってしまう。
+        if (keyIndex >= keys.size() && !keys.empty() && spent >= nextKeyCycle)
+        {
+            keyIndex = 0;
+        }
         const bool hasKeyLeft = keyIndex < keys.size();
         if (hasKeyLeft && spent >= nextKeyCycle)
         {
