@@ -33,6 +33,7 @@ public:
     static constexpr std::uint32_t kOffsetBootDevice = 0x018;  // 最優先起動デバイス (2B)
     static constexpr std::uint32_t kOffsetRs232c = 0x01A;      // RS-232C 設定 (2B)
     static constexpr std::uint32_t kOffsetScreenMode = 0x01D;  // 起動時画面モード (1B)
+    static constexpr std::uint32_t kOffsetSasiCount = 0x05A;   // SASI 接続台数 (1B)
 
     // 工場出荷状態の値。
     static constexpr std::uint32_t kDefaultRamSize = kMainRamSize;
@@ -48,6 +49,10 @@ public:
     static constexpr std::uint16_t kBootDeviceStandard = 0x0000;
     static constexpr std::uint16_t kBootDeviceSasi0 = 0x8000;
     static constexpr std::uint8_t kDefaultScreenMode = 16;
+    // SASI の接続台数。IPL-ROM は $FF0B00 でこれを $000CB4 へ写し、
+    // SASI ドライバ ($FF9684) が「ID < 台数か」で接続の有無を判定する。
+    // 0 のままだと ID 0 すら範囲外となり、READ コマンドが一度も発行されない。
+    static constexpr std::uint8_t kDefaultSasiCount = 1;
 
     Sram()
     {

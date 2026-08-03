@@ -17,12 +17,49 @@ constexpr u8 kSasiRequestSense = 0x03;
 constexpr u8 kSasiRead = 0x08;
 constexpr u8 kSasiWrite = 0x0A;
 constexpr u8 kSasiSeek = 0x0B;
+// $C2 は X68000 固有。IPL-ROM が最初に発行し ($FF99AC のテンプレート)、
+// ドライブのパラメータを設定する。コマンド 6 バイトの後に 10 バイトの
+// パラメータが続く ($FF990E で D3=9 の DBRA)。中身は使わないが、
+// 受け取り切らないと IPL-ROM が次へ進まない。
+constexpr u8 kSasiSpecify = 0xC2;
+constexpr u32 kSasiSpecifyParamBytes = 10;
 
 // SASI のセクタ長。X68000 の SASI HDD は 256 バイト/セクタ。
 constexpr u32 kSasiSectorSize = 256;
 
 // SASI のフェーズ。
+//
+// $E96003 の下位 5bit が実機のフェーズを表す。IPL-ROM は AND.B #$1F の後に
+// この値と比較して待つ ($FF97BA / $FF9842 / $FF991C)。
+// IPL-ROM が待つ値は 2 つだけ。ビットの意味を推測して組み立てるより、
+// 実際に比較されている値をそのまま名前にする方が間違えない。
+//   $0B コマンド・データフェーズ ($FF9842 / $FF9890 / $FF98BC)
+//       — コマンド 6 バイトの送出とセクタの授受の両方でこの値を待つ
+//   $03 $C2 のパラメータ送出待ち ($FF991C)
+//   $0F ステータスフェーズ       ($FF970A で D6=$0F、$FF97E8 で一致を待つ)
+//       — 終了ステータス 1 バイトを $E96001 から読む
+//   $1F メッセージフェーズ       ($FF971E で D6=$1F)
+//       — メッセージ 1 バイトを読んでバスを解放する
+//
+// Why not $07 を使うか: $FF97BA に $07 を待つ経路があるが、実際に呼ばれるのは
+// $FF981E 側で、そちらは $0B を待つ。$07 を返すとコマンドを 1 バイトも
+// 受け取れないまま止まる。
+// セレクション待ちだけはビット単位で、$E96003 の bit1 が **0** になるのを
+// 待つ ($FF96DA の BTST #1 → BEQ)。コマンドフェーズの $07 は bit1 が 1 なので、
+// セレクションを受け付けた直後にいきなり $07 を返すと待ちを抜けられない。
+// 「セレクション成立」を表す中間状態を挟む。
+constexpr u8 kSasiStatusCommand = 0x0B;
+constexpr u8 kSasiStatusData = 0x0B;
+constexpr u8 kSasiStatusSpecifyParam = 0x03;
+constexpr u8 kSasiStatusStatus = 0x0F;
+constexpr u8 kSasiStatusMessage = 0x1F;
+constexpr u8 kSasiStatusBusFree = 0x00;
+
 constexpr u8 kPhaseBusFree = 0;
+constexpr u8 kPhaseSelected = 6;  // セレクション成立。まだコマンドを受けない
+// $C2 のパラメータ待ち。通常のデータアウト ($0B) と違い、IPL-ROM は
+// ステータスフェーズと同じ $03 を待ってから送ってくる ($FF9910)。
+constexpr u8 kPhaseSpecifyParam = 7;
 constexpr u8 kPhaseCommand = 1;
 constexpr u8 kPhaseDataIn = 2;
 constexpr u8 kPhaseDataOut = 3;
@@ -332,7 +369,7 @@ u8 Machine::sasiRead(u32 addr)
 
     if (reg == 0x01)
     {
-        // データレジスタ。
+        // データレジスタ。ターゲットから CPU へ渡す側。
         if (sasi_.phase == kPhaseDataIn && sasi_.bufferPos < sasi_.bufferLength)
         {
             const u8 value = sasi_.buffer[sasi_.bufferPos++];
@@ -344,6 +381,7 @@ u8 Machine::sasiRead(u32 addr)
         }
         if (sasi_.phase == kPhaseStatus)
         {
+            // 終了ステータスの次はメッセージ。IPL-ROM は 2 バイト読む。
             sasi_.phase = kPhaseMessage;
             return sasi_.status;
         }
@@ -357,35 +395,32 @@ u8 Machine::sasiRead(u32 addr)
 
     if (reg == 0x03)
     {
-        // ステータスレジスタ。
-        //   bit0 (BSY): バスが使用中
-        //   bit1 (REQ): データの授受を要求している
-        //   bit2 (MSG): メッセージフェーズ
-        //   bit3 (C/D): 1 = コマンド/ステータス、0 = データ
-        //   bit4 (I/O): 1 = ターゲット → イニシエータ
-        u8 status = 0;
+        // ステータスレジスタ。IPL-ROM は下位 5bit をフェーズとして読む。
         switch (sasi_.phase)
         {
+            case kPhaseSelected:
+                // セレクションが成立した直後。IPL-ROM は bit1 が 0 になるのを
+                // 待っているので、ここでは 0 を返してから次の読みでコマンド
+                // フェーズへ移る。
+                sasi_.phase = kPhaseCommand;
+                return kSasiStatusBusFree;
+
             case kPhaseCommand:
-                status = 0x0B;  // BSY|REQ|C/D
-                break;
+                return kSasiStatusCommand;
             case kPhaseDataIn:
-                status = 0x13;  // BSY|REQ|I/O
-                break;
             case kPhaseDataOut:
-                status = 0x03;  // BSY|REQ
-                break;
+                return kSasiStatusData;
             case kPhaseStatus:
-                status = 0x1B;  // BSY|REQ|C/D|I/O
-                break;
+                return kSasiStatusStatus;
+
             case kPhaseMessage:
-                status = 0x1F;  // BSY|REQ|MSG|C/D|I/O
-                break;
+                return kSasiStatusMessage;
+
+            case kPhaseSpecifyParam:
+                return kSasiStatusSpecifyParam;
             default:
-                status = 0x00;  // バスフリー
-                break;
+                return kSasiStatusBusFree;
         }
-        return status;
     }
 
     return 0u;
@@ -395,17 +430,28 @@ void Machine::sasiWrite(u32 addr, u8 value)
 {
     const u32 reg = addr & 0x0Fu;
 
+    if (reg == 0x07)
+    {
+        // セレクション。IPL-ROM はここへターゲット ID を書き ($FF96CE)、
+        // $E96003 の bit1 (BSY) が 0 になるのを待つ ($FF96DA)。
+        //
+        // Why not $E96001 でセレクションとするか: 実機の IPL-ROM は
+        // $E96007 を使う。$E96001 はデータの授受専用で、セレクション前に
+        // 書かれることはない。
+        //
+        // ディスクが無ければ BSY を立てたまま (バスフリーにしない) にして
+        // タイムアウトさせる。
+        if (disk_ != nullptr && disk_->isPresent())
+        {
+            sasi_.phase = kPhaseSelected;
+            sasi_.commandLength = 0;
+        }
+        return;
+    }
+
     if (reg == 0x01)
     {
         // データレジスタへの書き込み。
-        if (sasi_.phase == kPhaseBusFree)
-        {
-            // セレクション。ターゲット ID が書かれる。
-            sasi_.phase = kPhaseCommand;
-            sasi_.commandLength = 0;
-            return;
-        }
-
         if (sasi_.phase == kPhaseCommand)
         {
             if (sasi_.commandLength < sizeof(sasi_.command))
@@ -431,6 +477,13 @@ void Machine::sasiWrite(u32 addr, u8 value)
 
             switch (opcode)
             {
+                case kSasiSpecify:
+                    // パラメータ 10 バイトを受け取ってから終了ステータスを返す。
+                    sasi_.bufferPos = 0;
+                    sasi_.bufferLength = kSasiSpecifyParamBytes;
+                    sasi_.phase = kPhaseSpecifyParam;
+                    return;
+
                 case kSasiTestUnitReady:
                 case kSasiRezeroUnit:
                 case kSasiSeek:
@@ -479,7 +532,7 @@ void Machine::sasiWrite(u32 addr, u8 value)
             }
         }
 
-        if (sasi_.phase == kPhaseDataOut)
+        if (sasi_.phase == kPhaseDataOut || sasi_.phase == kPhaseSpecifyParam)
         {
             if (sasi_.bufferPos < sizeof(sasi_.buffer))
             {
@@ -487,11 +540,12 @@ void Machine::sasiWrite(u32 addr, u8 value)
             }
             if (sasi_.bufferPos >= sasi_.bufferLength)
             {
-                const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
-                                (static_cast<u32>(sasi_.command[2]) << 8) |
-                                static_cast<u32>(sasi_.command[3]);
-                if (disk_ != nullptr && disk_->isPresent())
+                // WRITE ならディスクへ書く。$C2 のパラメータは捨てる。
+                if (sasi_.command[0] == kSasiWrite && disk_ != nullptr && disk_->isPresent())
                 {
+                    const u32 lba = (static_cast<u32>(sasi_.command[1] & 0x1Fu) << 16) |
+                                    (static_cast<u32>(sasi_.command[2]) << 8) |
+                                    static_cast<u32>(sasi_.command[3]);
                     disk_->writeSector(lba, sasi_.buffer, 1);
                 }
                 sasi_.phase = kPhaseStatus;

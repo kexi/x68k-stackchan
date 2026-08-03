@@ -73,18 +73,22 @@ public:
 // SASI のレジスタ。
 constexpr x68k::u32 kSasiData = x68k::kSasiBase + 1;
 constexpr x68k::u32 kSasiStatus = x68k::kSasiBase + 3;
+constexpr x68k::u32 kSasiSelect = x68k::kSasiBase + 7;
 
-// ステータスのビット。
-constexpr x68k::u8 kBusy = 0x01;
-constexpr x68k::u8 kRequest = 0x02;
-constexpr x68k::u8 kCommandData = 0x08;  // C/D: 1 = コマンド/ステータス
-constexpr x68k::u8 kInputOutput = 0x10;  // I/O: 1 = ターゲット → イニシエータ
+// ステータスレジスタが返すフェーズの値。IPL-ROM はこの値との一致を待つので、
+// ビットの意味ではなく値そのものが仕様になる。
+constexpr x68k::u8 kPhaseValueBusFree = 0x00;
+constexpr x68k::u8 kPhaseValueData = 0x0B;     // コマンド送出とセクタ授受
+constexpr x68k::u8 kPhaseValueStatus = 0x0F;   // 終了ステータスを読む
+constexpr x68k::u8 kPhaseValueMessage = 0x1F;  // メッセージを読む
 
 // SASI へ 6 バイトのコマンドを送る手順をなぞる。
 void sendCommand(x68k::Machine& m, x68k::u8 opcode, x68k::u32 lba, x68k::u8 count)
 {
-    // セレクション。ターゲット ID を書く。
-    m.ioWrite8(kSasiData, 0x01);
+    // セレクションは $E96007 へターゲット ID を書く。実機の IPL-ROM は
+    // その後 $E96003 の bit1 が 0 になるのを待ってからコマンドを送る。
+    m.ioWrite8(kSasiSelect, 0x01);
+    m.ioRead8(kSasiStatus);
 
     const x68k::u8 command[6] = {
         opcode,
@@ -102,11 +106,10 @@ void sendCommand(x68k::Machine& m, x68k::u8 opcode, x68k::u32 lba, x68k::u8 coun
 
 }  // namespace
 
-TEST_CASE("バスフリー状態ではビジーが立たない")
+TEST_CASE("バスフリー状態では何のフェーズも示さない")
 {
     x68k::Machine m;
-    const x68k::u8 status = m.ioRead8(kSasiStatus);
-    CHECK((status & kBusy) == 0);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
 }
 
 TEST_CASE("READ コマンドで指定セクタが読める")
@@ -117,11 +120,8 @@ TEST_CASE("READ コマンドで指定セクタが読める")
 
     sendCommand(m, 0x08 /* READ */, 0, 1);
 
-    // データ転送フェーズになる。ターゲットからイニシエータへの向き。
-    const x68k::u8 status = m.ioRead8(kSasiStatus);
-    CHECK((status & kBusy) != 0);
-    CHECK((status & kRequest) != 0);
-    CHECK((status & kInputOutput) != 0);
+    // データ転送フェーズになる。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueData);
 
     // セクタ 0 の中身が読める。
     CHECK(m.ioRead8(kSasiData) == 0x00);  // セクタ番号
@@ -143,13 +143,11 @@ TEST_CASE("セクタを読み切るとステータスフェーズへ移る")
         m.ioRead8(kSasiData);
     }
 
-    const x68k::u8 status = m.ioRead8(kSasiStatus);
-    // ステータスフェーズは C/D と I/O の両方が立つ。
-    CHECK((status & kCommandData) != 0);
-    CHECK((status & kInputOutput) != 0);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueStatus);
 
-    // ステータスは 0 (正常終了)。
+    // ステータスは 0 (正常終了)。読むとメッセージフェーズへ移る。
     CHECK(m.ioRead8(kSasiData) == 0x00);
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueMessage);
 }
 
 TEST_CASE("LBA を指定して別のセクタが読める")
@@ -170,10 +168,9 @@ TEST_CASE("ディスクが無ければエラーステータスを返す")
 
     sendCommand(m, 0x08, 0, 1);
 
-    // データフェーズには入らず、ステータスフェーズでエラーが返る。
-    const x68k::u8 status = m.ioRead8(kSasiStatus);
-    CHECK((status & kCommandData) != 0);
-    CHECK(m.ioRead8(kSasiData) != 0x00);  // 非ゼロ = エラー
+    // ディスクが無ければセレクションが成立しないので、バスフリーのまま。
+    // IPL-ROM 側はセレクション待ちがタイムアウトして「装置なし」と判断する。
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
 }
 
 TEST_CASE("TEST UNIT READY でディスクの有無が分かる")
@@ -188,9 +185,11 @@ TEST_CASE("TEST UNIT READY でディスクの有無が分かる")
     // これを飛ばすと次のセレクションが受け付けられない。
     m.ioRead8(kSasiData);
 
+    // ディスクを抜くとセレクションが成立しなくなる。実機ではここで
+    // IPL-ROM のセレクション待ちがタイムアウトし、「装置なし」と判断される。
     disk.present = false;
     sendCommand(m, 0x00, 0, 0);
-    CHECK(m.ioRead8(kSasiData) != 0x00);  // ステータス: エラー
+    CHECK(m.ioRead8(kSasiStatus) == kPhaseValueBusFree);
 }
 
 TEST_CASE("REQUEST SENSE がセンスデータを返す")

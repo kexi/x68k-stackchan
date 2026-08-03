@@ -73,6 +73,9 @@ void Sram::formatDefaults()
 
     data_[kOffsetScreenMode] = kDefaultScreenMode;
 
+    // SASI を 1 台繋がっていることにする。
+    data_[kOffsetSasiCount] = kDefaultSasiCount;
+
     // 初期化直後は「保存すべき変更」ではない (工場出荷状態そのもの)。
     dirty_ = false;
 }

@@ -63,11 +63,23 @@ public:
         return ok;
     }
 
+    // どのセクタが要求されたかを出す。起動しないディスクイメージを
+    // 作ったとき、IPL-ROM がどこまで読めたのかが分からないと直せない。
+    void setTrace(bool on)
+    {
+        trace_ = on;
+    }
+
     bool readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCount) override
     {
         constexpr x68k::u32 kSectorSize = 256;
         const std::size_t offset = static_cast<std::size_t>(lba) * kSectorSize;
         const std::size_t length = static_cast<std::size_t>(sectorCount) * kSectorSize;
+        if (trace_)
+        {
+            std::printf("[disk] read lba=%u count=%u%s\n", lba, sectorCount,
+                        offset + length > data_.size() ? " (範囲外)" : "");
+        }
         if (offset + length > data_.size())
         {
             return false;
@@ -96,6 +108,7 @@ public:
 
 private:
     std::vector<x68k::u8> data_;
+    bool trace_ = false;
 };
 
 // テキスト画面を PPM (P6) で書き出す。
@@ -136,6 +149,7 @@ void printUsage()
         "  --cycles N      実行する CPU サイクル数 (既定 20000000)\n"
         "  --ppm PATH      終了時にテキスト画面を PPM で書き出す\n"
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
+        "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
         "  --stats         実行した命令の内訳を最後に出す\n"
@@ -253,6 +267,7 @@ int main(int argc, char** argv)
     std::string ppmPath;
     x68k::u32 cycleLimit = 20000000;
     bool trace = false;
+    bool traceDisk = false;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
     std::size_t traceLast = 0;
@@ -286,6 +301,10 @@ int main(int argc, char** argv)
         else if (arg == "--trace")
         {
             trace = true;
+        }
+        else if (arg == "--trace-disk")
+        {
+            traceDisk = true;
         }
         else if (arg == "--trace-from" && hasNext)
         {
@@ -367,6 +386,7 @@ int main(int argc, char** argv)
     memory.iplRom = iplrom.data();
     memory.cgRom = cgrom.empty() ? nullptr : cgrom.data();
     machine.setMemory(memory);
+    disk.setTrace(traceDisk);
     machine.setDisk(&disk);
 
     machine.reset();
