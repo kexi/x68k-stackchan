@@ -25,7 +25,10 @@ Checks: >
   -readability-function-cognitive-complexity,
   -readability-braces-around-statements,
   -bugprone-easily-swappable-parameters,
+  -bugprone-branch-clone,
+  -bugprone-implicit-widening-of-multiplication-result,
   -misc-no-recursion,
+  -misc-non-private-member-variables-in-classes,
   -cert-err58-cpp
 
 # Why 上記を無効化するか:
@@ -38,7 +41,20 @@ Checks: >
 #                                  : 1 行の early return を素直に書きたい。
 #   bugprone-easily-swappable-parameters
 #                                  : read(addr, size) のような API で常時発火する。
+#   bugprone-branch-clone          : ハードウェアのデコード表では「別々の意味を持つが
+#                                    今は同じ挙動」の分岐が正当に並ぶ (未実装デバイスの
+#                                    スタブ read が揃って 0 を返す、MFP の GPIP/UDR など)。
+#                                    まとめると「どのアドレスを意図的に潰したか」が
+#                                    読めなくなり、実装を足すときの差分も追えなくなる。
+#   bugprone-implicit-widening-of-multiplication-result
+#                                  : std::array<u8, kChannelStride * 4> のように
+#                                    コンパイル時定数どうしの積で発火する。
+#                                    実行時のオーバーフロー経路が無いので誤検知。
 #   misc-no-recursion              : 例外処理などで相互再帰が自然な箇所がある。
+#   misc-non-private-member-variables-in-classes
+#                                  : CpuState は 68000 のレジスタファイルそのものを
+#                                    表す集約体で、d[8]/a[8]/pc/sr に直接触るのが
+#                                    命令実装の書き方。全部に getter を生やす意味がない。
 #   readability-uppercase-literal-suffix
 #                                  : アドレス定数 (0xE88000u) が並ぶヘッダで大量に出る。
 #                                    16 進の桁と大文字の U が視覚的に混ざる方が読みにくい。

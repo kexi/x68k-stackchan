@@ -23,6 +23,11 @@ jobs:
   # core/ が ESP32 非依存であることは本プロジェクトの開発速度の前提。
   # core/ がホストで動くから Mac 上で 68000 を走らせて Human68k をデバッグできる。
   # Nix のセットアップが要らない grep だけの検査なので、単独ジョブで速く落とす。
+  #
+  # grep の式は justfile の core-guard レシピと同一のものを使う。
+  # Why not `just core-guard`: このジョブの狙いは「Nix を待たずに数秒で落とす」
+  # ことなので、devShell の構築 (数分) を挟むと意味が無くなる。式の重複は
+  # 承知のうえで、pre-commit と `just check` は justfile 側を通る。
   core-guard:
     name: core/ has no ESP32 dependency
     runs-on: ubuntu-latest
@@ -40,6 +45,33 @@ jobs:
             exit 1
           fi
           echo "core/ is ESP32-independent: OK"
+
+  # ワークフロー自身の構文と式を検査する。lefthook の pre-commit にも置いているが、
+  # あちらは staged なファイルしか見ず、hook を通さない経路 (Web UI の編集、
+  # 他のツールからの push) では素通りする。CI 側を authoritative なゲートにする。
+  #
+  # Why not docker://rhysd/actionlint や reviewdog の action:
+  #   actionlint は flake.nix の devShell が既に固定している。外部 action を足すと
+  #   バージョンが二重管理になるうえ、docker:// 形式は pinact が
+  #   "action can't be pinned" で弾く (SHA ピン留めの規約から外れる)。
+  #   ここも他ジョブと同じく `nix develop -c just <task>` に揃える。
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6.1.3
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          purge: false
+          save: false
+
+      - name: Lint workflows
+        run: nix develop -c just actionlint
 
   host-tests:
     name: host tests and lint
@@ -66,6 +98,13 @@ jobs:
 
       - name: Lint (ruff)
         run: nix develop -c just lint
+
+      # clang-tidy は compile_commands.json (= CMake configure) が要るので
+      # pre-commit には置けない (コミットのたびに数十秒待たされる)。
+      # その代わり CI では必ず通す。WarningsAsErrors は bugprone-* / cert-* /
+      # clang-analyzer-* に絞ってあるので、落ちたら実バグの可能性が高い。
+      - name: Static analysis (clang-tidy)
+        run: nix develop -c just tidy
 
       - name: Host unit tests
         run: nix develop -c just test-host

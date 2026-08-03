@@ -31,9 +31,16 @@ test-host:
 
 # ASan/UBSan は 68000 コアのメモリ破壊 (EA 計算ミスによる配列外アクセス等) を
 # 一発で捕まえる。エミュレータ開発では通常テストより価値が高い場面が多い。
+#
+# Why clang++ を明示するか:
+#   CMake は既定で g++ を選ぶことがあるが、Nix の gcc は macOS 向けに
+#   ASan ランタイム (libasan) を同梱していない。そのままだとリンク時に
+#   `ld: library not found for -lasan` で落ちる。clang は compiler-rt を
+#   持っているので、サニタイザ付きビルドは clang に固定する。
 [doc('ASan/UBSan 付きでホストテストを実行する')]
 test-san:
-    cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+    cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+      -DENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
     cmake --build {{san_build}}
     ctest --test-dir {{san_build}} --output-on-failure
 
@@ -95,15 +102,15 @@ menuconfig:
 
 # fd の -E doctest は vendored な third-party ヘッダを整形対象から外すため。
 # upstream との差分が追えなくなるうえ、更新のたびに巨大な diff が出る。
-# なお host/ (ホスト用エミュレータランナー) は M2 で作る。作ったら対象に足すこと。
+# host/ (ホスト用エミュレータランナー) と main/ (実機ファームのエントリ) も対象。
 [doc('C/C++ と Python を整形する')]
 fmt:
-    fd -e c -e h -e cpp -e hpp . src test -E doctest --exec clang-format -i
+    fd -e c -e h -e cpp -e hpp . src test host main -E doctest --exec clang-format -i
     uv run ruff format tools
 
 [doc('整形されているか検査する (CI 用。書き換えない)')]
 fmt-check:
-    fd -e c -e h -e cpp -e hpp . src test -E doctest --exec clang-format --dry-run --Werror
+    fd -e c -e h -e cpp -e hpp . src test host main -E doctest --exec clang-format --dry-run --Werror
     uv run ruff format --check tools
 
 [doc('Python を lint する')]
@@ -113,15 +120,43 @@ lint:
 # clang-tidy は compile_commands.json (CMake が生成) を必要とする。
 # core/ は純粋 C++17 なのでホストビルドの compile_commands で解析できる。
 # platform/ と ESP-IDF ビルドは xtensa ヘッダで誤検知が出るため対象外。
+#
+# 専用のビルドディレクトリを使うのは、test-host が使う {{host_build}} を
+# 汚さないため。clang-tidy 用に CMAKE_CXX_COMPILER を clang++ へ固定するので、
+# 同じディレクトリを使い回すと test-host のたびに CMake が再 configure する。
+#
+# Why clang++ を明示するか:
+#   既定では CMake が g++ を選ぶことがあり、compile_commands.json に GCC 固有の
+#   フラグと GCC の libstdc++ パスが載る。clang ベースの clang-tidy はそれを
+#   解決できず、全ファイルが 'cstdint' file not found で落ちる。
+#
+# Why -isystem を明示的に注入するか:
+#   clang-tidy は Nix の clang-tools が供給する「非 wrapper」バイナリで、
+#   clang++ wrapper が渡している libc++ と sysroot の -isystem を持たない。
+#   その結果、単体では標準ヘッダを一切見つけられない (Nix on macOS で顕著)。
+#   wrapper 付き clang++ に検索パスを問い合わせ、そのまま clang-tidy へ渡す。
 [doc('core/ を clang-tidy で静的解析する')]
 tidy:
-    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-    fd -e c -e cpp . src/x68k/core --exec clang-tidy -p {{host_build}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cmake -S test -B build-tidy -G Ninja \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    extra=$(clang++ -std=c++17 -E -v -x c++ /dev/null 2>&1 \
+      | sed -n '/#include <...> search starts here:/,/End of search list./p' \
+      | sed '1d;$d' \
+      | sed 's/ (framework directory)//' \
+      | sed 's/^[[:space:]]*/-extra-arg=-isystem/' \
+      | tr '\n' ' ')
+    # shellcheck disable=SC2086
+    fd -e c -e cpp . src/x68k/core --exec-batch clang-tidy -p build-tidy --quiet $extra
 
 # ───── 集約 ────────────────────────────────────────────────────────────────
 
+# CI のジョブ構成と揃えておく (ci.yml の host-tests / core-guard に対応)。
+# ここに無い検査を CI にだけ足すと、手元で通ったのに CI で落ちるようになる。
+# 実機ファームのビルド (just build) だけは数分かかるので check には入れない。
 [doc('CI と同じ検査を一括で回す')]
-check: fmt-check lint tidy test-host
+check: fmt-check lint core-guard tidy test-host test-san actionlint
 
 # core/ に ESP32 依存が混入していないことを検査する。
 # core/ がホストで動くことが本プロジェクトの開発速度の前提なので、CI と
@@ -135,6 +170,10 @@ core-guard:
       exit 1
     fi
     echo "core/ is ESP32-independent: OK"
+
+[doc('GitHub Actions のワークフローを検査する')]
+actionlint:
+    actionlint
 
 [doc('GitHub Actions のピン留めを検証する (書き換えない)')]
 pinact-verify:
@@ -163,4 +202,4 @@ make-hdd FD OUT:
 
 [doc('ビルド成果物を消す')]
 clean:
-    rm -rf {{host_build}} {{san_build}} build
+    rm -rf {{host_build}} {{san_build}} build-tidy build

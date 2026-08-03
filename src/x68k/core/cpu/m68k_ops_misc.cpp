@@ -28,6 +28,23 @@ constexpr u32 sizeFromField(u32 field)
     return kLong;
 }
 
+// ORI/ANDI/EORI to CCR/SR は演算子だけが違い、対象 (CCR か SR か) が違うだけ。
+// opType は即値演算グループのビット 9-11 で、0=ORI / 1=ANDI / 5=EORI。
+// 呼び出し側で if/else を組むと「初期値を必ず上書きする」死んだ代入が残るので、
+// 演算そのものをここに切り出して値を返す形にしている。
+constexpr u16 applyLogicalOp(u32 opType, u16 current, u16 operand)
+{
+    if (opType == 0)
+    {
+        return static_cast<u16>(current | operand);
+    }
+    if (opType == 1)
+    {
+        return static_cast<u16>(current & operand);
+    }
+    return static_cast<u16>(current ^ operand);
+}
+
 u16 applyResultFlags(u16 sr, const alu::Result& r, bool writeExtend)
 {
     u16 out = static_cast<u16>(
@@ -119,7 +136,9 @@ u32 M68k::groupImmediate(u16 op)
             next |= mask;
         }
         writeEaToAddr(mode, reg, size, addr, next);
-        return targetIsRegister ? 8 : 8;
+        // BCHG/BCLR/BSET は書き戻しが入るぶん、レジスタ対象でもメモリ対象でも 8。
+        // (BTST だけが 6/4 と分かれる。上の early return を参照)
+        return 8;
     }
 
     const u32 sizeField = (op >> 6) & 3u;
@@ -150,19 +169,8 @@ u32 M68k::groupImmediate(u16 op)
         {
             // to CCR
             const u16 ccr = static_cast<u16>(st_.sr & sr_bit::kCcrMask);
-            u16 next = ccr;
-            if (opType == 0)
-            {
-                next = static_cast<u16>(ccr | (immediate & sr_bit::kCcrMask));
-            }
-            else if (opType == 1)
-            {
-                next = static_cast<u16>(ccr & (immediate & sr_bit::kCcrMask));
-            }
-            else
-            {
-                next = static_cast<u16>(ccr ^ (immediate & sr_bit::kCcrMask));
-            }
+            const u16 operand = static_cast<u16>(immediate & sr_bit::kCcrMask);
+            const u16 next = applyLogicalOp(opType, ccr, operand);
             st_.sr = static_cast<u16>((st_.sr & ~sr_bit::kCcrMask) | next);
             return 20;
         }
@@ -171,20 +179,7 @@ u32 M68k::groupImmediate(u16 op)
         {
             return 34;
         }
-        u16 next = st_.sr;
-        if (opType == 0)
-        {
-            next = static_cast<u16>(st_.sr | immediate);
-        }
-        else if (opType == 1)
-        {
-            next = static_cast<u16>(st_.sr & immediate);
-        }
-        else
-        {
-            next = static_cast<u16>(st_.sr ^ immediate);
-        }
-        setSr(next);
+        setSr(applyLogicalOp(opType, st_.sr, static_cast<u16>(immediate)));
         return 20;
     }
 
