@@ -130,9 +130,18 @@ bool loadRoms()
 {
     const std::size_t iplSize =
         x68k_platform::loadFile(x68k_platform::kIplromPath, g_iplRom, kIplromBytes);
-    if (iplSize == 0)
+    // 長さまで確かめる。
+    //
+    // loadFile はバッファに収まる限り任意の長さを成功として返す。
+    // 途中で切れた IPL-ROM を受け入れると、読めなかった部分は calloc の
+    // ゼロのままになり、リセットベクタが 0 を指して PC=0 で暴走する。
+    // 「ROM が壊れている」と分かる形で止める方がずっとよい。
+    const bool isIplComplete = iplSize == kIplromBytes;
+    if (!isIplComplete)
     {
-        ESP_LOGE(kTag, "IPL-ROM を読めません: %s", x68k_platform::kIplromPath);
+        ESP_LOGE(kTag, "IPL-ROM が %u バイトです (%u バイト必要): %s",
+                 static_cast<unsigned>(iplSize), static_cast<unsigned>(kIplromBytes),
+                 x68k_platform::kIplromPath);
         return false;
     }
     ESP_LOGI(kTag, "IPL-ROM: %u バイト", static_cast<unsigned>(iplSize));
@@ -146,7 +155,16 @@ bool loadRoms()
     const std::size_t cgSize =
         hasCgromBuffer ? x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes)
                        : 0;
-    bool cgromReady = cgSize > 0;
+    // CGROM も長さを見る。短いものを受け入れると大半の字形が欠け、
+    // 「表示は出るが読めない」という切り分けにくい状態になる。
+    // 長さが合わなければ CGROM 無しと同じ扱いにして代替へ落とす。
+    const bool isCgromComplete = cgSize == kCgromBytes;
+    if (cgSize > 0 && !isCgromComplete)
+    {
+        ESP_LOGW(kTag, "CGROM が %u バイトです (%u バイト必要)。代替を使います",
+                 static_cast<unsigned>(cgSize), static_cast<unsigned>(kCgromBytes));
+    }
+    bool cgromReady = isCgromComplete;
     if (cgromReady)
     {
         ESP_LOGI(kTag, "CGROM: %u バイト", static_cast<unsigned>(cgSize));
@@ -559,7 +577,20 @@ extern "C" void app_main(void)
     }
 
     // エミュレーションは Core1 で回す。
-    xTaskCreatePinnedToCore(emulatorTask, "x68k", 8192, nullptr, 5, nullptr, 1);
+    // 失敗を見逃さない。
+    //
+    // ここまでに PSRAM を数 MB と内部 SRAM を 128KB 確保しているので、
+    // スタック用の内部メモリが足りずに失敗することは現実に起こりうる。
+    // 見逃すと Core0 の表示・入力ループだけが回り続け、エミュレータは
+    // 1 命令も実行されない。利用者にはフリーズとしか見えない。
+    const BaseType_t taskCreated =
+        xTaskCreatePinnedToCore(emulatorTask, "x68k", 8192, nullptr, 5, nullptr, 1);
+    if (taskCreated != pdPASS)
+    {
+        ESP_LOGE(kTag, "エミュレーションタスクを作れません (内部メモリ不足)");
+        x68k_platform::DisplayLcd::showMessage("TASK ERROR", "cannot start emulator");
+        return;
+    }
 
     // Core0 は画面と入力を担当する。
     while (true)
