@@ -37,7 +37,7 @@ test-host:
 #   ASan ランタイム (libasan) を同梱していない。そのままだとリンク時に
 #   `ld: library not found for -lasan` で落ちる。clang は compiler-rt を
 #   持っているので、サニタイザ付きビルドは clang に固定する。
-[doc('ASan/UBSan 付きでホストテストを実行する')]
+#
 # 既知の問題: Apple Silicon の macOS では、Nix の clang で作った
 # サニタイザ版バイナリが起動時に固まる (--version すら出力なしで返らない)。
 # clang 21.1.8 arm64-apple-darwin + Darwin 25 で再現。ビルドは通るので
@@ -45,6 +45,7 @@ test-host:
 #
 # CI (Linux) では通るので、サニタイザの結果はそちらで確認する。
 # 手元で回したい場合は nix の外の clang を使うと動くことがある。
+[doc('ASan/UBSan 付きでホストテストを実行する')]
 test-san:
     cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
