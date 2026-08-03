@@ -422,16 +422,17 @@ const std::set<std::string>& unverifiedUpstream()
 const std::set<std::string>& knownFailures()
 {
     static const std::set<std::string> names = {
-        // 除算と範囲検査。
+        // 除算のオーバーフロー時の N/Z。
+        //
+        // 商が 16bit に収まらないとき、68000 は筆算を途中まで進めた内部状態を
+        // N/Z に残す。Motorola の資料でも「未定義」とされる部分で、
+        // 被除数・除数から単純な式では再現できない (被除数の符号・上位ワード・
+        // 1bit シフト後の値など、素直な候補はいずれも 50-85% しか一致しない)。
+        // 忠実に合わせるには除算マイクロコードをサイクル単位で実装する必要がある。
+        //
+        // 通常の除算 (オーバーフローしない場合) とゼロ除算は全件通っている。
         "DIVS",
         "DIVU",
-        "CHK",
-        // 周辺 I/O 向けの転送。
-        "MOVEP.l",
-        "MOVEP.w",
-        // 少数のケースだけ落ちるもの。
-        "ADDX.b",
-        "BTST",
     };
 
     return names;
@@ -524,6 +525,137 @@ TEST_CASE("すべてのベクタを突き合わせる")
     }
     CHECK_MESSAGE(unexpectedlyPassing.empty(),
                   "these now pass; remove them from knownFailures():" << fixed);
+}
+
+TEST_CASE("NOP")
+{
+    checkSuite("NOP");
+}
+
+TEST_CASE("MOVEQ")
+{
+    checkSuite("MOVEQ");
+}
+
+TEST_CASE("MOVE")
+{
+    checkSuite("MOVE.b");
+    checkSuite("MOVE.w");
+    checkSuite("MOVE.l");
+}
+
+TEST_CASE("ADD")
+{
+    checkSuite("ADD.b");
+    checkSuite("ADD.w");
+    checkSuite("ADD.l");
+}
+
+TEST_CASE("SUB")
+{
+    checkSuite("SUB.b");
+    checkSuite("SUB.w");
+    checkSuite("SUB.l");
+}
+
+TEST_CASE("CMP")
+{
+    checkSuite("CMP.b");
+    checkSuite("CMP.w");
+    checkSuite("CMP.l");
+}
+
+TEST_CASE("AND / OR / EOR")
+{
+    checkSuite("AND.b");
+    checkSuite("AND.w");
+    checkSuite("AND.l");
+    checkSuite("OR.b");
+    checkSuite("OR.w");
+    checkSuite("OR.l");
+    checkSuite("EOR.b");
+    checkSuite("EOR.w");
+    checkSuite("EOR.l");
+}
+
+TEST_CASE("分岐")
+{
+    checkSuite("Bcc");
+    checkSuite("BSR");
+    checkSuite("DBcc");
+}
+
+TEST_CASE("シフト / ローテート")
+{
+    checkSuite("ASL.b");
+    checkSuite("ASR.b");
+    checkSuite("LSL.b");
+    checkSuite("LSR.b");
+    checkSuite("ROL.b");
+    checkSuite("ROR.b");
+    checkSuite("ROXL.b");
+    checkSuite("ROXR.b");
+}
+
+TEST_CASE("単項演算")
+{
+    checkSuite("CLR.b");
+    checkSuite("CLR.w");
+    checkSuite("CLR.l");
+    checkSuite("NEG.b");
+    checkSuite("NOT.b");
+    checkSuite("TST.b");
+    checkSuite("SWAP");
+    checkSuite("EXT.w");
+    checkSuite("EXT.l");
+}
+
+TEST_CASE("制御転送")
+{
+    checkSuite("JMP");
+    checkSuite("JSR");
+    checkSuite("RTS");
+    checkSuite("LEA");
+    checkSuite("PEA");
+    checkSuite("LINK");
+    checkSuite("UNLINK");
+}
+
+TEST_CASE("MOVEM")
+{
+    checkSuite("MOVEM.w");
+    checkSuite("MOVEM.l");
+}
+
+TEST_CASE("DIVS が INT32_MIN / -1 で未定義動作に落ちない")
+{
+    // 保証すること: 被除数 0x80000000 を -1 で割っても、符号付き除算
+    // オーバーフローの未定義動作を起こさず、V を立てて結果を書かないこと。
+    //
+    // Why not 適合性ベクタに任せるか: upstream のベクタにこの組み合わせは
+    // 入っていない (被除数が 0x80000000 のケースが 0 件)。商が s32 に
+    // 収まらない唯一の入力なので、ここだけは自前で押さえる。
+    // サニタイザ付きビルド (just test-san) で走らせると効果が分かる。
+    VectorBus bus;
+    x68k::M68k cpu(bus);
+
+    x68k::M68kState st{};
+    st.d[0] = 0x80000000u;  // 被除数
+    st.d[1] = 0x0000FFFFu;  // 除数 = -1 (下位ワード)
+    st.sr = x68k::sr_bit::kSupervisor;
+    st.a[7] = 0x00001000u;
+    st.ssp = 0x00001000u;
+    st.pc = 0x00002004u;
+    st.ir = 0x81C1u;   // DIVS D1,D0
+    st.irc = 0x4E71u;  // 後続は NOP
+    cpu.loadStateForTest(st);
+
+    cpu.step();
+
+    const x68k::M68kState& out = cpu.state();
+    // 商 2147483648 は 16bit に収まらないので V が立ち、D0 は元のまま。
+    CHECK((out.sr & x68k::sr_bit::kOverflow) != 0);
+    CHECK(out.d[0] == 0x80000000u);
 }
 
 TEST_CASE("NOP")

@@ -88,6 +88,56 @@ u32 M68k::groupImmediate(u16 op)
     const bool isDynamicBitOp = (op & 0x0100u) != 0;
     const u32 opType = (op >> 9) & 7u;
 
+    // MOVEP Dx,(d16,Ay) / (d16,Ay),Dx : 0000 rrr 1mm 001 aaa
+    //
+    // 動的ビット操作と同じ bit8=1 の空間に入っているが、mode が 1 (An 直接) の
+    // ものだけが MOVEP。ビット操作は An を対象に取れないので衝突しない。
+    // Why not ビット操作側の後で判定するか: 先に判定しないと BCHG/BSET として
+    // 解釈され、An を書き換えてしまう。
+    const bool isMovep = isDynamicBitOp && mode == 1;
+    if (isMovep)
+    {
+        const u32 dataReg = (op >> 9) & 7u;
+        const u32 opmode = (op >> 6) & 3u;  // 4=w->reg 5=l->reg 6=w->mem 7=l->mem の下位2bit
+        const bool isLong = (opmode & 1u) != 0;
+        const bool toMemory = (opmode & 2u) != 0;
+
+        // 変位は命令語の直後の拡張ワード。effectiveAddress を使わないのは
+        // MOVEP が (d16,An) 形式に固定されていて、他のモードを取らないため。
+        const s16 disp = static_cast<s16>(fetch());
+        const u32 base = st_.a[reg] + static_cast<u32>(static_cast<s32>(disp));
+
+        // 8bit 幅の周辺デバイス向けに、1 バイトおき (アドレス +2 ずつ) に転送する。
+        const u32 byteCount = isLong ? 4u : 2u;
+        if (toMemory)
+        {
+            const u32 value = st_.d[dataReg];
+            for (u32 i = 0; i < byteCount; ++i)
+            {
+                // 上位バイトから順に置く。
+                const u32 shift = (byteCount - 1u - i) * 8u;
+                write8(base + i * 2u, static_cast<u8>((value >> shift) & 0xFFu));
+            }
+            return isLong ? 24 : 16;
+        }
+
+        u32 value = 0;
+        for (u32 i = 0; i < byteCount; ++i)
+        {
+            value = (value << 8) | read8(base + i * 2u);
+        }
+        // ワード転送は Dn の下位 16bit だけを差し替える。上位は保存される。
+        if (isLong)
+        {
+            st_.d[dataReg] = value;
+        }
+        else
+        {
+            st_.d[dataReg] = (st_.d[dataReg] & 0xFFFF0000u) | (value & 0xFFFFu);
+        }
+        return isLong ? 24 : 16;
+    }
+
     if (isDynamicBitOp || opType == 4)
     {
         // BTST/BCHG/BCLR/BSET。対象が Dn なら 32bit、メモリなら 8bit で回る。
@@ -106,6 +156,22 @@ u32 M68k::groupImmediate(u16 op)
         const u32 size = targetIsRegister ? kLong : kByte;
         bitNumber &= targetIsRegister ? 31u : 7u;
         const u32 mask = 1u << bitNumber;
+
+        // BTST だけは書き戻しがないので即値 (#) を対象に取れる。
+        // Why not readEaForModify に通すか: あれは書き戻し先のアドレスを
+        // 確定させる関数で、即値モードを扱えない。BTST #, # のように
+        // 「読むだけ」の形式はここで読み切る。
+        const bool isImmediateSource = mode == 7 && reg == 4;
+        if (bitOp == 0 && isImmediateSource)
+        {
+            const u32 immediateValue = readEa(mode, reg, size);
+            st_.sr = static_cast<u16>(st_.sr & ~sr_bit::kZero);
+            if ((immediateValue & mask) == 0)
+            {
+                st_.sr |= sr_bit::kZero;
+            }
+            return 4;
+        }
 
         u32 addr = 0;
         const u32 value = readEaForModify(mode, reg, size, addr);

@@ -119,7 +119,14 @@ u32 M68k::groupAdd(u16 op)
         // Z は累積: 結果がゼロでも前の Z が false なら false のまま。
         // 多倍長加算で「全ワードがゼロのときだけ Z」を実現するための規則。
         r.z = alu::accumulateZero((st_.sr & sr_bit::kZero) != 0, r.value == 0);
-        r.v = first.v || second.v;
+        // V は dst+src+X を「一つの加算」とみなして元の被演算子の符号から作る。
+        //
+        // Why not first.v || second.v とするか: 2 段に分けた中間結果の符号で
+        // 判定すると、負どうしの和がちょうど 0x80 になる場合 (例 d=80,s=FF,X=1)
+        // に段目の V が誤って立つ。実機は 1 回の加算として扱うのでこうはならない。
+        const bool srcIsNegative = alu::isNegative(src, size);
+        const bool dstIsNegative = alu::isNegative(dst, size);
+        r.v = (srcIsNegative == dstIsNegative) && (r.n != dstIsNegative);
         r.c = first.c || second.c;
         st_.sr = applyFlags(st_.sr, r, true);
 
@@ -214,7 +221,10 @@ u32 M68k::groupSub(u16 op)
         r.value = second.value;
         r.n = alu::isNegative(r.value, size);
         r.z = alu::accumulateZero((st_.sr & sr_bit::kZero) != 0, r.value == 0);
-        r.v = first.v || second.v;
+        // V は dst-src-X を「一つの減算」とみなす。理由は ADDX 側のコメント参照。
+        const bool srcIsNegative = alu::isNegative(src, size);
+        const bool dstIsNegative = alu::isNegative(dst, size);
+        r.v = (srcIsNegative != dstIsNegative) && (r.n != dstIsNegative);
         r.c = first.c || second.c;
         st_.sr = applyFlags(st_.sr, r, true);
 
@@ -374,27 +384,41 @@ u32 M68k::groupOrDiv(u16 op)
         const bool isSigned = opmode == 7;
         const u32 dividend = st_.d[reg];
 
+        // Why not s32 のまま割るか: D0=0x80000000 を -1 で割ると商が s32 に
+        // 収まらず、C++ の符号付き除算オーバーフロー (未定義動作) になる。
+        // 商が 16bit に収まるかを判定するのは除算の後なので、判定前に UB へ
+        // 落ちてしまう。両オペランドを先に s64 へ広げれば除算自体が必ず成立し、
+        // オーバーフロー判定を安全に後段で行える。
         s64 quotient = 0;
         s64 remainder = 0;
         if (isSigned)
         {
-            const s32 n = static_cast<s32>(dividend);
-            const s32 d = static_cast<s16>(divisor16);
+            const s64 n = static_cast<s64>(static_cast<s32>(dividend));
+            const s64 d = static_cast<s64>(static_cast<s16>(divisor16));
             quotient = n / d;
             remainder = n % d;
         }
         else
         {
-            const u32 n = dividend;
-            const u32 d = divisor16;
-            quotient = static_cast<s64>(n / d);
-            remainder = static_cast<s64>(n % d);
+            const s64 n = static_cast<s64>(dividend);
+            const s64 d = static_cast<s64>(divisor16);
+            quotient = n / d;
+            remainder = n % d;
         }
 
+        // C は除算では常にクリアされる (オーバーフロー時も含む)。
+        st_.sr = static_cast<u16>(st_.sr & ~sr_bit::kCarry);
+
         // 商が 16bit に収まらない場合は V を立てて結果を書かない。
-        const bool overflow =
+        //
+        // このとき N/Z は Motorola の資料でも「未定義」で、実機は筆算を途中まで
+        // 進めた内部状態を残す。被除数から単純な式では再現できないため
+        // (素直な候補はいずれも適合性ベクタの 50-85% しか一致しない)、
+        // ここでは触らずに元の値を残す。忠実に合わせるには除算マイクロコードを
+        // サイクル単位で実装する必要がある。
+        const bool isOverflow =
             isSigned ? (quotient > 32767 || quotient < -32768) : (quotient > 65535);
-        if (overflow)
+        if (isOverflow)
         {
             st_.sr |= sr_bit::kOverflow;
             return 70;

@@ -269,7 +269,23 @@ u32 M68k::groupMisc(u16 op)
         const u32 dstReg = (op >> 9) & 7u;
         const s16 bound = static_cast<s16>(readEa(mode, reg, kWord));
         const s16 value = static_cast<s16>(st_.d[dstReg] & 0xFFFFu);
-        if (value < 0 || value > bound)
+
+        // CHK は Z/V/C を必ずクリアし、N には「範囲外だった向き」を残す。
+        // 下側 (負) で外れたら N=1、上側で外れたら N=0。範囲内なら N=0。
+        //
+        // Why not Z を「値がゼロか」で作るか: 適合性ベクタの範囲内ケース
+        // (89/89) はすべて Z=0 で、値がゼロでも Z は立たない。
+        const bool isBelowZero = value < 0;
+        const bool isAboveBound = value > bound;
+        u16 sr = static_cast<u16>(
+            st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
+        if (isBelowZero)
+        {
+            sr |= sr_bit::kNegative;
+        }
+        st_.sr = sr;
+
+        if (isBelowZero || isAboveBound)
         {
             takeException(vector::kChk);
             return 40;
