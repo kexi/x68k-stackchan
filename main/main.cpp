@@ -323,6 +323,29 @@ private:
             return;
         }
 
+        // '%' で LCD へ送っている画素をそのまま吸い出す。
+        //
+        // テキスト画面の逆引き ('~') は VRAM の中身しか見ないので、
+        // 「VRAM は正しいのに LCD がおかしい」形の不具合を見つけられない。
+        // ラスタライズ後の画素を見れば、パレット・拡大・転送のどこで
+        // 崩れているかまで分かる。
+        const bool isFrameDumpRequest = c == '%';
+        if (isFrameDumpRequest)
+        {
+            dumpFrameBuffer();
+            return;
+        }
+
+        // '!' で画面を消して描き直す。表示が崩れたときに、崩れが
+        // 描画側に残っているのか LCD 側に残っているのかを切り分ける。
+        const bool isRefreshRequest = c == '!';
+        if (isRefreshRequest)
+        {
+            g_display.forceClear();
+            ESP_LOGI(kTag, "画面を消去して描き直します");
+            return;
+        }
+
         // '<' '>' で拡大率を変える。読みやすさと見える範囲は
         // 引き換えなので、実機を見ながら選べるようにする。
         const bool isZoomOut = c == '<';
@@ -351,6 +374,66 @@ private:
         framesLeft_ = kFramesPerStep;
     }
 
+    // LCD へ送っている RGB565 の画素をそのまま吐く。
+    //
+    // base64 で送る。生のバイナリだと ESP_LOG の行が混ざったときに
+    // 区切りが分からなくなり、0x0A を含む画素が改行と区別できない。
+    // 4/3 に膨らむが、150KB が 200KB になるだけで実用上は困らない。
+    static void dumpFrameBuffer()
+    {
+        if (g_frameBuffer == nullptr)
+        {
+            return;
+        }
+
+        constexpr x68k::u32 kWidth = x68k_platform::DisplayLcd::kScreenWidth;
+        constexpr x68k::u32 kHeight = x68k_platform::DisplayLcd::kScreenHeight;
+
+        std::printf("---- フレームバッファ %ux%u RGB565 base64 ----\n",
+                    static_cast<unsigned>(kWidth), static_cast<unsigned>(kHeight));
+
+        static const char kBase64[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+        const auto* bytes = reinterpret_cast<const std::uint8_t*>(g_frameBuffer);
+        const std::size_t total = static_cast<std::size_t>(kWidth) * kHeight * 2;
+
+        // 3 バイトを 4 文字へ。行が長すぎると受け側の取りこぼしが増えるので
+        // 76 文字で折る。
+        char line[80];
+        std::size_t col = 0;
+        for (std::size_t i = 0; i < total; i += 3)
+        {
+            const std::uint32_t b0 = bytes[i];
+            const std::uint32_t b1 = (i + 1 < total) ? bytes[i + 1] : 0;
+            const std::uint32_t b2 = (i + 2 < total) ? bytes[i + 2] : 0;
+            const std::uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+
+            line[col++] = kBase64[(triple >> 18) & 0x3F];
+            line[col++] = kBase64[(triple >> 12) & 0x3F];
+            line[col++] = (i + 1 < total) ? kBase64[(triple >> 6) & 0x3F] : '=';
+            line[col++] = (i + 2 < total) ? kBase64[triple & 0x3F] : '=';
+
+            if (col >= 76)
+            {
+                line[col] = '\0';
+                std::printf("%s\n", line);
+                col = 0;
+                // USB CDC の送信バッファを詰まらせない。詰まると
+                // 画面更新のループごと止まる。
+                vTaskDelay(1);
+            }
+        }
+        if (col > 0)
+        {
+            line[col] = '\0';
+            std::printf("%s\n", line);
+        }
+
+        std::printf("---- フレームバッファここまで ----\n");
+        std::fflush(stdout);
+    }
+
     static void dumpScreen()
     {
         if (g_textVram == nullptr || g_cgRom == nullptr)
@@ -373,6 +456,51 @@ private:
 };
 
 SerialConsole g_console;
+
+// 書き込みが進んだ先へ表示範囲を追わせる。
+//
+// 拡大すると 20 桁 x 7 行しか映らず、Human68k の 96 桁 x 32 行の左上しか
+// 見えない。プロンプトは左上にあるので起動直後は問題ないが、行が伸びたり
+// 画面が下へ進んだりすると、打っている場所が窓の外へ出てしまう。
+//
+// Why not Human68k のカーソル位置ワークを読むか: その番地は OS の
+// バージョンに依存する。VRAM から「最後に文字が書かれた位置」を求めれば
+// 内部構造を知らなくても済み、ホストでも同じ判定が使える。
+void followCursor()
+{
+    if (g_textVram == nullptr)
+    {
+        return;
+    }
+
+    // 画面全体の走査は 96x32 セル分あって毎フレームには重い。
+    // 追従が数フレーム遅れても操作感は変わらない。
+    static int skip = 0;
+    if (++skip < 8)
+    {
+        return;
+    }
+    skip = 0;
+
+    const x68k::u32 row = x68k::TextScrape::lastUsedRow(g_textVram);
+    const x68k::u32 column = x68k::TextScrape::lastUsedColumn(g_textVram, row);
+
+    // 窓に入る桁数・行数。
+    const x68k::u32 zoom = g_display.zoom();
+    const x68k::u32 cols = x68k_platform::DisplayLcd::kScreenWidth / zoom / 8;
+    const x68k::u32 rows = x68k_platform::DisplayLcd::kScreenHeight / zoom / 16;
+
+    // 書いている位置が右端・下端に来るように寄せる。行頭へ戻ったら
+    // 左端まで戻す。1 文字ぶん余白を持たせてカーソルが端に貼り付かない
+    // ようにする。
+    const x68k::u32 marginCols = 1;
+    const x68k::u32 wantCols = column + marginCols + 1;
+    const x68k::u32 x = wantCols > cols ? (wantCols - cols) * 8 : 0;
+    const x68k::u32 wantRows = row + 1;
+    const x68k::u32 y = wantRows > rows ? (wantRows - rows) * 16 : 0;
+
+    g_display.setViewport(x, y);
+}
 
 }  // namespace
 
@@ -413,7 +541,6 @@ extern "C" void app_main(void)
     // 等倍だと 8x16 の文字が 2 インチの画面にそのまま出て読み取れない。
     // 2 倍にすると 20 桁 x 7 行と狭くなるが、文字として判別できる。
     g_display.setViewport(0, 0);
-    g_display.setZoom(2);
     g_keyboard.begin();
 
     // シリアルからキーを拾えるようにする。
@@ -440,6 +567,7 @@ extern "C" void app_main(void)
         M5.update();
         g_keyboard.poll(g_machine);
         g_console.poll();
+        followCursor();
         g_display.present(g_machine, g_textVram);
         vTaskDelay(pdMS_TO_TICKS(16));  // 約 60Hz
     }

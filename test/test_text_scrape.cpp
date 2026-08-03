@@ -164,6 +164,43 @@ TEST_CASE("範囲外の行や nullptr で落ちない")
     CHECK(line[0] == '\0');
 }
 
+TEST_CASE("本文の末尾位置を求められる")
+{
+    const auto cgrom = makeCgrom();
+    std::vector<x68k::u8> vram(x68k::kTvramSize, 0x00);
+
+    putChar(vram, cgrom, 0, 5, 'A');
+    putChar(vram, cgrom, 1, 5, '>');
+    putChar(vram, cgrom, 2, 5, 'x');
+
+    CHECK(x68k::TextScrape::lastUsedRow(vram.data()) == 5);
+    CHECK(x68k::TextScrape::lastUsedColumn(vram.data(), 5) == 2);
+}
+
+TEST_CASE("ファンクションキー行は本文の末尾に数えない")
+{
+    const auto cgrom = makeCgrom();
+    std::vector<x68k::u8> vram(x68k::kTvramSize, 0x00);
+
+    // Human68k はファンクションキーの一覧を常に最下行へ出す。
+    // これを本文と数えると、表示位置が常に画面最下部へ飛んでしまう。
+    putChar(vram, cgrom, 0, 5, 'A');
+    for (x68k::u32 c = 0; c < 40; ++c)
+    {
+        putChar(vram, cgrom, c, x68k::TextScrape::kFunctionKeyRow, 'F');
+    }
+
+    CHECK(x68k::TextScrape::lastUsedRow(vram.data()) == 5);
+}
+
+TEST_CASE("何も書かれていなければ本文の末尾は 0 行目")
+{
+    const std::vector<x68k::u8> vram(x68k::kTvramSize, 0x00);
+
+    CHECK(x68k::TextScrape::lastUsedRow(vram.data()) == 0);
+    CHECK(x68k::TextScrape::lastUsedColumn(vram.data(), 0) == 0);
+}
+
 TEST_CASE("ASCII からスキャンコードへの対応")
 {
     // IPL-ROM 内の変換表から読み取った値。ここがずれると実機で

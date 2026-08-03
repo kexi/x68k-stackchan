@@ -68,10 +68,23 @@ public:
         forceFullRedraw_ = true;
     }
 
+    // LCD を黒で塗ってから描き直させる。表示が崩れたときの切り分けに使う。
+    void forceClear();
+
     // 起動時のメッセージを出す。ROM が見つからないときなどに使う。
     static void showMessage(const char* line1, const char* line2 = nullptr);
 
 private:
+    // LCD を黒で塗り潰し、次のフレームで全体を描き直させる。
+    //
+    // 拡大率や表示位置が変わると同じ画素に別の内容が来る。消さずに
+    // 描き直すと、前の設定で描いた文字が下に残って層になる。
+    void clearScreen();
+
+    // ダーティ行だけを送る実装。切り出し位置が動くと古い描画が残るため
+    // 現在は使っていない。表示位置を固定する運用に戻すときのために残す。
+    void presentDirtyRowsOnly(x68k::Machine& machine, const x68k::u8* textVram);
+
     // 拡大表示。全画面を作り直して送る。
     void renderZoomed(x68k::Machine& machine, const x68k::u8* textVram);
 

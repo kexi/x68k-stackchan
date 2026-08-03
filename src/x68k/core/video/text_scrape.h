@@ -48,6 +48,24 @@ public:
     // 1 セルが空 (全プレーンが 0) かどうか。
     [[nodiscard]] static bool isCellBlank(const u8* vram, u32 column, u32 row);
 
+    // Human68k がファンクションキーの一覧を出す行。
+    //
+    // 常に最下行に居座るので、「最後に文字が書かれた行」を素直に探すと
+    // 必ずここに当たり、本文の位置が分からなくなる。
+    static constexpr u32 kFunctionKeyRow = kRows - 1;
+
+    // 本文が書かれている一番下の行を返す。何も無ければ 0。
+    //
+    // ファンクションキー行は対象から外す。
+    //
+    // Why not Human68k のカーソル位置ワークを読むか: その番地は OS の
+    // バージョンに依存する。VRAM を見れば「今どこまで書かれたか」は
+    // 内部構造を知らなくても分かる。
+    [[nodiscard]] static u32 lastUsedRow(const u8* vram);
+
+    // 指定行で文字が書かれている一番右の桁を返す。空行なら 0。
+    [[nodiscard]] static u32 lastUsedColumn(const u8* vram, u32 row);
+
 private:
     // セルの 16 バイト (8x16 の 1bit ビットマップ) を取り出す。
     //

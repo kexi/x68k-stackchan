@@ -4,6 +4,7 @@
 #include "display_lcd.h"
 
 #include <M5Unified.h>
+#include <esp_log.h>
 
 #include "video/text_raster.h"
 
@@ -23,7 +24,43 @@ void DisplayLcd::begin(x68k::u16* buffer)
     forceFullRedraw_ = true;
 
     M5.Display.setColorDepth(16);
-    M5.Display.fillScreen(TFT_BLACK);
+
+    // バイト順の変換を通す。
+    //
+    // これが無いと M5GFX は「変換不要」と判断し、渡したポインタを
+    // そのまま SPI の DMA descriptor に設定する (Panel_LCD.cpp の
+    // no_convert 経路)。フレームバッファは PSRAM 上にあるため、
+    // CPU がキャッシュへ書いた内容と GDMA が PSRAM から読む内容が
+    // 食い違い、転送しても画面が更新されない。M5GFX 0.2.26 には
+    // DMA 可能メモリかの判定も ESP32-S3 向けの esp_cache_msync も無い。
+    //
+    // 変換を挟むと M5GFX は内部の DMA 可能バッファへ画素を写してから
+    // 送るので、この問題が起きない。
+    //
+    // Why not esp_cache_msync を自分で呼ぶか: M5GFX の DMA 経路は
+    // 外部 RAM 判定もエラー処理も持たないため、同期しても descriptor の
+    // 扱いは変わらない。内部バッファに寄せる方が確実。
+    M5.Display.setSwapBytes(true);
+
+    // 回転を明示する。
+    //
+    // CoreS3 は既定で rotation=1 になっており、この状態で pushImageDMA に
+    // 生の画素を渡すと座標が読み替えられ、実機では上下が入れ替わって
+    // 表示された。エミュレータ側は 320x240 の並びで画素を作っているので、
+    // パネルの向きをそれに合わせる。
+    M5.Display.setRotation(1);
+
+    // パネルの実寸と回転を記録する。想定 (320x240) と食い違うと
+    // 画面が右へずれたり上下が切れたりする。
+    ESP_LOGI("x68k.lcd", "LCD %dx%d rotation=%d colorDepth=%d", M5.Display.width(),
+             M5.Display.height(), M5.Display.getRotation(), M5.Display.getColorDepth());
+
+    // 画面を消す経路と描く経路を pushImageDMA に統一する。
+    //
+    // Why not fillScreen を使うか: 実機で fillScreen が LCD へ届かない
+    // 場面があった。pushImageDMA と混在させると SPI のトランザクションが
+    // 噛み合わないらしい。片方に寄せれば食い違いが起きない。
+    clearScreen();
 }
 
 void DisplayLcd::setZoom(x68k::u32 zoom)
@@ -34,7 +71,41 @@ void DisplayLcd::setZoom(x68k::u32 zoom)
         return;
     }
     zoom_ = clamped;
+    // 拡大率が変わると同じ画素に別の内容が来る。消さずに描き直すと、
+    // 前の拡大率で描いた文字が下に残って層になる。
+    clearScreen();
+}
+
+void DisplayLcd::forceClear()
+{
+    clearScreen();
+}
+
+void DisplayLcd::clearScreen()
+{
     forceFullRedraw_ = true;
+
+    if (buffer_ == nullptr)
+    {
+        return;
+    }
+
+    // バッファを黒で埋めて送る。
+    //
+    // Why not fillScreen を使うか: 実機で fillScreen が反映されなかった。
+    // pushImageDMA と混在させると SPI のトランザクションが噛み合わず、
+    // 塗り潰しが LCD へ届かないまま次の転送が始まるらしい。
+    // 転送経路を pushImageDMA だけに統一すれば、この食い違いが起きない。
+    const std::size_t pixels = static_cast<std::size_t>(kScreenWidth) * kScreenHeight;
+    M5.Display.waitDMA();
+    for (std::size_t i = 0; i < pixels; ++i)
+    {
+        buffer_[i] = 0;
+    }
+
+    M5.Display.pushImageDMA(0, 0, static_cast<int>(kScreenWidth), static_cast<int>(kScreenHeight),
+                            buffer_);
+    M5.Display.waitDMA();
 }
 
 void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram)
@@ -71,6 +142,13 @@ void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram)
         }
     }
 
+    // 前回の DMA 転送が終わるのを待ってから送る。
+    //
+    // pushImageDMA は転送の完了を待たずに戻る。待たずに次のフレームを
+    // 作ると、転送中のバッファを上書きすることになり、LCD には新旧が
+    // 混ざった画面が出る。等倍は行単位に分けて送るので目立たなかったが、
+    // 拡大は毎回 150KB を 1 回で送るため確実に競合する。
+    M5.Display.waitDMA();
     M5.Display.pushImageDMA(0, 0, static_cast<int>(kScreenWidth), static_cast<int>(kScreenHeight),
                             buffer_);
 }
@@ -83,7 +161,11 @@ void DisplayLcd::setViewport(x68k::u32 x, x68k::u32 y)
     }
     viewX_ = x;
     viewY_ = y;
-    // 表示範囲が変わったらダーティ情報は当てにならない。
+    // 表示範囲が変わったら全体を描き直す。
+    //
+    // Why not 消してから描くか: present は毎回全画面を送るので、
+    // 描き直せば古い内容は必ず上書きされる。消す一手間を挟むと
+    // 位置が動くたびに黒い画面が 1 フレーム挟まって明滅する。
     forceFullRedraw_ = true;
 }
 
@@ -114,6 +196,7 @@ void DisplayLcd::present(x68k::Machine& machine, const x68k::u8* textVram)
     {
         x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, kScreenWidth,
                                  kScreenHeight, buffer_, kScreenWidth);
+        M5.Display.waitDMA();
         M5.Display.pushImageDMA(0, 0, static_cast<int>(kScreenWidth),
                                 static_cast<int>(kScreenHeight), buffer_);
         bus.clearTextDirty();
@@ -125,6 +208,30 @@ void DisplayLcd::present(x68k::Machine& machine, const x68k::u8* textVram)
     {
         return;
     }
+
+    // 変化があれば全画面を作り直す。
+    //
+    // Why not ダーティ行だけ送るか: ダーティ行は「テキスト VRAM のどこが
+    // 変わったか」しか表さない。切り出し位置 (viewX_/viewY_) が動くと
+    // 同じ VRAM 行が LCD の別の位置に来るので、変わっていない行の古い
+    // 描画が LCD に残り、新しい描画と二重に見える。実機で「A> が 2 個
+    // 出る」形で露見した。
+    //
+    // 全画面でも 320x240 の変換で足りており、実測で間に合う。
+    // 転送量を削るのは、切り出し位置を固定できるようになってからでよい。
+    x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, kScreenWidth, kScreenHeight,
+                             buffer_, kScreenWidth);
+    M5.Display.waitDMA();
+    M5.Display.pushImageDMA(0, 0, static_cast<int>(kScreenWidth), static_cast<int>(kScreenHeight),
+                            buffer_);
+    bus.clearTextDirty();
+}
+
+// 以下はダーティ行だけを送る実装。切り出し位置が動くと使えないので
+// 現在は呼んでいない。表示位置を固定する運用に戻すときに復活させる。
+void DisplayLcd::presentDirtyRowsOnly(x68k::Machine& machine, const x68k::u8* textVram)
+{
+    auto& bus = machine.bus();
 
     // 表示している範囲に対応するタイル行だけを見る。
     const x68k::u32 firstRow = viewY_ / kTileHeight;
@@ -160,6 +267,9 @@ void DisplayLcd::present(x68k::Machine& machine, const x68k::u8* textVram)
         const x68k::u32 height = clampedEnd - clampedStart;
 
         x68k::u16* dest = buffer_ + static_cast<std::size_t>(destY) * kScreenWidth;
+        // 描く前に前回の転送を待つ。同じバッファを使い回すので、
+        // 転送中に render で上書きすると LCD に古い内容が残る。
+        M5.Display.waitDMA();
         x68k::TextRaster::render(textVram, machine.video(), viewX_, clampedStart, kScreenWidth,
                                  height, dest, kScreenWidth);
         M5.Display.pushImageDMA(0, static_cast<int>(destY), static_cast<int>(kScreenWidth),

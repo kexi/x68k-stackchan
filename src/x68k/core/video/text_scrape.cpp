@@ -48,6 +48,45 @@ bool TextScrape::isCellBlank(const u8* vram, u32 column, u32 row)
     return true;
 }
 
+u32 TextScrape::lastUsedColumn(const u8* vram, u32 row)
+{
+    if (vram == nullptr || row >= kRows)
+    {
+        return 0;
+    }
+
+    for (u32 column = kColumns; column-- > 0;)
+    {
+        if (!isCellBlank(vram, column, row))
+        {
+            return column;
+        }
+    }
+    return 0;
+}
+
+u32 TextScrape::lastUsedRow(const u8* vram)
+{
+    if (vram == nullptr)
+    {
+        return 0;
+    }
+
+    // ファンクションキー行から上へ探す。あの行は常に埋まっているので、
+    // 含めると必ずそこが返って本文の位置が分からなくなる。
+    for (u32 row = kFunctionKeyRow; row-- > 0;)
+    {
+        for (u32 column = 0; column < kColumns; ++column)
+        {
+            if (!isCellBlank(vram, column, row))
+            {
+                return row;
+            }
+        }
+    }
+    return 0;
+}
+
 void TextScrape::readRow(const u8* vram, const u8* cgrom, u32 row, char* out)
 {
     if (vram == nullptr || cgrom == nullptr || out == nullptr || row >= kRows)
