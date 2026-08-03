@@ -23,6 +23,7 @@
 #include "input_touch.h"
 #include "machine.h"
 #include "storage_sd.h"
+#include "video/cgrom_fallback.h"
 
 namespace
 {
@@ -131,17 +132,28 @@ bool loadRoms()
     ESP_LOGI(kTag, "IPL-ROM: %u バイト", static_cast<unsigned>(iplSize));
 
     // CGROM は無くても英数字は出せる (IPL-ROM 内の 6x12 ANK フォントを使う)。
+    //
+    // 代替を組み立てずに nullptr のまま進めると、IOCS は字形として 0 以外の
+    // 「読めた値」を使い、画面がベタ塗りの矩形になって Human68k の出力が
+    // 一切読めなくなる。ホスト側 (host/main.cpp) と同じ扱いに揃える。
+    const bool hasCgromBuffer = g_cgRom != nullptr;
     const std::size_t cgSize =
-        g_cgRom != nullptr
-            ? x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes)
-            : 0;
-    if (cgSize == 0)
+        hasCgromBuffer ? x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes)
+                       : 0;
+    bool cgromReady = cgSize > 0;
+    if (cgromReady)
     {
-        ESP_LOGW(kTag, "CGROM がありません。英数字のみ表示します");
+        ESP_LOGI(kTag, "CGROM: %u バイト", static_cast<unsigned>(cgSize));
+    }
+    else if (hasCgromBuffer)
+    {
+        x68k::buildCgromFromIplRom(g_iplRom, g_cgRom);
+        cgromReady = true;
+        ESP_LOGW(kTag, "CGROM がありません。IPL-ROM 内蔵 6x12 ANK フォントで代替します");
     }
     else
     {
-        ESP_LOGI(kTag, "CGROM: %u バイト", static_cast<unsigned>(cgSize));
+        ESP_LOGE(kTag, "CGROM 用の PSRAM を確保できませんでした。文字は表示できません");
     }
 
     if (!g_disk.open(x68k_platform::kHddPath))
@@ -154,7 +166,7 @@ bool loadRoms()
     memory.textVram = g_textVram;
     memory.graphicVram = g_graphicVram;
     memory.iplRom = g_iplRom;
-    memory.cgRom = cgSize > 0 ? g_cgRom : nullptr;
+    memory.cgRom = cgromReady ? g_cgRom : nullptr;
     g_machine.setMemory(memory);
     g_machine.setSasiBuffer(g_sasiBuffer);
     g_machine.setDisk(&g_disk);
