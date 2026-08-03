@@ -87,13 +87,15 @@ bool reserveMemory()
 {
     reportMemory("before reserve");
 
-    // 大きいものから順に PSRAM を取る。
+    // 必須のものを先に取る。
+    //
+    // グラフィック VRAM は無くてもコンソールは出せる (下で最後に取る)。
+    // 先に 512KB を消費すると、必須のものだけなら収まる状況でも
+    // そちらが失敗して起動を中止することになる。
     g_mainRam = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kMainRamBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_textVram = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kTextVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-    g_graphicVram = static_cast<x68k::u8*>(
-        heap_caps_calloc(1, kGraphicVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_cgRom = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kCgromBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_frameBufferA = static_cast<x68k::u16*>(
@@ -122,6 +124,17 @@ bool reserveMemory()
     else
     {
         ESP_LOGI(kTag, "IPL-ROM を内部 SRAM に配置しました");
+    }
+
+    // グラフィック VRAM は最後。取れなくても起動する。
+    //
+    // 今の表示はテキスト VRAM しか使わず、バスにも null チェックがある。
+    // グラフィック画面 (#7) を実装したら必須へ移す。
+    g_graphicVram = static_cast<x68k::u8*>(
+        heap_caps_calloc(1, kGraphicVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_graphicVram == nullptr)
+    {
+        ESP_LOGW(kTag, "グラフィック VRAM を確保できません。テキスト画面のみで続けます");
     }
 
     reportMemory("after reserve");
