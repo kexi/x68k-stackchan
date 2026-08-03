@@ -106,7 +106,12 @@ void Machine::reset()
     mfp_.reset();
     rtc_.reset();
     fdc_.reset();
+    // 転送バッファは外から与えられた設定なので、リセットで消さない。
+    // ここを丸ごと初期化すると nullptr に戻り、SASI が 1 バイトも
+    // 受け取れなくなる。
+    u8* const sasiBuffer = sasi_.buffer;
     sasi_ = SasiState{};
+    sasi_.buffer = sasiBuffer;
     dmac_.reset();
 
     // リセット直後は IPL-ROM が $000000 に写像されている。
