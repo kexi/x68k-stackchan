@@ -68,6 +68,7 @@ add_executable(x68k_tests
   test_bus.cpp
   test_text_raster.cpp
   test_boot.cpp
+  test_sasi.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 add_test(NAME x68k_tests COMMAND x68k_tests)
