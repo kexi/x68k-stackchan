@@ -73,6 +73,25 @@ FILE_AREA_LBA = 8
 # 指定するロードアドレスに合わせる。
 HUMAN_LOAD_ADDR = 0x006800
 
+# --- FAT12 のパラメータ -----------------------------------------------------
+#
+# HUMAN.SYS はブートコードが直接読み込むので FAT を経由しないが、
+# 起動後の Human68k は CONFIG.SYS や COMMAND.X を FAT から探す。
+# ファイルシステムが無いと、Human68k は何も読めずプロンプトを出せない。
+
+# FAT の開始位置。Human68k の領域はここから始まる。
+FAT_START_LBA = 32
+
+FAT_BYTES_PER_SECTOR = SASI_SECTOR_SIZE
+FAT_SECTORS_PER_CLUSTER = 4
+FAT_RESERVED_SECTORS = 1
+FAT_COPIES = 2
+FAT_ROOT_ENTRIES = 128
+FAT_MEDIA_DESCRIPTOR = 0xF8  # 固定ディスク
+
+# ディレクトリエントリ 1 件の大きさ。
+DIR_ENTRY_SIZE = 32
+
 
 def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
     """HUMAN.SYS を読み込んで実行する 68000 のコードを組む。
@@ -137,10 +156,16 @@ def build_boot_code(human_lba: int, human_sectors: int, entry: int) -> bytes:
 
 
 def build_id_sector(total_sectors: int) -> bytes:
-    """IPL-ROM が最初に読む識別セクタを組む。"""
+    """IPL-ROM が最初に読む識別セクタを組む。
+
+    総セクタ数はオフセット 8。IPL-ROM は $FF920A で 8(SP) を読み、
+    $9FD9 / $13D1D と比べてディスクの諸元テーブル ($FF99B2 から $14 刻み)
+    を選ぶ。位置を間違えると容量 0 とみなされ、小容量向けの諸元が
+    使われる。
+    """
     sector = bytearray(SASI_SECTOR_SIZE)
     sector[0:4] = BOOT_MAGIC
-    struct.pack_into(">I", sector, 4, total_sectors)
+    struct.pack_into(">I", sector, 8, total_sectors)
     return bytes(sector)
 
 
@@ -204,6 +229,115 @@ class XFile:
         return bytes(image)
 
 
+class Fat12:
+    """FAT12 のファイルシステムを組み立てる。
+
+    Human68k の FAT は PC の FAT12 とほぼ同じ。違うのはセクタ長が 256 バイト
+    であることと、ディレクトリエントリの日付形式くらいで、起動に要る範囲では
+    同じ構造で通る。
+    """
+
+    def __init__(self, total_sectors: int):
+        self.total_sectors = total_sectors
+        # FAT のエントリ数はクラスタ数で決まる。12bit なので 1.5 バイト/個。
+        self.cluster_count = total_sectors // FAT_SECTORS_PER_CLUSTER
+        fat_bytes = (self.cluster_count + 2) * 3 // 2
+        self.sectors_per_fat = (fat_bytes + FAT_BYTES_PER_SECTOR - 1) // FAT_BYTES_PER_SECTOR
+
+        root_bytes = FAT_ROOT_ENTRIES * DIR_ENTRY_SIZE
+        self.root_sectors = (root_bytes + FAT_BYTES_PER_SECTOR - 1) // FAT_BYTES_PER_SECTOR
+
+        self.fat_start = FAT_RESERVED_SECTORS
+        self.root_start = self.fat_start + FAT_COPIES * self.sectors_per_fat
+        self.data_start = self.root_start + self.root_sectors
+
+        self.fat = bytearray(self.sectors_per_fat * FAT_BYTES_PER_SECTOR)
+        self.root = bytearray(root_bytes)
+        self.data = bytearray()
+        self.next_cluster = 2
+        self.entry_count = 0
+
+        # FAT の先頭 2 エントリは予約。メディア記述子と終端を入れる。
+        self.set_fat_entry(0, 0xF00 | FAT_MEDIA_DESCRIPTOR)
+        self.set_fat_entry(1, 0xFFF)
+
+    def set_fat_entry(self, index: int, value: int) -> None:
+        """12bit のエントリを書く。2 個で 3 バイトを分け合う。"""
+        offset = index * 3 // 2
+        if index % 2 == 0:
+            self.fat[offset] = value & 0xFF
+            self.fat[offset + 1] = (self.fat[offset + 1] & 0xF0) | ((value >> 8) & 0x0F)
+        else:
+            self.fat[offset] = (self.fat[offset] & 0x0F) | ((value << 4) & 0xF0)
+            self.fat[offset + 1] = (value >> 4) & 0xFF
+
+    def add_file(self, name: str, data: bytes) -> None:
+        """ルートディレクトリへファイルを 1 つ足す。"""
+        if self.entry_count >= FAT_ROOT_ENTRIES:
+            raise ValueError("ルートディレクトリが一杯です")
+
+        cluster_bytes = FAT_SECTORS_PER_CLUSTER * FAT_BYTES_PER_SECTOR
+        cluster_count = max(1, (len(data) + cluster_bytes - 1) // cluster_bytes)
+        first_cluster = self.next_cluster
+
+        # クラスタを連続で確保し、チェーンを繋ぐ。
+        for i in range(cluster_count):
+            current = first_cluster + i
+            is_last = i == cluster_count - 1
+            self.set_fat_entry(current, 0xFFF if is_last else current + 1)
+        self.next_cluster += cluster_count
+
+        # データ領域へ書く。クラスタ境界まで 0 で埋める。
+        padded = data + bytes(cluster_count * cluster_bytes - len(data))
+        self.data.extend(padded)
+
+        # ディレクトリエントリ。名前は 8.3 の固定長で、空きは空白。
+        stem, _, ext = name.partition(".")
+        entry = bytearray(DIR_ENTRY_SIZE)
+        entry[0:8] = stem.upper().ljust(8)[:8].encode("ascii")
+        entry[8:11] = ext.upper().ljust(3)[:3].encode("ascii")
+        entry[11] = 0x20  # アーカイブ属性
+        struct.pack_into("<H", entry, 0x1A, first_cluster)
+        struct.pack_into("<I", entry, 0x1C, len(data))
+
+        offset = self.entry_count * DIR_ENTRY_SIZE
+        self.root[offset : offset + DIR_ENTRY_SIZE] = entry
+        self.entry_count += 1
+
+    def build_boot_sector(self) -> bytes:
+        """BPB を持つセクタを組む。Human68k はここを見て構造を知る。"""
+        sector = bytearray(FAT_BYTES_PER_SECTOR)
+        # 先頭 3 バイトはジャンプ命令の場所。Human68k は実行しないが、
+        # 「ここから BPB」の目印として慣習どおり置いておく。
+        sector[0:3] = b"\x60\x1e\x00"
+        sector[3:11] = b"X68IPL30"
+        struct.pack_into("<H", sector, 0x0B, FAT_BYTES_PER_SECTOR)
+        sector[0x0D] = FAT_SECTORS_PER_CLUSTER
+        struct.pack_into("<H", sector, 0x0E, FAT_RESERVED_SECTORS)
+        sector[0x10] = FAT_COPIES
+        struct.pack_into("<H", sector, 0x11, FAT_ROOT_ENTRIES)
+        # 総セクタ数。65536 以上なら 0 にして $20 の 32bit 側へ入れる。
+        if self.total_sectors < 0x10000:
+            struct.pack_into("<H", sector, 0x13, self.total_sectors)
+        else:
+            struct.pack_into("<H", sector, 0x13, 0)
+            struct.pack_into("<I", sector, 0x20, self.total_sectors)
+        sector[0x15] = FAT_MEDIA_DESCRIPTOR
+        struct.pack_into("<H", sector, 0x16, self.sectors_per_fat)
+        return bytes(sector)
+
+    def to_bytes(self) -> bytes:
+        """パーティション全体のバイト列を返す。"""
+        image = bytearray()
+        image.extend(self.build_boot_sector())
+        for _ in range(FAT_COPIES):
+            image.extend(self.fat)
+        image.extend(self.root)
+        image.extend(bytes(self.root_sectors * FAT_BYTES_PER_SECTOR - len(self.root)))
+        image.extend(self.data)
+        return bytes(image)
+
+
 def collect_files(source: Path) -> list[tuple[str, bytes]]:
     """イメージへ入れるファイルを集める。
 
@@ -248,14 +382,26 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     image[offset : offset + len(human_data)] = human_data
 
     human_sectors = (len(human_data) + SASI_SECTOR_SIZE - 1) // SASI_SECTOR_SIZE
-    next_lba = human_lba + human_sectors
-
     placed = [(human_name, human_lba, len(human_data))]
+
+    # FAT のファイルシステムを別に作る。
+    #
+    # HUMAN.SYS はブートコードが直接読むので FAT を経由しないが、
+    # 起動後の Human68k は CONFIG.SYS や COMMAND.X を FAT から探す。
+    # ここが無いと Human68k は何も読めず、プロンプトを出せない。
+    #
+    # HUMAN.SYS も FAT 側へ入れておく。ブートコードが読む生のコピーとは
+    # 別に、ファイルとしても見えている必要がある。
+    fat = Fat12(total_sectors - FAT_START_LBA)
+    fat.add_file("HUMAN.SYS", human_raw)
     for name, data in files[1:]:
-        offset = next_lba * SASI_SECTOR_SIZE
-        image[offset : offset + len(data)] = data
-        placed.append((name, next_lba, len(data)))
-        next_lba += (len(data) + SASI_SECTOR_SIZE - 1) // SASI_SECTOR_SIZE
+        fat.add_file(name, data)
+
+    fat_image = fat.to_bytes()
+    offset = FAT_START_LBA * SASI_SECTOR_SIZE
+    if offset + len(fat_image) > hdd_bytes:
+        raise ValueError("ファイルシステムが HDD の容量を超えています")
+    image[offset : offset + len(fat_image)] = fat_image
 
     boot_code = build_boot_code(human_lba, human_sectors, human.entry)
     if len(boot_code) > BOOT_CODE_SECTORS * SASI_SECTOR_SIZE:
@@ -276,7 +422,10 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     )
     print(f"  識別子: LBA {BOOT_ID_LBA}")
     for name, lba, size in placed:
-        print(f"  {name}: LBA {lba} / {size} バイト")
+        print(f"  {name}: LBA {lba} / {size} バイト (ブートコードが直接読む)")
+    print(f"  ファイルシステム: LBA {FAT_START_LBA} / {len(fat_image)} バイト")
+    print(f"    FAT {fat.sectors_per_fat} セクタ x {FAT_COPIES}")
+    print(f"    ルートディレクトリ {fat.entry_count} エントリ")
 
 
 def main() -> int:
