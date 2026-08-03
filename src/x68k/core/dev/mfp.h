@@ -127,6 +127,11 @@ public:
 
 private:
     void raise(bool groupA, u8 bit);
+
+    // Software EOI でサービス中のチャネルより下位を抑止するマスク。
+    // 抑止しないビットが 1。S=0 なら常に 0xFF。
+    [[nodiscard]] u8 serviceBlockMask(bool groupA) const;
+
     [[nodiscard]] u32 timerPrescale(u8 control) const;
 
     // タイマのデータレジスタへの書き込みを、停止中だけカウンタへ写す。

@@ -227,6 +227,102 @@ TEST_CASE("Software EOI では ISR が立つ")
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
 }
 
+TEST_CASE("Software EOI ではサービス中より下位の割り込みを受理しない")
+{
+    // 保証すること: S=1 で ISR が立っている間、それ以下の優先度の割り込みが
+    // 受理されないこと。ISR を立てるだけで優先度を見ないなら意味がない。
+    //
+    // 壊れると: ハンドラの実行中に同じ割り込みが再入し、スタックを食い潰す。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    // 受信バッファフル ($10) の方がタイマ B ($01) より優先度が高い。
+    enableGroupA(mfp, static_cast<x68k::u8>(x68k::Mfp::kIntRecvFull | x68k::Mfp::kIntTimerB));
+
+    mfp.receiveKeyboardByte(0x41);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+
+    // サービス中に下位の割り込みが上がっても受理できない。
+    mfp.write(x68k::Mfp::kTbdr, 1);
+    mfp.write(x68k::Mfp::kTbcr, 0x01);
+    mfp.tick(4 * 2);
+    CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerB) != 0);
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+    CHECK(mfp.acknowledgeInterrupt() == 0);
+
+    // ISR を落とせば受理できるようになる。
+    mfp.write(x68k::Mfp::kIsra, static_cast<x68k::u8>(~x68k::Mfp::kIntRecvFull));
+    CHECK(mfp.hasPendingInterrupt());
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+}
+
+TEST_CASE("Software EOI でもサービス中より上位の割り込みは受理する")
+{
+    // 保証すること: 抑止するのは「以下」だけで、上位の割り込みは通ること。
+    //
+    // 壊れると: 低優先度のハンドラ実行中に、キー入力やタイマなど本来
+    // 割り込めるはずのものが止まる。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    enableGroupA(mfp, static_cast<x68k::u8>(x68k::Mfp::kIntRecvFull | x68k::Mfp::kIntTimerB));
+
+    // 先に下位 (タイマ B) をサービス中にする。
+    mfp.write(x68k::Mfp::kTbdr, 1);
+    mfp.write(x68k::Mfp::kTbcr, 0x01);
+    mfp.tick(4 * 2);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerB) != 0);
+
+    // 上位 (受信バッファフル) は割り込める。
+    mfp.receiveKeyboardByte(0x41);
+    CHECK(mfp.hasPendingInterrupt());
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+}
+
+TEST_CASE("グループ A のサービス中はグループ B を全て抑止する")
+{
+    // 保証すること: 優先度がグループをまたいで一列に並ぶこと。
+    // グループ A はすべてグループ B より上位。
+    //
+    // 壊れると: グループごとに独立した優先度になり、A のハンドラ実行中に
+    // B が割り込む。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);           // S=1
+    enableGroupA(mfp, x68k::Mfp::kIntTimerB);  // グループ A の最下位
+    enableGroupB(mfp, x68k::Mfp::kIntGpip4);
+
+    mfp.write(x68k::Mfp::kTbdr, 1);
+    mfp.write(x68k::Mfp::kTbcr, 0x01);
+    mfp.tick(4 * 2);
+    CHECK(mfp.acknowledgeInterrupt() != 0);
+
+    // グループ B は A の最下位より下位なので受理されない。
+    mfp.write(x68k::Mfp::kAer, 0x00);
+    mfp.setVerticalBlank(true);
+    CHECK((mfp.peek(x68k::Mfp::kIprb) & x68k::Mfp::kIntGpip4) != 0);
+    CHECK_FALSE(mfp.hasPendingInterrupt());
+}
+
+TEST_CASE("Automatic EOI へ切り替えると ISR が捨てられる")
+{
+    // 保証すること: VR の S を 0 にした時点で ISR が 0 になること。
+    // S=0 の間、ISR は強制的に 0 に保たれる。
+    //
+    // 壊れると: Software EOI から切り替えた後もサービス中とみなされ、
+    // それ以下の優先度が二度と受理されなくなる。
+    x68k::Mfp mfp = makeMfp();
+    mfp.write(x68k::Mfp::kVr, 0x48);  // S=1
+    enableGroupA(mfp, x68k::Mfp::kIntRecvFull);
+    mfp.receiveKeyboardByte(0x41);
+    mfp.acknowledgeInterrupt();
+    CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntRecvFull) != 0);
+
+    mfp.write(x68k::Mfp::kVr, 0x40);  // S=0 へ切り替え
+
+    CHECK(mfp.peek(x68k::Mfp::kIsra) == 0);
+    CHECK(mfp.peek(x68k::Mfp::kIsrb) == 0);
+}
+
 TEST_CASE("割り込みを禁止すると保留も落ちる")
 {
     // 保証すること: IER のビットを 0 にすると、対応する IPR のビットも

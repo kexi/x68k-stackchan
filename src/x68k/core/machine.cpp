@@ -166,8 +166,8 @@ void Machine::serviceInterrupts()
 
     // CPU が今この割り込みを受け付けられるか先に確かめる。
     //
-    // acknowledgeInterrupt() は MFP の IPR を落として ISR へ移す破壊的な
-    // 操作なので、CPU がマスクしている間に呼ぶと割り込みが握りつぶされる。
+    // acknowledgeInterrupt() は MFP の IPR/ISR を書き換える破壊的な操作
+    // なので、CPU がマスクしている間に呼ぶと割り込みが握りつぶされる。
     // 実機のバスは IACK サイクルが走って初めてこの遷移が起きるので、
     // 受理できないときは触らないのが正しい。
     //

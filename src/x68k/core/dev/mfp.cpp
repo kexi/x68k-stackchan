@@ -181,6 +181,23 @@ void Mfp::write(u32 regIndex, u8 value)
             clearPrescalerIfStopped(3, static_cast<u8>(value & 7u));
             return;
 
+        // ベクタレジスタ。S を落としたら ISR を捨てる。
+        //
+        // S=0 (Automatic EOI) の間、ISR は強制的に 0 に保たれる。
+        // 残したままだと、Software EOI から切り替えた後もサービス中と
+        // みなされ、それ以下の優先度が二度と受理されなくなる。
+        case kVr:
+        {
+            reg_[kVr] = value;
+            const bool isAutomaticEoi = (value & kVrSoftwareEoi) == 0;
+            if (isAutomaticEoi)
+            {
+                reg_[kIsra] = 0;
+                reg_[kIsrb] = 0;
+            }
+            return;
+        }
+
         // 割り込み許可レジスタ。禁止したチャネルの保留を落とす。
         //
         // MC68901 は IER のビットを 0 にすると、対応する IPR のビットも
@@ -371,10 +388,60 @@ void Mfp::receiveKeyboardByte(u8 value)
     raise(true, kIntRecvFull);
 }
 
+u8 Mfp::serviceBlockMask(bool groupA) const
+{
+    // Software EOI (VR bit3 = 1) でサービス中のチャネルがあるとき、
+    // それ以下の優先度を抑止するマスクを返す。抑止しないビットが 1。
+    //
+    // 優先度はグループ A の bit7 が最上位、グループ B の bit0 が最下位で、
+    // 16 段階が一列に並ぶ。サービス中のチャネルより真に高い優先度だけが
+    // 割り込める。同じチャネルの再入も許さない。
+    //
+    // Automatic EOI (S=0) では ISR が常に 0 なので、この関数は全許可を返す。
+    // X68000 の IOCS は S=0 を使うため、実機ではこちらの経路しか通らない。
+    const u8 isrA = reg_[kIsra];
+    const u8 isrB = reg_[kIsrb];
+
+    // サービス中が無ければ何も抑止しない。
+    //
+    // hasPendingInterrupt() は毎命令通るので、ここを早く抜けることが効く。
+    // X68000 は Automatic EOI (S=0) を使い ISR が常に 0 なので、実機では
+    // 必ずこの分岐で返る。下のループを毎回回すと実効クロックが 14% 落ちた。
+    if ((isrA | isrB) == 0)
+    {
+        return 0xFF;
+    }
+
+    // サービス中のチャネルが居るグループ。A が居れば A が上位。
+    const bool servicedInGroupA = isrA != 0;
+
+    // 別のグループを問われたら、上下は丸ごと決まる。
+    if (groupA != servicedInGroupA)
+    {
+        // A がサービス中で B を問われた → B は全て下位なので全抑止。
+        // B がサービス中で A を問われた → A は全て上位なので全許可。
+        return groupA ? 0xFF : 0x00;
+    }
+
+    // 同じグループ内では、最上位のサービス中ビットより上だけが通る。
+    const u8 serviced = servicedInGroupA ? isrA : isrB;
+    u8 allowed = 0;
+    for (int bit = 7; bit >= 0; --bit)
+    {
+        const u8 mask = static_cast<u8>(1u << bit);
+        if ((serviced & mask) != 0)
+        {
+            break;
+        }
+        allowed = static_cast<u8>(allowed | mask);
+    }
+    return allowed;
+}
+
 bool Mfp::hasPendingInterrupt() const
 {
-    const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra]);
-    const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb]);
+    const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra] & serviceBlockMask(true));
+    const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb] & serviceBlockMask(false));
     return (pendingA | pendingB) != 0;
 }
 
@@ -382,8 +449,9 @@ u32 Mfp::acknowledgeInterrupt()
 {
     // 優先度はグループ A の bit7 が最上位、グループ B の bit0 が最下位。
     // ベクタ番号は VR の上位 4bit + 割り込み番号 (0-15)。
-    const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra]);
-    const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb]);
+    // Software EOI でサービス中のものがあれば、それ以下は受理しない。
+    const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra] & serviceBlockMask(true));
+    const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb] & serviceBlockMask(false));
 
     // VR bit3 (S) が EOI の方式を選ぶ。
     //
