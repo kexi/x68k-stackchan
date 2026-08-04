@@ -464,6 +464,36 @@ u32 M68k::groupMisc(u16 op)
         return 12;
     }
 
+    // TAS: 0100 1010 11 mmm rrr
+    //
+    // バイトを読んで N/Z を立て、bit7 を立てて書き戻す。サイズ欄が 3 の
+    // 位置に居るので、下の単項演算 (サイズ欄 0-2) とは別に先に捌く。
+    //
+    // Why not 単項演算の switch に混ぜないか: あちらは sizeField から
+    // 演算サイズを決める形になっている。TAS は sizeField=3 を「サイズ」
+    // ではなく命令の識別に使うので、同じ枠に入れると sizeFromField(3) が
+    // 意味を持たない値を返す経路ができる。
+    //
+    // Why not 実機の 5 サイクル read-modify-write を再現しないか:
+    // バスを占有したまま読んで書く点が実機との違いだが、本エミュレータは
+    // バスマスタが CPU と DMAC しかなく、DMAC の転送は命令境界でしか
+    // 進まない。分割不可能性が問題になる場面が無い。
+    // (upstream のテストベクタもこのタイミングは未実装と明記している)
+    // $4AFC (mode 7 / reg 4) だけは TAS ではなく ILLEGAL 命令。
+    // 実効アドレスとして意味を持たない組み合わせをその 1 つに割り当てて
+    // あるので、ここで先に弾かないと ILLEGAL を TAS として実行してしまう。
+    const bool isIllegalOpcode = op == 0x4AFCu;
+    const bool isTas = !isIllegalOpcode && (op & 0xFFC0u) == 0x4AC0u;
+    if (isTas)
+    {
+        u32 addr = 0;
+        const u32 value = readEaForModify(mode, reg, kByte, addr);
+        setLogicFlags(value, kByte);
+        writeEaToAddr(mode, reg, kByte, addr, value | 0x80u);
+        // データレジスタ直接なら 4、メモリなら 14 サイクル。
+        return mode == 0 ? 4 : 14;
+    }
+
     // 単項演算: NEGX/CLR/NEG/NOT/TST : 0100 ooo 0 ss mmm rrr
     const u32 sizeField = (op >> 6) & 3u;
     if (sizeField != 3)
