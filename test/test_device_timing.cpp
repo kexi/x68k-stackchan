@@ -11,6 +11,7 @@
 // 見えない」こと**。将来また quantum を入れるなら、このテストが通る形で
 // なければならない。
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -164,31 +165,72 @@ TEST_SUITE("device-timing")
         CHECK(delayedAt > pastFineAt);
     }
 
-    // --- Machine レベルの回帰テストについて -------------------------------
+    // Machine が quantum を再導入したら落ちるテスト。
     //
-    // 「Machine が quantum を再導入したら落ちる」テストを 6 通り試して、
-    // **どれも quantum を戻した状態で通ってしまった**ので入れていない。
-    // 試したのは:
-    //   1. run() と step() の最終状態を比べる
-    //      -> run() が終了時に保留を flush するので一致する
-    //   2. 総サイクル数を quantum の倍数から外して比べる
-    //      -> 止めた位置で保留が 0 だと一致する
-    //   3. ラスタが変わるまでの run() 呼び出し回数を数える
-    //      -> quantum あり/なしとも 80 で同じだった
-    //   4. 1 フレームぶんのラスタ遷移回数を数える
-    //      -> CRTC の累算器が受け取る総量は同じなので同じ回数になる
+    // 最初は「デバイスの状態を外から比べる」形で 4 通り試して、どれも
+    // quantum を戻した状態で通ってしまった:
+    //   1. run() と step() の最終状態を比べる (終了時の flush で一致)
+    //   2. 総サイクルを quantum の倍数から外す (止めた位置で保留 0 なら一致)
+    //   3. ラスタが変わるまでの run() 呼び出し回数 (あり/なしとも 80)
+    //   4. 1 フレームのラスタ遷移回数 (累算器が受け取る総量が同じ)
     //
-    // 理由ははっきりしている。**CRTC も RTC も MFP も加算アキュムレータ
-    // なので、渡す総量が同じなら最終状態は必ず一致する。** 違いが出るのは
-    // 「途中のある瞬間に外から覗いたとき」だけで、run() の外からはその
-    // 瞬間に触れない。
+    // CRTC も RTC も MFP も加算アキュムレータなので、渡す総量が同じなら
+    // 最終状態は一致する。それが 4 通りとも失敗した理由。
     //
-    // 上の 3 つのデバイス単体テストは、まさにその「途中で覗く」形になって
-    // いる (tick を細かく呼びながら毎回 changed() を見る)。Machine 経由で
-    // 同じことをするには run() の内側にフックが要り、そのために製品コード
-    // へ計測用の口を開けるのは割に合わない。
-    //
-    // したがってここでの防御は「デバイス単体で、その粒度なら観測可能な
-    // ずれが出る」ことを固定するところまで。Machine が再び quantum を
-    // 入れるなら、上の 3 つが示す粒度を避けなければならない。
+    // 見落としていたのは **CPU が途中の状態を観測する** 経路だった。
+    // Machine::run は「割り込み判定 -> 1 命令 -> tick」を繰り返すので、
+    // tick が遅れると次の serviceInterrupts() が割り込みを見逃す。
+    // 受理されたかどうかは SR とスタックに残るので、外から確かめられる。
+    TEST_CASE("run() の tick 遅れで割り込みの受理が遅れない")
+    {
+        static std::vector<x68k::u8> ram(0x10000, 0);
+        const auto poke16 = [](x68k::u32 addr, x68k::u16 v)
+        {
+            ram[addr] = static_cast<x68k::u8>(v >> 8);
+            ram[addr + 1] = static_cast<x68k::u8>(v & 0xFF);
+        };
+        std::fill(ram.begin(), ram.end(), 0);
+        poke16(0, 0x0000);
+        poke16(2, 0x8000);  // SSP
+        poke16(4, 0x0000);
+        poke16(6, 0x0400);  // PC = $400
+        for (x68k::u32 a = 0x400; a < 0x8000; a += 2)
+        {
+            poke16(a, 0x4E71);  // NOP (4 サイクル)
+        }
+
+        x68k::Machine m;
+        x68k::MemoryMap map{};
+        map.mainRam = ram.data();
+        m.setMemory(map);
+        m.reset();
+
+        // タイマ B を分周 4 (最小)・データ 1 で動かし、割り込みを許可する。
+        m.mfp().write(0x10, 1);     // TBDR = 1 (毎回タイムアウト)
+        m.mfp().write(0x0D, 0x01);  // TBCR = 分周 4
+        m.mfp().write(0x03, x68k::Mfp::kIntTimerB);
+        m.mfp().write(0x09, x68k::Mfp::kIntTimerB);
+        // MFP はレベル 6。CPU 側のマスクを下げて受理できるようにする。
+        m.cpu().setSr(0x2000);
+
+        // 分周器を半分 (2 MFP サイクル = 4 CPU サイクル) 進めておく。
+        // ここが要点で、位相 0 だと quantum があっても差が出ない。
+        m.mfp().tick(4);
+
+        const x68k::u32 sspBefore = m.cpu().state().a[7];
+
+        // 2 命令ぶん (8 サイクル) 回す。
+        //
+        // 命令ごとに tick していれば、1 命令目の後にタイマ B がタイムアウト
+        // して割り込みが上がり、2 回目の serviceInterrupts() で受理される。
+        // 8 サイクルの quantum があると、tick は 2 命令目の後に 1 度だけ
+        // 走るので、run(8) を抜けるまで受理されない。
+        m.run(8);
+
+        // 受理されていれば例外フレーム (SR + PC = 6 バイト) が積まれ、
+        // SR の割り込みマスクが 6 へ上がる。
+        const x68k::u32 sspAfter = m.cpu().state().a[7];
+        CHECK(sspAfter < sspBefore);
+        CHECK(m.cpu().state().interruptMask() == 6);
+    }
 }
