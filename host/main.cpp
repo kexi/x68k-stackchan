@@ -8,8 +8,8 @@
 // 対し、ここなら 1 秒で回せてデバッガも使える。これが開発速度を決める。
 //
 // 使い方:
-//   x68k-run --iplrom rom/iplrom.dat [--hdd rom/hdd0.hdf] [--ppm out.ppm]
-//            [--trace] [--cycles N]
+//   x68k-run --iplrom rom/iplrom.dat [--hdd rom/hdd0.hdf] [--fd0 disk.xdf]
+//            [--ppm out.ppm] [--trace] [--cycles N]
 
 #include <cstdio>
 #include <cstdlib>
@@ -113,6 +113,136 @@ public:
 
 private:
     std::vector<x68k::u8> data_;
+    bool trace_ = false;
+};
+
+// フロッピーイメージをメモリ上に持つ実装。
+//
+// 受け付ける形式は XDF (ヘッダ無しの生セクタダンプ) と DIM (256 バイトの
+// ヘッダ付き)。どちらもファイル長からジオメトリを引く
+// (detectFloppyFormat)。拡張子は見ない。手元のイメージは拡張子が
+// 実態と食い違っていることがあり、長さの方が確実に当たる。
+class FileFloppy final : public x68k::FloppyImage
+{
+public:
+    bool load(const std::string& path)
+    {
+        bool ok = false;
+        std::vector<x68k::u8> raw = readFile(path, &ok);
+        if (!ok)
+        {
+            return false;
+        }
+
+        const auto size = static_cast<x68k::u32>(raw.size());
+        x68k::u32 offset = 0;
+        format_ = x68k::detectFloppyFormat(size, &offset, &geometry_);
+        if (format_ == x68k::FloppyFormat::Unknown)
+        {
+            // 長さが分からないイメージは受け付けない。
+            //
+            // 切り上げて「とりあえず 2HD」として読ませると、末尾の
+            // トラックが読めないまま「ディスクはある」と見えてしまう。
+            // Human68k は FAT を読んだ時点でおかしくなるが、そこまで
+            // 症状が離れると原因に辿り着けない。
+            return false;
+        }
+
+        // ヘッダを落として中身だけを持つ。以後 CHS の換算にオフセットが
+        // 混ざらない。
+        data_.assign(raw.begin() + offset, raw.end());
+        return true;
+    }
+
+    void setWriteProtected(bool on)
+    {
+        writeProtected_ = on;
+    }
+
+    void setTrace(bool on)
+    {
+        trace_ = on;
+    }
+
+    [[nodiscard]] x68k::FloppyFormat format() const
+    {
+        return format_;
+    }
+
+    bool readSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, x68k::u8* buffer) override
+    {
+        std::size_t offset = 0;
+        const bool ok = locate(cylinder, head, record, &offset);
+        if (trace_)
+        {
+            std::printf("[fd] read c=%u h=%u r=%u%s\n", cylinder, head, record,
+                        ok ? "" : " (範囲外)");
+        }
+        if (!ok)
+        {
+            return false;
+        }
+        std::memcpy(buffer, data_.data() + offset, geometry_.sectorSize);
+        return true;
+    }
+
+    bool writeSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record,
+                     const x68k::u8* buffer) override
+    {
+        if (writeProtected_)
+        {
+            return false;
+        }
+        std::size_t offset = 0;
+        const bool ok = locate(cylinder, head, record, &offset);
+        if (trace_)
+        {
+            std::printf("[fd] write c=%u h=%u r=%u%s\n", cylinder, head, record,
+                        ok ? "" : " (範囲外)");
+        }
+        if (!ok)
+        {
+            return false;
+        }
+        std::memcpy(data_.data() + offset, buffer, geometry_.sectorSize);
+        return true;
+    }
+
+    [[nodiscard]] bool isPresent() const override
+    {
+        return !data_.empty();
+    }
+
+    [[nodiscard]] bool isWriteProtected() const override
+    {
+        return writeProtected_;
+    }
+
+    [[nodiscard]] const x68k::FloppyGeometry& geometry() const override
+    {
+        return geometry_;
+    }
+
+private:
+    // CHS からイメージ内のオフセットを引く。R は 1 起点。
+    bool locate(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, std::size_t* offset) const
+    {
+        const bool inRange = cylinder < geometry_.cylinders && head < geometry_.heads &&
+                             record >= 1 && record <= geometry_.sectorsPerTrack;
+        if (!inRange)
+        {
+            return false;
+        }
+        const x68k::u32 lba =
+            ((cylinder * geometry_.heads) + head) * geometry_.sectorsPerTrack + (record - 1);
+        *offset = static_cast<std::size_t>(lba) * geometry_.sectorSize;
+        return *offset + geometry_.sectorSize <= data_.size();
+    }
+
+    std::vector<x68k::u8> data_;
+    x68k::FloppyGeometry geometry_{};
+    x68k::FloppyFormat format_ = x68k::FloppyFormat::Unknown;
+    bool writeProtected_ = false;
     bool trace_ = false;
 };
 
@@ -264,6 +394,9 @@ void printUsage()
         "  --iplrom PATH   IPL-ROM (128KB)。必須\n"
         "  --cgrom PATH    CGROM (768KB)。省略時は IPL-ROM 内蔵 6x12 ANK で代替\n"
         "  --hdd PATH      SASI ハードディスクイメージ\n"
+        "  --fd0 PATH      FDD0 に入れるフロッピーイメージ (XDF / DIM)\n"
+        "  --fd1 PATH      FDD1 に入れるフロッピーイメージ\n"
+        "  --fd0-readonly  FDD0 をライトプロテクトする (--fd1-readonly も同様)\n"
         "  --cycles N      実行する CPU サイクル数 (既定 20000000)\n"
         "  --ppm PATH      終了時に画面 (テキスト+グラフィック合成) を PPM で書き出す\n"
         "  --text-only     --ppm でグラフィック面を合成せずテキストだけを出す\n"
@@ -442,6 +575,9 @@ int main(int argc, char** argv)
     std::string iplromPath;
     std::string cgromPath;
     std::string hddPath;
+    // FDD0 / FDD1 に入れるイメージ。X68000 の内蔵ドライブは 2 台。
+    std::string fdPath[x68k::Fdc::kDriveCount];
+    bool fdWriteProtect[x68k::Fdc::kDriveCount] = {};
     std::string ppmPath;
     std::string guiDemoPath;
     bool dumpText = false;
@@ -479,6 +615,22 @@ int main(int argc, char** argv)
         else if (arg == "--hdd" && hasNext)
         {
             hddPath = argv[++i];
+        }
+        else if (arg == "--fd0" && hasNext)
+        {
+            fdPath[0] = argv[++i];
+        }
+        else if (arg == "--fd1" && hasNext)
+        {
+            fdPath[1] = argv[++i];
+        }
+        else if (arg == "--fd0-readonly")
+        {
+            fdWriteProtect[0] = true;
+        }
+        else if (arg == "--fd1-readonly")
+        {
+            fdWriteProtect[1] = true;
         }
         else if (arg == "--dump-text")
         {
@@ -616,6 +768,41 @@ int main(int argc, char** argv)
         return 1;
     }
 
+    // フロッピー。読めなかったら起動させずに止める。
+    //
+    // Why not 読めなくても続行するか: 「イメージを指定したのに入っていない」
+    // まま起動すると、IPL-ROM は FD を諦めて次の起動デバイスへ行く。
+    // 利用者から見ると「--fd0 を付けたのに HDD から起動した」であり、
+    // 原因 (長さが未対応だった) がどこにも出ない。
+    FileFloppy floppy[x68k::Fdc::kDriveCount];
+    for (x68k::u32 d = 0; d < x68k::Fdc::kDriveCount; ++d)
+    {
+        if (fdPath[d].empty())
+        {
+            continue;
+        }
+        if (!floppy[d].load(fdPath[d]))
+        {
+            std::fprintf(stderr,
+                         "フロッピーイメージを読めません: %s\n"
+                         "  対応するのは XDF (ヘッダ無しのセクタダンプ) と "
+                         "DIM (256 バイトヘッダ付き) で、\n"
+                         "  長さが 2HD 1261568 / 1025024、2DD 655360 / 737280、"
+                         "2D 327680 バイトのもの\n"
+                         "  (DIM はこれに 256 を足した長さ)。\n",
+                         fdPath[d].c_str());
+            return 1;
+        }
+        floppy[d].setWriteProtected(fdWriteProtect[d]);
+        floppy[d].setTrace(traceDisk);
+
+        const x68k::FloppyGeometry& geo = floppy[d].geometry();
+        std::printf("[fd%u] %s (%s) %uC x %uH x %uS x %uB%s\n", d, fdPath[d].c_str(),
+                    floppy[d].format() == x68k::FloppyFormat::Dim ? "DIM" : "XDF", geo.cylinders,
+                    geo.heads, geo.sectorsPerTrack, geo.sectorSize,
+                    fdWriteProtect[d] ? " 書込禁止" : "");
+    }
+
     // メモリ領域を確保する。
     std::vector<x68k::u8> mainRam(x68k::kMainRamSize, 0);
     std::vector<x68k::u8> textVram(x68k::kTvramSize, 0);
@@ -649,6 +836,16 @@ int main(int argc, char** argv)
 
     disk.setTrace(traceDisk);
     machine.setDisk(&disk);
+
+    // フロッピーを繋ぐ。指定の無いドライブは「ディスクが入っていない」まま。
+    for (x68k::u32 d = 0; d < x68k::Fdc::kDriveCount; ++d)
+    {
+        if (fdPath[d].empty())
+        {
+            continue;
+        }
+        machine.setFloppyDisk(d, &floppy[d]);
+    }
 
     machine.reset();
 

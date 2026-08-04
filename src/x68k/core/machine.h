@@ -79,6 +79,17 @@ public:
         disk_ = disk;
     }
 
+    // フロッピードライブ (FDD0/FDD1) にイメージを入れる。null で取り出す。
+    //
+    // Why not setDisk と同じ口にするか: FD は CHS でアクセスされ、
+    // セクタ長も 1024 バイト (2HD) と SASI の 256 バイトで違う。同じ
+    // DiskImage に押し込むと「どちらのセクタ長で数えた LBA か」を
+    // 呼び出し側しか知らない状態になり、読み出し位置を静かに間違える。
+    void setFloppyDisk(u32 drive, FloppyImage* image)
+    {
+        fdc_.setImage(drive, image);
+    }
+
     // リセットして IPL-ROM の先頭から実行を始める。
     void reset();
 
@@ -209,6 +220,36 @@ public:
     void ioWrite16(u32 addr, u16 value) override;
 
 private:
+    // DMAC のチャネル 0 (FDC) を Fdc へ繋ぐ中継。
+    //
+    // Why not Machine 自身が両方のチャネルを引き受けるか: Machine は既に
+    // チャネル 1 (SASI) の DmaDevice である。1 つのオブジェクトで 2 つの
+    // チャネルを兼ねると dmaRead/dmaWrite の中で「今どちらのチャネルから
+    // 呼ばれたか」を状態で判断することになり、転送の途中でその状態がずれた
+    // ときに黙って相手のバッファを読む。チャネルごとに別のオブジェクトを
+    // 繋げば、取り違えは型として起こらない。
+    class FdcDmaPort final : public DmaDevice
+    {
+    public:
+        explicit FdcDmaPort(Fdc& fdc) : fdc_(fdc) {}
+
+        bool dmaRead(u8* value) override
+        {
+            return fdc_.dmaRead(value);
+        }
+        bool dmaWrite(u8 value) override
+        {
+            return fdc_.dmaWrite(value);
+        }
+        void dmaComplete(bool isComplete) override
+        {
+            fdc_.dmaComplete(isComplete);
+        }
+
+    private:
+        Fdc& fdc_;
+    };
+
     void serviceInterrupts();
     // 保留していた割り込みを CPU へ渡せたら true。
     // 優先度の高い方から順に試し、1 つ通ったらそこで止めるために戻り値を使う。
@@ -232,6 +273,7 @@ private:
     Adpcm adpcm_;
     Sprite sprite_;
     Dmac dmac_;
+    FdcDmaPort fdcDmaPort_{fdc_};
     DiskImage* disk_ = nullptr;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。

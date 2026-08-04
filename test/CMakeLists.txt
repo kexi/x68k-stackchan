@@ -125,6 +125,7 @@ add_executable(x68k_tests
   test_text_scrape.cpp
   test_cgrom_fallback.cpp
   test_boot.cpp
+  test_boot_disk.cpp
   test_sasi.cpp
   test_rtc.cpp
   test_dmac.cpp

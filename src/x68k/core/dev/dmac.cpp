@@ -8,21 +8,35 @@ namespace x68k
 
 void Dmac::reset()
 {
-    channel_.fill(0);
-    other_.fill(0);
+    for (auto& channel : channels_)
+    {
+        channel.fill(0);
+    }
+
+    // 繋がっているデバイスはリセットで外さない。SASI の転送バッファや
+    // FDC のイメージと同じく「外から与えられた配線」であって、
+    // リセットで変わるものではない。
+}
+
+void Dmac::setDevice(u32 channel, DmaDevice* device)
+{
+    if (channel >= kChannelCount)
+    {
+        return;
+    }
+    devices_[channel] = device;
 }
 
 u8 Dmac::read(u32 offset) const
 {
-    // SASI が使うのはチャネル 1 ($E84040-$E8407F)。
     const u32 channel = offset / kChannelStride;
     const u32 reg = offset % kChannelStride;
 
-    if (channel != kSasiChannel)
+    if (channel >= kChannelCount)
     {
-        return offset < other_.size() ? other_[offset] : 0u;
+        return 0u;
     }
-    return reg < channel_.size() ? channel_[reg] : 0u;
+    return channels_[channel][reg];
 }
 
 void Dmac::write(u32 offset, u8 value)
@@ -30,16 +44,7 @@ void Dmac::write(u32 offset, u8 value)
     const u32 channel = offset / kChannelStride;
     const u32 reg = offset % kChannelStride;
 
-    if (channel != kSasiChannel)
-    {
-        if (offset < other_.size())
-        {
-            other_[offset] = value;
-        }
-        return;
-    }
-
-    if (reg >= channel_.size())
+    if (channel >= kChannelCount)
     {
         return;
     }
@@ -47,34 +52,35 @@ void Dmac::write(u32 offset, u8 value)
     if (reg == kRegCsr)
     {
         // CSR は書き込んだビットがクリアされる。IPL-ROM は転送前に
-        // $FF を書いて全部落とす ($FF9944)。
-        channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] & ~value);
+        // $FF を書いて全部落とす (SASI は $FF9944、FDC は $FF8F3C)。
+        channels_[channel][kRegCsr] = static_cast<u8>(channels_[channel][kRegCsr] & ~value);
         return;
     }
 
-    channel_[reg] = value;
+    channels_[channel][reg] = value;
 
     // CCR の bit7 で転送が始まる。
     const bool isStartRequested = reg == kRegCcr && (value & kCcrStart) != 0;
     if (isStartRequested)
     {
-        runTransfer();
+        runTransfer(channel);
     }
 }
 
-void Dmac::runTransfer()
+void Dmac::runTransfer(u32 channel)
 {
-    if (device_ == nullptr || memory_ == nullptr)
+    DmaDevice* const device = devices_[channel];
+    if (device == nullptr || memory_ == nullptr)
     {
         return;
     }
 
-    u32 addr = (static_cast<u32>(channel_[kRegMar]) << 24) |
-               (static_cast<u32>(channel_[kRegMar + 1]) << 16) |
-               (static_cast<u32>(channel_[kRegMar + 2]) << 8) |
-               static_cast<u32>(channel_[kRegMar + 3]);
-    u32 count =
-        (static_cast<u32>(channel_[kRegMtc]) << 8) | static_cast<u32>(channel_[kRegMtc + 1]);
+    auto& regs = channels_[channel];
+
+    u32 addr = (static_cast<u32>(regs[kRegMar]) << 24) |
+               (static_cast<u32>(regs[kRegMar + 1]) << 16) |
+               (static_cast<u32>(regs[kRegMar + 2]) << 8) | static_cast<u32>(regs[kRegMar + 3]);
+    u32 count = (static_cast<u32>(regs[kRegMtc]) << 8) | static_cast<u32>(regs[kRegMtc + 1]);
 
     // HD63450 の MTC は 0 を 65536 と解釈する (16bit で表せる最大長を
     // 表現するため)。0 を「転送なし」と読むと最大サイズの要求が黙って
@@ -85,13 +91,13 @@ void Dmac::runTransfer()
         count = 0x10000;
     }
 
-    const bool isToDevice = (channel_[kRegOcr] & kOcrDirectionToMemory) == 0;
+    const bool isToDevice = (regs[kRegOcr] & kOcrDirectionToMemory) == 0;
 
     while (count > 0)
     {
         if (isToDevice)
         {
-            if (!device_->dmaWrite(memory_->dmaMemRead(addr)))
+            if (!device->dmaWrite(memory_->dmaMemRead(addr)))
             {
                 break;
             }
@@ -99,7 +105,7 @@ void Dmac::runTransfer()
         else
         {
             u8 value = 0;
-            if (!device_->dmaRead(&value))
+            if (!device->dmaRead(&value))
             {
                 break;
             }
@@ -111,12 +117,12 @@ void Dmac::runTransfer()
 
     // 進んだぶんをレジスタへ書き戻す。IPL-ROM は残りカウントを見ないが、
     // 実機と同じ状態にしておかないと後から辻褄が合わなくなる。
-    channel_[kRegMar] = static_cast<u8>(addr >> 24);
-    channel_[kRegMar + 1] = static_cast<u8>(addr >> 16);
-    channel_[kRegMar + 2] = static_cast<u8>(addr >> 8);
-    channel_[kRegMar + 3] = static_cast<u8>(addr);
-    channel_[kRegMtc] = static_cast<u8>(count >> 8);
-    channel_[kRegMtc + 1] = static_cast<u8>(count);
+    regs[kRegMar] = static_cast<u8>(addr >> 24);
+    regs[kRegMar + 1] = static_cast<u8>(addr >> 16);
+    regs[kRegMar + 2] = static_cast<u8>(addr >> 8);
+    regs[kRegMar + 3] = static_cast<u8>(addr);
+    regs[kRegMtc] = static_cast<u8>(count >> 8);
+    regs[kRegMtc + 1] = static_cast<u8>(count);
 
     // 要求量を転送し切れたときだけ完了 (COC) を立てる。IPL-ROM は COC だけを
     // 見て転送の成否を判断するので、途中で止まったのに COC を立てると
@@ -125,18 +131,24 @@ void Dmac::runTransfer()
     // 「1 バイトでも進んだら成功」にはしない。尻切れのブートコードを
     // 完全なものとして実行するのが、まさに避けたい失敗の形。
     const bool isComplete = count == 0;
+
+    // デバイスへ終わりを伝える。自分では転送長を知らないデバイス (FDC) が
+    // 実行フェーズを畳むのに要る。伝えないとメインステータスの CB が
+    // 立ったままになり、次のコマンド送出が止まる。
+    device->dmaComplete(isComplete);
+
     if (isComplete)
     {
-        channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] | kCsrChannelOperationComplete);
+        regs[kRegCsr] = static_cast<u8>(regs[kRegCsr] | kCsrChannelOperationComplete);
     }
     else
     {
         // 打ち切りはエラーとして残す。CER にも理由を書いておかないと
         // CSR の ERR だけでは後から原因を追えない。
-        channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] | kCsrError);
-        channel_[kRegCer] = kCerBusErrorDevice;
+        regs[kRegCsr] = static_cast<u8>(regs[kRegCsr] | kCsrError);
+        regs[kRegCer] = kCerBusErrorDevice;
     }
-    channel_[kRegCsr] = static_cast<u8>(channel_[kRegCsr] & ~kCsrChannelActive);
+    regs[kRegCsr] = static_cast<u8>(regs[kRegCsr] & ~kCsrChannelActive);
 }
 
 }  // namespace x68k

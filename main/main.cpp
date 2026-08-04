@@ -67,6 +67,8 @@ x68k::u16* g_frameBufferB = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
+// フロッピー 2 台。イメージが無ければ「ディスクが入っていない」まま。
+x68k_platform::SdFloppy g_floppy[x68k::Fdc::kDriveCount];
 x68k_platform::DisplayLcd g_display;
 x68k_platform::TouchKeyboard g_keyboard;
 x68k_platform::FrameChannel g_frames;
@@ -392,6 +394,22 @@ bool loadRoms()
     if (!g_disk.open(x68k_platform::kHddPath))
     {
         ESP_LOGW(kTag, "HDD イメージを開けません: %s", x68k_platform::kHddPath);
+    }
+
+    // フロッピーは任意。無くても SASI から起動できるので、開けなくても
+    // 警告に留める (HDD と同じ扱い)。
+    {
+        const char* const paths[x68k::Fdc::kDriveCount] = {x68k_platform::kFd0Path,
+                                                           x68k_platform::kFd1Path};
+        for (x68k::u32 d = 0; d < x68k::Fdc::kDriveCount; ++d)
+        {
+            if (!g_floppy[d].open(paths[d]))
+            {
+                ESP_LOGI(kTag, "FDD%u にディスクを入れません: %s", d, paths[d]);
+                continue;
+            }
+            g_machine.setFloppyDisk(d, &g_floppy[d]);
+        }
     }
 
     x68k::MemoryMap memory;

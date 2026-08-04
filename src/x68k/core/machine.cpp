@@ -83,9 +83,14 @@ constexpr u32 kSccInterruptLevel = 5;
 
 Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
 {
-    // SASI のデータ転送は DMAC 経由で行われる。DMAC からはデータの出どころが
-    // SASI、転送先がバスに見える。
-    dmac_.setDevice(this);
+    // SASI と FDC のデータ転送はどちらも DMAC 経由で行われる。DMAC からは
+    // データの出どころがデバイス、転送先がバスに見える。
+    //
+    // チャネルの割り当ては実機のとおり。FDC がチャネル 0 (IPL-ROM の
+    // $FF8F3C が $E84005/$E8400A/$E8400C/$E84007 を叩く)、SASI が
+    // チャネル 1 ($FF9944 が $E84045… を叩く)。
+    dmac_.setDevice(Dmac::kSasiChannel, this);
+    dmac_.setDevice(Dmac::kFdcChannel, &fdcDmaPort_);
     dmac_.setMemory(this);
 
     // G-VRAM の窓 ($C00000-$DFFFFF) はページ選択を兼ねており、CPU の書き込みを
@@ -457,9 +462,11 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kFdcBase:
-            // FDC (uPD72065)。ドライブ未接続として振る舞う状態機械。
+            // FDC (uPD72065)。イメージを繋げば実際に読み書きする。
             //   $E94001 メインステータス
             //   $E94003 データ (コマンド送出と結果の受け取り)
+            // セクタの中身は DMAC のチャネル 0 経由で流れるので、
+            // ここ ($E94003) を通るのはコマンドと結果バイトだけ。
             if ((addr & 0x0Fu) == 0x01)
             {
                 return fdc_.readStatus();
@@ -567,6 +574,12 @@ void Machine::ioWrite8(u32 addr, u8 value)
             {
                 // ドライブ制御 (選択とモーター)。
                 fdc_.writeDriveControl(value);
+            }
+            else if ((addr & 0x0Fu) == 0x07)
+            {
+                // ドライブ選択とモーター。IPL-ROM の $FF909E が
+                // 「$80 | ドライブ番号」をここへ書いてからコマンドを送る。
+                fdc_.writeDriveSelect(value);
             }
             return;
 

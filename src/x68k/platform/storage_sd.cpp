@@ -297,4 +297,139 @@ bool SdDisk::writeSector(x68k::u32 lba, const x68k::u8* buffer, x68k::u32 sector
     return ok;
 }
 
+// --- SdFloppy ----------------------------------------------------------------
+
+SdFloppy::~SdFloppy()
+{
+    close();
+}
+
+bool SdFloppy::open(const char* path)
+{
+    close();
+
+    std::FILE* f = std::fopen(path, "r+b");
+    writeProtected_ = false;
+    if (f == nullptr)
+    {
+        // 書き込み不可でも読めれば起動はできる。ライトプロテクトされた
+        // ディスクとして扱う (ST3 の bit6 に出る)。
+        f = std::fopen(path, "rb");
+        writeProtected_ = true;
+    }
+    if (f == nullptr)
+    {
+        return false;
+    }
+
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size <= 0)
+    {
+        std::fclose(f);
+        return false;
+    }
+
+    const x68k::FloppyFormat format =
+        x68k::detectFloppyFormat(static_cast<x68k::u32>(size), &dataOffset_, &geometry_);
+    if (format == x68k::FloppyFormat::Unknown)
+    {
+        ESP_LOGE(kTag, "フロッピーイメージの長さが未対応: %s (%ld バイト)", path, size);
+        std::fclose(f);
+        return false;
+    }
+
+    file_ = f;
+    ESP_LOGI(kTag, "%s (%s) %uC x %uH x %uS x %uB%s", path,
+             format == x68k::FloppyFormat::Dim ? "DIM" : "XDF", geometry_.cylinders,
+             geometry_.heads, geometry_.sectorsPerTrack, geometry_.sectorSize,
+             writeProtected_ ? " 書込禁止" : "");
+    return true;
+}
+
+void SdFloppy::close()
+{
+    if (file_ != nullptr)
+    {
+        std::fclose(static_cast<std::FILE*>(file_));
+        file_ = nullptr;
+    }
+}
+
+bool SdFloppy::isPresent() const
+{
+    return file_ != nullptr;
+}
+
+bool SdFloppy::isWriteProtected() const
+{
+    return writeProtected_;
+}
+
+const x68k::FloppyGeometry& SdFloppy::geometry() const
+{
+    return geometry_;
+}
+
+bool SdFloppy::locate(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, long* offset) const
+{
+    const bool inRange = cylinder < geometry_.cylinders && head < geometry_.heads && record >= 1 &&
+                         record <= geometry_.sectorsPerTrack;
+    if (!inRange)
+    {
+        return false;
+    }
+    const x68k::u32 lba =
+        ((cylinder * geometry_.heads) + head) * geometry_.sectorsPerTrack + (record - 1);
+    *offset = static_cast<long>(dataOffset_) +
+              static_cast<long>(lba) * static_cast<long>(geometry_.sectorSize);
+    return true;
+}
+
+bool SdFloppy::readSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, x68k::u8* buffer)
+{
+    if (file_ == nullptr)
+    {
+        return false;
+    }
+    long offset = 0;
+    if (!locate(cylinder, head, record, &offset))
+    {
+        return false;
+    }
+    auto* f = static_cast<std::FILE*>(file_);
+    if (std::fseek(f, offset, SEEK_SET) != 0)
+    {
+        return false;
+    }
+    const std::size_t want = geometry_.sectorSize;
+    return std::fread(buffer, 1, want, f) == want;
+}
+
+bool SdFloppy::writeSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record,
+                           const x68k::u8* buffer)
+{
+    if (file_ == nullptr || writeProtected_)
+    {
+        return false;
+    }
+    long offset = 0;
+    if (!locate(cylinder, head, record, &offset))
+    {
+        return false;
+    }
+    auto* f = static_cast<std::FILE*>(file_);
+    if (std::fseek(f, offset, SEEK_SET) != 0)
+    {
+        return false;
+    }
+    const std::size_t want = geometry_.sectorSize;
+    const bool ok = std::fwrite(buffer, 1, want, f) == want;
+    // FATFS は fclose まで FAT を確定させない。電源をいつ切られるか
+    // 分からないので、1 セクタごとに吐き出す。
+    std::fflush(f);
+    return ok;
+}
+
 }  // namespace x68k_platform
