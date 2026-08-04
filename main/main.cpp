@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 
 #include "app_mode.h"
@@ -226,6 +227,90 @@ constexpr x68k::u32 kSliceCycles = 20000;
 // 変わるまで残ってしまう。要求だけ立てて、実行は所有者に任せる
 // (g_dumpRequested と同じ形)。
 std::atomic<bool> g_redrawRequested{false};
+
+// JIT が成立するかを確かめる最小の実験。
+//
+// 「実行可能メモリを取れるか」「そこへ書いた Xtensa 命令が本当に走るか」の
+// 2 点だけを見る。ここが通らなければ動的再コンパイルの検討自体が無意味。
+//
+// 生成するのは a2 (戻り値レジスタ) へ定数を入れて返るだけの関数。
+//   MOVI.N a2, imm   … 0x0C + (imm<<4) の 2 バイト (imm は 0-15)
+//   RET.N            … 0xF00D の 2 バイト
+// どちらも Xtensa の narrow (2 バイト) 命令。リトルエンディアンで並べる。
+//
+// Why not 大きい定数を入れないか: MOVI.N の即値は 4bit しか無い。
+// ここで確かめたいのは「走るか」だけなので、幅は要らない。
+// 既定では呼ばない。CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
+// MALLOC_CAP_EXEC が必ず失敗する (実測)。JIT を再検討するときに
+// sdkconfig で保護を切ってから呼ぶ。
+[[maybe_unused]] void probeJitFeasibility()
+{
+    constexpr std::size_t kProbeBytes = 64;
+    // 取り方を何通りか試す。どれで取れるかが JIT の実現性そのもの。
+    struct Attempt
+    {
+        const char* name;
+        std::uint32_t caps;
+    };
+    const Attempt attempts[] = {
+        {"EXEC|32BIT", MALLOC_CAP_EXEC | MALLOC_CAP_32BIT},
+        {"EXEC", MALLOC_CAP_EXEC},
+        {"EXEC|INTERNAL", MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL},
+        {"IRAM_8BIT", MALLOC_CAP_IRAM_8BIT},
+    };
+    std::uint8_t* code = nullptr;
+    const char* usedName = nullptr;
+    for (const Attempt& a : attempts)
+    {
+        code = static_cast<std::uint8_t*>(heap_caps_malloc(kProbeBytes, a.caps));
+        ESP_LOGI(kTag, "[jit] %s -> %p", a.name, static_cast<void*>(code));
+        if (code != nullptr)
+        {
+            usedName = a.name;
+            break;
+        }
+    }
+    if (code == nullptr)
+    {
+        ESP_LOGW(kTag, "[jit] 実行可能メモリをどの方法でも確保できない");
+        return;
+    }
+    ESP_LOGI(kTag, "[jit] %s で確保", usedName);
+
+    // 生成するのは `int probe(void) { return 10; }` と同じコード。
+    //
+    // バイト列はアセンブラの出力をそのまま使う。自分でビットを組み立てて
+    // 2 回落とした (MOVI.N のフィールド配置を取り違えて
+    // InstrFetchProhibited、その前にバイト書き込みで LoadStoreError)。
+    // エンコーディングは推測せず、`xtensa-esp32s3-elf-gcc -O2` の出力を
+    // objdump/objcopy で確かめた値を置く:
+    //
+    //   004136  entry a1, 32     -> 36 41 00
+    //   a20c    movi.n a2, 10    -> 0c a2
+    //   f01d    retw.n           -> 1d f0
+    //
+    // entry / retw.n はウィンドウ ABI の対で、通常の関数ポインタ呼び出し
+    // (callx8) と噛み合う。
+    //
+    // IRAM は 32bit 単位でしかアクセスできないので、ワードで書く。
+    constexpr std::uint8_t kImm = 10;
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(code);
+    word[0] = 0x0C004136u;  // 36 41 00 0c
+    word[1] = 0x00F01DA2u;  // a2 1d f0 --
+
+    // IRAM は直接実行されるが、書いた直後は命令パイプラインが古い内容を
+    // 持ちうる。isync で同期する。
+    asm volatile("isync" ::: "memory");
+
+    using ProbeFn = int (*)();
+    ProbeFn fn = nullptr;
+    std::memcpy(&fn, &code, sizeof(fn));
+    const int result = fn();
+
+    ESP_LOGI(kTag, "[jit] 実行可能メモリ %p / 生成コードの戻り値 = %d (期待 %d)", code, result,
+             static_cast<int>(kImm));
+    heap_caps_free(code);
+}
 
 void reportMemory(const char* phase)
 {
