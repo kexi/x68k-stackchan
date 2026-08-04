@@ -372,8 +372,90 @@ private:
     void writeEaToAddr(u32 mode, u32 reg, u32 size, u32 addr, u32 value);
 
     // --- フラグ --------------------------------------------------------------
-    X68K_HOT_PATH void setLogicFlags(u32 value, u32 size);
-    [[nodiscard]] X68K_HOT_PATH bool testCondition(u32 cond) const;
+    // 論理演算後の N/Z を作る。V と C はクリア、X は変化しない。
+    //
+    // MOVE / AND / OR / EOR / NOT / TST / CLR / SWAP / EXT が使う、
+    // 最も多く呼ばれるフラグ更新。実装は m68k.cpp にあり、命令グループは
+    // 別 TU なので ESP32-S3 では必ず実呼び出しになっていた。
+    // (TU を跨ぐ呼び出しのインライン化だけが実測で効く — readEa +2.8%、
+    //  fetch +3.6%、同一 TU の effectiveAddress は 0.0% だった)
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // ここでは m68k_alu.h を include せずに済ませたいので数値で書く。
+    // **0/1/2 ではない** — 一度そう思い込んで適合性ベクタを 25 件落とした。
+    void setLogicFlags(u32 value, u32 size)
+    {
+        u16 sr = static_cast<u16>(
+            st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
+        u32 v = value;
+        u32 sign = 0x80000000u;
+        if (size == 1)  // kByte
+        {
+            v &= 0xFFu;
+            sign = 0x80u;
+        }
+        else if (size == 2)  // kWord
+        {
+            v &= 0xFFFFu;
+            sign = 0x8000u;
+        }
+        if (v == 0)
+        {
+            sr |= sr_bit::kZero;
+        }
+        if ((v & sign) != 0)
+        {
+            sr |= sr_bit::kNegative;
+        }
+        st_.sr = sr;
+    }
+    // 条件コードを評価する。Bcc / DBcc / Scc が使う。
+    //
+    // 分岐は全命令の 22.3% で、その全部がここを通る。実装は m68k.cpp に
+    // あり、命令グループは別 TU なので実呼び出しになっていた。
+    [[nodiscard]] bool testCondition(u32 cond) const
+    {
+        const bool c = (st_.sr & sr_bit::kCarry) != 0;
+        const bool v = (st_.sr & sr_bit::kOverflow) != 0;
+        const bool z = (st_.sr & sr_bit::kZero) != 0;
+        const bool n = (st_.sr & sr_bit::kNegative) != 0;
+
+        switch (cond)
+        {
+            case 0x0:
+                return true;  // T
+            case 0x1:
+                return false;  // F
+            case 0x2:
+                return !c && !z;  // HI
+            case 0x3:
+                return c || z;  // LS
+            case 0x4:
+                return !c;  // CC (HS)
+            case 0x5:
+                return c;  // CS (LO)
+            case 0x6:
+                return !z;  // NE
+            case 0x7:
+                return z;  // EQ
+            case 0x8:
+                return !v;  // VC
+            case 0x9:
+                return v;  // VS
+            case 0xA:
+                return !n;  // PL
+            case 0xB:
+                return n;  // MI
+            case 0xC:
+                return n == v;  // GE
+            case 0xD:
+                return n != v;  // LT
+            case 0xE:
+                return !z && (n == v);  // GT
+            default:
+                return z || (n != v);  // LE
+        }
+    }
 
     // --- 命令グループ --------------------------------------------------------
     // 戻り値は消費サイクル数。未実装なら halted を立てて 0 を返す。

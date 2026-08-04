@@ -585,67 +585,6 @@ void M68k::writeEaToAddr(u32 mode, u32 reg, u32 size, u32 addr, u32 value)
 
 // --- フラグ ----------------------------------------------------------------
 
-void M68k::setLogicFlags(u32 value, u32 size)
-{
-    // 論理演算は V と C をクリアし、N と Z だけを結果から作る。X は変化しない。
-    u16 sr = static_cast<u16>(
-        st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
-    const u32 v = truncate(value, size);
-    if (v == 0)
-    {
-        sr |= sr_bit::kZero;
-    }
-    if ((v & signBit(size)) != 0)
-    {
-        sr |= sr_bit::kNegative;
-    }
-    st_.sr = sr;
-}
-
-bool M68k::testCondition(u32 cond) const
-{
-    const bool c = (st_.sr & sr_bit::kCarry) != 0;
-    const bool v = (st_.sr & sr_bit::kOverflow) != 0;
-    const bool z = (st_.sr & sr_bit::kZero) != 0;
-    const bool n = (st_.sr & sr_bit::kNegative) != 0;
-
-    switch (cond)
-    {
-        case 0x0:
-            return true;  // T
-        case 0x1:
-            return false;  // F
-        case 0x2:
-            return !c && !z;  // HI
-        case 0x3:
-            return c || z;  // LS
-        case 0x4:
-            return !c;  // CC (HS)
-        case 0x5:
-            return c;  // CS (LO)
-        case 0x6:
-            return !z;  // NE
-        case 0x7:
-            return z;  // EQ
-        case 0x8:
-            return !v;  // VC
-        case 0x9:
-            return v;  // VS
-        case 0xA:
-            return !n;  // PL
-        case 0xB:
-            return n;  // MI
-        case 0xC:
-            return n == v;  // GE
-        case 0xD:
-            return n != v;  // LT
-        case 0xE:
-            return !z && (n == v);  // GT
-        default:
-            return z || (n != v);  // LE
-    }
-}
-
 // --- 割り込み --------------------------------------------------------------
 
 void M68k::requestInterrupt(u32 level, u32 vectorNumber)
