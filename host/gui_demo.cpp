@@ -526,6 +526,14 @@ Result run(u16* pixels)
     // 積むと SCC が受信割り込みを上げ、ベクタ $54 のハンドラが走る。
     result.mouseEnabled = machine.scc().isMouseEnabled();
     result.mouseAccepted = machine.moveMouse(kMouseDx, kMouseDy, true, false);
+    if (!result.mouseAccepted)
+    {
+        // 積めなかったらハンドラは起きない。ここで止めないと、下のループが
+        // 「最初の STOP で止まったまま」空回りし、成功として返ってしまう。
+        result.failure = "SCC がマウスレポートを受け付けなかった";
+        result.instructions = executed;
+        return result;
+    }
 
     // 2 段目: 割り込みで起きたハンドラを最後の STOP まで走らせる。
     while (executed < kMaxInstructions && !machine.isHalted())
@@ -551,7 +559,13 @@ Result run(u16* pixels)
         result.instructions = executed;
         return result;
     }
-    if (!machine.cpu().state().stopped)
+    // 「止まっている」だけでは足りない。1 つ目の STOP #$2000 でも
+    // stopped は立つので、ハンドラが一度も走らなくてもこの条件は通る。
+    // 割り込みマスクが 7 になっていることまで見て、末尾の STOP #$2700 に
+    // 到達したことを確かめる。
+    const M68kState& finalState = machine.cpu().state();
+    const bool reachedFinalStop = finalState.stopped && finalState.interruptMask() == 7;
+    if (!reachedFinalStop)
     {
         result.failure = "割り込みハンドラの STOP に到達しなかった";
         result.instructions = executed;

@@ -15,5 +15,11 @@
 #
 # Why not 全体で leak 検出を切らないか: エミュレータ本体やテストが
 # 実際に漏らしたときは捕まえたい。抑制はこの 1 パターンに絞る。
+# 関数名で照合するため LSAN_OPTIONS に symbolize=1 が要る (justfile 参照)。
+# シンボル化されないと以下は 1 つも当たらない。
 leak:doctest::detail::setTestSuite
-leak:doctest::String::String
+leak:doctest::String
+leak:doctest::detail::TestSuite
+# 静的初期化そのものを対象にする保険。上の 3 つが当たらない環境でも
+# doctest の登録経路はここを通る。
+leak:__static_initialization_and_destruction
