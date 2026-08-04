@@ -6,6 +6,7 @@
 #include <M5Unified.h>
 #include <esp_log.h>
 
+#include "video/graphic_raster.h"
 #include "video/text_raster.h"
 
 namespace x68k_platform
@@ -69,6 +70,36 @@ void DisplayLcd::setViewport(x68k::u32 x, x68k::u32 y)
     forceFullRedraw_ = true;
 }
 
+bool DisplayLcd::shouldComposite(x68k::Machine& machine) const
+{
+    // 表示許可が下りていないなら合成しない。
+    //
+    // Why not 実体があれば常に合成するか: 合成はテキスト単独より高い。
+    // グラフィック面を 1 ドットずつ解いてパレットを引き、その上へテキストを
+    // 透明判定つきで重ねるので、画素あたりの仕事が倍近くになる。
+    // Human68k のコンソールはグラフィック面を使わない ($E82600 に $0020 =
+    // テキストのみ許可。IPL-ROM の $FF6436 が MOVE.W #$0020,$00E82600 で
+    // 書いている) ので、SX-Window を起動するまでは払う必要のない代金になる。
+    // ゲストが自分で許可を出した時だけ合成へ切り替えれば、既存のコンソールは
+    // 今までどおりの速さで動く。
+    return graphicVram_ != nullptr && machine.video().graphicEnabled();
+}
+
+void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, x68k::u32 srcWidth,
+                              x68k::u32 srcHeight, x68k::u16* out)
+{
+    if (shouldComposite(machine))
+    {
+        // 奥から順に重ねる。優先順位と透明の扱いは GraphicRaster が持つ。
+        x68k::GraphicRaster::composite(graphicVram_, textVram, machine.video(), viewX_, viewY_,
+                                       srcWidth, srcHeight, out, kScreenWidth);
+        return;
+    }
+
+    x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, srcWidth, srcHeight, out,
+                             kScreenWidth);
+}
+
 void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out)
 {
     const x68k::u32 srcWidth = kScreenWidth / zoom_;
@@ -77,8 +108,7 @@ void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, 
     // いったん左上の srcWidth x srcHeight に等倍で描いてから、
     // 右下から引き伸ばす。バッファを 1 枚で済ませるため、
     // 上書きされる前の画素を先に読む向き (右下→左上) で回す。
-    x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, srcWidth, srcHeight, out,
-                             kScreenWidth);
+    renderPlanes(machine, textVram, srcWidth, srcHeight, out);
 
     for (x68k::u32 y = srcHeight; y-- > 0;)
     {
@@ -126,13 +156,32 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
 
     auto& bus = machine.bus();
 
+    // 合成中は毎フレーム作り直す。
+    //
+    // Why not グラフィック面もダーティ追跡に頼らないか: SystemBus が印を
+    // 付けるのはテキスト VRAM への書き込みだけで (bus.cpp の write8/write16
+    // はテキスト領域からしか markTextDirty を呼ばない)、G-VRAM は追跡されて
+    // いない。ダーティだけを見ていると、SX-Window が絵だけを描き換えた
+    // フレームが「変化なし」と判定され、画面が止まったままになる。
+    // グラフィック面を出している間だけ毎フレーム描くことにすれば、
+    // テキストしか使わない Human68k のコンソールは今までどおり
+    // 「変化が無ければ何もしない」で済む。
+    const bool isCompositing = shouldComposite(machine);
+
+    // 表示許可が切り替わった瞬間も描き直す。合成をやめたフレームは
+    // ダーティが立たないままグラフィックの残骸が画面に残るため。
+    const bool didModeChange = isCompositing != wasComposited_;
+
     // 変化が無ければ作り直さない。プロンプトが点滅しているだけなら
     // ここで抜けるので、Core1 の時間をエミュレーションに回せる。
-    const bool needsRedraw = forceFullRedraw_ || bus.anyTextDirty();
+    const bool needsRedraw =
+        forceFullRedraw_ || didModeChange || isCompositing || bus.anyTextDirty();
     if (!needsRedraw)
     {
         return false;
     }
+
+    wasComposited_ = isCompositing;
 
     const bool isZoomed = zoom_ > 1;
     if (isZoomed)
@@ -148,8 +197,7 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
         // 動くと同じ VRAM 行が LCD の別の位置に来るので、変わっていない行の
         // 古い描画が残り、新しい描画と二重に見える。実機で「A> が 2 個
         // 出る」形で露見した。320x240 の変換なら実測で間に合う。
-        x68k::TextRaster::render(textVram, machine.video(), viewX_, viewY_, kScreenWidth,
-                                 kScreenHeight, out, kScreenWidth);
+        renderPlanes(machine, textVram, kScreenWidth, kScreenHeight, out);
     }
 
     bus.clearTextDirty();

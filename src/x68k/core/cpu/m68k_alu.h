@@ -194,6 +194,142 @@ inline Result bcdSub(u32 dst, u32 src, bool extend)
     return out;
 }
 
+// 除算 (DIVU/DIVS) の結果とフラグ。
+//
+// 68000 の除算は「32bit ÷ 16bit → 商 16bit + 余り 16bit」で、商が 16bit に
+// 収まらないとオーバーフローになる。オーバーフロー時は商も余りも書き戻さない
+// (レジスタは元のまま) ので、呼び出し側は overflow を見て書き戻しを止める。
+struct DivResult
+{
+    u32 quotient;   // 下位 16bit のみ有効
+    u32 remainder;  // 下位 16bit のみ有効
+    bool overflow;
+    bool n;
+    bool z;
+};
+
+// 符号なし除算 (DIVU) の中身。divisor が 0 でないことは呼び出し側の責任。
+//
+// 実装は 68000 のマイクロコードと同じ「シフト減算 (筆算)」で組む。
+//
+// Why not 素直に C++ の / と % で商を出して比較するか:
+//   結果だけなら C++ の除算で足りる。ここで筆算をなぞるのは、オーバーフロー時に
+//   実機が残す N/Z を出すため。マイクロコードは商がオーバーフローすると
+//   ループの途中で抜け、そのときの内部状態が N/Z に残る。C++ の除算では
+//   その「途中」が存在しないので、抜けた瞬間の状態を作れない。
+//
+// アルゴリズム:
+//   余りレジスタに被除数の上位 16bit を置き、下位 16bit を 1bit ずつ
+//   降ろしながら「引けるなら引いて商のビットを立てる」を 16 回繰り返す。
+//   ループに入る前に既に上位 16bit ≥ 除数なら、商の 17bit 目が立つことが
+//   確定するのでその場でオーバーフロー (実機もここで早期に抜ける)。
+inline DivResult divideUnsigned(u32 dividend, u32 divisor)
+{
+    const u32 d = divisor & 0xFFFFu;
+
+    DivResult out{};
+
+    // 早期オーバーフロー判定。上位 16bit が除数以上なら商は 17bit 以上になる。
+    if ((dividend >> 16) >= d)
+    {
+        out.overflow = true;
+        // オーバーフローで抜けた時点の内部状態が N/Z に出る。実機のベクタでは
+        // この経路は必ず N=1, Z=0 (商レジスタの最上位に 1 が立ったまま
+        // 抜けるため、Z が立つ余地がない)。
+        out.n = true;
+        out.z = false;
+        return out;
+    }
+
+    // 筆算本体。remainder は 17bit 必要になる場面はない (上のガードで
+    // 上位 < 除数を保証済み) が、シフトで一時的に溢れるので u32 で持つ。
+    u32 remainder = dividend >> 16;
+    u32 quotient = 0;
+    for (int i = 15; i >= 0; --i)
+    {
+        remainder = (remainder << 1) | ((dividend >> static_cast<u32>(i)) & 1u);
+        if (remainder >= d)
+        {
+            remainder -= d;
+            quotient |= 1u << static_cast<u32>(i);
+        }
+    }
+
+    out.quotient = quotient & 0xFFFFu;
+    out.remainder = remainder & 0xFFFFu;
+    out.overflow = false;
+    out.n = (out.quotient & 0x8000u) != 0;
+    out.z = out.quotient == 0;
+    return out;
+}
+
+// 符号付き除算 (DIVS) の中身。divisor が 0 でないことは呼び出し側の責任。
+//
+// 68000 は両オペランドの絶対値を取ってから符号なしの筆算を回し、最後に符号を
+// 付け直す。オーバーフロー判定も絶対値どうしで行うため、「負の商は -32768 まで
+// 許される」という非対称性がそのまま出る。
+inline DivResult divideSigned(u32 dividend, u32 divisor)
+{
+    const bool dividendNegative = (dividend & 0x80000000u) != 0;
+    const bool divisorNegative = (divisor & 0x8000u) != 0;
+    const bool quotientNegative = dividendNegative != divisorNegative;
+
+    // 絶対値は符号なしで取る。dividend = 0x80000000 の絶対値は s32 に
+    // 収まらないので、s32 のまま negate すると未定義動作になる。
+    const u32 absDividend = dividendNegative ? (0u - dividend) : dividend;
+    const u32 absDivisor = divisorNegative ? ((0u - divisor) & 0xFFFFu) : (divisor & 0xFFFFu);
+
+    DivResult out{};
+
+    // 早期オーバーフロー判定。符号なしと同じく上位 16bit で見る。
+    if ((absDividend >> 16) >= absDivisor)
+    {
+        out.overflow = true;
+        out.n = true;
+        out.z = false;
+        return out;
+    }
+
+    u32 remainder = absDividend >> 16;
+    u32 quotient = 0;
+    for (int i = 15; i >= 0; --i)
+    {
+        remainder = (remainder << 1) | ((absDividend >> static_cast<u32>(i)) & 1u);
+        if (remainder >= absDivisor)
+        {
+            remainder -= absDivisor;
+            quotient |= 1u << static_cast<u32>(i);
+        }
+    }
+
+    // 符号付きの範囲に収まるかを、符号を付ける前の絶対値で判定する。
+    //
+    // Why not 符号を付けてから -32768..32767 で見るか: 絶対値が 0x8000 の
+    // ときに商が正か負かで可否が変わる。絶対値のまま見れば
+    // 「正の商なら 0x8000 は溢れ、負の商なら 0x8000 (= -32768) は許す」を
+    // 分岐ひとつで書ける。符号付きに直してから見ると、-32768 を作る過程で
+    // 一度 32768 を経由することになり、判定順を間違えやすい。
+    const bool absOverflow = quotientNegative ? (quotient > 0x8000u) : (quotient > 0x7FFFu);
+    if (absOverflow)
+    {
+        out.overflow = true;
+        out.n = true;
+        out.z = false;
+        return out;
+    }
+
+    // 余りの符号は被除数に従う (商の符号ではない)。C++ の % と同じ規則。
+    const u32 signedQuotient = quotientNegative ? (0u - quotient) : quotient;
+    const u32 signedRemainder = dividendNegative ? (0u - remainder) : remainder;
+
+    out.quotient = signedQuotient & 0xFFFFu;
+    out.remainder = signedRemainder & 0xFFFFu;
+    out.overflow = false;
+    out.n = (out.quotient & 0x8000u) != 0;
+    out.z = out.quotient == 0;
+    return out;
+}
+
 }  // namespace alu
 }  // namespace x68k
 

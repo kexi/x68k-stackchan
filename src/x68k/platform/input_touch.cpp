@@ -61,6 +61,28 @@ void TouchKeyboard::setVisible(bool visible)
     }
 }
 
+void TouchKeyboard::setX68kInputEnabled(bool enabled)
+{
+    if (isX68kInputEnabled_ == enabled)
+    {
+        return;
+    }
+    isX68kInputEnabled_ = enabled;
+
+    // 触っている途中の状態を捨てる。
+    //
+    // Why: 押したまま切り替えると、isDragging_ と lastTouchX/Y_ が
+    // 切り替え前の座標を指したまま残る。戻ってきて最初に触った位置との
+    // 差がそのまま移動量になり、カーソルが画面の端まで飛ぶ
+    // (「触り始めは基準点を置くだけ」で防いでいるのと同じ問題が、
+    //  モードをまたいで再現する)。
+    //
+    // lastKeyIndex_ も戻す。押しっぱなしのキーを覚えたまま顔へ抜けると、
+    // 戻って同じキーを押したときに「まだ離していない」と見なして無視する。
+    isDragging_ = false;
+    lastKeyIndex_ = -1;
+}
+
 void TouchKeyboard::draw()
 {
     if (!visible_)
@@ -95,9 +117,16 @@ void TouchKeyboard::draw()
     }
 }
 
-void TouchKeyboard::poll(KeyQueue& keys)
+void TouchKeyboard::poll(KeyQueue& keys, MouseQueue& mouse)
 {
-    if (!visible_)
+    // 顔モードの間は X68000 へ何も送らない。
+    //
+    // Why not 何も見ずに返るか: 見ずに返っても状態は壊れない。
+    // setX68kInputEnabled が切り替えの時点で isDragging_ と
+    // lastKeyIndex_ を捨てるので、顔モードの間に指を離したことを
+    // 覚えておく必要が無い。ここで touch を読まないぶん、顔モードでは
+    // M5.Touch の読み出しも省ける。
+    if (!isX68kInputEnabled_)
     {
         return;
     }
@@ -107,12 +136,63 @@ void TouchKeyboard::poll(KeyQueue& keys)
     {
         // 離したので次のキーを受け付ける。
         lastKeyIndex_ = -1;
+
+        // ボタンを離したことを伝える。
+        //
+        // Why not 何もしないか: 押したまま指を離すと、ゲストから見ると
+        // ボタンが押しっぱなしになる。SX-Window ではドラッグが終わらず、
+        // ウィンドウが指に貼り付いたままになる。
+        if (isDragging_)
+        {
+            isDragging_ = false;
+            mouse.push(0, 0, false, false);
+        }
         return;
     }
 
-    if (touch.y < kKeyboardTop)
+    // キーボードを出していないときは画面全体をマウスに使う。
+    //
+    // Why not 出していない間も下部をキーボード扱いにするか: 描かれていない
+    // キーを押せることになる。見えないものが反応する状態は、意図しない
+    // 文字が入るだけで害しかない (main.cpp が setVisible(false) している
+    // 理由もこれ)。
+    const bool isMouseArea = !visible_ || touch.y < kKeyboardTop;
+    if (isMouseArea)
     {
-        return;  // 画面側のタッチ
+        // 触り始めは基準点を置くだけ。前に離した位置との差を送ると飛ぶ。
+        if (!isDragging_)
+        {
+            isDragging_ = true;
+            lastTouchX_ = touch.x;
+            lastTouchY_ = touch.y;
+            // 押下だけを伝える。移動量は次のループから。
+            mouse.push(0, 0, true, false);
+            return;
+        }
+
+        const int dx = touch.x - lastTouchX_;
+        const int dy = touch.y - lastTouchY_;
+        lastTouchX_ = touch.x;
+        lastTouchY_ = touch.y;
+
+        // 動いていなくてもボタンの状態は保つ。MouseQueue が
+        // 「変化が無ければ送らない」を判断する。
+        mouse.push(dx, dy, true, false);
+        return;
+    }
+
+    // ここへ来た時点で指はマウス領域の外にいる。ドラッグ中だったなら
+    // ボタンを離す。
+    //
+    // Why 要るか: 指をマウス領域で押したままキーボード領域へ滑らせると、
+    // このフレームで isMouseArea が false になりキーボード側へ落ちる。
+    // isDragging_ を立てたままだと、ゲストは「左ボタンを押したまま」と
+    // 認識し続ける。SX-Window ではタイプしながらドラッグが続く形になる。
+    // 指が離れるまで解放が届かない。
+    if (isDragging_)
+    {
+        mouse.push(0, 0, false, false);
+        isDragging_ = false;
     }
 
     const int col = touch.x / kKeyWidth;

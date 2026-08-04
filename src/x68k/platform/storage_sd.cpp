@@ -4,12 +4,14 @@
 #include "storage_sd.h"
 
 #include <cstdio>
+#include <string>
 
 #include "driver/sdspi_host.h"
 #include "driver/spi_common.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#include "sram_persist.h"
 
 namespace x68k_platform
 {
@@ -104,6 +106,130 @@ std::size_t loadFile(const char* path, std::uint8_t* buffer, std::size_t bufferS
     return read == static_cast<std::size_t>(size) ? read : 0;
 }
 
+namespace
+{
+
+// SramFileOps を FATFS で実装したもの。方針は sram_persist.h が持ち、
+// ここは「実際にカードを触る」部分だけを引き受ける。
+//
+// Why not 方針もここに書くか: FATFS を直に叩く関数は電源断のタイミングを
+// 再現できず、ホストのテストに載らない。壊れ方が「利用者の設定が全部消える」
+// である以上、検査できない場所に判断を置きたくない。
+class FatFileOps final : public SramFileOps
+{
+public:
+    std::size_t read(const char* path, std::uint8_t* buffer, std::size_t bufferSize) override
+    {
+        return loadFile(path, buffer, bufferSize);
+    }
+
+    bool write(const char* path, const std::uint8_t* buffer, std::size_t size) override
+    {
+        std::FILE* f = std::fopen(path, "wb");
+        if (f == nullptr)
+        {
+            return false;
+        }
+
+        const std::size_t written = std::fwrite(buffer, 1, size, f);
+        // fflush だけでは足りない。FATFS は fclose で FAT とディレクトリエントリを
+        // 確定させるので、閉じずに電源が切れると長さ 0 のファイルが残る。
+        const bool isFlushed = std::fflush(f) == 0;
+        const bool isClosed = std::fclose(f) == 0;
+        if (written != size || !isFlushed || !isClosed)
+        {
+            // 半端なファイルを残さないのが SramFileOps::write の契約。
+            std::remove(path);
+            return false;
+        }
+        return true;
+    }
+
+    bool remove(const char* path) override
+    {
+        // 元から無い場合も成功として扱う。呼び出し側は区別しない。
+        return std::remove(path) == 0 || !exists(path);
+    }
+
+    bool rename(const char* from, const char* to) override
+    {
+        return std::rename(from, to) == 0;
+    }
+
+    [[nodiscard]] bool exists(const char* path) override
+    {
+        std::FILE* f = std::fopen(path, "rb");
+        if (f == nullptr)
+        {
+            return false;
+        }
+        std::fclose(f);
+        return true;
+    }
+};
+
+}  // namespace
+
+bool saveFile(const char* path, const std::uint8_t* buffer, std::size_t size)
+{
+    FatFileOps ops;
+    return saveSramImage(ops, path, buffer, size);
+}
+
+// --- SRAM --------------------------------------------------------------------
+
+bool loadSram(x68k::Machine& machine)
+{
+    // 16KB なのでスタックには置かず static にする。
+    //
+    // Why not スタックに置くか: この関数はエミュレーションタスク (スタック 8KB)
+    // からも呼べる位置にあり、16KB の配列を積むとその場でオーバーフローする。
+    // 呼ばれるのは起動時の 1 回だけなので、常駐しても惜しくない大きさでもない。
+    static std::uint8_t image[x68k::kSramSize];
+
+    // 本体が無い/壊れているときは .tmp からの復旧まで面倒を見る。
+    // 保存は remove(本体) → rename(.tmp) の順に進むので、その隙間で電源が
+    // 落ちると完全な .tmp だけが残る。ここで拾わないと、原子的に書いた意味が
+    // 無くなって工場出荷値へ落ちる。並び順の根拠は sram_persist.h に書いた。
+    FatFileOps ops;
+    const SramLoadResult result =
+        loadSramImage(ops, kSramPath, machine.sram(), image, sizeof(image));
+
+    if (result == SramLoadResult::kRecovered)
+    {
+        ESP_LOGW(kTag, "本体が失われていたため %s%s から復旧しました", kSramPath, kTempSuffix);
+    }
+    return result != SramLoadResult::kNone;
+}
+
+bool saveSramIfDirty(x68k::Machine& machine)
+{
+    if (!machine.sram().isDirty())
+    {
+        return false;
+    }
+
+    // dirty は書き込みに成功したときだけ落とす。
+    //
+    // Why not 先に落として失敗を握り潰さないか: 「次に SRAM が書かれれば
+    // また dirty が立つ」は、その書き込みが最後の設定変更だった場合に
+    // 成立しない。SD の一時的な I/O エラーで 1 回失敗しただけで、以降
+    // 誰も SRAM を書かなければ変更は永久に保存されない。設定を変えて
+    // すぐ電源を切る使い方はまさにこれに当たる。
+    //
+    // 呼び出し側が 10 秒間隔で間引いているので、失敗しても再試行は
+    // 10 秒に 1 回で済む。毎スライス 16KB を書き続けることにはならない。
+
+    const bool ok = saveFile(kSramPath, machine.sram().data(), x68k::kSramSize);
+    if (!ok)
+    {
+        ESP_LOGW(kTag, "SRAM を保存できません: %s", kSramPath);
+        return false;
+    }
+    machine.sram().clearDirty();
+    return true;
+}
+
 // --- SdDisk ------------------------------------------------------------------
 
 SdDisk::~SdDisk()
@@ -167,6 +293,141 @@ bool SdDisk::writeSector(x68k::u32 lba, const x68k::u8* buffer, x68k::u32 sector
     }
     const std::size_t want = static_cast<std::size_t>(sectorCount) * kSectorSize;
     const bool ok = std::fwrite(buffer, 1, want, f) == want;
+    std::fflush(f);
+    return ok;
+}
+
+// --- SdFloppy ----------------------------------------------------------------
+
+SdFloppy::~SdFloppy()
+{
+    close();
+}
+
+bool SdFloppy::open(const char* path)
+{
+    close();
+
+    std::FILE* f = std::fopen(path, "r+b");
+    writeProtected_ = false;
+    if (f == nullptr)
+    {
+        // 書き込み不可でも読めれば起動はできる。ライトプロテクトされた
+        // ディスクとして扱う (ST3 の bit6 に出る)。
+        f = std::fopen(path, "rb");
+        writeProtected_ = true;
+    }
+    if (f == nullptr)
+    {
+        return false;
+    }
+
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size <= 0)
+    {
+        std::fclose(f);
+        return false;
+    }
+
+    const x68k::FloppyFormat format =
+        x68k::detectFloppyFormat(static_cast<x68k::u32>(size), &dataOffset_, &geometry_);
+    if (format == x68k::FloppyFormat::Unknown)
+    {
+        ESP_LOGE(kTag, "フロッピーイメージの長さが未対応: %s (%ld バイト)", path, size);
+        std::fclose(f);
+        return false;
+    }
+
+    file_ = f;
+    ESP_LOGI(kTag, "%s (%s) %uC x %uH x %uS x %uB%s", path,
+             format == x68k::FloppyFormat::Dim ? "DIM" : "XDF", geometry_.cylinders,
+             geometry_.heads, geometry_.sectorsPerTrack, geometry_.sectorSize,
+             writeProtected_ ? " 書込禁止" : "");
+    return true;
+}
+
+void SdFloppy::close()
+{
+    if (file_ != nullptr)
+    {
+        std::fclose(static_cast<std::FILE*>(file_));
+        file_ = nullptr;
+    }
+}
+
+bool SdFloppy::isPresent() const
+{
+    return file_ != nullptr;
+}
+
+bool SdFloppy::isWriteProtected() const
+{
+    return writeProtected_;
+}
+
+const x68k::FloppyGeometry& SdFloppy::geometry() const
+{
+    return geometry_;
+}
+
+bool SdFloppy::locate(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, long* offset) const
+{
+    const bool inRange = cylinder < geometry_.cylinders && head < geometry_.heads && record >= 1 &&
+                         record <= geometry_.sectorsPerTrack;
+    if (!inRange)
+    {
+        return false;
+    }
+    const x68k::u32 lba =
+        ((cylinder * geometry_.heads) + head) * geometry_.sectorsPerTrack + (record - 1);
+    *offset = static_cast<long>(dataOffset_) +
+              static_cast<long>(lba) * static_cast<long>(geometry_.sectorSize);
+    return true;
+}
+
+bool SdFloppy::readSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record, x68k::u8* buffer)
+{
+    if (file_ == nullptr)
+    {
+        return false;
+    }
+    long offset = 0;
+    if (!locate(cylinder, head, record, &offset))
+    {
+        return false;
+    }
+    auto* f = static_cast<std::FILE*>(file_);
+    if (std::fseek(f, offset, SEEK_SET) != 0)
+    {
+        return false;
+    }
+    const std::size_t want = geometry_.sectorSize;
+    return std::fread(buffer, 1, want, f) == want;
+}
+
+bool SdFloppy::writeSector(x68k::u32 cylinder, x68k::u32 head, x68k::u32 record,
+                           const x68k::u8* buffer)
+{
+    if (file_ == nullptr || writeProtected_)
+    {
+        return false;
+    }
+    long offset = 0;
+    if (!locate(cylinder, head, record, &offset))
+    {
+        return false;
+    }
+    auto* f = static_cast<std::FILE*>(file_);
+    if (std::fseek(f, offset, SEEK_SET) != 0)
+    {
+        return false;
+    }
+    const std::size_t want = geometry_.sectorSize;
+    const bool ok = std::fwrite(buffer, 1, want, f) == want;
+    // FATFS は fclose まで FAT を確定させない。電源をいつ切られるか
+    // 分からないので、1 セクタごとに吐き出す。
     std::fflush(f);
     return ok;
 }

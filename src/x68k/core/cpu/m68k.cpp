@@ -17,7 +17,6 @@ namespace
 // 外へ出るときに上位 8bit が捨てられるだけ)。レジスタ側でマスクすると
 // A0 に $F9C321E4 を入れて読み出したときに $00C321E4 が返るという
 // 実機と違う挙動になり、テストベクタが軒並み落ちる。
-constexpr u32 kAddrMask = 0x00FFFFFFu;
 
 // サイズ指定の内部表現。1/2/4 バイトをそのまま使う。
 constexpr u32 kByte = 1;
@@ -112,16 +111,6 @@ void M68k::loadStateForTest(const M68kState& s)
 //   テストベクタの pc は MAME の m_au 由来で同じ定義なので、これに合わせている。
 //   ここを 1 ワードずらすと、分岐先も PC 相対アドレッシングも全部ずれる。
 
-u16 M68k::fetch()
-{
-    const u16 value = st_.ir;
-    st_.ir = st_.irc;
-    // PC は既に「次に読むアドレス」なので、そこから読んで 1 ワード進める。
-    st_.irc = read16(st_.pc);
-    st_.pc = st_.pc + 2;
-    return value;
-}
-
 void M68k::refillPrefetch(u32 newPc)
 {
     // 奇数アドレスへの分岐はアドレスエラー。
@@ -142,25 +131,75 @@ void M68k::refillPrefetch(u32 newPc)
     // IOCS 側はそこで「不正ベクタ」として処理する仕組み。
     // PC 自体を丸めてしまうとテストベクタ (32bit の PC を期待する) が
     // 落ちるので、丸めるのはアクセスの瞬間だけにする。
-    st_.ir = bus_.read16(newPc & kAddrMask);
-    st_.irc = bus_.read16((newPc + 2) & kAddrMask);
+    const u32 a = newPc & M68k::kAddrMask;
+    // 分岐のたびに 2 ワード読む。ここも直接経路を通す。
+    // 4 バイトとも窓に収まるときだけ (またぐ場合は下の一般路が境界を見る)。
+    if (fastRamReadable_ && fastRamHasLong(a))
+    {
+        st_.ir = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+        st_.irc = static_cast<u16>((fastRam_[a + 2] << 8) | fastRam_[a + 3]);
+        st_.pc = newPc + 4;
+        return;
+    }
+    // 命令フェッチの最頻の行き先は IPL-ROM (実測で全アクセスの 79%)。
+    if (u32 off = 0; fastRomHas(a, 4, off))
+    {
+        st_.ir = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+        st_.irc = static_cast<u16>((fastRom_[off + 2] << 8) | fastRom_[off + 3]);
+        st_.pc = newPc + 4;
+        return;
+    }
+
+    st_.ir = bus_.read16(a);
+    st_.irc = bus_.read16((newPc + 2) & M68k::kAddrMask);
     st_.pc = newPc + 4;
 }
 
 // --- メモリアクセス --------------------------------------------------------
 
+// 直接経路 (fastRam_) について:
+//   SystemBus::read16 は virtual なので、命令フェッチもオペランド読みも
+//   vtable 経由の間接呼び出しになる。呼び先が確定しないためインライン展開が
+//   効かず、実体は「配列から 2 バイト読む」だけなのに呼び出しの分を必ず払う。
+//   実行の大半はメインメモリに当たるので、そこだけを先に判定して素通しにする。
+//
+//   fastRam_ は bus_ が持つメインメモリと同じ実体を指す (写しではない)。
+//   DMAC はバス経由で触るが、同じ配列に当たるのでコヒーレンシの問題は無い。
+//
+//   バスエラーの扱い: メインメモリは応答しない領域ではないので、直接経路を
+//   通ったアクセスは必ず成功する。faulted_ を見に行く必要が無い。
+
 u8 M68k::read8(u32 addr)
 {
-    return bus_.read8(addr & kAddrMask);
+    const u32 a = addr & M68k::kAddrMask;
+    if (fastRamReadable_ && fastRamHasByte(a))
+    {
+        return fastRam_[a];
+    }
+    if (u32 off = 0; fastRomHas(a, 1, off))
+    {
+        return fastRom_[off];
+    }
+    return bus_.read8(a);
 }
 
 u16 M68k::read16(u32 addr)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, true);
         return 0;
+    }
+    if (fastRamReadable_ && fastRamHasWord(a))
+    {
+        // 68000 はビッグエンディアン。ホストのエンディアンに依存しないよう
+        // バイトから組む (SystemBus::read16 と同じ形)。
+        return static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+    }
+    if (u32 off = 0; fastRomHas(a, 2, off))
+    {
+        return static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
     }
     const u16 value = bus_.read16(a);
     if (bus_.lastAccessFaulted())
@@ -175,16 +214,29 @@ u16 M68k::read16(u32 addr)
 
 u32 M68k::read32(u32 addr)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, true);
         return 0;
     }
+    // ロングは 4 バイトとも窓に収まるときだけ直接読む。
+    // またぐ場合は下の 2 回に分ける経路がそれぞれ境界を見る。
+    if (fastRamReadable_ && fastRamHasLong(a))
+    {
+        return (static_cast<u32>(fastRam_[a]) << 24) | (static_cast<u32>(fastRam_[a + 1]) << 16) |
+               (static_cast<u32>(fastRam_[a + 2]) << 8) | fastRam_[a + 3];
+    }
+    if (u32 off = 0; fastRomHas(a, 4, off))
+    {
+        return (static_cast<u32>(fastRom_[off]) << 24) |
+               (static_cast<u32>(fastRom_[off + 1]) << 16) |
+               (static_cast<u32>(fastRom_[off + 2]) << 8) | fastRom_[off + 3];
+    }
     // 68000 のバスは 16bit なのでロングは 2 回に分かれる。上位が先。
     const u32 hi = bus_.read16(a);
     const bool hiFaulted = bus_.lastAccessFaulted();
-    const u32 lo = bus_.read16((a + 2) & kAddrMask);
+    const u32 lo = bus_.read16((a + 2) & M68k::kAddrMask);
     if (hiFaulted || bus_.lastAccessFaulted())
     {
         takeBusError(a, true);
@@ -193,17 +245,33 @@ u32 M68k::read32(u32 addr)
     return (hi << 16) | lo;
 }
 
+// 書き込みの直接経路は ROM 写像の有無に関係なく通してよい。
+//
+// Why: 写像中でも $000000-$1FFFFF への書き込み先は RAM 側で、ROM は書けない
+// (SystemBus::write8 も同じく mainRam へ書く)。読み出しだけが ROM に化ける。
 void M68k::write8(u32 addr, u8 value)
 {
-    bus_.write8(addr & kAddrMask, value);
+    const u32 a = addr & M68k::kAddrMask;
+    if (fastRamHasByte(a))
+    {
+        fastRam_[a] = value;
+        return;
+    }
+    bus_.write8(a, value);
 }
 
 void M68k::write16(u32 addr, u16 value)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
+        return;
+    }
+    if (fastRamHasWord(a))
+    {
+        fastRam_[a] = static_cast<u8>(value >> 8);
+        fastRam_[a + 1] = static_cast<u8>(value & 0xFFu);
         return;
     }
     bus_.write16(a, value);
@@ -211,14 +279,22 @@ void M68k::write16(u32 addr, u16 value)
 
 void M68k::write32(u32 addr, u32 value)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
         return;
     }
+    if (fastRamHasLong(a))
+    {
+        fastRam_[a] = static_cast<u8>(value >> 24);
+        fastRam_[a + 1] = static_cast<u8>(value >> 16);
+        fastRam_[a + 2] = static_cast<u8>(value >> 8);
+        fastRam_[a + 3] = static_cast<u8>(value & 0xFFu);
+        return;
+    }
     bus_.write16(a, static_cast<u16>(value >> 16));
-    bus_.write16((a + 2) & kAddrMask, static_cast<u16>(value & 0xFFFFu));
+    bus_.write16((a + 2) & M68k::kAddrMask, static_cast<u16>(value & 0xFFFFu));
 }
 
 // --- 例外 ------------------------------------------------------------------
@@ -341,30 +417,11 @@ bool M68k::requirePrivilege()
 
 // --- 実効アドレス ----------------------------------------------------------
 
-u32 M68k::effectiveAddress(u32 mode, u32 reg, u32 size)
+u32 M68k::effectiveAddressSlow(u32 mode, u32 reg, u32 size)
 {
+    // mode 2/3/4 ((An) / (An)+ / -(An)) はヘッダ側で捌き済み。ここには来ない。
     switch (mode)
     {
-        case 2:  // (An)
-            return st_.a[reg];
-
-        case 3:  // (An)+
-        {
-            const u32 addr = st_.a[reg];
-            // A7 をバイト単位で触るときは 2 増減する。スタックポインタが
-            // 奇数になるとアドレスエラーになるための特例。
-            const u32 step = (reg == 7 && size == kByte) ? 2u : size;
-            st_.a[reg] = addr + step;
-            return addr;
-        }
-
-        case 4:  // -(An)
-        {
-            const u32 step = (reg == 7 && size == kByte) ? 2u : size;
-            st_.a[reg] = st_.a[reg] - step;
-            return st_.a[reg];
-        }
-
         case 5:  // (d16,An)
         {
             const s16 disp = static_cast<s16>(fetch());
@@ -436,18 +493,9 @@ u32 M68k::effectiveAddress(u32 mode, u32 reg, u32 size)
     return 0;
 }
 
-u32 M68k::readEa(u32 mode, u32 reg, u32 size)
+u32 M68k::readEaSlow(u32 mode, u32 reg, u32 size)
 {
-    if (mode == 0)
-    {
-        return truncate(st_.d[reg], size);
-    }
-    if (mode == 1)
-    {
-        // An はワード指定でも符号拡張された 32bit として読まれる。
-        return size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(st_.a[reg])))
-                             : st_.a[reg];
-    }
+    // mode 0/1 (Dn/An 直接) はヘッダ側で捌き済み。ここには来ない。
     if (mode == 7 && reg == 4)
     {
         // #immediate
@@ -474,33 +522,9 @@ u32 M68k::readEa(u32 mode, u32 reg, u32 size)
     return read32(addr);
 }
 
-void M68k::writeEa(u32 mode, u32 reg, u32 size, u32 value)
+void M68k::writeEaSlow(u32 mode, u32 reg, u32 size, u32 value)
 {
-    if (mode == 0)
-    {
-        // Dn への書き込みはサイズぶんだけを差し替える。上位は保存される。
-        if (size == kByte)
-        {
-            st_.d[reg] = (st_.d[reg] & 0xFFFFFF00u) | (value & 0xFFu);
-        }
-        else if (size == kWord)
-        {
-            st_.d[reg] = (st_.d[reg] & 0xFFFF0000u) | (value & 0xFFFFu);
-        }
-        else
-        {
-            st_.d[reg] = value;
-        }
-        return;
-    }
-    if (mode == 1)
-    {
-        // An への書き込みは常に 32bit。ワード指定なら符号拡張される。
-        st_.a[reg] =
-            size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
-        return;
-    }
-
+    // mode 0/1 (Dn/An 直接) はヘッダ側で捌き済み。ここには来ない。
     const u32 addr = effectiveAddress(mode, reg, size);
     writeEaToAddr(mode, reg, size, addr, value);
 }
@@ -560,67 +584,6 @@ void M68k::writeEaToAddr(u32 mode, u32 reg, u32 size, u32 addr, u32 value)
 }
 
 // --- フラグ ----------------------------------------------------------------
-
-void M68k::setLogicFlags(u32 value, u32 size)
-{
-    // 論理演算は V と C をクリアし、N と Z だけを結果から作る。X は変化しない。
-    u16 sr = static_cast<u16>(
-        st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
-    const u32 v = truncate(value, size);
-    if (v == 0)
-    {
-        sr |= sr_bit::kZero;
-    }
-    if ((v & signBit(size)) != 0)
-    {
-        sr |= sr_bit::kNegative;
-    }
-    st_.sr = sr;
-}
-
-bool M68k::testCondition(u32 cond) const
-{
-    const bool c = (st_.sr & sr_bit::kCarry) != 0;
-    const bool v = (st_.sr & sr_bit::kOverflow) != 0;
-    const bool z = (st_.sr & sr_bit::kZero) != 0;
-    const bool n = (st_.sr & sr_bit::kNegative) != 0;
-
-    switch (cond)
-    {
-        case 0x0:
-            return true;  // T
-        case 0x1:
-            return false;  // F
-        case 0x2:
-            return !c && !z;  // HI
-        case 0x3:
-            return c || z;  // LS
-        case 0x4:
-            return !c;  // CC (HS)
-        case 0x5:
-            return c;  // CS (LO)
-        case 0x6:
-            return !z;  // NE
-        case 0x7:
-            return z;  // EQ
-        case 0x8:
-            return !v;  // VC
-        case 0x9:
-            return v;  // VS
-        case 0xA:
-            return !n;  // PL
-        case 0xB:
-            return n;  // MI
-        case 0xC:
-            return n == v;  // GE
-        case 0xD:
-            return n != v;  // LT
-        case 0xE:
-            return !z && (n == v);  // GT
-        default:
-            return z || (n != v);  // LE
-    }
-}
 
 // --- 割り込み --------------------------------------------------------------
 

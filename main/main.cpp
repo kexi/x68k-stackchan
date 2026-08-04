@@ -16,18 +16,25 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <driver/usb_serial_jtag.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 
+#include "app_mode.h"
+#include "audio.h"
+#include "avatar.h"
 #include "display_lcd.h"
+#include "speaker_m5.h"
 #include "frame_channel.h"
 #include "input_touch.h"
 #include "key_queue.h"
+#include "servo.h"
 #include "io/ascii_keymap.h"
 #include "machine.h"
 #include "storage_sd.h"
@@ -40,7 +47,7 @@ namespace
 constexpr char kTag[] = "x68k";
 
 // エミュレータが必要とするメモリ。
-constexpr std::size_t kMainRamBytes = x68k::kMainRamSize;    // 1MB
+constexpr std::size_t kMainRamBytes = x68k::kMainRamSize;    // 2MB
 constexpr std::size_t kTextVramBytes = x68k::kTvramSize;     // 512KB
 constexpr std::size_t kGraphicVramBytes = x68k::kTvramSize;  // 512KB
 constexpr std::size_t kIplromBytes = x68k::kIplromSize;      // 128KB
@@ -61,10 +68,249 @@ x68k::u16* g_frameBufferB = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
+// フロッピー 2 台。イメージが無ければ「ディスクが入っていない」まま。
+x68k_platform::SdFloppy g_floppy[x68k::Fdc::kDriveCount];
 x68k_platform::DisplayLcd g_display;
 x68k_platform::TouchKeyboard g_keyboard;
 x68k_platform::FrameChannel g_frames;
 x68k_platform::KeyQueue g_keys;
+x68k_platform::MouseQueue g_mouse;
+
+// --- 音源 (YM2151 / MSM6258V) ---
+//
+// 合成は Core1 (エミュレーションコア) で行う。Machine を所有するのが
+// Core1 だからで、表示と同じ切り分け (frame_channel.h) をそのまま音へ
+// 当てはめた形。できたサンプルは AudioChannel のリングを通って Core0 の
+// 音声タスクへ渡り、そこから M5Unified のスピーカーへ流れる。
+//
+// Why not 3 つ目のコアに載せないか: ESP32-S3 は 2 コアしかない。
+// Why not Core0 で合成しないか: 合成には OPM のレジスタと ADPCM の FIFO を
+// 読む必要があり、それはゲストが $E90003 / $E92003 へ書いている最中に
+// 変わる。Core0 から読めば表示で避けたのと同じデータ競合を音で再現する
+// ことになる。
+x68k_platform::AudioChannel g_audio;
+x68k_platform::M5SpeakerSink g_speaker;
+
+// 音源を鳴らすか。
+//
+// 実測 (下の docs/knowledge/cores3-emulator-runtime.md の値) では、音が
+// 鳴っていない間のコストがほぼゼロなので既定は ON。合成そのものは
+// Machine::renderAudio が「全スロット無音なら合成を省く」早期リターンを
+// 持っており、待機中に払うのは 512 サンプルのゼロ埋めだけになる。
+//
+// Why not ビルド時の #if だけにしないか: 実機で「音を切ったら速くなるか」を
+// 焼き直さずに比べたい。逆に実行時だけにすると、音を使わない構成でも
+// スピーカーの I2S タスクと DMA バッファ (8 x 256) が常駐する。両方持つ。
+#ifndef X68K_ENABLE_AUDIO
+#define X68K_ENABLE_AUDIO 1
+#endif
+std::atomic<bool> g_audioEnabled{X68K_ENABLE_AUDIO != 0};
+
+// 音声タスクが動いているか。スピーカーを開けなかったときは false のまま。
+bool g_speakerReady = false;
+
+// テスト音を鳴らしてほしい。表示コアが立て、エミュレーションコアが消す。
+//
+// Why 要るか: 「音が鳴る」ことを実機で確かめたいが、耳では確かめられない
+// (人が横にいないと分からない)。ゲストのソフトが音を出すのを待つのも、
+// Human68k のプロンプトからは何も鳴らないので当てにならない。OPM を
+// 直接キーオンする口があれば、待機中は振幅ゼロ・鳴らせば非ゼロ、という
+// 対比をログの数字だけで作れる。
+//
+// Why not これを core/ に置かないか: これは実機の確認手段であって
+// X68000 の機能ではない。Opm のレジスタを 2 段書きするだけなので、
+// ゲストがやるのと同じ経路 (writeAddress/writeData) で足りる。
+//
+// Why not 表示コアから直接 Opm を叩かないか: Opm は Machine の一部で、
+// 所有者は Core1。表示コアから書くと、合成の最中にレジスタが変わる。
+// 画面ダンプ (g_dumpRequested) と同じく要求だけ立てる。
+std::atomic<bool> g_testToneRequested{false};
+
+// OPM ch0 を「すぐ最大音量で鳴り続ける」設定にしてキーオンする。
+// エミュレーションコアから呼ぶ (Machine を触るため)。
+void playTestTone(x68k::Machine& machine)
+{
+    x68k::Opm& opm = machine.opm();
+    const auto writeReg = [&opm](x68k::u8 reg, x68k::u8 value)
+    {
+        // 実機と同じ 2 段書き (アドレス latch → データ)。
+        opm.writeAddress(reg);
+        opm.writeData(value);
+    };
+
+    // 4 スロットとも AR 最大・減衰なし・TL 0 (最大音量)。
+    // test/test_audio.cpp の setupLoudChannel と同じ設定にしてある。
+    // ホストのテストが検査したのと同じ音を実機で出せば、両者の突き合わせが
+    // できる (ホストで測った振幅と実機のログが一致するはず)。
+    for (x68k::u8 slot = 0; slot < 4; ++slot)
+    {
+        const x68k::u8 offset = static_cast<x68k::u8>(slot * 8);
+        writeReg(static_cast<x68k::u8>(0x40 + offset), 0x01);  // DT1=0 MUL=1
+        writeReg(static_cast<x68k::u8>(0x60 + offset), 0x00);  // TL=0
+        writeReg(static_cast<x68k::u8>(0x80 + offset), 0x1F);  // KS=0 AR=31
+        writeReg(static_cast<x68k::u8>(0xA0 + offset), 0x00);  // D1R=0
+        writeReg(static_cast<x68k::u8>(0xC0 + offset), 0x00);  // DT2=0 D2R=0
+        writeReg(static_cast<x68k::u8>(0xE0 + offset), 0x0F);  // D1L=0 RR=15
+    }
+    writeReg(0x20, 0xC7);  // RL=両方on FL=0 CONN=7
+    writeReg(0x28, 0x4A);  // KC (オクターブ 4 の A)
+    writeReg(0x30, 0x00);  // KF=0
+    writeReg(0x08, 0x78);  // 全スロットキーオン
+}
+
+// テスト音を止める (キーオフ)。RR=15 にしてあるのですぐ減衰する。
+void stopTestTone(x68k::Machine& machine)
+{
+    machine.opm().writeAddress(0x08);
+    machine.opm().writeData(0x00);
+}
+
+// --- スタックチャン (顔 ⇄ X68000) ---
+//
+// FSM を触るのは表示コア (Core0) だけ。エミュレーションコアへは下の
+// atomic 1 つだけを渡す (app_mode.h の AppModeMachine のコメントを見よ)。
+x68k_platform::AppModeMachine g_mode;
+x68k_platform::Avatar g_avatar;
+
+// 顔の大きさが LCD と一致していることを確かめる。
+//
+// Avatar は core/ を引き込まないために自前で 320x240 を持っている
+// (avatar.h の kWidth を見よ)。食い違うと pushFrame が別の大きさの
+// バッファを送り、画面が崩れるか読み過ぎる。
+static_assert(x68k_platform::Avatar::kWidth == x68k_platform::DisplayLcd::kScreenWidth,
+              "顔の幅が LCD と違う");
+static_assert(x68k_platform::Avatar::kHeight == x68k_platform::DisplayLcd::kScreenHeight,
+              "顔の高さが LCD と違う");
+
+// サーボ。既定は NullServo (何もしない)。
+//
+// Why 既定を NullServo にするか: CoreS3 単体が通常の開発形態で、
+// サーボの信号線を出す Port.A (GPIO 1/2) は M5Unified が外部 I2C にも
+// 使う。Port.A に I2C の Unit を挿している環境で既定を PWM にすると、
+// I2C のバスへ 50Hz の矩形波を流し込むことになる (servo.h の冒頭)。
+//
+// Why not コンパイル時に選ばせないか: どちらを使うかは焼いた後に
+// 「サーボを挿してみる」で決まる。焼き直しが要ると、繋いで試すたびに
+// 数分待つことになる。両方を実体として持ち、ポインタで差し替える。
+x68k_platform::NullServo g_nullServo;
+x68k_platform::LedcServo g_ledcServo;
+x68k_platform::Servo* g_servo = &g_nullServo;
+
+// 1 スライスで進めてよいサイクル数。表示コアが書き、エミュレーションコアが読む。
+//
+// 0 は「顔モードで止める」(EmulationPolicy::Paused)。
+//
+// Why not エミュレーションコアから g_mode を読ませないか: AppModeMachine は
+// mode_ と policy_ の 2 つを持ち、遷移はその両方にまたがる。ロック無しで
+// 別コアから読むと、切り替えの途中の食い違った組を見うる。表示コアが
+// 決めた結果を 1 つの値へ落としてから渡せば、読む側は組の一貫性を
+// 気にせずに済む (g_desiredZoom が同じ形をしている)。
+std::atomic<x68k::u32> g_allowedSliceCycles{0};
+
+// 1 回の run で進める量 (X68K モードでの値)。1 フレーム (約 180,000 サイクル)
+// より細かくして、画面更新と入力の応答が鈍くならないようにする。
+//
+// Why not emulatorTask の中に置いたままにしないか: 表示コアが
+// AppModeMachine::sliceCycles(kSliceCycles) を呼んで g_allowedSliceCycles を
+// 決めるので、両方のコアから見える必要がある。2 か所に書くと、
+// 片方だけ変えたときに顔モードとの比が意図せず変わる。
+constexpr x68k::u32 kSliceCycles = 20000;
+
+// X68000 へ戻ったので画面を作り直してほしい。表示コアが立て、
+// エミュレーションコアが消す。
+//
+// Why not 表示コアから DisplayLcd::invalidateAll を直接呼ばないか:
+// forceFullRedraw_ を読んで消すのは renderTo で、それはエミュレーション
+// コアが回している (display_lcd.h が「エミュレーションコアから呼ぶ」と
+// 明記している)。表示コアから立てると、renderTo がフラグを消す瞬間と
+// ぶつかって全画面の描き直しが 1 回消える。顔の残った画面が次に VRAM が
+// 変わるまで残ってしまう。要求だけ立てて、実行は所有者に任せる
+// (g_dumpRequested と同じ形)。
+std::atomic<bool> g_redrawRequested{false};
+
+// JIT が成立するかを確かめる最小の実験。
+//
+// 「実行可能メモリを取れるか」「そこへ書いた Xtensa 命令が本当に走るか」の
+// 2 点だけを見る。ここが通らなければ動的再コンパイルの検討自体が無意味。
+//
+// 生成するのは a2 (戻り値レジスタ) へ定数を入れて返るだけの関数。
+//   MOVI.N a2, imm   … 0x0C + (imm<<4) の 2 バイト (imm は 0-15)
+//   RET.N            … 0xF00D の 2 バイト
+// どちらも Xtensa の narrow (2 バイト) 命令。リトルエンディアンで並べる。
+//
+// Why not 大きい定数を入れないか: MOVI.N の即値は 4bit しか無い。
+// ここで確かめたいのは「走るか」だけなので、幅は要らない。
+// 既定では呼ばない。CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
+// MALLOC_CAP_EXEC が必ず失敗する (実測)。JIT を再検討するときに
+// sdkconfig で保護を切ってから呼ぶ。
+[[maybe_unused]] void probeJitFeasibility()
+{
+    constexpr std::size_t kProbeBytes = 64;
+    // 取り方を何通りか試す。どれで取れるかが JIT の実現性そのもの。
+    struct Attempt
+    {
+        const char* name;
+        std::uint32_t caps;
+    };
+    const Attempt attempts[] = {
+        {"EXEC|32BIT", MALLOC_CAP_EXEC | MALLOC_CAP_32BIT},
+        {"EXEC", MALLOC_CAP_EXEC},
+        {"EXEC|INTERNAL", MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL},
+        {"IRAM_8BIT", MALLOC_CAP_IRAM_8BIT},
+    };
+    std::uint8_t* code = nullptr;
+    const char* usedName = nullptr;
+    for (const Attempt& a : attempts)
+    {
+        code = static_cast<std::uint8_t*>(heap_caps_malloc(kProbeBytes, a.caps));
+        ESP_LOGI(kTag, "[jit] %s -> %p", a.name, static_cast<void*>(code));
+        if (code != nullptr)
+        {
+            usedName = a.name;
+            break;
+        }
+    }
+    if (code == nullptr)
+    {
+        ESP_LOGW(kTag, "[jit] 実行可能メモリをどの方法でも確保できない");
+        return;
+    }
+    ESP_LOGI(kTag, "[jit] %s で確保", usedName);
+
+    // 生成するのは `int probe(void) { return 10; }` と同じコード。
+    //
+    // バイト列はアセンブラの出力をそのまま使う。自分でビットを組み立てて
+    // 2 回落とした (MOVI.N のフィールド配置を取り違えて
+    // InstrFetchProhibited、その前にバイト書き込みで LoadStoreError)。
+    // エンコーディングは推測せず、`xtensa-esp32s3-elf-gcc -O2` の出力を
+    // objdump/objcopy で確かめた値を置く:
+    //
+    //   004136  entry a1, 32     -> 36 41 00
+    //   a20c    movi.n a2, 10    -> 0c a2
+    //   f01d    retw.n           -> 1d f0
+    //
+    // entry / retw.n はウィンドウ ABI の対で、通常の関数ポインタ呼び出し
+    // (callx8) と噛み合う。
+    //
+    // IRAM は 32bit 単位でしかアクセスできないので、ワードで書く。
+    constexpr std::uint8_t kImm = 10;
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(code);
+    word[0] = 0x0C004136u;  // 36 41 00 0c
+    word[1] = 0x00F01DA2u;  // a2 1d f0 --
+
+    // IRAM は直接実行されるが、書いた直後は命令パイプラインが古い内容を
+    // 持ちうる。isync で同期する。
+    asm volatile("isync" ::: "memory");
+
+    using ProbeFn = int (*)();
+    ProbeFn fn = nullptr;
+    std::memcpy(&fn, &code, sizeof(fn));
+    const int result = fn();
+
+    ESP_LOGI(kTag, "[jit] 実行可能メモリ %p / 生成コードの戻り値 = %d (期待 %d)", code, result,
+             static_cast<int>(kImm));
+    heap_caps_free(code);
+}
 
 void reportMemory(const char* phase)
 {
@@ -82,6 +328,9 @@ void reportMemory(const char* phase)
 // キャッシュを超えるアクセスは素の速度まで落ちる。取れなければ PSRAM へ
 // フォールバックする (動くが遅くなる)。
 x68k::u8* g_sasiBuffer = nullptr;
+
+// 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
+x68k::u16* g_avatarSprite = nullptr;
 
 bool reserveMemory()
 {
@@ -126,10 +375,28 @@ bool reserveMemory()
         ESP_LOGI(kTag, "IPL-ROM を内部 SRAM に配置しました");
     }
 
+    // 顔のスプライト (320x240 の RGB565 = 150KB)。
+    //
+    // ここで押さえるのは、後から取ると PSRAM が断片化していて連続領域が
+    // 取れないため (このファイル冒頭の方針)。顔を最初に出すのは
+    // 切り替えた後なので「使うときに取る」でも動きそうに見えるが、
+    // そのときには 2MB のメインメモリと CGROM が既に PSRAM を分断している。
+    //
+    // 取れなくても起動する。仮の実装は M5.Display へ直接描いており
+    // (avatar.cpp)、スプライトが無くても顔は出る。本物の Avatar へ
+    // 差し替えたときに要るぶんを、今の段階から実測で押さえておく。
+    g_avatarSprite = static_cast<x68k::u16*>(heap_caps_calloc(
+        1, x68k_platform::Avatar::kSpriteBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_avatarSprite == nullptr)
+    {
+        ESP_LOGW(kTag, "顔のスプライトを確保できません。仮の顔は出ますが Avatar は載せられません");
+    }
+
     // グラフィック VRAM は最後。取れなくても起動する。
     //
-    // 今の表示はテキスト VRAM しか使わず、バスにも null チェックがある。
-    // グラフィック画面 (#7) を実装したら必須へ移す。
+    // 取れれば SX-Window のようにグラフィック面を使うソフトが動く。
+    // 取れなくてもバスに null チェックがあり (読むと 0、書きは捨てる)、
+    // 表示側も nullptr ならテキストだけを描くので、コンソールは使える。
     g_graphicVram = static_cast<x68k::u8*>(
         heap_caps_calloc(1, kGraphicVramBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (g_graphicVram == nullptr)
@@ -141,9 +408,9 @@ bool reserveMemory()
 
     // 確保できたかを確かめる。
     //
-    // グラフィック VRAM は外してある。今の表示はテキスト VRAM しか使わず、
-    // バスに null チェックがあるので (読むと 0、書きは捨てる)、取れなくても
-    // コンソールは出せる。グラフィック画面を実装したら必須に加える。
+    // グラフィック VRAM は外してある。バスに null チェックがあり
+    // (読むと 0、書きは捨てる)、表示側も nullptr ならテキストだけを
+    // 描くので、取れなくてもコンソールは出せる。
     //
     // CGROM は必須にする。バスの null チェックで落ちはしないが、字形が
     // 1 つも無ければ画面が真っ黒のままで、起動しても何もできない。
@@ -214,6 +481,22 @@ bool loadRoms()
         ESP_LOGW(kTag, "HDD イメージを開けません: %s", x68k_platform::kHddPath);
     }
 
+    // フロッピーは任意。無くても SASI から起動できるので、開けなくても
+    // 警告に留める (HDD と同じ扱い)。
+    {
+        const char* const paths[x68k::Fdc::kDriveCount] = {x68k_platform::kFd0Path,
+                                                           x68k_platform::kFd1Path};
+        for (x68k::u32 d = 0; d < x68k::Fdc::kDriveCount; ++d)
+        {
+            if (!g_floppy[d].open(paths[d]))
+            {
+                ESP_LOGI(kTag, "FDD%u にディスクを入れません: %s", d, paths[d]);
+                continue;
+            }
+            g_machine.setFloppyDisk(d, &g_floppy[d]);
+        }
+    }
+
     x68k::MemoryMap memory;
     memory.mainRam = g_mainRam;
     memory.textVram = g_textVram;
@@ -230,6 +513,19 @@ bool loadRoms()
 // エミュレーションコアから使うが、定義は下にある。
 void followCursor();
 void dumpScreen();
+
+// シリアルコンソール (SerialConsole) から使うが、定義は下にある。
+// FSM の決定を周辺へ反映する。
+void applyModeTransition(const x68k_platform::ModeTransition& transition);
+
+// 顔を 1 枚描いて LCD へ送る。
+void drawFaceNow();
+// 顔の状態 (まぶた・表情) をシリアルへ出す。
+void logFaceState();
+// サーボを LEDC の実装へ差し替える。
+void enableLedcServo();
+// 首を 1 段階動かす。key は 'h'/'l'/'k'/'j'。
+void moveHead(char key);
 
 // シリアルから画面ダンプを求められたら立つ。
 //
@@ -270,20 +566,34 @@ std::atomic<bool> g_halted{false};
 // 配置されるため。エミュレーションのホットループを侵されたくない。
 void emulatorTask(void* /*arg*/)
 {
-    // 1 回の run で進める量。1 フレーム (約 180,000 サイクル) より細かくして、
-    // 画面更新と入力の応答が鈍くならないようにする。
-    constexpr x68k::u32 kSliceCycles = 20000;
     constexpr std::uint32_t kReportIntervalMs = 5000;
+
+    // SRAM を SD へ書き戻す間隔。
+    //
+    // Why not 書き込みのたびに保存するか: Human68k は設定を数バイトずつ書くので、
+    // 1 バイトごとに 16KB を書くと SD の同じセクタを何百回も潰す。
+    // Why not 終了時にまとめて保存するか: 組み込みに「終了」は無い。
+    // 利用者は電源を切るだけなので、書き戻す機会がそこにしかないと必ず失われる。
+    // 10 秒なら、間引きとしては十分で、失うのは直前の 1 回ぶんの設定変更で済む。
+    constexpr std::uint32_t kSramSaveIntervalMs = 10000;
 
     std::uint64_t totalCycles = 0;
     std::uint64_t lastReportCycles = 0;
     std::uint32_t lastReportMs = 0;
+    std::uint32_t lastSramSaveMs = 0;
 
     while (true)
     {
         if (g_machine.isHalted())
         {
             ESP_LOGE(kTag, "停止しました。未実装命令 %04X", g_machine.haltedOpcode());
+            // 止まる前に SRAM を書き戻す。
+            //
+            // Why not 定期保存だけに任せるか: 保存は 10 秒間隔で間引いている。
+            // 設定を書き換えた直後に未実装命令を踏むと、ここでタスクごと
+            // 消えるので次の保存機会が永久に来ない。エミュレータが止まる
+            // 原因は未実装命令であって SD ではないから、書き戻しは通る。
+            x68k_platform::saveSramIfDirty(g_machine);
             // 表示は所有者に任せる。ここで M5.Display を触ると
             // 表示コアの転送とぶつかる。
             g_halted = true;
@@ -291,17 +601,87 @@ void emulatorTask(void* /*arg*/)
             return;
         }
 
-        g_machine.run(kSliceCycles);
-        totalCycles += kSliceCycles;
+        // 顔モードの扱いは表示コアが決めて、進めてよい量だけを渡してくる。
+        //
+        // 既定 (KeepRunning) では kSliceCycles がそのまま来るので、
+        // ここは X68K モードと変わらない。Throttled なら細く、
+        // Paused なら 0 (run を飛ばす)。
+        //
+        // Why not 0 のときに長く眠らないか: このループは run 以外にも
+        // SRAM の書き戻しと停止の検出を持つ。眠りを伸ばすとそちらの
+        // 反応まで鈍る。停止中は下の vTaskDelay(1) を毎周回すので、
+        // 止めている間の CPU は run を飛ばすだけで十分に空く。
+        const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
+        if (sliceCycles > 0)
+        {
+            g_machine.run(sliceCycles);
+            totalCycles += sliceCycles;
+        }
+
+        // 音を 1 ブロック合成してリングへ積む。
+        //
+        // Machine (OPM のレジスタと ADPCM の FIFO) を触るのはこのコアだけ。
+        // 表示と同じ切り分けで、できたサンプルだけを Core0 へ渡す。
+        //
+        // Why not 「1 スライスにつき必ず 1 ブロック」にしないか: 1 ブロックは
+        // 512 サンプル = 32.8ms ぶんの音だが、1 スライス (20000 サイクル) の
+        // 実時間は 6.1ms しかない。毎スライス積むと 5 倍の速さで作ることに
+        // なり、リングはすぐ満杯になって捨てるだけになる。逆にゲストの
+        // サイクル数で刻むのも合わない。実効クロックが実機の 32% なので、
+        // ゲスト時間で 32.8ms ぶんを作る頃には実時間で 100ms 経っており、
+        // スピーカーの DMA が先に枯れる。
+        //
+        // リングに溜まっている数を見て、足りないときだけ作る。消費側
+        // (音声タスク) が実時間で引いていくので、これだけで実時間に
+        // 追従する。段数から 1 枚ぶん余裕を残すのは、次の 1 枚を書ける
+        // 空きを常に確保して writeBlock の空振りを減らすため。
+        // テスト音を求められていたらここで鳴らす。Opm の所有者はこのコア。
+        //
+        // 一定時間で自動的に止める。押しっぱなしにすると、以後ずっと
+        // 合成が走って「待機中は振幅ゼロ」の対比が取れなくなる。
+        static std::uint32_t toneUntilMs = 0;
+        if (g_testToneRequested.exchange(false))
+        {
+            playTestTone(g_machine);
+            toneUntilMs = xTaskGetTickCount() * portTICK_PERIOD_MS + 3000;
+            ESP_LOGI(kTag, "テスト音: OPM ch0 キーオン (3 秒)");
+        }
+        const bool isToneDue =
+            toneUntilMs != 0 && xTaskGetTickCount() * portTICK_PERIOD_MS >= toneUntilMs;
+        if (isToneDue)
+        {
+            stopTestTone(g_machine);
+            toneUntilMs = 0;
+            ESP_LOGI(kTag, "テスト音: キーオフ");
+        }
+
+        const bool isAudioOn = g_audioEnabled.load(std::memory_order_relaxed);
+        if (isAudioOn && g_audio.pending() < x68k_platform::AudioChannel::kBlockCount - 2)
+        {
+            static_cast<void>(x68k_platform::pumpAudio(g_machine, g_audio));
+        }
 
         // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
         g_keys.drain(g_machine);
+
+        // 溜まったマウスの動きを SCC へ流す。
+        //
+        // キーと同じくこのコアから送る。SCC の受信 FIFO と割り込み保留は
+        // 割り込み処理がここで触るので、表示コアから書くと競合する。
+        g_mouse.drain(g_machine);
 
         // シリアルから画面ダンプを求められていたらここで出す。
         // テキスト VRAM の所有者はこのコア。
         if (g_dumpRequested.exchange(false))
         {
             dumpScreen();
+        }
+
+        // X68000 へ戻ったなら全画面を作り直す。顔が描いた内容が
+        // 残っているので、ダーティ行だけでは消えない。
+        if (g_redrawRequested.exchange(false))
+        {
+            g_display.invalidateAll();
         }
 
         // 希望の拡大率が今と違えば、変換の前に合わせる。
@@ -347,8 +727,134 @@ void emulatorTask(void* /*arg*/)
             lastReportCycles = totalCycles;
         }
 
-        // ウォッチドッグに殺されないよう必ず譲る。
-        vTaskDelay(1);
+        // 変更された SRAM を SD へ書き戻す。
+        //
+        // ここで行うのは、SRAM を触ってよいのがこのコアだけだから。表示コアから
+        // 呼ぶと、エミュレーションが書いている最中の 16KB を読むことになる。
+        const bool isSramSaveDue = now - lastSramSaveMs >= kSramSaveIntervalMs;
+        if (isSramSaveDue)
+        {
+            lastSramSaveMs = now;
+            if (x68k_platform::saveSramIfDirty(g_machine))
+            {
+                ESP_LOGI(kTag, "SRAM を保存しました: %s", x68k_platform::kSramPath);
+            }
+        }
+
+        // ウォッチドッグに殺されないよう定期的に譲る。
+        //
+        // 毎スライス譲ると、1 tick (1ms) が 1 スライスの実時間 (実測 6.1ms)
+        // に対して無視できない。実測では毎回譲ると 2760kHz、8 スライスに
+        // 1 回にすると 3200kHz で、譲る回数を減らした分がそのまま速度になる。
+        //
+        // Why not 譲るのをやめるか: docs/knowledge/cores3-emulator-runtime.md に
+        // ある通り、taskYIELD() で済ませようとしてリセットループに入った。
+        // アイドルタスクは優先度 0 なので、ブロックしない限り回ってこない。
+        // ESP-IDF のタスクウォッチドッグはアイドルタスクが 5 秒走らないことを
+        // 見て落とすので、譲る口自体は必ず残す必要がある。
+        //
+        // Why 8 か: 譲る間隔 = 8 スライス x 6.1ms ≒ 49ms。ウォッチドッグの
+        // 5 秒に対して 100 倍の余裕がある。合成 ON で変換が最も重いとき
+        // (実測 23.5ms/スライス) でも 235ms で、まだ 21 倍の余裕が残る。
+        // これ以上伸ばしても速度は頭打ちで (N=16 で +1.5% の計算)、
+        // 余裕を削るだけなので割に合わない。
+        //
+        // Why not 「N スライスごと」ではなく経過時間で判断しないか:
+        // 時間を測るには esp_timer を毎周読むことになる。譲る条件が
+        // 数え上げで足りるうちは、余計な計測を入れない方がホットループが軽い。
+        constexpr int kSlicesPerYield = 8;
+        static int slicesSinceYield = 0;
+
+        // 停止中 (sliceCycles == 0) は毎周譲る。
+        //
+        // Why: 停止中は run を飛ばすのでループが一瞬で回りきる。数え上げだけで
+        // 間引くと、8 周回るのに掛かる時間がほぼ 0 になり、譲らないまま
+        // 空回りし続ける。それは taskYIELD() で踏んだのと同じ
+        // 「アイドルタスクが回らない」状態で、ウォッチドッグに落とされる。
+        const bool isPaused = sliceCycles == 0;
+        const bool isYieldDue = ++slicesSinceYield >= kSlicesPerYield;
+        if (isPaused || isYieldDue)
+        {
+            slicesSinceYield = 0;
+            vTaskDelay(1);
+        }
+    }
+}
+
+// リングから取り出してスピーカーへ流すタスク。Core0 で回す。
+//
+// Why Core0 か: Core1 はエミュレーションが 100% 使い切っている
+// (実測でスライスの 80% が Machine::run)。ここを Core1 に置くと、
+// 8 スライスに 1 回の vTaskDelay まで順番が回らず、その間 I2S の DMA が
+// 枯れて音が途切れる。issue #8 が引く stackchan-dapan の知見
+// (Wi-Fi/lwIP を Core0 へ pin しないと音が途切れる) と裏表の話で、
+// 「音に関わるタスクを、詰まっているコアから追い出す」のが要点。
+//
+// Why not 表示ループ (app_main の while) に混ぜないか: あちらは
+// 16ms ごとに 150KB を SPI へ流して待つ。その待ちの間はリングを
+// 引けないので、1 ブロック 32.8ms に対して転送時間が無視できない。
+// 別タスクなら転送中でも優先度で割り込める。
+//
+// Why not Machine を触らないか: 触らない。ここへ来るのは完成した
+// サンプルだけで、frame_channel と同じ切り分けになっている。
+void audioTask(void* /*arg*/)
+{
+    // 振幅を報告する間隔。実機では音を耳で確かめられないので、
+    // 「キーオンしたら非ゼロ、待機中はゼロ」をログの数字で見る。
+    //
+    // Why 1 秒か: テスト音 ('!') は 3 秒しか鳴らない。5 秒間隔だと
+    // 鳴っている区間と鳴っていない区間が同じ報告に混ざり、
+    // 「待機中はゼロ」が確かめられない。
+    constexpr std::uint32_t kReportIntervalMs = 1000;
+
+    std::uint32_t lastReportMs = 0;
+    std::int32_t peakSinceReport = 0;
+    std::uint32_t blocksSinceReport = 0;
+
+    while (true)
+    {
+        // リングにあるぶんを全部流す。
+        //
+        // ここで数えるために drainAudio ではなく自分で回す。振幅は
+        // sink へ渡す前にしか見られない (playRaw から戻った後の
+        // バッファは、次のブロックで上書きされうる)。
+        while (const std::int16_t* block = g_audio.pop())
+        {
+            const std::int32_t peak =
+                x68k_platform::peakAmplitude(block, x68k_platform::AudioChannel::kBlockFrames);
+            if (peak > peakSinceReport)
+            {
+                peakSinceReport = peak;
+            }
+            ++blocksSinceReport;
+
+            g_speaker.write(block, x68k_platform::AudioChannel::kBlockFrames);
+        }
+
+        const std::uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        const bool isReportDue = now - lastReportMs >= kReportIntervalMs;
+        if (isReportDue)
+        {
+            // ブロック数は実時間に追従しているかの検算になる。
+            // 1 ブロック 512 サンプル / 15625Hz なので、正常なら 1 秒あたり
+            // 約 30.5 ブロック。桁違いに多ければ playRaw が実際には
+            // 何もしていない (speaker_m5.h の isEnabled 判定を見よ)。
+            ESP_LOGI(kTag, "音声 %u ブロック/秒 (期待 30) 最大振幅 %d 取りこぼし %u",
+                     static_cast<unsigned>(blocksSinceReport), static_cast<int>(peakSinceReport),
+                     static_cast<unsigned>(g_audio.droppedBlocks()));
+            lastReportMs = now;
+            peakSinceReport = 0;
+            blocksSinceReport = 0;
+        }
+
+        // 1 ブロックは 32.8ms ぶんの音。その 1/4 の周期で見に行けば、
+        // Speaker が握れる 2 枚を切らさずに継ぎ足せる。
+        //
+        // Why not ブロックが積まれるまでブロッキングで待たないか:
+        // セマフォを 1 本増やすことになるが、得られるのは 8ms ごとの
+        // 空振り (リングを見て何も無ければ寝る) を省くことだけ。
+        // 空振りのコストは atomic の読み 2 回で、測るまでもなく小さい。
+        vTaskDelay(pdMS_TO_TICKS(8));
     }
 }
 
@@ -395,6 +901,36 @@ private:
             return;
         }
 
+        // '|' で音源の ON/OFF を切り替える。
+        //
+        // Why not 焼き直して比べないか: 「音を足すとどれだけ遅くなるか」は
+        // 同じ実行の中で比べないと、SD の中身や PSRAM の割り付けといった
+        // 起動ごとの差が混ざる。1 文字で切り替えられれば、実効クロックの
+        // 報告 (5 秒ごと) を挟んで前後を直接読み比べられる。
+        //
+        // Why '|' か: '~' '<' '>' と同じく Human68k のコマンドラインで
+        // 使い道が薄く、取り上げても困らない。
+        const bool isAudioToggle = c == '|';
+        if (isAudioToggle)
+        {
+            const bool enabled = !g_audioEnabled.load();
+            g_audioEnabled = enabled;
+            ESP_LOGI(kTag, "音源: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '!' で OPM のテスト音を 3 秒鳴らす。
+        //
+        // 実機では音を耳で確かめられないので、これと 5 秒ごとの
+        // 「最大振幅」のログを組にして、鳴っていることを数字で見る。
+        // 実際に鳴らすのはエミュレーションコア (Opm の所有者)。
+        const bool isTestTone = c == '!';
+        if (isTestTone)
+        {
+            g_testToneRequested = true;
+            return;
+        }
+
         // '<' '>' で拡大率を変える。読みやすさと見える範囲は
         // 引き換えなので、実機を見ながら選べるようにする。
         //
@@ -424,10 +960,294 @@ private:
             return;
         }
 
+        // Tab で顔 ⇄ X68000 を切り替える。
+        //
+        // Why not 印字できる文字を使わないか: 顔モードでも X68K モードでも
+        // 押せる必要があるが、X68K モードでは打った文字が Human68k へ
+        // 流れる。'f' のような文字を充てると、コマンドを打つたびに
+        // モードが変わる。Tab は Human68k のプロンプトで使い道が薄く、
+        // 取り上げても困らない。
+        //
+        // Why not タッチで切り替えないか: 画面全体が X68000 のマウス領域に
+        // なっている (main.cpp の setVisible(false) を見よ)。切り替え用の
+        // 領域を切ると、そこだけカーソルが動かせなくなる。物理ボタンの
+        // 無い CoreS3 でこれを解くには、長押しやジェスチャの判定が要る。
+        // まずシリアルから切り替えられれば、FSM と入力の遮断は確かめられる。
+        const bool isModeToggle = c == '\t';
+        if (isModeToggle)
+        {
+            applyModeTransition(g_mode.request(x68k_platform::ModeRequest::Toggle));
+            return;
+        }
+
+        // ここから下は顔モード専用の操作。
+        //
+        // Why X68K モードでは受け付けないか: X68K モードで打った文字は
+        // Human68k へ流れる。'e' を横取りすると `dir e*` のような
+        // コマンドが打てなくなる。顔モードなら打った文字の行き先が
+        // 無いので、取り上げても失うものが無い。
+        const bool isFaceMode = g_mode.mode() == x68k_platform::AppMode::Face;
+
+        // 'e' で表情を順に送る。実機の画面を直接見られないので、
+        // 表情が変わったことはログ (logFaceState) で確かめる。
+        const bool isExpressionCycle = isFaceMode && c == 'e';
+        if (isExpressionCycle)
+        {
+            const auto next = static_cast<x68k_platform::FaceExpression>(
+                (static_cast<std::size_t>(g_avatar.expression()) + 1) %
+                x68k_platform::kFaceExpressionCount);
+            g_avatar.setExpression(next);
+            // 表情はまばたきと違って自分では変わらない。tick が
+            // 「変化なし」を返すので、ここで描き直しておかないと
+            // 次のまばたきまで新しい表情が画面に出ない。
+            drawFaceNow();
+            logFaceState();
+            return;
+        }
+
+        // 'S' でサーボ (LEDC) を張る。既定は NullServo。
+        const bool isServoEnable = isFaceMode && c == 'S';
+        if (isServoEnable)
+        {
+            enableLedcServo();
+            return;
+        }
+
+        // 'h'/'l'/'k'/'j' で首を振る。vi の向きに合わせてある。
+        //
+        // Why 手で振れるようにするか: サーボが繋がっているかは
+        // ソフトウェアからは分からない (servo.h の冒頭)。動いたことを
+        // 確かめる手立ては目で見るしかないので、任意の角度を
+        // 出せる口が要る。
+        const bool isHeadMove = isFaceMode && (c == 'h' || c == 'l' || c == 'k' || c == 'j');
+        if (isHeadMove)
+        {
+            moveHead(c);
+            return;
+        }
+
+        // 顔モードの間は X68000 へ文字を送らない。
+        //
+        // タッチと揃える。顔を出している間に打った文字が溜まって、
+        // 戻った瞬間に一気に流れ込むのを防ぐ。
+        if (!g_mode.isX68kInputEnabled())
+        {
+            return;
+        }
+
         // 残りは X68000 へ。押下と解放に分ける仕事は KeyQueue が持つ。
         g_keys.push(c);
     }
 };
+
+// 顔を 1 枚描いて LCD へ送る。表示コアから呼ぶ。
+//
+// Why DisplayLcd::pushFrame を通すか: 顔のスプライトは PSRAM にある。
+// M5GFX へ生のポインタを渡す経路は、入力も出力も RGB565 だと
+// 「変換不要」と判断して PSRAM のアドレスをそのまま DMA descriptor へ
+// 入れる。ESP32-S3 は CPU キャッシュと PSRAM の同期をハードウェアで
+// 保証しないので、転送しても画面が変わらない
+// (docs/knowledge/cores3-emulator-runtime.md の 5 節)。
+// pushFrame は setSwapBytes(true) を前提に組んであり、この罠を既に
+// 解いてある。X68000 の画面と同じ口を通せば踏み直さずに済む。
+void drawFaceNow()
+{
+    if (!g_avatar.render())
+    {
+        // スプライトが取れなかった。顔は出せないので、そうと分かる
+        // 表示を出す。黒画面のまま放置すると「固まった」と読めてしまう。
+        x68k_platform::DisplayLcd::showMessage("FACE", "no sprite buffer");
+        return;
+    }
+    g_display.pushFrame(g_avatar.spriteBuffer());
+}
+
+// 顔の状態をシリアルへ出す。
+//
+// Why 要るか: 実機の LCD は直接見られない。顔が動いているかを確かめる
+// 手立てが「人に写真を撮ってもらう」しか無いと、まばたきが止まっていても
+// 気付けない。まぶたの開き具合と表情をログに出しておけば、テキスト画面を
+// text_scrape で読み戻すのと同じように、シリアルだけで挙動を判定できる。
+//
+// Why not 毎コマ出さないか: まばたき中は 16ms ごとに変化するので、
+// 全部出すとログがそれで埋まり、エミュレーションの進捗報告が読めなくなる。
+// 段階の変わり目だけ出せば、まばたきの回数と間隔は再構成できる。
+void logFaceState()
+{
+    static x68k_platform::BlinkPhase lastPhase = x68k_platform::BlinkPhase::Open;
+    static x68k_platform::FaceExpression lastExpression = x68k_platform::FaceExpression::Neutral;
+
+    const x68k_platform::BlinkPhase phase = g_avatar.blinkPhase();
+    const x68k_platform::FaceExpression expression = g_avatar.expression();
+
+    const bool hasChanged = phase != lastPhase || expression != lastExpression;
+    if (!hasChanged)
+    {
+        return;
+    }
+    lastPhase = phase;
+    lastExpression = expression;
+
+    const char* phaseName = "開";
+    if (phase == x68k_platform::BlinkPhase::Closing)
+    {
+        phaseName = "閉じ中";
+    }
+    else if (phase == x68k_platform::BlinkPhase::Opening)
+    {
+        phaseName = "開き中";
+    }
+
+    static const char* const kExpressionNames[] = {"素", "笑", "眠", "驚"};
+
+    ESP_LOGI(kTag, "顔: まぶた=%s(%u) 表情=%s まばたき=%u コマ=%u 次まで=%ums", phaseName,
+             static_cast<unsigned>(g_avatar.lidClosure()),
+             kExpressionNames[static_cast<std::size_t>(expression)],
+             static_cast<unsigned>(g_avatar.blinkCount()),
+             static_cast<unsigned>(g_avatar.frameCount()),
+             static_cast<unsigned>(g_avatar.msUntilBlink()));
+}
+
+// サーボを LEDC の実装へ差し替える。
+//
+// 一度張ったら戻さない。戻す口を作ると、LEDC を解放してからもう一度
+// 張る手順が要り、失敗したときにどちらでもない状態が残る。
+void enableLedcServo()
+{
+    const bool isAlreadyEnabled = g_servo == &g_ledcServo;
+    if (isAlreadyEnabled)
+    {
+        ESP_LOGI(kTag, "サーボは既に有効です");
+        return;
+    }
+
+    // CoreS3 の Port.A。スタックチャンの作例が最も多く使う配線。
+    g_ledcServo.setPins(1, 2);
+    if (!g_ledcServo.begin())
+    {
+        ESP_LOGE(kTag, "サーボを有効にできません。NullServo のままにします");
+        return;
+    }
+
+    g_servo = &g_ledcServo;
+    // 正面へ向ける。付いていれば首が中央に来る。
+    g_servo->setPose({});
+    ESP_LOGI(kTag, "サーボ有効。h/l で左右、k/j で上下 (pan duty=%u tilt duty=%u)",
+             static_cast<unsigned>(g_ledcServo.lastPanDuty()),
+             static_cast<unsigned>(g_ledcServo.lastTiltDuty()));
+}
+
+// 首を 1 段階動かす。
+void moveHead(char key)
+{
+    // 1 回あたりの角度。
+    //
+    // Why 15 度か: 可動域が ±45 度なので、端まで 3 回で届く。
+    // 細かくすると端へ持っていくのに何度も打つことになり、
+    // 動いたかどうかを見るための操作としては使いにくい。
+    constexpr float kStepDeg = 15.0F;
+
+    // 今の指令値から動かす。
+    //
+    // Why not 絶対角を打たせないか: 実機で確かめたいのは「打つたびに
+    // 首が動くか」で、相対の方が操作が短い。
+    x68k_platform::HeadPose pose =
+        g_servo == &g_ledcServo ? g_ledcServo.lastPose() : g_nullServo.lastPose();
+
+    if (key == 'h')
+    {
+        pose.pan -= kStepDeg;
+    }
+    else if (key == 'l')
+    {
+        pose.pan += kStepDeg;
+    }
+    else if (key == 'k')
+    {
+        pose.tilt += kStepDeg;
+    }
+    else if (key == 'j')
+    {
+        pose.tilt -= kStepDeg;
+    }
+
+    g_servo->setPose(pose);
+
+    // 何を出したかをログへ出す。
+    //
+    // 【重要】これは「指令」であって「動いた証拠」ではない。サーボの
+    // 信号線は応答を返さないので、繋がっているかも回ったかも
+    // ソフトウェアからは分からない (servo.h の冒頭)。
+    if (g_servo == &g_ledcServo)
+    {
+        ESP_LOGI(kTag, "首: pan=%d 度 tilt=%d 度 duty pan=%u tilt=%u (指令のみ。動作は未確認)",
+                 static_cast<int>(g_ledcServo.lastPose().pan),
+                 static_cast<int>(g_ledcServo.lastPose().tilt),
+                 static_cast<unsigned>(g_ledcServo.lastPanDuty()),
+                 static_cast<unsigned>(g_ledcServo.lastTiltDuty()));
+        return;
+    }
+    ESP_LOGI(kTag, "首: pan=%d 度 tilt=%d 度 (サーボ無効。指示は捨てられた)",
+             static_cast<int>(g_nullServo.lastPose().pan),
+             static_cast<int>(g_nullServo.lastPose().tilt));
+}
+
+// FSM の決定を実際の周辺へ反映する。表示コアから呼ぶ。
+//
+// Why not AppModeMachine の中でやらないか: ここで触るのは M5.Display と
+// MouseQueue と atomic で、どれも ESP-IDF に依存する。FSM に持たせると
+// ホストのテストから外れる。FSM は「何をすべきか」を値で返すだけにして、
+// 実行はこの関数に集める (app_mode.h の ModeTransition のコメントを見よ)。
+void applyModeTransition(const x68k_platform::ModeTransition& transition)
+{
+    // 進めてよい量を更新する。モードが変わっていなくても、ポリシーの
+    // 差し替え直後に呼ばれることがあるので毎回書く。
+    g_allowedSliceCycles = g_mode.sliceCycles(kSliceCycles);
+
+    // 入力の経路を開け閉めする。顔モードではタッチが X68000 へ届かない。
+    g_keyboard.setX68kInputEnabled(g_mode.isX68kInputEnabled());
+
+    if (!transition.changed)
+    {
+        return;
+    }
+
+    // 押したまま切り替えた指のボタンを離しておく。
+    //
+    // 顔モードの間タッチは届かないので、押しっぱなしのままだと
+    // ゲストはボタンが押されたままと見なし続ける。
+    if (transition.shouldReleaseMouseButtons)
+    {
+        g_mouse.push(0, 0, false, false);
+    }
+
+    if (transition.to == x68k_platform::AppMode::Face)
+    {
+        // 顔を 1 枚描いて出す。以後は表示ループが毎コマ更新する。
+        //
+        // ここで 1 回描くのは、切り替えた瞬間に X68000 の画面が残る間を
+        // 作らないため。表示ループの周期 (約 16ms) を待つと、その 1 コマ
+        // ぶん前のモードの画面が見える。
+        drawFaceNow();
+        // 正面へ戻す。NullServo は捨てる。
+        g_servo->setPose({});
+    }
+    else
+    {
+        // X68000 へ戻る。顔が描いた内容が画面に残っているので、
+        // ダーティ行だけを送る通常の経路では消えない。全画面を
+        // 作り直させる (実行はエミュレーションコア)。
+        if (transition.shouldRedraw)
+        {
+            g_redrawRequested = true;
+        }
+        // 首の保持をやめる。X68000 を触っている間サーボに力を入れ続けると
+        // 電流を食い、安物のサーボは唸りが出る。
+        g_servo->detach();
+    }
+
+    ESP_LOGI(kTag, "モード: %s", transition.to == x68k_platform::AppMode::Face ? "顔" : "X68000");
+}
 
 // テキスト画面を ASCII に逆引きしてシリアルへ出す。
 //
@@ -529,6 +1349,23 @@ extern "C" void app_main(void)
         return;
     }
 
+    // 前回の SRAM を復元する。reset() より先に行う。
+    //
+    // 実機の SRAM はバッテリバックアップで電源を切っても残る。起動デバイスや
+    // 画面モードの設定はここにあるので、復元しないと毎回工場出荷値で立ち上がる。
+    //
+    // 初回起動では sram.dat が無いので false になるが、これは異常ではない。
+    // Sram の構築時に工場出荷値が入っており、10 秒後の書き戻しで生成される。
+    if (x68k_platform::loadSram(g_machine))
+    {
+        ESP_LOGI(kTag, "SRAM を復元しました: %s", x68k_platform::kSramPath);
+    }
+    else
+    {
+        ESP_LOGI(kTag, "SRAM を復元できません。工場出荷値で起動します: %s",
+                 x68k_platform::kSramPath);
+    }
+
     g_machine.reset();
     ESP_LOGI(kTag, "リセット完了 PC=%08X", g_machine.cpu().state().pc - 4);
 
@@ -550,6 +1387,17 @@ extern "C" void app_main(void)
         x68k_platform::DisplayLcd::showMessage("INIT ERROR", "key queue");
         return;
     }
+    if (!g_mouse.begin())
+    {
+        ESP_LOGE(kTag, "マウスのキューを用意できません");
+        x68k_platform::DisplayLcd::showMessage("INIT ERROR", "mouse queue");
+        return;
+    }
+
+    // グラフィック面を表示に加える。
+    //
+    // nullptr でも構わない (確保に失敗した場合)。そのときはテキストだけを描く。
+    g_display.setGraphicVram(g_graphicVram);
 
     // Human68k のコンソールは 768x512。左上から映す。
     //
@@ -562,8 +1410,60 @@ extern "C" void app_main(void)
     // 見えないのに触ると反応する状態は、意図しない文字が入るだけで害しかない。
     // 使うなら、フレームの下部を空けて描くか、キーボード領域だけ別に
     // 転送する仕組みが要る。今はシリアルから打てるので急がない。
+    //
+    // マウスはこの設定と無関係に効く。キーボードを出していない間は
+    // 画面全体がマウス領域になる (input_touch.cpp の poll を見よ)。
+    // SX-Window はマウスが無いと何も操作できないので、ここを塞げない。
     g_keyboard.setVisible(false);
     g_keyboard.begin();
+
+    // スピーカーを開く。
+    //
+    // 開けなくても起動する。音が出ないだけで X68000 は動くので、
+    // ここで止める理由がない (グラフィック VRAM と同じ扱い)。
+    g_speakerReady = g_speaker.begin();
+    if (g_speakerReady)
+    {
+        ESP_LOGI(kTag, "スピーカー: %u Hz (音源は %s。'|' で切り替え)",
+                 static_cast<unsigned>(x68k_platform::M5SpeakerSink::kSampleRate),
+                 g_audioEnabled.load() ? "ON" : "OFF");
+    }
+    else
+    {
+        ESP_LOGW(kTag, "スピーカーを開けません。音は出ませんが X68000 は動きます");
+        // 合成しても捨てるだけなので、エミュレーションコアの手間を省く。
+        g_audioEnabled = false;
+    }
+
+    // 顔 ⇄ X68000 の切り替えを用意する。
+    //
+    // 既定は X68K モード (app_mode.h)。起動直後に見たいのは Human68k が
+    // 立ち上がったかどうかで、顔から始めると確かめるのに切り替えが要る。
+    //
+    // ここで applyModeTransition を通すのは、g_allowedSliceCycles を
+    // 初期化するため。0 のまま残すとエミュレーションが 1 命令も進まず、
+    // 利用者にはフリーズとしか見えない。
+    // 起動直後に押さえたスプライトを渡す。
+    //
+    // nullptr なら顔は出せない。起動を止めるほどではない (X68000 は動く)
+    // ので、そうと分かるログを出して続ける。
+    g_avatar.setSpriteBuffer(g_avatarSprite);
+    if (!g_avatar.hasSpriteBuffer())
+    {
+        ESP_LOGW(kTag, "顔のバッファがありません。顔モードは絵を出しません");
+    }
+
+    // サーボは既定で NullServo (何もしない)。'S' を打つと LEDC を張る。
+    //
+    // Why not 起動時に張らないか: Port.A (GPIO 1/2) は M5Unified が
+    // 外部 I2C にも使う。Port.A に I2C の Unit を挿している環境で
+    // 勝手に PWM を出すと、I2C のバスへ矩形波を流し込むことになる
+    // (servo.h の冒頭)。使う人が明示的に選んだときだけ張る。
+    g_servo->begin();
+    ESP_LOGI(kTag, "サーボ: 既定は無効 (NullServo)。'S' で LEDC を張ります");
+
+    applyModeTransition(g_mode.request(x68k_platform::ModeRequest::ToX68k));
+    ESP_LOGI(kTag, "Tab で顔 ⇄ X68000、'e' で表情、'S' でサーボ");
 
     // シリアルからキーを拾えるようにする。
     //
@@ -573,7 +1473,9 @@ extern "C" void app_main(void)
     const bool isConsoleReady = usb_serial_jtag_driver_install(&usbCfg) == ESP_OK;
     if (isConsoleReady)
     {
-        ESP_LOGI(kTag, "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ");
+        ESP_LOGI(kTag,
+                 "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ、"
+                 "'|' で音源の ON/OFF");
     }
     else
     {
@@ -596,12 +1498,39 @@ extern "C" void app_main(void)
         return;
     }
 
+    // 音声は Core0 で流す (合成は Core1。audioTask の冒頭を見よ)。
+    //
+    // 優先度は表示ループ (app_main、既定 1) より高い 4 にする。表示は
+    // 16ms ごとに 150KB を SPI へ流すので、同じなら転送の間 DMA の補充が
+    // 止まる。エミュレーション (5) より低くするのは、音のために 68000 の
+    // 実行を止めないため。1 ブロック 32.8ms に対して、このタスクの
+    // 実際の仕事は playRaw を数回呼ぶだけで、8 スライスに 1 回の
+    // vTaskDelay(1) で十分に順番が回ってくる。
+    //
+    // スタック 4096 は playRaw が再帰も大きなローカルも持たないため
+    // (Speaker_Class.cpp の _set_next_wav は wav_info_t 1 個)。
+    if (g_speakerReady)
+    {
+        const BaseType_t audioCreated =
+            xTaskCreatePinnedToCore(audioTask, "x68k_audio", 4096, nullptr, 4, nullptr, 0);
+        if (audioCreated != pdPASS)
+        {
+            // 起動は続ける。音が出ないだけで X68000 は動く。
+            // 合成しても引き取り手がいないので、そちらも止める。
+            ESP_LOGW(kTag, "音声タスクを作れません。音は出ませんが X68000 は動きます");
+            g_audioEnabled = false;
+            g_speakerReady = false;
+        }
+    }
+
     // Core0 は画面と入力を担当する。
     bool isHalted = false;
+    // 顔のアニメーションに渡す実時間の基準。
+    std::int64_t lastTickUs = esp_timer_get_time();
     while (true)
     {
         M5.update();
-        g_keyboard.poll(g_keys);
+        g_keyboard.poll(g_keys, g_mouse);
         g_console.poll();
 
         // エミュレーションが止まったらメッセージを出して、以後は
@@ -618,13 +1547,53 @@ extern "C" void app_main(void)
             continue;
         }
 
+        // 顔を動かす。
+        //
+        // Why 実時間を渡すか: このループは vTaskDelay(16) を挟むが、
+        // フレームの転送 (320x240 の SPI) やモード切り替えで実際の間隔は
+        // 揺れる。コマ数で数えるとまばたきの速さが負荷に引きずられる。
+        // 経過した実時間を渡せば、コマが飛んでも間隔は保たれる
+        // (avatar.h の tick のコメントを見よ)。
+        const std::int64_t nowUs = esp_timer_get_time();
+        const std::uint32_t elapsedMs = static_cast<std::uint32_t>((nowUs - lastTickUs) / 1000);
+        if (elapsedMs > 0)
+        {
+            lastTickUs = nowUs;
+            const bool isFaceVisible = g_mode.mode() == x68k_platform::AppMode::Face;
+            const bool hasChanged = g_avatar.tick(elapsedMs);
+            // 顔モードのときだけ描く。
+            //
+            // Why not 顔モード以外でも tick を回すか: 回している。まばたきの
+            // 位相を進めておけば、切り替えた瞬間に「ずっと目を開けたまま
+            // だった顔」から始まらない。描画と転送だけを顔モードに絞る。
+            if (isFaceVisible && hasChanged)
+            {
+                drawFaceNow();
+                logFaceState();
+            }
+        }
+
         // 変換済みのフレームがあれば LCD へ送る。
         //
         // Machine には一切触らない。触るのはエミュレーションコアだけで、
         // ここへは完成した RGB565 が渡ってくる。
         if (x68k::u16* frame = g_frames.take(); frame != nullptr)
         {
-            g_display.pushFrame(frame);
+            // 顔モードの間は LCD へ送らない。
+            //
+            // Why not フレームを作らせないか: KeepRunning ではエミュレーションが
+            // 走り続けるので画面は変わり続ける。作るのをやめると、戻ったときに
+            // VRAM が次に変わるまで古い画面が残る (ダーティ行だけを送る仕組み
+            // なので、変化が無ければ何も送られない)。作らせておいて、
+            // 送る直前で捨てる方が復帰が速い。
+            //
+            // Why not take() ごと飛ばさないか: 飛ばすと公開済みのフレームが
+            // 返らず、エミュレーションコアは次の publish に失敗し続ける。
+            // 受け取って done() を返し、送らないだけにする。
+            if (g_mode.mode() == x68k_platform::AppMode::X68k)
+            {
+                g_display.pushFrame(frame);
+            }
             g_frames.done();
         }
 

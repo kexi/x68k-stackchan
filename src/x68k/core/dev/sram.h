@@ -14,6 +14,7 @@
 #define X68K_CORE_DEV_SRAM_H
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 #include "../memmap.h"
@@ -67,6 +68,21 @@ public:
     // 工場出荷状態に初期化する。マジックが壊れているときに IPL-ROM がやることを
     // エミュレータ側で先回りして行う。
     void formatDefaults();
+
+    // 保存しておいたイメージを取り込む。受け入れたら true。
+    //
+    // 受け入れる条件は「ちょうど kSramSize バイト」かつ「マジックが正しい」。
+    // 拒否した場合は現在の内容を一切変更しない。
+    //
+    // Why not ファイルを直接読ませるか: core/ は ESP32 非依存を保つ必要があり、
+    // ファイルシステムの都合を持ち込めない。バイト列を受け取る形にすれば
+    // 検査の中身はホストのテストで確かめられ、実機側は読むだけで済む。
+    //
+    // Why not 短いイメージを 0 埋めで受け入れるか: 途中で切れた sram.dat は
+    // 「起動デバイスだけ読めて画面設定はゼロ」のような中途半端な状態を作る。
+    // 症状は起動しないか画面が出ないかで、原因が SRAM だと気付きにくい。
+    // 工場出荷値へ落とす方が復帰できる。
+    bool loadImage(const std::uint8_t* image, std::size_t length);
 
     [[nodiscard]] std::uint8_t read8(std::uint32_t offset) const
     {

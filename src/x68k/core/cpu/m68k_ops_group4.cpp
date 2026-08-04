@@ -16,8 +16,6 @@ using alu::kByte;
 using alu::kLong;
 using alu::kWord;
 
-constexpr u32 kAddrMask = 0x00FFFFFFu;
-
 constexpr u32 sizeFromField(u32 field)
 {
     if (field == 0)
@@ -37,6 +35,56 @@ u32 M68k::groupMisc(u16 op)
 {
     const u32 mode = (op >> 3) & 7u;
     const u32 reg = op & 7u;
+
+    // --- 最頻の 2 系統だけ先に振り分ける ------------------------------------
+    //
+    // このグループ (0100) は全命令の 25.2% を占める最頻グループだが、実装は
+    // 固定パターンから順に見る if の直列で末尾まで 26 段ある。命令語ごとに
+    // 実測したところ (200M サイクル / groupMisc 到達 5179411 回):
+    //
+    //   単項演算 (NEGX/CLR/NEG/NOT/TST)  47.4%  <- チェーン最末尾 (26 段目)
+    //   MOVEM                            29.6%  <- 22 段目
+    //   LEA                              11.7%
+    //   JSR                               3.6%
+    //   その他                            7.7%
+    //
+    // **77% が 22 段以上の失敗比較を歩いてから**実体に着いていた。
+    //
+    // Why not switch へ書き直さないか: この関数は 600 行あり、TAS と ILLEGAL
+    // ($4AFC)、EXT.W と NBCD ($4880 / $4800) のように「手前で捕まること」が
+    // 正しさの前提になっている組が複数ある。全体を組み替えると、その順序
+    // 依存を 1 つ取り落としただけで別命令として実行される。
+    //
+    // Why not 本体をここへ移動しないか: 移動は差分が大きく、移動漏れや
+    // 変数の捕捉ミスが混ざる余地がある。goto で**既存の本体へ飛ぶ**なら、
+    // 実行される命令列は今までと 1 命令も変わらない。
+    //
+    // 先取りしてよいことは op = $4000-$4FFF の全数で確かめた:
+    //   opField ∈ {0,2,4,6,A} かつ sizeField != 3 の 960 個は、手前の分岐に
+    //   **1 つも捕まらない**。よって飛ばしても到達先は変わらない。
+    //   MOVEM ($FB80 マスク) も同じ条件で手前と重ならない。
+    {
+        const u32 opFieldFast = (op >> 8) & 0xFu;
+        const bool isUnaryOpField = opFieldFast == 0x0u || opFieldFast == 0x2u ||
+                                    opFieldFast == 0x4u || opFieldFast == 0x6u ||
+                                    opFieldFast == 0xAu;
+        const bool isUnaryFast = ((op >> 6) & 3u) != 3u && isUnaryOpField;
+        if (isUnaryFast)
+        {
+            goto unary_ops;
+        }
+        // MOVEM は mode 0 (Dn 直接) を取らない。EXT.W ($4880-$4887) と
+        // EXT.L ($48C0-$48C7) がこのマスクに入ってしまい、手前で捕まるべき
+        // 16 個をここで奪ってしまうため、mode 0 を外す。
+        //
+        // 最初に mode の除外を書かずに通したところ、EXT.L D1 ($48C1) が
+        // MOVEM として実行されて適合性ベクタが 105 件落ちた。
+        const bool isMovemFast = (op & 0xFB80u) == 0x4880u && mode != 0;
+        if (isMovemFast)
+        {
+            goto movem_op;
+        }
+    }
 
     // --- 固定パターンの命令から先に判定する ---------------------------------
 
@@ -247,8 +295,6 @@ u32 M68k::groupMisc(u16 op)
 
     // --- パターンで分ける命令 -----------------------------------------------
 
-    const u32 opField = (op >> 8) & 0xFu;
-
     // LEA <ea>,An : op = 0100 rrr 111 mmm rrr
     if ((op & 0x01C0u) == 0x01C0u)
     {
@@ -338,6 +384,7 @@ u32 M68k::groupMisc(u16 op)
     }
 
     // MOVEM : 0100 1d00 1s mmm rrr
+movem_op:
     if ((op & 0xFB80u) == 0x4880u)
     {
         const bool memoryToRegister = (op & 0x0400u) != 0;
@@ -464,13 +511,63 @@ u32 M68k::groupMisc(u16 op)
         return 12;
     }
 
-    // 単項演算: NEGX/CLR/NEG/NOT/TST : 0100 ooo 0 ss mmm rrr
-    const u32 sizeField = (op >> 6) & 3u;
-    if (sizeField != 3)
+    // TAS: 0100 1010 11 mmm rrr
+    //
+    // バイトを読んで N/Z を立て、bit7 を立てて書き戻す。サイズ欄が 3 の
+    // 位置に居るので、下の単項演算 (サイズ欄 0-2) とは別に先に捌く。
+    //
+    // Why not 単項演算の switch に混ぜないか: あちらは sizeField から
+    // 演算サイズを決める形になっている。TAS は sizeField=3 を「サイズ」
+    // ではなく命令の識別に使うので、同じ枠に入れると sizeFromField(3) が
+    // 意味を持たない値を返す経路ができる。
+    //
+    // Why not 実機の 5 サイクル read-modify-write を再現しないか:
+    // バスを占有したまま読んで書く点が実機との違いだが、本エミュレータは
+    // バスマスタが CPU と DMAC しかなく、DMAC の転送は命令境界でしか
+    // 進まない。分割不可能性が問題になる場面が無い。
+    // (upstream のテストベクタもこのタイミングは未実装と明記している)
+    // $4AFC (mode 7 / reg 4) だけは TAS ではなく ILLEGAL 命令。
+    // 実効アドレスとして意味を持たない組み合わせをその 1 つに割り当てて
+    // あるので、ここで先に弾かないと ILLEGAL を TAS として実行してしまう。
+    if (op == 0x4AFCu)
     {
-        const u32 size = sizeFromField(sizeField);
+        // ILLEGAL。実機は不当命令例外 (ベクタ 4) を起こす。
+        //
+        // Why not 下の unary_ops へ流さないか: $4AFC は sizeField=3 なので
+        // 単項演算の条件に入らず、末尾の unimplemented() まで落ちる。
+        // あれは「まだ実装していない命令に当たった」ことを開発者へ知らせる
+        // ための停止で、実機には無い状態。ゲストが意図して ILLEGAL を
+        // 置いた場合 (デバッガのブレークポイント等) にエミュレータごと
+        // 止まってしまう。
+        //
+        // 積む PC は命令そのもの (faulting = true)。RTE で戻ると同じ
+        // 命令を再実行するのが実機の振る舞い。
+        takeException(vector::kIllegalInstruction, true);
+        return 34;
+    }
+    {
+        const bool isTas = (op & 0xFFC0u) == 0x4AC0u;
+        if (!isTas)
+        {
+            goto unary_ops;
+        }
+    }
+    {
+        u32 addr = 0;
+        const u32 value = readEaForModify(mode, reg, kByte, addr);
+        setLogicFlags(value, kByte);
+        writeEaToAddr(mode, reg, kByte, addr, value | 0x80u);
+        // データレジスタ直接なら 4、メモリなら 14 サイクル。
+        return mode == 0 ? 4 : 14;
+    }
 
-        switch (opField)
+    // 単項演算: NEGX/CLR/NEG/NOT/TST : 0100 ooo 0 ss mmm rrr
+unary_ops:
+    if (((op >> 6) & 3u) != 3)
+    {
+        const u32 size = sizeFromField((op >> 6) & 3u);
+
+        switch ((op >> 8) & 0xFu)
         {
             case 0x0:  // NEGX
             {

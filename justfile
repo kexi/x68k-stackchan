@@ -38,18 +38,23 @@ test-host:
 #   `ld: library not found for -lasan` で落ちる。clang は compiler-rt を
 #   持っているので、サニタイザ付きビルドは clang に固定する。
 #
-# 既知の問題: Apple Silicon の macOS では、Nix の clang で作った
-# サニタイザ版バイナリが起動時に固まる (--version すら出力なしで返らない)。
-# clang 21.1.8 arm64-apple-darwin + Darwin 25 で再現。ビルドは通るので
-# コンパイルの問題ではなく、ランタイムの初期化で止まっているように見える。
+# macOS では ASan が外れ UBSan だけになる (test/CMakeLists.txt で分岐)。
+# macOS 26 の dyld と ASan ランタイムが初期化中にデッドロックし、main に入る前に
+# 固まるため。Apple 供給の clang でも同じなので OS 側の問題で、ツールチェーンの
+# 差し替えでは直らない。詳細な機序は test/CMakeLists.txt のコメントに書いた。
 #
-# CI (Linux) では通るので、サニタイザの結果はそちらで確認する。
-# 手元で回したい場合は nix の外の clang を使うと動くことがある。
+# したがって配列外アクセス (ASan) の検出は Linux の CI が担保する。
+# 手元の macOS で拾えるのは UB (符号付きオーバーフロー・不正シフト量) まで。
 [doc('ASan/UBSan 付きでホストテストを実行する')]
 test-san:
     cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
     cmake --build {{san_build}}
+    # doctest の TEST_SUITE が静的初期化で確保する文字列は解放されない
+    # (設計上そうなっている)。テスト本体の漏れだけを見たいので抑制する。
+    # 詳細は test/lsan.supp に書いた。
+    # LSan の扱いは test/test_main.cpp の __lsan_default_options に書いた。
+    # 外から LSAN_OPTIONS を渡す形はシンボル化が要り、CI で当たらなかった。
     ctest --test-dir {{san_build}} --output-on-failure
 
 [doc('ホストのエミュレータランナー x68k-run をビルドする')]

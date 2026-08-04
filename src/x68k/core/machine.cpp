@@ -72,14 +72,35 @@ constexpr u8 kPhaseMessage = 5;
 // MFP の割り込みレベル。X68000 では MFP がレベル 6 に繋がっている。
 constexpr u32 kMfpInterruptLevel = 6;
 
+// SCC の割り込みレベル。X68000 では SCC (マウス / RS-232C) がレベル 5。
+//
+// MFP (6) より低いので、キーボードやタイマの処理中はマウスが待たされる。
+// これは実機と同じ順序。ここを 6 以上にすると、マウスを動かし続けている間
+// システムタイマが取りこぼされて時計が遅れる。
+constexpr u32 kSccInterruptLevel = 5;
+
 }  // namespace
 
 Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
 {
-    // SASI のデータ転送は DMAC 経由で行われる。DMAC からはデータの出どころが
-    // SASI、転送先がバスに見える。
-    dmac_.setDevice(this);
+    // SASI と FDC のデータ転送はどちらも DMAC 経由で行われる。DMAC からは
+    // データの出どころがデバイス、転送先がバスに見える。
+    //
+    // チャネルの割り当ては実機のとおり。FDC がチャネル 0 (IPL-ROM の
+    // $FF8F3C が $E84005/$E8400A/$E8400C/$E84007 を叩く)、SASI が
+    // チャネル 1 ($FF9944 が $E84045… を叩く)。
+    dmac_.setDevice(Dmac::kSasiChannel, this);
+    dmac_.setDevice(Dmac::kFdcChannel, &fdcDmaPort_);
     dmac_.setMemory(this);
+
+    // G-VRAM の窓 ($C00000-$DFFFFF) はページ選択を兼ねており、CPU の書き込みを
+    // 共有ワードのどのニブル/バイトへ折り込むかが色数モードで決まる。
+    // バスがモードを引けるようにここで繋ぐ。
+    bus_.setVideoController(&video_);
+
+    // メインメモリへのアクセスを仮想関数抜きで通せるようにする。
+    // 以後、実体・ROM 写像・ウォッチが変わるたびにバスが CPU へ教え直す。
+    bus_.attachFastPathCpu(&cpu_);
 
     // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
     // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
@@ -100,12 +121,36 @@ void Machine::setMemory(const MemoryMap& memory)
 
 void Machine::reset()
 {
-    sram_.formatDefaults();
+    // SRAM はリセットで消さない。実機はバッテリバックアップなので、
+    // リセットしても電源を切っても内容が残る。
+    //
+    // Why not 無条件に formatDefaults を呼ぶか: 以前はそうしていたが、
+    // Human68k が起動デバイスや画面モードを書き換えた直後にリセットすると
+    // 工場出荷値へ戻ってしまう。実機と挙動が違ううえ、SD へ保存しても
+    // 次の起動で必ず上書きされるので保存する意味が無くなる。
+    //
+    // ただしマジックが壊れているときだけは初期化する。IPL-ROM は不正な
+    // SRAM を見つけると自分で書き戻しにかかるが、その経路を通す前に
+    // 途中の読み出しでゴミの設定を使ってしまう。ここで先回りしておく。
+    if (!sram_.hasValidMagic())
+    {
+        sram_.formatDefaults();
+    }
     crtc_.reset();
     video_.reset();
     mfp_.reset();
     rtc_.reset();
     fdc_.reset();
+    scc_.reset();
+    iosc_.reset();
+    sprite_.reset();
+    // 音源も他のデバイスと同じくリセットする。
+    //
+    // 実機はシステムリセット線が両チップへ届く。落とさないと、鳴っている
+    // 音がリセット後も鳴り続け、ADPCM はリセット前に FIFO へ残っていた
+    // バイトを復号し続ける。
+    opm_.reset();
+    adpcm_.reset();
     // 転送バッファは外から与えられた設定なので、リセットで消さない。
     // ここを丸ごと初期化すると nullptr に戻り、SASI が 1 バイトも
     // 受け取れなくなる。
@@ -132,12 +177,7 @@ u32 Machine::step()
         return 0;
     }
 
-    mfp_.tick(cycles);
-    rtc_.tick(cycles);
-    if (crtc_.tick(cycles))
-    {
-        mfp_.setVerticalBlank(crtc_.inVerticalBlank());
-    }
+    tickDevices(cycles);
 
     return cycles;
 }
@@ -147,21 +187,94 @@ u32 Machine::run(u32 cycles)
     u32 spent = 0;
     while (spent < cycles)
     {
-        const u32 used = step();
+        serviceInterrupts();
+
+        const u32 used = cpu_.step();
         if (used == 0)
         {
             break;  // 停止した
         }
         spent += used;
+
+        tickDevices(used);
     }
+
     return spent;
 }
 
-void Machine::serviceInterrupts()
+void Machine::tickDevices(u32 cycles)
+{
+    mfp_.tick(cycles);
+
+    // RTC も CRTC もまとめない。
+    //
+    // 一度は「RTC は 1 秒単位でしか変わらないから粗くてよい」「CRTC の
+    // ずれは 1 ラスタ未満だから見えない」として quantum を入れたが、
+    // どちらも実測で観測可能なずれが出た:
+    //   CRTC 64 サイクル -> 垂直帰線の開始が 24 サイクル遅れる
+    //   RTC 10000 サイクル -> 秒の境界が最大 1998 サイクル遅れる
+    //   MFP 8 サイクル -> 分周器の位相次第で割り込みが 4 サイクル遅れる
+    //
+    // いずれもゲストが命令単位でポーリングできる値なので、「分解能より
+    // 細かいから見えない」は成り立たない。ポーリングループの反復回数
+    // として観測できる。速度のために正しさを崩す取引だったので戻した。
+    rtc_.tick(cycles);
+
+    if (crtc_.tick(cycles))
+    {
+        mfp_.setVerticalBlank(crtc_.inVerticalBlank());
+    }
+}
+
+void Machine::serviceInterruptsSlow()
+{
+    // MFP (レベル 6) を先に見る。SCC (レベル 5) より優先度が高いので、
+    // 両方保留していたら MFP が勝つ。
+    //
+    // Why not SCC を先に見るか: 68000 は 1 回の割り込み受理で 1 つしか
+    // 処理しない。低い方を先に渡すと、高い方が待たされるどころか
+    // 「マウスを動かし続けている間キー入力が通らない」形で逆転する。
+    // I/O コントローラ (レベル 1) は最下位なので最後に見る。MFP/SCC が
+    // 保留している間は FDC の完了通知が待たされる。これは実機と同じ順序。
+    if (!serviceMfpInterrupt() && !serviceSccInterrupt())
+    {
+        serviceIoScInterrupt();
+    }
+}
+
+bool Machine::serviceIoScInterrupt()
+{
+    // 線は serviceInterrupts() が呼ぶ前に取り直してある。
+    if (!iosc_.hasPendingInterrupt())
+    {
+        return false;
+    }
+
+    // MFP / SCC と同じく、CPU が受け付けられるか先に確かめる。
+    const u32 mask = cpu_.state().interruptMask();
+    const bool isMasked = IoSc::kInterruptLevel <= mask;
+    if (isMasked)
+    {
+        return false;
+    }
+
+    // I/O コントローラも自分のベクタ番号を返すデバイス。$E9C003 に書かれた
+    // ベース ($60) にソース番号を足した値になる。オートベクタ (24+1=25) に
+    // すると ROM が $180 へ張った FDC ハンドラ ($FF1130) へ届かない。
+    const u8 vectorNumber = iosc_.acknowledgeInterrupt();
+    if (vectorNumber == 0)
+    {
+        return false;
+    }
+    cpu_.requestInterrupt(IoSc::kInterruptLevel, vectorNumber);
+    return true;
+}
+
+bool Machine::serviceMfpInterrupt()
 {
     if (!mfp_.hasPendingInterrupt())
     {
-        return;
+        return false;
     }
 
     // CPU が今この割り込みを受け付けられるか先に確かめる。
@@ -177,7 +290,7 @@ void Machine::serviceInterrupts()
     const bool isMasked = kMfpInterruptLevel <= mask;
     if (isMasked)
     {
-        return;
+        return false;
     }
 
     // MFP は自分のベクタ番号を返すデバイス (自動ベクタではない)。
@@ -189,9 +302,40 @@ void Machine::serviceInterrupts()
     const u32 vectorNumber = mfp_.acknowledgeInterrupt();
     if (vectorNumber == 0)
     {
-        return;
+        return false;
     }
     cpu_.requestInterrupt(kMfpInterruptLevel, vectorNumber);
+    return true;
+}
+
+bool Machine::serviceSccInterrupt()
+{
+    if (!scc_.hasPendingInterrupt())
+    {
+        return false;
+    }
+
+    // MFP と同じ理由で、受理できるか先に確かめてから acknowledge する。
+    //
+    // acknowledgeInterrupt() は保留を落とす破壊的な操作なので、CPU が
+    // マスクしている間に呼ぶとマウスのレポートが握りつぶされる。実機の
+    // バスは IACK サイクルが走って初めてこの遷移が起きる。
+    const u32 mask = cpu_.state().interruptMask();
+    const bool isMasked = kSccInterruptLevel <= mask;
+    if (isMasked)
+    {
+        return false;
+    }
+
+    // SCC も自分のベクタ番号を返すデバイス (WR2 に書かれた値が基になる)。
+    // 自動ベクタにすると IOCS が張ったマウス用ハンドラへ届かない。
+    const u32 vectorNumber = scc_.acknowledgeInterrupt();
+    if (vectorNumber == 0)
+    {
+        return false;
+    }
+    cpu_.requestInterrupt(kSccInterruptLevel, vectorNumber);
+    return true;
 }
 
 void Machine::pressKey(u8 scanCode)
@@ -199,14 +343,106 @@ void Machine::pressKey(u8 scanCode)
     mfp_.receiveKeyboardByte(scanCode);
 }
 
+bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
+{
+    return scc_.moveMouse(dx, dy, leftButton, rightButton);
+}
+
+// --- 音声 --------------------------------------------------------------------
+//
+// FM (OPM) と ADPCM を足してモノラルで返す。実機は両者を独立した経路で
+// アナログ的に混ぜるが、ここでは合成後に加算する。
+void Machine::renderAudio(std::int16_t* out, std::size_t frames)
+{
+    if (out == nullptr)
+    {
+        return;
+    }
+
+    // 両方とも鳴っていなければ、合成そのものを省いてゼロで埋める。
+    //
+    // これが実機で音源を常時 ON にできるかどうかを分ける。X68000 を
+    // 触っている時間の大半 (起動中、コマンド入力待ち) は音が鳴っておらず、
+    // そこで 8ch x 4op を回すのは丸ごと無駄になる。Opm::renderSamples は
+    // 同じ早期リターンを持つが、ここは 1 サンプルずつ混ぜる都合で
+    // renderOneSample を呼ぶため、その恩恵を受けられない。
+    //
+    // Why not isSilent の判定を毎サンプル行わないか: エンベロープは
+    // 1 ブロックの途中で切れうるが、鳴り終わった残りをゼロで埋めるか
+    // 減衰しきった値で埋めるかの差しかない。ブロックの頭で 1 回だけ見る。
+    const bool isQuiet = opm_.isSilent() && !adpcm_.isPlaying();
+    if (isQuiet)
+    {
+        for (std::size_t i = 0; i < frames; ++i)
+        {
+            out[i] = 0;
+        }
+        return;
+    }
+
+    for (std::size_t i = 0; i < frames; ++i)
+    {
+        const std::int32_t fm = opm_.renderOneSample();
+        const std::int32_t pcm = adpcm_.renderOneSample();
+
+        // Why not それぞれ 1/2 にしてから足すか: 実機でも FM と ADPCM が
+        // 同時に最大振幅になることはまずない。常時半分にすると、片方しか
+        // 鳴っていない大半の時間で音量を 6dB 損する。飽和で受ける。
+        std::int32_t mix = fm + pcm;
+        constexpr std::int32_t kMin = -32768;
+        constexpr std::int32_t kMax = 32767;
+        if (mix < kMin)
+        {
+            mix = kMin;
+        }
+        if (mix > kMax)
+        {
+            mix = kMax;
+        }
+        out[i] = static_cast<std::int16_t>(mix);
+    }
+}
+
 // --- I/O ディスパッチ --------------------------------------------------------
+
+namespace
+{
+
+// スプライト VRAM ($EB8000-$EBFFFF) に当たるか。
+//
+// Why not ioRead8 の switch (base = addr & $FFE000) に混ぜないか:
+// スプライト VRAM は 32KB あり、$FFE000 でマスクすると $EB8000 / $EBA000 /
+// $EBC000 / $EBE000 の 4 つの case に散る。$EBC000 と $EBE000 は BG の
+// ネームテーブルで、PCG と連続した 1 つの実体として扱う必要がある
+// (dev/sprite.h の冒頭を参照)。範囲判定 1 つにまとめたほうが、
+// 実体が連続しているという性質がコードにそのまま出る。
+inline bool isSpriteVram(u32 addr)
+{
+    return addr >= kSpriteVramBase && addr < kSpriteVramEnd;
+}
+
+}  // namespace
 
 u8 Machine::ioRead8(u32 addr)
 {
     const u32 base = addr & 0xFFE000u;
 
+    // スプライト VRAM は 4 つの base にまたがるので switch より先に見る。
+    if (isSpriteVram(addr))
+    {
+        return sprite_.vramRead8(addr - kSpriteVramBase);
+    }
+
     switch (base)
     {
+        case kSpriteRegBase:
+        {
+            // レジスタはワード単位。バイトアクセスは上下を切り出す。
+            // ワード境界へ丸めてから読み、奇数アドレスなら下位バイトを返す。
+            const u16 value = sprite_.read((addr - kSpriteRegBase) & ~1u);
+            return static_cast<u8>((addr & 1) != 0 ? (value & 0xFFu) : (value >> 8));
+        }
+
         case kCrtcBase:
             // CRTC はワード単位。バイトアクセスは上下を切り出す。
             {
@@ -266,32 +502,58 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kOpmBase:
-            // YM2151。ステータスレジスタは bit7 = BUSY。
-            // 常に「準備完了」(bit7 = 0) を返さないと IOCS の初期化ループが
-            // 終わらない。
+            // YM2151。ステータスは $E90003 に現れる (奇数側の $E90001 は
+            // レジスタ番号の書き込み専用)。
+            //
+            // IPL-ROM の待ちループ ($FF9C9C: TST.B $E90003 / BMI.S) は
+            // bit7 (BUSY) が落ちるまで回り、タイムアウトを持たない。
+            // Opm::readStatus は常に bit7 = 0 を返す。
+            if ((addr & 0x0Fu) == 0x03)
+            {
+                return opm_.readStatus();
+            }
+            return 0u;
+
+        case kAdpcmBase:
+            // MSM6258V。$E92001 がステータス、$E92003 がデータ。
+            // データ側は書き込み専用なので読んでも 0。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                return adpcm_.readStatus();
+            }
             return 0u;
 
         case kFdcBase:
-            // FDC (uPD72065)。ドライブ未接続として振る舞う状態機械。
+            // FDC (uPD72065)。イメージを繋げば実際に読み書きする。
             //   $E94001 メインステータス
             //   $E94003 データ (コマンド送出と結果の受け取り)
+            // セクタの中身は DMAC のチャネル 0 経由で流れるので、
+            // ここ ($E94003) を通るのはコマンドと結果バイトだけ。
             if ((addr & 0x0Fu) == 0x01)
             {
                 return fdc_.readStatus();
             }
             if ((addr & 0x0Fu) == 0x03)
             {
-                return fdc_.readData();
+                const u8 data = fdc_.readData();
+                // 結果バイトを読み切ると FDC 側の保留が畳まれることがある。
+                // 読んだ直後に線を取り直さないと、要因が消えているのに
+                // 線が上がったままになりハンドラが再入する。
+                updateFdcInterruptLine();
+                return data;
             }
             return 0u;
 
         case kDmacBase:
             return dmac_.read(addr - kDmacBase);
 
-        case kAdpcmBase:
         case kSccBase:
-        case kPpiBase:
+            return sccRead(addr);
+
         case kIoScBase:
+            return iosc_.read(addr - kIoScBase);
+
+        case kPpiBase:
         case kPrinterBase:
             // スタブ。読み出しは 0。
             return 0u;
@@ -305,8 +567,25 @@ void Machine::ioWrite8(u32 addr, u8 value)
 {
     const u32 base = addr & 0xFFE000u;
 
+    if (isSpriteVram(addr))
+    {
+        sprite_.vramWrite8(addr - kSpriteVramBase, value);
+        return;
+    }
+
     switch (base)
     {
+        case kSpriteRegBase:
+        {
+            // ワード単位のレジスタへのバイト書き込み。読んで片側だけ差し替える。
+            const u32 offset = (addr - kSpriteRegBase) & ~1u;
+            const u16 old = sprite_.read(offset);
+            const u16 next = (addr & 1) != 0 ? static_cast<u16>((old & 0xFF00u) | value)
+                                             : static_cast<u16>((old & 0x00FFu) | (value << 8));
+            sprite_.write(offset, next);
+            return;
+        }
+
         case kCrtcBase:
         {
             const u32 reg = (addr - kCrtcBase) / 2;
@@ -351,15 +630,61 @@ void Machine::ioWrite8(u32 addr, u8 value)
             dmac_.write(addr - kDmacBase, value);
             return;
 
+        case kSccBase:
+            sccWrite(addr, value);
+            return;
+
+        case kIoScBase:
+            iosc_.write(addr - kIoScBase, value);
+            return;
+
         case kFdcBase:
             if ((addr & 0x0Fu) == 0x03)
             {
                 fdc_.writeData(value);
+                // コマンドが揃った時点で割り込みが上がることがある
+                // (SEEK / RECALIBRATE)。逆に SENSE INTERRUPT STATUS は
+                // 落とす。どちらも writeData の中で起きるので、
+                // 書いた直後に線を取り直す。
+                updateFdcInterruptLine();
             }
             else if ((addr & 0x0Fu) == 0x05)
             {
                 // ドライブ制御 (選択とモーター)。
                 fdc_.writeDriveControl(value);
+            }
+            else if ((addr & 0x0Fu) == 0x07)
+            {
+                // ドライブ選択とモーター。IPL-ROM の $FF909E が
+                // 「$80 | ドライブ番号」をここへ書いてからコマンドを送る。
+                fdc_.writeDriveSelect(value);
+            }
+            return;
+
+        case kOpmBase:
+            // YM2151。$E90001 にレジスタ番号、$E90003 に値。
+            // IPL-ROM の書き込み手順 ($FF9C8A -> $FF9C94) がこの順に叩く。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                opm_.writeAddress(value);
+            }
+            else if ((addr & 0x0Fu) == 0x03)
+            {
+                opm_.writeData(value);
+            }
+            return;
+
+        case kAdpcmBase:
+            // MSM6258V。$E92001 がコマンド、$E92003 がデータ。
+            // IPL-ROM は $E92001 に #$04 (停止) / #$02 (再生) を書く
+            // ($FF9A68 / $FF9A8C)。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                adpcm_.writeCommand(value);
+            }
+            else if ((addr & 0x0Fu) == 0x03)
+            {
+                adpcm_.writeData(value);
             }
             return;
 
@@ -389,6 +714,12 @@ u16 Machine::ioRead16(u32 addr)
     {
         return video_.read(addr - kVideoCtrlBase);
     }
+    // スプライトレジスタはワードが最小単位。read8 を 2 回に分けると、
+    // 丸めたオフセットから同じワードを 2 度切り出すことになる。
+    if (base == kSpriteRegBase)
+    {
+        return sprite_.read(addr - kSpriteRegBase);
+    }
 
     return static_cast<u16>((ioRead8(addr) << 8) | ioRead8(addr + 1));
 }
@@ -405,6 +736,13 @@ void Machine::ioWrite16(u32 addr, u16 value)
     if (base == kVideoCtrlBase)
     {
         video_.write(addr - kVideoCtrlBase, value);
+        return;
+    }
+    // ワードでまとめて書く。バイト 2 回に分けると、上位バイトだけ書いた
+    // 途中の値でプライオリティの数え直しが走る。
+    if (base == kSpriteRegBase)
+    {
+        sprite_.write(addr - kSpriteRegBase, value);
         return;
     }
 
@@ -483,6 +821,62 @@ u8 Machine::dmaMemRead(u32 addr)
 void Machine::dmaMemWrite(u32 addr, u8 value)
 {
     bus_.write8(addr, value);
+}
+
+// --- SCC ---------------------------------------------------------------------
+//
+// Z8530 は 8bit デバイスで、16bit バスの下位バイト側に繋がっている。
+// レジスタは奇数アドレスにのみ現れる (MFP と同じ理由)。
+//
+//   $E98001 ch B 制御 / $E98003 ch B データ   ← マウス
+//   $E98005 ch A 制御 / $E98007 ch A データ   ← RS-232C
+//
+// IPL-ROM は MOVE.W で $E98000 のような偶数アドレスへ書くが、実際に
+// デバイスへ届くのは下位バイト = 奇数アドレス側。
+// 例: MOVE.W #$0062,$E98000 は $E98000 に $00、$E98001 に $62 を書く。
+// この $62 が WR5 への値になる。
+//
+// Why not 偶数アドレスも同じレジスタへ割り当てるか: MFP で同じことをして
+// 壊れた。Z8530 は制御ポートを「読むとレジスタポインタが 0 に戻る」ので、
+// 偶数側の読みでもポインタが戻ると、MOVE.W で読んだときに上位バイトの
+// アクセスがポインタを潰し、下位バイトが必ず RR0 を読むことになる。
+
+u8 Machine::sccRead(u32 addr)
+{
+    // 偶数側は実体が無い。0 を返す。
+    const bool isOddAddress = (addr & 1) != 0;
+    if (!isOddAddress)
+    {
+        return 0u;
+    }
+
+    // $E98001/$E98003 が ch B、$E98005/$E98007 が ch A。
+    // bit2 でチャネル、bit1 で制御/データを選ぶ。
+    const u32 offset = addr & 0x07u;
+    const u32 channel = (offset & 0x04u) != 0 ? Scc::kChannelA : Scc::kChannelB;
+    const bool isDataPort = (offset & 0x02u) != 0;
+
+    return isDataPort ? scc_.readData(channel) : scc_.readControl(channel);
+}
+
+void Machine::sccWrite(u32 addr, u8 value)
+{
+    const bool isOddAddress = (addr & 1) != 0;
+    if (!isOddAddress)
+    {
+        return;
+    }
+
+    const u32 offset = addr & 0x07u;
+    const u32 channel = (offset & 0x04u) != 0 ? Scc::kChannelA : Scc::kChannelB;
+    const bool isDataPort = (offset & 0x02u) != 0;
+
+    if (isDataPort)
+    {
+        scc_.writeData(channel, value);
+        return;
+    }
+    scc_.writeControl(channel, value);
 }
 
 // --- SASI --------------------------------------------------------------------

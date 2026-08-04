@@ -10,14 +10,20 @@
 #ifndef X68K_CORE_MACHINE_H
 #define X68K_CORE_MACHINE_H
 
+#include <cstddef>
 #include <cstdint>
 
 #include "bus.h"
 #include "cpu/m68k.h"
+#include "dev/adpcm.h"
 #include "dev/dmac.h"
 #include "dev/fdc.h"
+#include "dev/iosc.h"
 #include "dev/mfp.h"
+#include "dev/opm.h"
 #include "dev/rtc.h"
+#include "dev/scc.h"
+#include "dev/sprite.h"
 #include "dev/sram.h"
 #include "dev/video.h"
 
@@ -74,11 +80,22 @@ public:
         disk_ = disk;
     }
 
+    // フロッピードライブ (FDD0/FDD1) にイメージを入れる。null で取り出す。
+    //
+    // Why not setDisk と同じ口にするか: FD は CHS でアクセスされ、
+    // セクタ長も 1024 バイト (2HD) と SASI の 256 バイトで違う。同じ
+    // DiskImage に押し込むと「どちらのセクタ長で数えた LBA か」を
+    // 呼び出し側しか知らない状態になり、読み出し位置を静かに間違える。
+    void setFloppyDisk(u32 drive, FloppyImage* image)
+    {
+        fdc_.setImage(drive, image);
+    }
+
     // リセットして IPL-ROM の先頭から実行を始める。
     void reset();
 
     // 指定サイクル数ぶん実行する。実際に消費したサイクル数を返す。
-    // デバイスの時間もまとめて進める。
+    // デバイスの時間は命令ごとに進める (step() と同じ粒度)。
     u32 run(u32 cycles);
 
     // 1 命令だけ実行する。トレース用。
@@ -131,9 +148,63 @@ public:
     {
         return fdc_;
     }
+    [[nodiscard]] Scc& scc()
+    {
+        return scc_;
+    }
+    [[nodiscard]] IoSc& iosc()
+    {
+        return iosc_;
+    }
+    [[nodiscard]] Sprite& sprite()
+    {
+        return sprite_;
+    }
+    [[nodiscard]] const Sprite& sprite() const
+    {
+        return sprite_;
+    }
+    [[nodiscard]] Opm& opm()
+    {
+        return opm_;
+    }
+    [[nodiscard]] Adpcm& adpcm()
+    {
+        return adpcm_;
+    }
+
+    // 音声を frames サンプルぶんモノラルで合成して out へ書く (pull 型)。
+    //
+    // platform 層が「必要になったときに必要な分だけ」取りに来る形にしてある。
+    // Why not エミュレータ側から push するか: 出力側 (M5Unified のスピーカー)
+    // のバッファが空くタイミングは platform 層しか知らない。push にすると
+    // core/ が出力レートとバッファ長を知る必要が出て、ESP32 非依存でなくなる。
+    //
+    // 呼ぶのは Machine を所有するコア (実機では Core1) だけ。ここは
+    // OPM のレジスタと ADPCM の FIFO を読むので、別コアから呼ぶと
+    // ゲストが $E90003 を書いている最中の状態が混ざる。できたサンプルを
+    // 別コアへ渡す仕事は platform/audio.h が持つ。
+    //
+    // 鳴っている音が 1 つも無ければ合成を省いてゼロで埋める。実機の
+    // リアルタイムループから毎スライス呼べるのはこの早期リターンのため
+    // (実測は docs/knowledge/cores3-emulator-runtime.md の音声の節)。
+    void renderAudio(std::int16_t* out, std::size_t frames);
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
+
+    // マウスが動いた / ボタンの状態が変わった。
+    //
+    // pressKey と同じく、ホストや platform 層が外から入力を注入する口。
+    // dx/dy は前回からの相対移動量 (X68000 のマウスは絶対座標を持たない)。
+    //
+    // IOCS がマウスを有効化していない間の呼び出しは捨てられる。SCC の受信
+    // FIFO が埋まっている間の呼び出しも同じく捨てられる (レポートは 3 バイト
+    // 揃って初めて意味を持つので、途中まで積むことはしない)。
+    //
+    // 積めたら true、捨てたら false。呼び出し側が送り直しを判断できるように
+    // する (Scc::moveMouse のコメントに理由を書いた)。
+    bool moveMouse(int dx, int dy, bool leftButton, bool rightButton);
 
     // CPU が停止しているか (未実装命令に当たった等)。
     [[nodiscard]] bool isHalted() const
@@ -154,9 +225,90 @@ public:
     void ioWrite16(u32 addr, u16 value) override;
 
 private:
-    void serviceInterrupts();
+    // DMAC のチャネル 0 (FDC) を Fdc へ繋ぐ中継。
+    //
+    // Why not Machine 自身が両方のチャネルを引き受けるか: Machine は既に
+    // チャネル 1 (SASI) の DmaDevice である。1 つのオブジェクトで 2 つの
+    // チャネルを兼ねると dmaRead/dmaWrite の中で「今どちらのチャネルから
+    // 呼ばれたか」を状態で判断することになり、転送の途中でその状態がずれた
+    // ときに黙って相手のバッファを読む。チャネルごとに別のオブジェクトを
+    // 繋げば、取り違えは型として起こらない。
+    class FdcDmaPort final : public DmaDevice
+    {
+    public:
+        explicit FdcDmaPort(Fdc& fdc) : fdc_(fdc) {}
+
+        bool dmaRead(u8* value) override
+        {
+            return fdc_.dmaRead(value);
+        }
+        bool dmaWrite(u8 value) override
+        {
+            return fdc_.dmaWrite(value);
+        }
+        void dmaComplete(bool isComplete) override
+        {
+            fdc_.dmaComplete(isComplete);
+        }
+
+    private:
+        Fdc& fdc_;
+    };
+
+    // 割り込みを 1 つだけ受理する。毎命令通る。
+    //
+    // 3 つのデバイスすべてに保留が無い状態が圧倒的に多いので、その判定を
+    // ここでインラインに済ませ、何か上がっているときだけ .cpp 側の
+    // 優先度付き処理 (serviceInterruptsSlow) を呼ぶ。
+    //
+    // Why not それぞれの service*Interrupt をそのまま呼ぶか: あちらは
+    // 「保留があるか」「CPU が受け付けられるか」「ベクタ番号は何か」を
+    // 順に見る本体で、.cpp 側にあるので ESP32-S3 では実呼び出しになる。
+    // プロファイルで serviceIoScInterrupt / serviceMfpInterrupt だけで
+    // 400 サンプル近くを占めていた。
+    //
+    // FDC の線はバスアクセス以外の契機 (DMA 完了など) でも変わるので、
+    // 判定の前に必ず取り直す。ここは inline な setFdcLine 1 回で済む。
+    void serviceInterrupts()
+    {
+        updateFdcInterruptLine();
+        const bool anyPending =
+            mfp_.hasPendingInterrupt() || scc_.hasPendingInterrupt() || iosc_.hasPendingInterrupt();
+        if (!anyPending)
+        {
+            return;
+        }
+        serviceInterruptsSlow();
+    }
+
+    // serviceInterrupts() の遅い側。どれか 1 つでも保留があるときだけ呼ばれ、
+    // MFP (6) > SCC (5) > I/O コントローラ (1) の順に受理を試す。
+    void serviceInterruptsSlow();
+    // 保留していた割り込みを CPU へ渡せたら true。
+    // 優先度の高い方から順に試し、1 つ通ったらそこで止めるために戻り値を使う。
+    bool serviceMfpInterrupt();
+    bool serviceSccInterrupt();
+    bool serviceIoScInterrupt();
+    // FDC の割り込み線を I/O コントローラへ反映する。
+    // FDC 自身は自分がどのコントローラに繋がっているかを知らないので、
+    // 線の橋渡しは Machine が持つ。
+    // FDC の割り込み線を I/O コントローラへ反映する。毎命令通るので inline。
+    //
+    // Why not Fdc から直接 IoSc を叩かないか: Fdc が IoSc を知ると、FDC 単体の
+    // テストに割り込みコントローラを連れてくる必要が出る。実機でも「線が
+    // 繋がっている」だけで FDC はコントローラの存在を知らないので、配線を
+    // 持つのは両者を組み立てる Machine の責務にしてある。
+    void updateFdcInterruptLine()
+    {
+        iosc_.setFdcLine(fdc_.hasInterrupt());
+    }
     u8 sasiRead(u32 addr);
     void sasiWrite(u32 addr, u8 value);
+    u8 sccRead(u32 addr);
+    void sccWrite(u32 addr, u8 value);
+
+    // 時間で動くデバイスへ経過サイクルを渡す。step() と run() の共通路。
+    void tickDevices(u32 cycles);
 
     Sram sram_;
     SystemBus bus_;
@@ -166,7 +318,13 @@ private:
     Mfp mfp_;
     Rtc rtc_;
     Fdc fdc_;
+    Scc scc_;
+    IoSc iosc_;
+    Opm opm_;
+    Adpcm adpcm_;
+    Sprite sprite_;
     Dmac dmac_;
+    FdcDmaPort fdcDmaPort_{fdc_};
     DiskImage* disk_ = nullptr;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。

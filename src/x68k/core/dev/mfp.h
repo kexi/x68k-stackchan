@@ -84,6 +84,10 @@ public:
     static constexpr u8 kIntGpip1 = 0x02;
     static constexpr u8 kIntGpip0 = 0x01;
 
+    // タイマ制御レジスタの下位 3bit が表す分周比。
+    // 0 は停止、1-7 が 4/10/16/50/64/100/200 分周 (MC68901 の仕様)。
+    static constexpr u32 kPrescaleTable[8] = {0, 4, 10, 16, 50, 64, 100, 200};
+
     void reset();
 
     // レジスタを読む。
@@ -94,8 +98,97 @@ public:
     void write(u32 regIndex, u8 value);
 
     // CPU のサイクル数ぶん時間を進める。タイマのカウントダウンを行う。
-    void tick(u32 cycles);
+    //
+    // 停止中のタイマを弾く判定だけをここに置く。プロファイルでは
+    // Mfp::tick と tickTimer の合計が 2171 サンプルで、CPU のディスパッチ
+    // 全体より大きい単独最大の項目だった。tickTimer は .cpp 側にあり、
+    // 4 本ぶん無条件に呼んでいた。
+    //
+    // X68000 が実際に動かすのはタイマ C (システムクロック) と D
+    // (RS-232C ボーレート) だけで、A/B は IOCS が使うときしか動かない。
+    // 止まっているタイマは制御レジスタの下位 3bit が 0 なので、そこを見れば
+    // 呼ぶ前に分かる。
+    //
+    // Why not timerPrescale() をそのまま呼ばないか: あれは bit3 (外部入力を
+    // 要するモード) の判定を含む .cpp 側の関数で、ここで呼ぶと結局 4 回の
+    // 呼び出しが残る。下位 3bit が 0 なら bit3 の値に関わらず停止なので、
+    // 速い側の判定としてはこれで十分 (bit3 が立つ場合は下の tickTimer が
+    // 改めて timerPrescale() を引いて 0 を返す)。
 
+    // MFP は 4MHz、CPU は 10MHz。4/10 ≒ 1/2.5 だが、割り算を避けて 2 で割る
+    // 近似にしてある (タイマ精度は Human68k の起動に影響しない)。
+    static constexpr u32 kCpuToMfpShift = 1;
+
+    void tick(u32 cycles)
+    {
+        const u32 mfpCycles = cycles >> kCpuToMfpShift;
+        if (mfpCycles == 0)
+        {
+            return;
+        }
+        // 動いているタイマだけを詰めた表を引く。本数と分周値は制御
+        // レジスタが書かれたときにしか変わらない。
+        //
+        // Why キャッシュするか: この関数は **命令ごとに必ず通る**。毎回 3
+        // 本のレジスタを読み、ビットを切り出し、止まって
+        // いる本数ぶん空振りするのは、変わらない答えを繰り返し計算して
+        // いることになる。実機と同じ run() 経路のプロファイルでは
+        // Mfp::tick の前置きだけで約 330 サンプル (全体の 6%)。
+        //
+        // 一度この最適化を 0.0% と判定して捨てたことがある。当時の run() は
+        // 8 サイクルの quantum を使っており、ホスト側は quantum を通らない
+        // step() 経路でプロファイルを取っていたため、Mfp::tick の前置きが
+        // 埋もれて見えていた (aed4797)。quantum はその後、観測可能なずれを
+        // 作ると分かって撤廃した。
+        for (u32 i = 0; i < runningCount_; ++i)
+        {
+            const RunningTimer& t = running_[i];
+            u32& counter = prescaleCounter_[t.index];
+            counter += mfpCycles;
+            if (counter < t.prescale)
+            {
+                continue;  // まだ 1 回も減らない。ここが最頻。
+            }
+            tickTimerCounted(static_cast<int>(t.index), t.prescale);
+        }
+    }
+
+private:
+    // 動作中のタイマ 1 本ぶんの決まりきった情報。
+    struct RunningTimer
+    {
+        std::size_t index = 0;  // 0-3
+        u32 prescale = 0;       // MFP サイクル単位
+    };
+
+    // 制御レジスタから running_ を組み直す。制御レジスタを書いたときに呼ぶ。
+    void refreshRunningTimers()
+    {
+        const u8 tcdcr = reg_[kTcdcr];
+        const u8 ctl[4] = {reg_[kTacr], reg_[kTbcr], static_cast<u8>((tcdcr >> 4) & 7u),
+                           static_cast<u8>(tcdcr & 7u)};
+        runningCount_ = 0;
+        for (std::size_t i = 0; i < 4; ++i)
+        {
+            // bit3 が立つモードは外部入力 TAI/TBI を要する。未実装なので
+            // 経過サイクルだけでは進められない (timerPrescale と同じ判定)。
+            const bool needsExternalInput = (ctl[i] & 0x08u) != 0;
+            if (needsExternalInput)
+            {
+                continue;
+            }
+            const u32 prescale = kPrescaleTable[ctl[i] & 7u];
+            if (prescale == 0)
+            {
+                continue;
+            }
+            running_[runningCount_].index = i;
+            running_[runningCount_].prescale = prescale;
+            ++runningCount_;
+        }
+    }
+
+public:
     // 垂直帰線の開始/終了を通知する。GPIP4 の状態が変わり、
     // 設定によっては割り込みが上がる。
     void setVerticalBlank(bool active);
@@ -119,13 +212,37 @@ public:
     }
 
     // 保留中で、マスクされていない割り込みがあるか。
-    [[nodiscard]] bool hasPendingInterrupt() const;
+    //
+    // ここは **毎命令通る**。実行時間の大半は「保留が 1 つも無い」状態なので、
+    // その判定だけをインラインに置き、実際に保留があるときだけ .cpp 側の
+    // 完全な判定 (serviceBlockMask を含む) を呼ぶ。
+    //
+    // IPR & IMR が 0 なら、どんなマスクを掛けても 0 のまま。つまり
+    // serviceBlockMask を見るまでもなく「保留無し」が確定する。
+    //
+    // Why not 全部インラインにしないか: serviceBlockMask は ISR を走査する
+    // ループを含み、展開すると命令フェッチの熱い経路を押し出す。ESP32-S3 の
+    // I-cache では、この経路を小さく保つこと自体が効く (デバイス tick の
+    // まとめ込みが実機だけで +12.8% だったのと同じ理由)。
+    [[nodiscard]] bool hasPendingInterrupt() const
+    {
+        const bool anyPending = ((reg_[kIpra] & reg_[kImra]) | (reg_[kIprb] & reg_[kImrb])) != 0;
+        if (!anyPending)
+        {
+            return false;
+        }
+        return hasPendingInterruptBlocked();
+    }
 
     // 最も優先度の高い保留割り込みのベクタ番号を返し、その割り込みを
     // サービス中へ移す。保留が無ければ 0 を返す。
     u32 acknowledgeInterrupt();
 
 private:
+    // hasPendingInterrupt() の遅い側。IPR & IMR に何か立っているときだけ
+    // 呼ばれ、Software EOI の抑止を含めて判定する。
+    [[nodiscard]] bool hasPendingInterruptBlocked() const;
+
     void raise(bool groupA, u8 bit);
 
     // Software EOI でサービス中のチャネルより下位を抑止するマスク。
@@ -141,13 +258,18 @@ private:
     // タイマを停止させたら、プリスケーラの端数を捨てる。
     // 実機はメインカウンタを保つ一方、プリスケーラの残量は失う。
     void clearPrescalerIfStopped(int index, u8 control);
-    void tickTimer(int index, u8 control, u32 cycles);
+    // 分周の閾値に達したぶんだけカウンタを減らし、必要なら割り込みを上げる。
+    // 累算は呼び出し側 (tickOne) が済ませてある。
+    void tickTimerCounted(int index, u32 prescale);
 
     std::array<u8, kRegCount> reg_{};
     // 各タイマの分周カウンタ。実機の分周器に相当する。
     std::array<u32, 4> prescaleCounter_{};
     // タイマの現在値。データレジスタ書き込みでリロードされる。
     std::array<u8, 4> timerValue_{};
+    // 動作中のタイマだけを詰めた表。refreshRunningTimers() が作る。
+    std::array<RunningTimer, 4> running_{};
+    u32 runningCount_ = 0;
 };
 
 }  // namespace x68k

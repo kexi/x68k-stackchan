@@ -8,16 +8,6 @@ namespace x68k
 namespace
 {
 
-// タイマ制御レジスタの下位 3bit が分周比を表す。
-// 0 は停止、1-7 が それぞれ 4/10/16/50/64/100/200 分周。
-constexpr u32 kPrescaleTable[8] = {0, 4, 10, 16, 50, 64, 100, 200};
-
-// X68000 の MFP のクロックは 4MHz。CPU は 10MHz なので、
-// CPU サイクルを MFP サイクルへ換算する必要がある。
-// 分数のままだと毎回割り算が入るので、CPU サイクルを 2 で割って近似する
-// (4/10 ≒ 1/2.5 だが、タイマ精度は Human68k の起動には影響しない)。
-constexpr u32 kCpuToMfpShift = 1;
-
 // GPIP4 (垂直帰線) のビット位置。
 constexpr u8 kGpipVDisp = 0x10;
 
@@ -55,6 +45,9 @@ void Mfp::reset()
     // 本エミュレータは送信を即座に完了したものとして扱うので、
     // 常に空いていることにする。
     reg_[kTsr] = kTsrBufferEmpty;
+
+    // 制御レジスタを 0 にしたので動作中タイマの表も空にする。
+    refreshRunningTimers();
 }
 
 u8 Mfp::read(u32 regIndex)
@@ -169,16 +162,19 @@ void Mfp::write(u32 regIndex, u8 value)
         case kTacr:
             reg_[kTacr] = value;
             clearPrescalerIfStopped(0, value);
+            refreshRunningTimers();
             return;
         case kTbcr:
             reg_[kTbcr] = value;
             clearPrescalerIfStopped(1, value);
+            refreshRunningTimers();
             return;
         case kTcdcr:
             reg_[kTcdcr] = value;
             // C は上位 3bit、D は下位 3bit。別々に見る。
             clearPrescalerIfStopped(2, static_cast<u8>((value >> 4) & 7u));
             clearPrescalerIfStopped(3, static_cast<u8>(value & 7u));
+            refreshRunningTimers();
             return;
 
         // ベクタレジスタ。S を落としたら ISR を捨てる。
@@ -248,7 +244,7 @@ u32 Mfp::timerPrescale(u8 control) const
     {
         return 0;
     }
-    return kPrescaleTable[control & 7u];
+    return Mfp::kPrescaleTable[control & 7u];
 }
 
 void Mfp::loadTimerIfStopped(int index, u8 control, u8 value)
@@ -285,17 +281,8 @@ void Mfp::raise(bool groupA, u8 bit)
     reg_[iprIndex] |= bit;
 }
 
-void Mfp::tickTimer(int index, u8 control, u32 cycles)
+void Mfp::tickTimerCounted(int index, u32 prescale)
 {
-    const u32 prescale = timerPrescale(control);
-    if (prescale == 0)
-    {
-        // 停止中か、TAI/TBI を要するモード。後者は入力を実装していないので、
-        // 経過サイクルだけでは進めようがない。
-        return;
-    }
-
-    prescaleCounter_[static_cast<std::size_t>(index)] += cycles;
     while (prescaleCounter_[static_cast<std::size_t>(index)] >= prescale)
     {
         prescaleCounter_[static_cast<std::size_t>(index)] -= prescale;
@@ -336,21 +323,6 @@ void Mfp::tickTimer(int index, u8 control, u32 cycles)
                 break;
         }
     }
-}
-
-void Mfp::tick(u32 cycles)
-{
-    const u32 mfpCycles = cycles >> kCpuToMfpShift;
-    if (mfpCycles == 0)
-    {
-        return;
-    }
-
-    tickTimer(0, reg_[kTacr], mfpCycles);
-    tickTimer(1, reg_[kTbcr], mfpCycles);
-    // タイマ C は TCDCR の上位 3bit、タイマ D は下位 3bit。
-    tickTimer(2, static_cast<u8>((reg_[kTcdcr] >> 4) & 7u), mfpCycles);
-    tickTimer(3, static_cast<u8>(reg_[kTcdcr] & 7u), mfpCycles);
 }
 
 void Mfp::setVerticalBlank(bool active)
@@ -438,7 +410,7 @@ u8 Mfp::serviceBlockMask(bool groupA) const
     return allowed;
 }
 
-bool Mfp::hasPendingInterrupt() const
+bool Mfp::hasPendingInterruptBlocked() const
 {
     const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra] & serviceBlockMask(true));
     const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb] & serviceBlockMask(false));

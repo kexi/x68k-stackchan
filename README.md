@@ -43,7 +43,10 @@ A>
 CoreS3 の LCD は 320x240、Human68k のコンソールは 768x512 なので、等倍で
 40 桁 x 15 行を切り出して表示します。書き込みが進むと表示位置がそこへ追従します。
 
-実効クロックは **3.3MHz**（実機 10MHz の 33%）。
+実効クロックは **3.3MHz**（実機 10MHz の 33%）。ただしこれは
+メインメモリ 1MB・テキスト画面のみだった頃の実測値です。その後
+2MB 化とグラフィック画面の重ね合わせを入れたぶん下がっているはずで、
+**再測定はまだしていません**（[#4](https://github.com/kexi/x68k-stackchan/issues/4)）。
 
 USB シリアルからキーを打てます。`~` を送るとテキスト画面を ASCII に逆引きして
 返すので、LCD を見なくても画面の内容を確認できます。
@@ -67,8 +70,11 @@ just make-cgrom <東雲フォントの bdf ディレクトリ> sd/cgrom.dat
 検証の状況:
 
 - 68000 コアは [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000)
-  の命令単位テストベクタで検証済み（`just test-vectors`）
-- ホストの単体テストは 158 test cases / 788 assertions が通る（`just test-host`）
+  の命令単位テストベクタで検証済み（`just test-vectors`）。
+  127 suites / 128,236 件が既知の失敗なしで通ります。除外しているのは
+  upstream が「検証できていない」と明記している TAS / TRAPV の 2 命令だけです
+  （[#6](https://github.com/kexi/x68k-stackchan/issues/6)）
+- ホストの単体テストは 309 test cases / 1829 assertions が通る（`just test-host`）
 - 実機ファーム（ESP-IDF）のビルドが通る。バイナリは約 480KB
 
 | 実装 | 状態 |
@@ -78,9 +84,51 @@ just make-cgrom <東雲フォントの bdf ディレクトリ> sd/cgrom.dat
 | SASI（起動デバイス）+ DMAC | 実装済み。ここから Human68k がロードされる |
 | FDC | 実装済み。Human68k の初期化が通る |
 | テキスト画面（4 プレーン合成） | 実装済み |
+| グラフィック画面（G-VRAM 16 / 256 / 65536 色、テキストとの重ね合わせ） | 実装済み。実機のソフトでの確認は未 |
+| SCC（Z8530）のマウス | 実装済み。実機のソフトでの確認は未 |
 | 実機バックエンド（SD / LCD / タッチ入力 / シリアル） | 実装済み。実機で Human68k が動く |
-| グラフィック画面・FM 音源・スプライト | 未実装 |
+| FM 音源・ADPCM・スプライト・BG | 未実装 |
 | スタックチャン統合（顔表示・サーボ） | 未実装 |
+
+### SX-Window（Human68k の純正 GUI）について
+
+GUI を動かすための前提は入れてあります（グラフィック画面、マウス、
+メインメモリ 2MB）。レジスタの解釈とマウスのプロトコルは資料ではなく
+**IPL-ROM を逆アセンブルして裏取り**しています（根拠のアドレスは
+`src/x68k/core/dev/scc.h` と `src/x68k/core/dev/video.h` のコメントに
+書いてあります）。
+
+ただし **SX-Window 本体のディスクイメージは同梱できない**ので、
+実際に起動させて確かめたわけではありません。イメージを用意すれば
+そのまま試せる状態、というところまでです。
+
+GUI が使う経路 (G-VRAM / パレット / プライオリティ合成 / SCC マウス) を
+自前の 68000 プログラムで通しで叩くデモがあります。重なった窓と
+メニューバーが出て、マウスがゲストの割り込みハンドラまで届きます。
+
+```
+just build-host
+./build-host/x68k-run --iplrom rom/iplrom.dat --gui-demo /tmp/gui.ppm
+```
+
+**これは SX-Window ではありません。** 足りないものは
+[docs/knowledge/sx-window-requirements.md](docs/knowledge/sx-window-requirements.md) に
+1 項目ずつ挙げてあります。
+
+### Human68k の起動イメージは自分で作れます
+
+「イメージが無いから試せない」と思いがちですが、**Human68k を展開した
+ディレクトリがあれば、そこから起動可能な HDD イメージを作れます**。
+
+```
+just make-hdd <Human68k を展開したディレクトリ> rom/hdd0.hdf
+just run --hdd rom/hdd0.hdf --cycles 900000000 --keys "dir
+" --dump-text
+```
+
+`A>` プロンプトが出て `dir` が動くところまで確認できます
+(`dir` の結果まで見るならサイクルは 9 億ほど要ります)。
+`--ppm` を付ければテキストとグラフィックを合成した画面を画像で出せます。
 
 ## なぜ自作するのか
 

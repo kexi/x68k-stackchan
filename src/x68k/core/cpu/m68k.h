@@ -23,6 +23,30 @@
 
 #include "m68k_types.h"
 
+// ホットパスを内部 SRAM (IRAM) へ置くための印。
+//
+// ESP32-S3 では実行コードの既定の置き場所が Flash で、キャッシュミスのたびに
+// SPI 越しの読み出しが挟まる。命令ディスパッチのように「毎命令必ず通る」
+// 関数はここが効く。IRAM へ置けばキャッシュを介さず内部 SRAM から直接実行
+// できるので、ミスの分がまるごと消える。
+//
+// Why not <esp_attr.h> の IRAM_ATTR をそのまま使うか: core/ は ESP32 非依存
+// でなければならず (ホストでテストとエミュレータを回すのが開発速度の前提)、
+// esp_ 系のヘッダを含めた時点で core-guard が落ちる。IRAM_ATTR の実体は
+// セクション属性 1 つなので、同じものを自前で書けば依存を持ち込まずに済む。
+//
+// Why not ESP_PLATFORM ではなく __XTENSA__ で分けるか: __XTENSA__ は Xtensa
+// 向けのツールチェーンなら何でも立つ。ESP-IDF のリンカスクリプトが無い環境で
+// .iram1 を指定すると配置先の無いセクションになる。ESP-IDF が必ず定義する
+// ESP_PLATFORM を使えば「IDF でビルドされている」ことを直接表せる。
+//
+// ホストでは空に展開されるので、テストもエミュレータも今までどおり動く。
+#if defined(ESP_PLATFORM)
+#define X68K_HOT_PATH __attribute__((section(".iram1")))
+#else
+#define X68K_HOT_PATH
+#endif
+
 namespace x68k
 {
 
@@ -31,12 +55,16 @@ class M68k
 public:
     explicit M68k(Bus& bus) : bus_(bus) {}
 
+    // 68000 の外部アドレスバスは 24bit。上位 8bit は出ないので、
+    // アドレス計算の結果は必ずここで折り返す。
+    static constexpr u32 kAddrMask = 0x00FFFFFFu;
+
     // ベクタ $000 から SSP、$004 から PC を読んで初期化する。
     void reset();
 
     // 命令を 1 つ実行し、消費したサイクル数を返す。
     // halted または stopped の場合は何もせず 0 を返す。
-    u32 step();
+    X68K_HOT_PATH u32 step();
 
     // 割り込みを要求する。level は 1-7 (7 はマスク不可)。
     // 実際に受け付けられるかは SR の割り込みマスクによる。
@@ -76,21 +104,163 @@ public:
     // 完全に指定したいので、setSr のような副作用を挟まない。
     void loadStateForTest(const M68kState& s);
 
+    // 仮想関数を通さずに直接触ってよいメインメモリの窓を教える。
+    //
+    // Why これが要るか: Bus::read16 は virtual なので、命令フェッチとオペランド
+    // 読みのたびに vtable 経由の間接呼び出しになる。呼び先が確定しないため
+    // インライン展開もできず、短い関数なのに呼び出し規約の分だけ必ず払う。
+    // CoreS3 の実測ではスライスの 80% が run() の中で、その大半がこの経路。
+    //
+    // 窓は「先頭から length バイトが base の指す配列そのもの」であること。
+    // SystemBus が同じ配列を指しているので、DMA (Machine::dmaMemRead) が
+    // バス経由で触っても同じ実体に当たる。写しではないのでコヒーレンシの
+    // 問題が起きない。
+    //
+    // Why not CPU に写しを持たせないか: DMAC と CPU が同じ番地を触るので、
+    // 写しにすると SASI の転送結果が CPU から見えない (あるいはその逆)。
+    // ポインタを共有する形なら、そもそも同期する対象が無い。
+    //
+    // Why not M68k をバス型でテンプレート化しないか: テストベクタの検証は
+    // 疎な連想配列のバス実装を渡して回している (test/test_m68k_vectors.cpp)。
+    // テンプレート化すると CPU コアのインスタンスがバス実装ごとに増え、
+    // 「CPU だけを切り離して検証する」という Bus の存在意義が薄れる。
+    // 窓を教えるだけなら、教えなければ今までどおり全部が仮想関数を通る。
+    //
+    // romAtZero は「$000000 に IPL-ROM が写像されている」間 true。写像中は
+    // 窓の読み出しが RAM ではなく ROM 側に当たるので、fast path を止める。
+    void setFastRam(u8* base, u32 length)
+    {
+        fastRam_ = base;
+        fastRamLimit_ = base != nullptr ? length : 0;
+    }
+
+    // $000000 の ROM 写像が外れたかどうかを伝える。
+    //
+    // 写像中は読み出しが ROM に当たるため、RAM の窓を使ってはいけない。
+    // SystemBus::setRomMappedAtZero と必ず対で呼ぶ。
+    void setFastRamReadable(bool readable)
+    {
+        fastRamReadable_ = readable;
+    }
+
+    // 仮想関数を通さずに読んでよい IPL-ROM の窓を教える。
+    //
+    // Why メイン RAM と別に持つか: CPU のメモリアクセスを実際に数えたら、
+    // IPL-ROM が全体の 79% で最頻だった (メイン RAM は 17.7%)。
+    // 内訳は docs/knowledge/cores3-emulator-runtime.md にある。
+    // 起動処理も IOCS も本体は ROM 内にあり、命令フェッチがそこへ集中する。
+    //
+    // ROM は書けないので読み出しだけを通す。busBase は「この窓の先頭が
+    // 68000 のアドレス空間のどこに見えるか」で、X68000 では $FE0000。
+    //
+    // Why not アドレスを m68k.h に定数で持たないか: 68000 コアは機種の
+    // アドレス配置 (memmap.h) を知らないでいるべきで、その独立性こそ
+    // Bus を挟んでいる理由。窓の位置は必ず SystemBus から教わる。
+    void setFastRom(const u8* base, u32 busBase, u32 length)
+    {
+        fastRom_ = base;
+        fastRomBase_ = busBase;
+        fastRomLength_ = base != nullptr ? length : 0;
+    }
+
 private:
+    // fast path を通してよいアクセスか。
+    //
+    // 2 バイトとも窓に収まることを見る。境界をまたぐワードは
+    // 配列の外を触るので、必ず遅い経路 (バス) に落とす。
+    [[nodiscard]] bool fastRamHasWord(u32 a) const
+    {
+        return fastRam_ != nullptr && a + 1 < fastRamLimit_;
+    }
+    [[nodiscard]] bool fastRamHasByte(u32 a) const
+    {
+        return fastRam_ != nullptr && a < fastRamLimit_;
+    }
+    // ロングは 4 バイトとも窓に収まるときだけ。またぐアクセスは境界を
+    // 正しく見せるために遅い経路 (バス) へ落とす。
+    [[nodiscard]] bool fastRamHasLong(u32 a) const
+    {
+        return fastRam_ != nullptr && a + 3 < fastRamLimit_;
+    }
+
+    // IPL-ROM の窓に size バイトとも収まるか。収まれば ROM 内オフセットを返す。
+    // またぐアクセスは遅い経路 (バス) に落として境界を正しく見せる。
+    [[nodiscard]] bool fastRomHas(u32 a, u32 size, u32& offsetOut) const
+    {
+        if (fastRom_ == nullptr || a < fastRomBase_)
+        {
+            return false;
+        }
+        const u32 off = a - fastRomBase_;
+        if (off + size > fastRomLength_)
+        {
+            return false;
+        }
+        offsetOut = off;
+        return true;
+    }
+
     // --- プリフェッチ --------------------------------------------------------
     // 命令語を 1 ワード取り出し、キューを 1 つ進める。
-    u16 fetch();
+    //
+    // **全命令が必ず 1 回以上通る**。中身はキューをずらして 1 ワード読むだけ
+    // なので、.cpp 側に置くと実体より呼び出しの方が高くつく。
+    //
+    // 読み出し先は IPL-ROM かメイン RAM のどちらか (実測で ROM 79% /
+    // RAM 17.7%)。その 2 つは窓が張ってあるので、ここで直接引く。
+    // 窓の外 (I/O やバスエラー領域) から命令を読むことは通常起きないが、
+    // 起きたときのために .cpp の read16 へ落とす。
+    u16 fetch()
+    {
+        const u16 value = st_.ir;
+        st_.ir = st_.irc;
+
+        // PC は既に「次に読むアドレス」を指している。
+        const u32 a = st_.pc & kAddrMask;
+
+        // 奇数アドレスからのワード読みはアドレスエラー。
+        //
+        // Why 窓の判定より前に置くか: 下の直接経路は read16 を通らないので、
+        // ここで見ないとアドレスエラーが起きないまま奇数番地から命令語を
+        // 組み立ててしまう。通常は refillPrefetch が奇数分岐を弾くので
+        // 到達しにくいが、loadStateForTest で奇数 PC を流し込むと差が出る
+        // (インライン化前は read16 の中で必ず判定していた)。
+        if ((a & 1) != 0)
+        {
+            st_.irc = read16(a);
+            st_.pc = st_.pc + 2;
+            return value;
+        }
+
+        if (fastRamReadable_ && fastRamHasWord(a))
+        {
+            st_.irc = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+        }
+        else if (u32 off = 0; fastRomHas(a, 2, off))
+        {
+            st_.irc = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+        }
+        else
+        {
+            st_.irc = read16(a);
+        }
+        st_.pc = st_.pc + 2;
+        return value;
+    }
     // プリフェッチキューを PC の位置から埋め直す (分岐後など)。
-    void refillPrefetch(u32 newPc);
+    X68K_HOT_PATH void refillPrefetch(u32 newPc);
 
     // --- メモリアクセス ------------------------------------------------------
     // ワード/ロングの奇数アドレスアクセスはアドレスエラーになる。
-    u8 read8(u32 addr);
-    u16 read16(u32 addr);
-    u32 read32(u32 addr);
-    void write8(u32 addr, u8 value);
-    void write16(u32 addr, u16 value);
-    void write32(u32 addr, u32 value);
+    //
+    // 命令フェッチとオペランドの読み書きが全部ここを通る。実測で 1 スライス
+    // (20000 サイクル) の 8 割が run() の中なので、この経路が最も効く。
+    X68K_HOT_PATH u8 read8(u32 addr);
+    X68K_HOT_PATH u16 read16(u32 addr);
+    X68K_HOT_PATH u32 read32(u32 addr);
+    X68K_HOT_PATH void write8(u32 addr, u8 value);
+    X68K_HOT_PATH void write16(u32 addr, u16 value);
+    X68K_HOT_PATH void write32(u32 addr, u32 value);
 
     // --- 例外 ----------------------------------------------------------------
     // 積む PC の基準が 2 通りある。TRAP / CHK / DIVU の 0 除算 / 割り込みは
@@ -107,9 +277,115 @@ private:
     // --- 実効アドレス --------------------------------------------------------
     // mode/reg から実効アドレスを計算する。size はディスプレースメント計算と
     // -(An)/(An)+ の増減幅に効く (バイトで A7 を触ると 2 増減する特例がある)。
-    u32 effectiveAddress(u32 mode, u32 reg, u32 size);
-    u32 readEa(u32 mode, u32 reg, u32 size);
-    void writeEa(u32 mode, u32 reg, u32 size, u32 value);
+    // mode 2/3/4 ((An) / (An)+ / -(An)) はレジスタの読み書きだけで済むので
+    // ここで捌く。拡張ワードを読む mode 5-7 は .cpp 側へ回す。
+    //
+    // この 3 つはメモリを触る命令で最も多い形。展開しても分岐 2 つと
+    // 加減算 1 つにしかならない。
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // そのまま増減幅になる。A7 をバイトで触るときだけ 2 にする特例は、
+    // スタックポインタが奇数になるとアドレスエラーになるため。
+    u32 effectiveAddress(u32 mode, u32 reg, u32 size)
+    {
+        if (mode == 2)  // (An)
+        {
+            return st_.a[reg];
+        }
+        if (mode == 3)  // (An)+
+        {
+            const u32 addr = st_.a[reg];
+            const u32 step = (reg == 7 && size == 1) ? 2u : size;
+            st_.a[reg] = addr + step;
+            return addr;
+        }
+        if (mode == 4)  // -(An)
+        {
+            const u32 step = (reg == 7 && size == 1) ? 2u : size;
+            st_.a[reg] = st_.a[reg] - step;
+            return st_.a[reg];
+        }
+        return effectiveAddressSlow(mode, reg, size);
+    }
+
+    X68K_HOT_PATH u32 effectiveAddressSlow(u32 mode, u32 reg, u32 size);
+    // レジスタ直接 (mode 0/1) だけをここで捌き、それ以外は .cpp の
+    // 実効アドレス計算へ回す。
+    //
+    // MOVE は全命令の 19.2% で、その転送元・転送先はレジスタ直接が最頻。
+    // プロファイルでは groupMove の readEa 行 (179) と writeEa 行 (151) が
+    // 命令実装の中で最大の 2 項目だった。どちらも .cpp 側にあり、
+    // ESP32-S3 では実呼び出しになる。
+    //
+    // Why not 全部インラインにしないか: mode 2-7 は拡張ワードの読み出しや
+    // ポインタの増減を含み、展開すると呼び出し側 (各命令グループ) が
+    // 一斉に膨らむ。I-cache を押し出して逆効果になりうる。
+    // レジスタ直接は「配列を 1 つ引いて型を切る」だけなので、
+    // 呼び出しの方が高くつく。
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // ここは m68k_alu.h を include せずに済ませたいので数値で書くが、
+    // **0/1/2 ではない**。一度そう思い込んで書き、適合性ベクタが
+    // 25 件落ちた (MOVE.b の転送元が常に 0 になった)。
+    u32 readEa(u32 mode, u32 reg, u32 size)
+    {
+        if (mode == 0)
+        {
+            const u32 v = st_.d[reg];
+            if (size == 1)  // kByte
+            {
+                return v & 0xFFu;
+            }
+            if (size == 2)  // kWord
+            {
+                return v & 0xFFFFu;
+            }
+            return v;
+        }
+        if (mode == 1)
+        {
+            // An はワード指定でも符号拡張された 32bit として読まれる。
+            const u32 v = st_.a[reg];
+            if (size == 2)  // kWord
+            {
+                return static_cast<u32>(static_cast<s32>(static_cast<s16>(v)));
+            }
+            return v;
+        }
+        return readEaSlow(mode, reg, size);
+    }
+
+    void writeEa(u32 mode, u32 reg, u32 size, u32 value)
+    {
+        if (mode == 0)
+        {
+            // Dn への書き込みはサイズぶんだけを差し替える。上位は保存される。
+            u32& d = st_.d[reg];
+            if (size == 1)  // kByte
+            {
+                d = (d & 0xFFFFFF00u) | (value & 0xFFu);
+                return;
+            }
+            if (size == 2)  // kWord
+            {
+                d = (d & 0xFFFF0000u) | (value & 0xFFFFu);
+                return;
+            }
+            d = value;
+            return;
+        }
+        if (mode == 1)
+        {
+            // An への書き込みは常に 32bit。ワード指定なら符号拡張される。
+            st_.a[reg] =
+                size == 2 ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
+            return;
+        }
+        writeEaSlow(mode, reg, size, value);
+    }
+
+    X68K_HOT_PATH u32 readEaSlow(u32 mode, u32 reg, u32 size);
+    X68K_HOT_PATH void writeEaSlow(u32 mode, u32 reg, u32 size, u32 value);
     // 書き込み先の実効アドレスを一度だけ計算して使い回すための版。
     // ADD.b (An)+,D0 のように「読んでから同じ場所へ書く」命令で、
     // ポインタを二重に進めてしまう事故を防ぐ。
@@ -117,28 +393,118 @@ private:
     void writeEaToAddr(u32 mode, u32 reg, u32 size, u32 addr, u32 value);
 
     // --- フラグ --------------------------------------------------------------
-    void setLogicFlags(u32 value, u32 size);
-    [[nodiscard]] bool testCondition(u32 cond) const;
+    // 論理演算後の N/Z を作る。V と C はクリア、X は変化しない。
+    //
+    // MOVE / AND / OR / EOR / NOT / TST / CLR / SWAP / EXT が使う、
+    // 最も多く呼ばれるフラグ更新。実装は m68k.cpp にあり、命令グループは
+    // 別 TU なので ESP32-S3 では必ず実呼び出しになっていた。
+    // (TU を跨ぐ呼び出しのインライン化だけが実測で効く — readEa +2.8%、
+    //  fetch +3.6%、同一 TU の effectiveAddress は 0.0% だった)
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // ここでは m68k_alu.h を include せずに済ませたいので数値で書く。
+    // **0/1/2 ではない** — 一度そう思い込んで適合性ベクタを 25 件落とした。
+    void setLogicFlags(u32 value, u32 size)
+    {
+        u16 sr = static_cast<u16>(
+            st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
+        u32 v = value;
+        u32 sign = 0x80000000u;
+        if (size == 1)  // kByte
+        {
+            v &= 0xFFu;
+            sign = 0x80u;
+        }
+        else if (size == 2)  // kWord
+        {
+            v &= 0xFFFFu;
+            sign = 0x8000u;
+        }
+        if (v == 0)
+        {
+            sr |= sr_bit::kZero;
+        }
+        if ((v & sign) != 0)
+        {
+            sr |= sr_bit::kNegative;
+        }
+        st_.sr = sr;
+    }
+    // 条件コードを評価する。Bcc / DBcc / Scc が使う。
+    //
+    // 分岐は全命令の 22.3% で、その全部がここを通る。実装は m68k.cpp に
+    // あり、命令グループは別 TU なので実呼び出しになっていた。
+    [[nodiscard]] bool testCondition(u32 cond) const
+    {
+        const bool c = (st_.sr & sr_bit::kCarry) != 0;
+        const bool v = (st_.sr & sr_bit::kOverflow) != 0;
+        const bool z = (st_.sr & sr_bit::kZero) != 0;
+        const bool n = (st_.sr & sr_bit::kNegative) != 0;
+
+        switch (cond)
+        {
+            case 0x0:
+                return true;  // T
+            case 0x1:
+                return false;  // F
+            case 0x2:
+                return !c && !z;  // HI
+            case 0x3:
+                return c || z;  // LS
+            case 0x4:
+                return !c;  // CC (HS)
+            case 0x5:
+                return c;  // CS (LO)
+            case 0x6:
+                return !z;  // NE
+            case 0x7:
+                return z;  // EQ
+            case 0x8:
+                return !v;  // VC
+            case 0x9:
+                return v;  // VS
+            case 0xA:
+                return !n;  // PL
+            case 0xB:
+                return n;  // MI
+            case 0xC:
+                return n == v;  // GE
+            case 0xD:
+                return n != v;  // LT
+            case 0xE:
+                return !z && (n == v);  // GT
+            default:
+                return z || (n != v);  // LE
+        }
+    }
 
     // --- 命令グループ --------------------------------------------------------
     // 戻り値は消費サイクル数。未実装なら halted を立てて 0 を返す。
-    u32 execute(u16 op);
-    u32 groupMove(u16 op, u32 size);
-    u32 groupImmediate(u16 op);  // 0000: ORI/ANDI/SUBI/ADDI/EORI/CMPI/BTST 等
-    u32 groupMisc(u16 op);       // 0100: MOVEM/LEA/JMP/JSR/CLR/NEG/NOT/TST/EXT 等
-    u32 groupQuickAlu(u16 op);   // 0101: ADDQ/SUBQ/Scc/DBcc
-    u32 groupBranch(u16 op);     // 0110: Bcc/BRA/BSR
-    u32 groupMoveq(u16 op);      // 0111
-    u32 groupOrDiv(u16 op);      // 1000: OR/DIVU/DIVS/SBCD
-    u32 groupSub(u16 op);        // 1001: SUB/SUBA/SUBX
-    u32 groupCmpEor(u16 op);     // 1011: CMP/CMPA/CMPM/EOR
-    u32 groupAndMul(u16 op);     // 1100: AND/MULU/MULS/ABCD/EXG
-    u32 groupAdd(u16 op);        // 1101: ADD/ADDA/ADDX
+    // どのグループを IRAM へ置くかは、ホストの `just run --stats` で採った
+    // 実行頻度で決めた (IPL-ROM から Human68k のプロンプトまで 2 億サイクル、
+    // 2055 万命令)。内訳は misc 25.2% / 分岐 22.3% / 即値 13.8% /
+    // MOVE.b 11.5% / MOVE.w 4.7% / ADDQ 等 3.8% / AND・MUL 3.7% /
+    // ADD 3.5% / MOVE.l 3.0% / シフト 2.8% / CMP・EOR 2.0% / MOVEQ 1.9%。
+    // 上位 4 つで 7 割を超えるが、groupMove は 3 サイズが 1 関数を共有する
+    // ので合わせて 19.2% になる。残りの OR/DIV と SUB は 1% 未満なので
+    // Flash に置いたままにして IRAM を節約する。
+    X68K_HOT_PATH u32 execute(u16 op);
+    X68K_HOT_PATH u32 groupMove(u16 op, u32 size);  // 19.2% (b/w/l 合計)
+    X68K_HOT_PATH u32 groupImmediate(u16 op);  // 0000: ORI/ANDI/SUBI/ADDI/EORI/CMPI/BTST 等 13.8%
+    X68K_HOT_PATH u32 groupMisc(u16 op);  // 0100: MOVEM/LEA/JMP/JSR/CLR/NEG/NOT/TST/EXT 等 25.2%
+    X68K_HOT_PATH u32 groupQuickAlu(u16 op);  // 0101: ADDQ/SUBQ/Scc/DBcc 3.8%
+    X68K_HOT_PATH u32 groupBranch(u16 op);    // 0110: Bcc/BRA/BSR 22.3%
+    X68K_HOT_PATH u32 groupMoveq(u16 op);     // 0111 1.9%
+    u32 groupOrDiv(u16 op);                   // 1000: OR/DIVU/DIVS/SBCD 0.9% (Flash のまま)
+    u32 groupSub(u16 op);                     // 1001: SUB/SUBA/SUBX 0.9% (Flash のまま)
+    X68K_HOT_PATH u32 groupCmpEor(u16 op);    // 1011: CMP/CMPA/CMPM/EOR 2.0%
+    X68K_HOT_PATH u32 groupAndMul(u16 op);    // 1100: AND/MULU/MULS/ABCD/EXG 3.7%
+    X68K_HOT_PATH u32 groupAdd(u16 op);       // 1101: ADD/ADDA/ADDX 3.5%
     // ABCD と SBCD。命令語の形式が同じで補正の向きだけが違うのでまとめる。
     // memoryMode は -(Ay),-(Ax) 形式か、isAdd は ABCD か SBCD か。
     u32 execBcdAddSub(u16 op, bool memoryMode, bool isAdd);
 
-    u32 groupShift(u16 op);
+    X68K_HOT_PATH u32 groupShift(u16 op);  // 2.8%
     // メモリに対する 1 ビットシフト。命令語の形式がレジスタ版と違う。
     u32 memoryShift(u16 op);  // 1110: ASL/ASR/LSL/LSR/ROL/ROR/ROXL/ROXR
 
@@ -146,6 +512,15 @@ private:
     u32 unimplemented(u16 op);
 
     Bus& bus_;
+    // 仮想関数を通さずに触れるメインメモリ。所有しない (bus_ と同じ実体を指す)。
+    u8* fastRam_ = nullptr;
+    u32 fastRamLimit_ = 0;
+    // 仮想関数を通さずに読める IPL-ROM。所有しない。
+    const u8* fastRom_ = nullptr;
+    u32 fastRomBase_ = 0;
+    u32 fastRomLength_ = 0;
+    // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
+    bool fastRamReadable_ = false;
     M68kState st_;
     // 保留中の割り込みレベル (0 = なし)。
     u32 pendingIrq_ = 0;

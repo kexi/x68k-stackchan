@@ -43,6 +43,38 @@ bool Sram::hasValidMagic() const
     return data_[kOffsetMagic + 7] == kMagicTail;
 }
 
+bool Sram::loadImage(const std::uint8_t* image, std::size_t length)
+{
+    if (image == nullptr || length != data_.size())
+    {
+        return false;
+    }
+
+    // マジックの検査は取り込む前に、渡されたバイト列に対して行う。
+    //
+    // Why not いったん data_ へ写してから hasValidMagic を見るか: 拒否したとき
+    // 元の内容が既に壊れている。呼び出し側は「拒否されたら工場出荷値へ」と
+    // 判断するので実害は無いように見えるが、ゴミを一度でも SRAM に載せると
+    // 「拒否したのに保存されて次回も同じゴミを読む」経路ができる。
+    for (std::uint32_t i = 0; i < 7; ++i)
+    {
+        if (image[kOffsetMagic + i] != kMagicText[i])
+        {
+            return false;
+        }
+    }
+    if (image[kOffsetMagic + 7] != kMagicTail)
+    {
+        return false;
+    }
+
+    std::memcpy(data_.data(), image, data_.size());
+
+    // 読み込んだ直後は SD の内容と一致している。書き戻す必要は無い。
+    dirty_ = false;
+    return true;
+}
+
 void Sram::formatDefaults()
 {
     data_.fill(0);
@@ -61,14 +93,21 @@ void Sram::formatDefaults()
 
     // 起動デバイスは SASI を最優先にする。
     //
-    // Why not 標準優先順位 ($0000): 標準だと FD から探し始める。本エミュレータの
-    // FDC はドライブ未接続を表すスタブでしかなく、IPL-ROM の
-    // 「RQM|DIO|CB が揃うのを待つ」ループ ($FF89DE) はタイムアウトを持たない。
-    // 応答しなければ永久に待ち、応答すれば「FD がある」と誤認されて
-    // コマンド処理へ進みエラー停止する。どちらにも倒せないので、
-    // FD を経由せず直接 SASI から起動させる。
+    // 元の理由: FDC がドライブ未接続を表すスタブでしかなく、標準優先順位
+    // ($0000) だと FD から探し始めて IPL-ROM の待ちループ ($FF89DE、
+    // タイムアウト無し) で止まる恐れがあった。
     //
-    // FDC を正しく実装すれば標準優先順位に戻せる。
+    // その理由は解消した。FDC はイメージを繋げば実際に読み書きし、繋がなければ
+    // 従来どおりドライブ未接続を返す。標準優先順位でも止まらないことは
+    // ホストで確認済み (ディスク無し / 空の 2HD / 起動可能な SASI イメージの
+    // いずれでも 4 億サイクル走らせて FDC の待ちループに入らない)。
+    //
+    // Why not それでも標準優先順位へ戻さないか: 「止まらない」ことしか
+    // 確認できていない。実物の Human68k イメージを手元に置けないため
+    // (NOTICE.md)、標準優先順位にしたときに Human68k の起動が今までどおり
+    // 通るかは検証できていない。起動デバイスの既定値を変えて Human68k が
+    // 起動しなくなる退行は、FD 起動が使えないことより明確に悪い。
+    // 実物のイメージで両方の優先順位を比べられるようになったら戻せる。
     write16(kOffsetBootDevice, kBootDeviceSasi0);
 
     data_[kOffsetScreenMode] = kDefaultScreenMode;
