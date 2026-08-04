@@ -593,10 +593,24 @@ void Fdc::executeCommand()
             interruptDrive_ = selectedDrive_;
 
             FloppyImage* const img = currentImage();
-            pendingSt0_ =
-                img != nullptr
-                    ? unitSelect()
-                    : static_cast<u8>(kSt0AbnormalTermination | kSt0NotReady | unitSelect());
+            // メディアがあるときは pendingSt0_ を触らない。
+            //
+            // Why not 正常終了 (unitSelect()) を積まないか: uPD72065 の
+            // READ ID は**自前の結果フェーズ**を持つコマンドで、
+            // SENSE INTERRUPT STATUS が返す値ではない。ここで上書きすると、
+            // 直前の SEEK が残した SE (Seek End) が消える。IPL-ROM の起動走査は
+            // $FF0330 の BTST #$1D で ST0 の bit5 (= SE) を見るので、
+            // 消えると「シークが終わっていない」と判断されて再試行に入る。
+            //
+            // 実測: RECAL($20) -> SEEK($20) -> READ ID($00) と続き、
+            // 3 つ目で $C90 が $00 になって走査が進まなくなっていた。
+            //
+            // 異常 (メディア無し) だけは残す。伝わらないと困る。
+            if (img == nullptr)
+            {
+                pendingSt0_ =
+                    static_cast<u8>(kSt0AbnormalTermination | kSt0NotReady | unitSelect());
+            }
             interruptPending_ = true;
             phase_ = Phase::Command;
             commandLength_ = 0;

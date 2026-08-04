@@ -1378,3 +1378,36 @@ TEST_CASE("READ DATA の実行フェーズは RQM を立てて CPU に読ませ�
         CHECK((rig.machine.ioRead8(kFdcStatusPort) & 0x80u) != 0);
     }
 }
+
+TEST_CASE("READ ID は直前のシーク結果を上書きしない")
+{
+    // 保証すること: READ ID が SENSE INTERRUPT STATUS の値を潰さないこと。
+    //
+    // uPD72065 の READ ID は**自前の結果フェーズ**を持つコマンドで、
+    // SENSE INTERRUPT STATUS が返す値ではない。ここで正常終了を積むと、
+    // 直前の SEEK / RECALIBRATE が残した SE (Seek End, bit5) が消える。
+    //
+    // IPL-ROM の起動走査は $FF0330 の BTST #$1D (= ST0 の bit5) を見るので、
+    // 消えると「シークが終わっていない」と判断して再試行に入る。
+    // 実測では RECAL($20) → SEEK($20) → READ ID($00) と続き、3 つ目で
+    // $000C90 が $00 になって走査が止まっていた。
+    Rig rig;
+    FakeFloppy floppy;
+    rig.machine.setFloppyDisk(0, &floppy);
+
+    // SEEK でシリンダ 1 へ。SE が立つ。
+    rig.sendFdcCommand({0x0F, 0x00, 0x01});
+    rig.sendFdcCommand({0x08});  // SENSE INTERRUPT STATUS
+    const x68k::u8 afterSeek = rig.machine.ioRead8(kFdcDataPort);
+    CHECK((afterSeek & 0x20u) != 0);          // SE
+    (void)rig.machine.ioRead8(kFdcDataPort);  // PCN
+
+    // もう一度シークしてから READ ID を投げる。
+    rig.sendFdcCommand({0x0F, 0x00, 0x01});
+    rig.sendFdcCommand({0x0A, 0x00});  // READ ID
+    rig.sendFdcCommand({0x08});
+    const x68k::u8 afterReadId = rig.machine.ioRead8(kFdcDataPort);
+
+    // READ ID の後も SE が残っていること。$00 になっていたら潰されている。
+    CHECK((afterReadId & 0x20u) != 0);
+}
