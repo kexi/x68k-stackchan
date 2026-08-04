@@ -12,12 +12,6 @@ namespace
 // 0 は停止、1-7 が それぞれ 4/10/16/50/64/100/200 分周。
 constexpr u32 kPrescaleTable[8] = {0, 4, 10, 16, 50, 64, 100, 200};
 
-// X68000 の MFP のクロックは 4MHz。CPU は 10MHz なので、
-// CPU サイクルを MFP サイクルへ換算する必要がある。
-// 分数のままだと毎回割り算が入るので、CPU サイクルを 2 で割って近似する
-// (4/10 ≒ 1/2.5 だが、タイマ精度は Human68k の起動には影響しない)。
-constexpr u32 kCpuToMfpShift = 1;
-
 // GPIP4 (垂直帰線) のビット位置。
 constexpr u8 kGpipVDisp = 0x10;
 
@@ -336,21 +330,6 @@ void Mfp::tickTimer(int index, u8 control, u32 cycles)
                 break;
         }
     }
-}
-
-void Mfp::tick(u32 cycles)
-{
-    const u32 mfpCycles = cycles >> kCpuToMfpShift;
-    if (mfpCycles == 0)
-    {
-        return;
-    }
-
-    tickTimer(0, reg_[kTacr], mfpCycles);
-    tickTimer(1, reg_[kTbcr], mfpCycles);
-    // タイマ C は TCDCR の上位 3bit、タイマ D は下位 3bit。
-    tickTimer(2, static_cast<u8>((reg_[kTcdcr] >> 4) & 7u), mfpCycles);
-    tickTimer(3, static_cast<u8>(reg_[kTcdcr] & 7u), mfpCycles);
 }
 
 void Mfp::setVerticalBlank(bool active)

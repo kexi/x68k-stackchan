@@ -94,7 +94,56 @@ public:
     void write(u32 regIndex, u8 value);
 
     // CPU のサイクル数ぶん時間を進める。タイマのカウントダウンを行う。
-    void tick(u32 cycles);
+    //
+    // 停止中のタイマを弾く判定だけをここに置く。プロファイルでは
+    // Mfp::tick と tickTimer の合計が 2171 サンプルで、CPU のディスパッチ
+    // 全体より大きい単独最大の項目だった。tickTimer は .cpp 側にあり、
+    // 4 本ぶん無条件に呼んでいた。
+    //
+    // X68000 が実際に動かすのはタイマ C (システムクロック) と D
+    // (RS-232C ボーレート) だけで、A/B は IOCS が使うときしか動かない。
+    // 止まっているタイマは制御レジスタの下位 3bit が 0 なので、そこを見れば
+    // 呼ぶ前に分かる。
+    //
+    // Why not timerPrescale() をそのまま呼ばないか: あれは bit3 (外部入力を
+    // 要するモード) の判定を含む .cpp 側の関数で、ここで呼ぶと結局 4 回の
+    // 呼び出しが残る。下位 3bit が 0 なら bit3 の値に関わらず停止なので、
+    // 速い側の判定としてはこれで十分 (bit3 が立つ場合は下の tickTimer が
+    // 改めて timerPrescale() を引いて 0 を返す)。
+
+    // MFP は 4MHz、CPU は 10MHz。4/10 ≒ 1/2.5 だが、割り算を避けて 2 で割る
+    // 近似にしてある (タイマ精度は Human68k の起動に影響しない)。
+    static constexpr u32 kCpuToMfpShift = 1;
+
+    void tick(u32 cycles)
+    {
+        const u32 mfpCycles = cycles >> kCpuToMfpShift;
+        if (mfpCycles == 0)
+        {
+            return;
+        }
+        const u8 tacr = reg_[kTacr];
+        const u8 tbcr = reg_[kTbcr];
+        const u8 tcdcr = reg_[kTcdcr];
+        const u8 tccr = static_cast<u8>((tcdcr >> 4) & 7u);
+        const u8 tdcr = static_cast<u8>(tcdcr & 7u);
+        if ((tacr & 7u) != 0)
+        {
+            tickTimer(0, tacr, mfpCycles);
+        }
+        if ((tbcr & 7u) != 0)
+        {
+            tickTimer(1, tbcr, mfpCycles);
+        }
+        if (tccr != 0)
+        {
+            tickTimer(2, tccr, mfpCycles);
+        }
+        if (tdcr != 0)
+        {
+            tickTimer(3, tdcr, mfpCycles);
+        }
+    }
 
     // 垂直帰線の開始/終了を通知する。GPIP4 の状態が変わり、
     // 設定によっては割り込みが上がる。
