@@ -18,6 +18,7 @@
 #include "dev/adpcm.h"
 #include "dev/dmac.h"
 #include "dev/fdc.h"
+#include "dev/iosc.h"
 #include "dev/mfp.h"
 #include "dev/opm.h"
 #include "dev/rtc.h"
@@ -151,6 +152,10 @@ public:
     {
         return scc_;
     }
+    [[nodiscard]] IoSc& iosc()
+    {
+        return iosc_;
+    }
     [[nodiscard]] Sprite& sprite()
     {
         return sprite_;
@@ -255,6 +260,11 @@ private:
     // 優先度の高い方から順に試し、1 つ通ったらそこで止めるために戻り値を使う。
     bool serviceMfpInterrupt();
     bool serviceSccInterrupt();
+    bool serviceIoScInterrupt();
+    // FDC の割り込み線を I/O コントローラへ反映する。
+    // FDC 自身は自分がどのコントローラに繋がっているかを知らないので、
+    // 線の橋渡しは Machine が持つ。
+    void updateFdcInterruptLine();
     u8 sasiRead(u32 addr);
     void sasiWrite(u32 addr, u8 value);
     u8 sccRead(u32 addr);
@@ -269,6 +279,7 @@ private:
     Rtc rtc_;
     Fdc fdc_;
     Scc scc_;
+    IoSc iosc_;
     Opm opm_;
     Adpcm adpcm_;
     Sprite sprite_;

@@ -31,11 +31,17 @@ constexpr u8 kCmdReadDeleted = 0x0C;
 constexpr u8 kCmdFlagMultiTrack = 0x80;
 
 // 結果ステータス ST0 のビット。
-// 終了コードは bit7-6 の 2bit で、00 正常終了 / 01 異常終了 / 11 無効なコマンド。
-// 無効なコマンドは片方だけでなく両方立てる。bit7 だけだと
-// 「ドライブのレディ状態が変化した」(10) の意味になってしまう。
+// 終了コード (IC) は bit7-6 の 2bit で、uPD765/72065 の定義は
+//   00 正常終了 / 01 異常終了 / 10 無効なコマンド / 11 レディ状態が変化した。
+//
+// Why not 無効なコマンドを $C0 (両ビット) にしないか: 一度そう書いていたが、
+// それは 11 = 「レディ状態が変化した」の意味になる。IPL-ROM の FDC 割り込み
+// ハンドラは $FF1162 で CMP.B #$80,D0 / BEQ $FF11A2 と書かれていて、
+// ちょうど $80 のときだけハンドラを抜ける。$C0 を返すとこの分岐が外れ、
+// ハンドラが結果フェーズを読み続けて抜けられなくなる (実際に SASI 起動が
+// 画面出力前で止まった)。$80 が正しいことはデータシートと ROM の双方が示す。
 constexpr u8 kSt0AbnormalTermination = 0x40;
-constexpr u8 kSt0InvalidCommand = 0xC0;
+constexpr u8 kSt0InvalidCommand = 0x80;
 // bit4 = 装置チェック (ドライブが応答しない)。
 constexpr u8 kSt0EquipmentCheck = 0x10;
 // bit5 = シーク終了。
@@ -443,13 +449,40 @@ void Fdc::executeCommand()
             selectedDrive_ = static_cast<u8>(command_[1] & 0x03u);
             presentCylinder_[selectedDrive_] = 0;
             interruptDrive_ = selectedDrive_;
-            // メディアが無ければ「シーク終了 + 異常終了 + 装置チェック」。
-            // 実機の uPD72065 も、トラック 0 信号が返らないまま規定
-            // ステップ数を使い切ると装置チェックで終わる。
+            // RECALIBRATE のパラメータは HD|US ではなく US だけで、ヘッドは
+            // 常に 0 に戻る。ここで落とさないと直前のコマンドのヘッドが
+            // 残り、ST0 の bit2 (HD) が立ったままになる。
+            //
+            // Why not 放置してよくないか: この ST0 は割り込みハンドラ経由で
+            // $C90 に積まれ、ドライブの状態としてあとから読まれる。直前の
+            // コマンドのヘッドが残ると「ヘッド 1 にいるドライブ」として
+            // 記録され、以降の判定がそれを引きずる。RECALIBRATE の意味は
+            // 「トラック 0 かつヘッド 0 へ戻す」なので、ここで落とすのが正しい。
+            currentHead_ = 0;
+            // メディアが無ければ「シーク終了 + 異常終了 + ノットレディ」。
+            //
+            // Why not 装置チェック (EC) も立てないか: IPL-ROM は起動時に
+            // ドライブ 0-3 へ順に RECALIBRATE を投げて存在を調べ
+            // ($FF8C26 経由。実測のパラメータは $04/$05/$06/$07)、その結果を
+            // 割り込みハンドラ経由で $C90 に積む。積まれた値を最終的に読むのは
+            // ブートセクタ側 ($00007FBA の AND.L / $00007FC0 の BNE) で、
+            // そのマスクは ST0 の EC (bit4) を残す。ドライブが無いだけで EC を
+            // 立てると、ここが「装置エラー」と判定してエラー処理へ抜ける。
+            // 実測では ST0=$78 のとき D0=$10000000 が残って分岐し、フロッピーを
+            // 挿していないときに SASI からの起動まで巻き添えで止まった。
+            // NR (bit3) は同じマスクで落ちるので、こちらで表すのが正しい。
+            //
+            // 実機の uPD72065 はトラック 0 信号が返らないまま規定ステップ数を
+            // 使い切ると EC で終わるが、それは「ドライブはあるが壊れている」
+            // 場合の話で、そもそもドライブが繋がっていない (= ノットレディ) の
+            // とは別物である。
+            //
+            // この退行は割り込みを配線するまで現れなかった。配線前は $C90 が
+            // 誰にも埋められず、ブートセクタは 0 を読んでいたため。
             pendingSt0_ = currentImage() != nullptr
                               ? static_cast<u8>(kSt0SeekEnd | unitSelect())
                               : static_cast<u8>(kSt0SeekEnd | kSt0AbnormalTermination |
-                                                kSt0EquipmentCheck | kSt0NotReady | unitSelect());
+                                                kSt0NotReady | unitSelect());
             interruptPending_ = true;
             phase_ = Phase::Command;
             commandLength_ = 0;
@@ -707,15 +740,19 @@ bool Fdc::advanceSector()
 
 void Fdc::finishExecute()
 {
-    // 実行フェーズを終える。結果バイトは積まない。
+    // 実行フェーズを終える。割り込みは上げるが、結果バイトは積まない。
     //
     // IPL-ROM は READ/WRITE DATA の結果を FDC 割り込みハンドラ ($FF1130) で
-    // 読み、ドライブごとの状態表 $C90 へ積む。本エミュレータは FDC の
-    // 割り込み線を配線していないので、ここで結果を積むと誰も読まず、
-    // メインステータスの CB が落ちないまま次のコマンド送出 ($FF9036) が
-    // 永久に止まる。ROM 側の完了条件は $FF9014 → $FF9006 の
-    // 「メインステータスの下位 5bit が 0 になる」なので、即アイドルへ
-    // 戻すのが正しい。転送の成否は DMAC の CSR (COC/ERR) が伝える。
+    // 読み、ドライブごとの状態表 $C90 へ積む。そのハンドラは結果フェーズが
+    // 残っていなければ自分で SENSE INTERRUPT STATUS を投げて ST0 を取りに
+    // 来る ($FF1152 で CB を見てから $FF1158 の MOVEQ #8,D1) ので、
+    // 結果を残しておく必要は無い。
+    //
+    // Why not ここで結果を積まないか: 積むとメインステータスの CB が
+    // 落ちないまま次のコマンド送出 ($FF9036) が永久に止まる。ROM 側の
+    // 完了条件は $FF9014 → $FF9006 の「メインステータスの下位 5bit が 0 に
+    // なる」なので、即アイドルへ戻すのが正しい。転送の成否は DMAC の CSR
+    // (COC/ERR) と、割り込みハンドラが読む ST0 が伝える。
     transfer_ = Transfer::None;
     sectorBytes_ = 0;
     sectorPos_ = 0;

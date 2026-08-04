@@ -18,14 +18,18 @@
 // $E84007 (ch0 CCR) に $80 を書いて起動し、$FF9014 が $E84000 (ch0 CSR) の
 // bit4 (ERR) を見る。SASI が使うチャネル 1 とは別チャネルである点に注意。
 //
-// 割り込み線は配線していない。実機の FDC は IRQ レベル 1 のオートベクタで
-// (MFP は通さない)、IPL-ROM の割り込みハンドラ ($FF1130) が結果フェーズを
-// 読み出してドライブごとの状態表 $C90 に積む。本エミュレータにはその経路が
-// 無いので、結果を積むコマンドは IPL-ROM がその場で読むもの
-// (SENSE DRIVE STATUS / SENSE INTERRUPT STATUS) に限る。DMA を使う
-// READ/WRITE DATA は結果を持たずコマンド待ちへ戻す。積んだまま残すと
-// メインステータスの CB が落ちず、次のコマンド送出 ($FF9036) がそこで
-// 永久に止まる。この制約はイメージを繋いでも変わらない。
+// 割り込み線は I/O 割り込みコントローラ ($E9C000、dev/iosc.h) 経由で
+// 配線してある。FDC は IRQ レベル 1 で、MFP (6) や SCC (5) は通さない。
+// hasInterrupt() が線の状態で、Machine がそれを IoSc のデバイス 0 へ渡す。
+// IPL-ROM の割り込みハンドラ ($FF1130、ベクタ $60) が結果フェーズを
+// 読み出してドライブごとの状態表 $C90 に積む。
+//
+// ただし結果バイトはここでは積まない。IPL-ROM のハンドラは自分で
+// SENSE INTERRUPT STATUS を投げて ST0 を取りに来る作りなので
+// ($FF1158 の MOVEQ #8,D1)、READ/WRITE DATA の結果を残しておく必要が無い。
+// 積んだまま残すとメインステータスの CB が落ちず、次のコマンド送出
+// ($FF9036) がそこで永久に止まる。結果を持つのは IPL-ROM がその場で読む
+// コマンド (SENSE DRIVE STATUS / SENSE INTERRUPT STATUS) に限る。
 
 #ifndef X68K_CORE_DEV_FDC_H
 #define X68K_CORE_DEV_FDC_H

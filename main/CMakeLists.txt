@@ -22,6 +22,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/dev/rtc.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/dmac.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/fdc.cpp"
+        "${X68K_ROOT}/src/x68k/core/dev/iosc.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/scc.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/sprite.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/opm.cpp"

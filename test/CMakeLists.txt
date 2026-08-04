@@ -84,6 +84,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/dev/rtc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/dmac.cpp
   ${X68K_ROOT}/src/x68k/core/dev/fdc.cpp
+  ${X68K_ROOT}/src/x68k/core/dev/iosc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/scc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/opm.cpp
   ${X68K_ROOT}/src/x68k/core/dev/adpcm.cpp
@@ -131,6 +132,8 @@ add_executable(x68k_tests
   test_dmac.cpp
   test_mfp.cpp
   test_fdc.cpp
+  test_fdc_rom_handler.cpp
+  test_iosc.cpp
   test_scc.cpp
   test_mouse_queue.cpp
   test_opm.cpp

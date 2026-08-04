@@ -142,6 +142,7 @@ void Machine::reset()
     rtc_.reset();
     fdc_.reset();
     scc_.reset();
+    iosc_.reset();
     sprite_.reset();
     // 転送バッファは外から与えられた設定なので、リセットで消さない。
     // ここを丸ごと初期化すると nullptr に戻り、SASI が 1 バイトも
@@ -202,10 +203,54 @@ void Machine::serviceInterrupts()
     // Why not SCC を先に見るか: 68000 は 1 回の割り込み受理で 1 つしか
     // 処理しない。低い方を先に渡すと、高い方が待たされるどころか
     // 「マウスを動かし続けている間キー入力が通らない」形で逆転する。
-    if (!serviceMfpInterrupt())
+    // I/O コントローラ (レベル 1) は最下位なので最後に見る。MFP/SCC が
+    // 保留している間は FDC の完了通知が待たされる。これは実機と同じ順序。
+    if (!serviceMfpInterrupt() && !serviceSccInterrupt())
     {
-        serviceSccInterrupt();
+        serviceIoScInterrupt();
     }
+}
+
+// FDC の割り込み線を I/O コントローラの bit0 へ反映する。
+//
+// Why not FDC から直接 IoSc を叩かないか: Fdc が IoSc を知ると、FDC 単体の
+// テストに割り込みコントローラを連れてくる必要が出る。実機でも「線が
+// 繋がっている」だけで FDC はコントローラの存在を知らないので、
+// 配線を持つのは両者を組み立てる Machine の責務にしてある。
+void Machine::updateFdcInterruptLine()
+{
+    iosc_.setSource(IoSc::kDeviceFdc, fdc_.hasInterrupt());
+}
+
+bool Machine::serviceIoScInterrupt()
+{
+    // FDC の保留状態は DMA 完了などバスアクセス以外の契機でも変わるので、
+    // 判定の直前に線を取り直す。
+    updateFdcInterruptLine();
+
+    if (!iosc_.hasPendingInterrupt())
+    {
+        return false;
+    }
+
+    // MFP / SCC と同じく、CPU が受け付けられるか先に確かめる。
+    const u32 mask = cpu_.state().interruptMask();
+    const bool isMasked = IoSc::kInterruptLevel <= mask;
+    if (isMasked)
+    {
+        return false;
+    }
+
+    // I/O コントローラも自分のベクタ番号を返すデバイス。$E9C003 に書かれた
+    // ベース ($60) にソース番号を足した値になる。オートベクタ (24+1=25) に
+    // すると ROM が $180 へ張った FDC ハンドラ ($FF1130) へ届かない。
+    const u8 vectorNumber = iosc_.acknowledgeInterrupt();
+    if (vectorNumber == 0)
+    {
+        return false;
+    }
+    cpu_.requestInterrupt(IoSc::kInterruptLevel, vectorNumber);
+    return true;
 }
 
 bool Machine::serviceMfpInterrupt()
@@ -473,7 +518,12 @@ u8 Machine::ioRead8(u32 addr)
             }
             if ((addr & 0x0Fu) == 0x03)
             {
-                return fdc_.readData();
+                const u8 data = fdc_.readData();
+                // 結果バイトを読み切ると FDC 側の保留が畳まれることがある。
+                // 読んだ直後に線を取り直さないと、要因が消えているのに
+                // 線が上がったままになりハンドラが再入する。
+                updateFdcInterruptLine();
+                return data;
             }
             return 0u;
 
@@ -483,8 +533,10 @@ u8 Machine::ioRead8(u32 addr)
         case kSccBase:
             return sccRead(addr);
 
-        case kPpiBase:
         case kIoScBase:
+            return iosc_.read(addr - kIoScBase);
+
+        case kPpiBase:
         case kPrinterBase:
             // スタブ。読み出しは 0。
             return 0u;
@@ -565,10 +617,19 @@ void Machine::ioWrite8(u32 addr, u8 value)
             sccWrite(addr, value);
             return;
 
+        case kIoScBase:
+            iosc_.write(addr - kIoScBase, value);
+            return;
+
         case kFdcBase:
             if ((addr & 0x0Fu) == 0x03)
             {
                 fdc_.writeData(value);
+                // コマンドが揃った時点で割り込みが上がることがある
+                // (SEEK / RECALIBRATE)。逆に SENSE INTERRUPT STATUS は
+                // 落とす。どちらも writeData の中で起きるので、
+                // 書いた直後に線を取り直す。
+                updateFdcInterruptLine();
             }
             else if ((addr & 0x0Fu) == 0x05)
             {

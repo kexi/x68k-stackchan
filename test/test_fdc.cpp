@@ -14,11 +14,16 @@
 //
 // 特に危ないのが結果フェーズの置き去りである。IPL-ROM は DMA を使う
 // READ/WRITE DATA の結果を、コマンド送出のその場では読まず FDC 割り込み
-// ハンドラ ($FF1130) に任せている。本エミュレータは FDC の割り込み線を
-// 配線していないので、結果バイトを積むと誰も読まない。すると次のコマンド
-// 送出ルーチン ($FF9036) が CB (bit4) の落ちるのを待ち続けて止まる。
-// この退行は「FDC のテストが通っている」だけでは捕まらず、起動を最後まで
-// 走らせて初めて分かるので、ここで直接ステータスを見る。
+// ハンドラ ($FF1130) に任せている。そのハンドラは自分で SENSE INTERRUPT
+// STATUS を投げて ST0 を取りに来るので、結果バイトを積む必要は無い。積むと
+// 次のコマンド送出ルーチン ($FF9036) が CB (bit4) の落ちるのを待ち続けて
+// 止まる。この退行は「FDC のテストが通っている」だけでは捕まらず、起動を
+// 最後まで走らせて初めて分かるので、ここで直接ステータスを見る。
+//
+// 無効コマンドの ST0 が $80 であることも同じ性質の退行を持つ。IPL-ROM の
+// ハンドラは $FF1162 の CMP.B #$80,D0 / BEQ $FF11A2 でちょうど $80 のときだけ
+// 抜けるので、$C0 を返すとハンドラから出られず、割り込みを配線した途端に
+// 起動が止まる。
 //
 // 転送経路は Machine + DMAC を通して検査する。FDC 単体で dmaRead を叩くだけ
 // では「DMAC のチャネル 0 に繋がっていない」という配線ミスが素通りする。
@@ -295,22 +300,38 @@ TEST_CASE("イメージが無ければ WRITE DATA も結果フェーズを残さ
     CHECK(isIdle(fdc));
 }
 
-TEST_CASE("イメージが無ければ RECALIBRATE は装置チェックで終わる")
+TEST_CASE("イメージが無ければ RECALIBRATE はノットレディで終わり、装置チェックは立てない")
 {
     x68k::Fdc fdc;
     fdc.reset();
 
-    // RECALIBRATE ($07)。$FF8C26 が発行する。
+    // RECALIBRATE ($07)。IPL-ROM は起動時にドライブ 0-3 へ順に投げて
+    // 存在を調べる ($FF8C26 経由。実測のパラメータは $04/$05/$06/$07)。
     sendCommand(fdc, {0x07, 0x00});
     CHECK(isIdle(fdc));
     CHECK(fdc.hasInterrupt());
 
     // SENSE INTERRUPT STATUS ($08) で異常終了を受け取る。
-    // ST0 の bit7-6 = 01 が異常終了、bit4 が装置チェック。
     sendCommand(fdc, {0x08});
     const x68k::u8 st0 = fdc.readData();
-    CHECK((st0 & 0xC0u) == 0x40u);
-    CHECK((st0 & 0x10u) != 0);
+    CHECK((st0 & 0xC0u) == 0x40u);  // 異常終了
+    CHECK((st0 & 0x08u) != 0);      // ノットレディ
+
+    // 装置チェック (bit4) は立てない。
+    //
+    // この ST0 は割り込みハンドラ経由で $C90 に積まれ、最後はブートセクタが
+    // 読む ($00007FBA の AND.L / $00007FC0 の BNE)。そのマスクは EC を
+    // 残すので、ドライブが無いだけで EC を立てると「装置エラー」と判定され、
+    // フロッピー未挿入時に SASI からの起動まで巻き添えで止まる
+    // (実測では ST0=$78 のとき D0=$10000000 が残って分岐した)。
+    // 割り込みを配線するまでは $C90 が埋まらなかったので現れなかった退行。
+    CHECK((st0 & 0x10u) == 0);
+
+    // ヘッド (bit2) も落ちていること。RECALIBRATE の意味は「トラック 0 かつ
+    // ヘッド 0 へ戻す」で、パラメータに HD は無い。直前のコマンドのヘッドが
+    // 残ると、ドライブの状態として誤った値が $C90 に記録される。
+    CHECK((st0 & 0x04u) == 0);
+
     (void)fdc.readData();  // シリンダ番号
     CHECK(isIdle(fdc));
     CHECK_FALSE(fdc.hasInterrupt());
@@ -340,10 +361,17 @@ TEST_CASE("割り込みが無いのに SENSE INTERRUPT STATUS を投げたら無
 
     sendCommand(fdc, {0x08});
 
-    // ST0 の bit7-6 = 11 が無効コマンド。ここで正常終了を返すと
-    // IPL-ROM が「まだ処理すべき割り込みがある」と判断して回り続ける。
+    // ST0 の終了コード (bit7-6) が 10 = 無効コマンド、つまり ST0 は $80。
+    // ここで正常終了を返すと IPL-ROM が「まだ処理すべき割り込みがある」と
+    // 判断して回り続ける。
+    //
+    // 値まで固定するのは、IPL-ROM の FDC 割り込みハンドラが $FF1162 で
+    // CMP.B #$80,D0 / BEQ $FF11A2 と、ちょうど $80 のときだけ抜けるため。
+    // 11 (= $C0) を返すと分岐が外れてハンドラから抜けられず、割り込みを
+    // 配線した途端に起動が止まる。マスクだけの検査では素通りするので、
+    // ここは等値で押さえる。
     const x68k::u8 st0 = fdc.readData();
-    CHECK((st0 & 0xC0u) == 0xC0u);
+    CHECK(st0 == 0x80u);
     CHECK(isIdle(fdc));
 }
 
@@ -372,8 +400,10 @@ TEST_CASE("未知のコマンドは無効コマンドとして返す")
     fdc.reset();
 
     sendCommand(fdc, {0x1F});
+    // 無効コマンドの ST0 は $80 (終了コード 10)。$C0 は「レディ状態が
+    // 変化した」の意味で、IPL-ROM のハンドラが抜けられなくなる。
     const x68k::u8 st0 = fdc.readData();
-    CHECK((st0 & 0xC0u) == 0xC0u);
+    CHECK(st0 == 0x80u);
     CHECK(isIdle(fdc));
 }
 
@@ -1264,4 +1294,58 @@ TEST_CASE("reset してもイメージは外れない")
     // ここで外れると、リセット後の起動で必ず「FD なし」になる。
     sendCommand(fdc, {0x04, 0x00});
     CHECK((fdc.readData() & 0x20u) != 0);
+}
+
+// --- I/O 割り込みコントローラ経由の割り込み配線 -----------------------------
+//
+// FDC 単体の hasInterrupt() が正しくても、$E9C000 のコントローラへ繋がって
+// いなければ IPL-ROM のハンドラ ($FF1130) は一度も動かない。逆に繋ぎ方を
+// 間違えると、起動中の ROM に予期しないベクタが飛んで暴走する。
+// ここは Machine 越しに「線が実際に届くか」を見る。
+
+TEST_CASE("FDC の割り込みが I/O コントローラ経由でベクタ $60 として届く")
+{
+    Rig rig;
+    FakeFloppy floppy;
+    rig.machine.setFloppyDisk(0, &floppy);
+
+    // IPL-ROM と同じ初期化。$FF0CC2 がベクタ、$FF0D04 が許可を書く。
+    rig.machine.ioWrite8(0xE9C003, 0x60);
+    rig.machine.ioWrite8(0xE9C001, 0x06);
+
+    // まだ何も起きていないので線は上がっていない。
+    CHECK_FALSE(rig.machine.iosc().hasPendingInterrupt());
+
+    // RECALIBRATE で FDC の割り込みを起こす。
+    rig.sendFdcCommand({0x07, 0x00});
+    CHECK(rig.machine.fdc().hasInterrupt());
+
+    // Machine が線を渡していれば、コントローラ側にも上がっている。
+    // ベクタは $60 = IPL-ROM の FDC ハンドラ ($FF1130) の位置。
+    CHECK(rig.machine.iosc().hasPendingInterrupt());
+    CHECK(rig.machine.iosc().acknowledgeInterrupt() == 0x60);
+
+    // SENSE INTERRUPT STATUS で要因を読むと線が下がること。
+    // レベル割り込みなので、ここで下がらないとハンドラが再入し続ける。
+    rig.sendFdcCommand({0x08});
+    (void)rig.machine.ioRead8(kFdcDataPort);  // ST0
+    (void)rig.machine.ioRead8(kFdcDataPort);  // シリンダ番号
+    CHECK_FALSE(rig.machine.fdc().hasInterrupt());
+    CHECK_FALSE(rig.machine.iosc().hasPendingInterrupt());
+}
+
+TEST_CASE("I/O コントローラが未初期化なら FDC の割り込みは配送されない")
+{
+    Rig rig;
+    FakeFloppy floppy;
+    rig.machine.setFloppyDisk(0, &floppy);
+
+    // ROM がまだ $E9C001/$E9C003 を書いていない状態。
+    rig.sendFdcCommand({0x07, 0x00});
+    CHECK(rig.machine.fdc().hasInterrupt());
+
+    // 線は上がっているが、許可もベクタも未設定なので配送しない。
+    // ここで配送するとベクタ 0 (リセット SSP) へ飛んで暴走する。
+    CHECK_FALSE(rig.machine.iosc().hasPendingInterrupt());
+    CHECK(rig.machine.iosc().acknowledgeInterrupt() == 0);
 }
