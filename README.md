@@ -102,6 +102,34 @@ GUI を動かすための前提は入れてあります（グラフィック画�
 実際に起動させて確かめたわけではありません。イメージを用意すれば
 そのまま試せる状態、というところまでです。
 
+GUI が使う経路 (G-VRAM / パレット / プライオリティ合成 / SCC マウス) を
+自前の 68000 プログラムで通しで叩くデモがあります。重なった窓と
+メニューバーが出て、マウスがゲストの割り込みハンドラまで届きます。
+
+```
+just build-host
+./build-host/x68k-run --iplrom rom/iplrom.dat --gui-demo /tmp/gui.ppm
+```
+
+**これは SX-Window ではありません。** 足りないものは
+[docs/knowledge/sx-window-requirements.md](docs/knowledge/sx-window-requirements.md) に
+1 項目ずつ挙げてあります。
+
+### Human68k の起動イメージは自分で作れます
+
+「イメージが無いから試せない」と思いがちですが、**Human68k を展開した
+ディレクトリがあれば、そこから起動可能な HDD イメージを作れます**。
+
+```
+just make-hdd <Human68k を展開したディレクトリ> rom/hdd0.hdf
+just run --hdd rom/hdd0.hdf --cycles 900000000 --keys "dir
+" --dump-text
+```
+
+`A>` プロンプトが出て `dir` が動くところまで確認できます
+(`dir` の結果まで見るならサイクルは 9 億ほど要ります)。
+`--ppm` を付ければテキストとグラフィックを合成した画面を画像で出せます。
+
 ## なぜ自作するのか
 
 px68k を移植すれば早いのは確かです。それでも自分で書いているのは、
