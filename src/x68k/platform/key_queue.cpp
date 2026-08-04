@@ -130,11 +130,40 @@ void MouseQueue::drain(x68k::Machine& machine)
         return;
     }
 
-    sentLeftButton_ = left;
-    sentRightButton_ = right;
-
     // 飽和は Scc::moveMouse が持つ (レポートは 1 バイト符号付き)。
-    machine.moveMouse(dx, dy, left, right);
+    const bool accepted = machine.moveMouse(dx, dy, left, right);
+    if (accepted)
+    {
+        sentLeftButton_ = left;
+        sentRightButton_ = right;
+        return;
+    }
+
+    // 断られたら、送ろうとしたぶんを丸ごと差し戻す。次の drain() で送り直す。
+    //
+    // SCC は FIFO に 3 バイトの空きが無いとレポートを丸ごと捨てる。CPU が
+    // 割り込みを止めている間 (レベル 5 のマスク) に入力が続くとこれが起きる。
+    //
+    // Why not 送る前に sentLeftButton_ を更新してしまわないか: ボタンは
+    // 「押されている/いない」という状態であって、変化そのものは 1 度しか
+    // 流れない。送ったことにして捨てられると、次の drain() では left ==
+    // sentLeftButton_ になって「変化なし」と判断され、解放が二度と届かない。
+    // ゲストから見るとボタンが押されたままになり、SX-Window のドラッグが
+    // 終わらない。受理されたときだけ状態を進めれば、解放は必ず届く。
+    //
+    // Why not 移動量だけ捨てて済ませないか: dx/dy は相対量なので、捨てた
+    // ぶんの距離は永久に失われる。ボタンと違って後から辻褄が合う値が
+    // 来ることは無く、指を滑らせた距離とカーソルの移動量がずれ続ける。
+    // 足し戻せば「1 スライスぶん遅れる」だけで距離は保たれる。
+    //
+    // Why not 差し戻さずリトライ用の別のフィールドを持たないか: push() が
+    // 足し込む先と同じ変数へ戻せば、差し戻した後に届いた動きも自然に
+    // 合流する。2 つ持つと「どちらを先に送るか」という順序の問題が生まれ、
+    // レポートの中身が時系列と食い違う余地ができる。
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    pendingDx_ += dx;
+    pendingDy_ += dy;
+    xSemaphoreGive(mutex_);
 }
 
 }  // namespace x68k_platform

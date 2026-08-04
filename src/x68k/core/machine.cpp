@@ -271,9 +271,9 @@ void Machine::pressKey(u8 scanCode)
     mfp_.receiveKeyboardByte(scanCode);
 }
 
-void Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
+bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 {
-    scc_.moveMouse(dx, dy, leftButton, rightButton);
+    return scc_.moveMouse(dx, dy, leftButton, rightButton);
 }
 
 // --- I/O ディスパッチ --------------------------------------------------------

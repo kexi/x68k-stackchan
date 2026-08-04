@@ -92,8 +92,11 @@ public:
     //   out      : 変換先。width * height 個の u16 が必要
     //   outStride: out の 1 行あたりの要素数 (width と違う場合に指定)
     //
-    // 透明ドットには何も書かない (out の元の内容が残る)。背後のプレーンを
-    // 先に描いてからこれを呼べば重ね合わせになる。
+    // 表示が許可されたグラフィックページどうしを、$E82500 の GP3-GP0 の順
+    // (値が小さいほど手前) に重ねる。手前のページが透明なドットでは、その
+    // 後ろのページの色が出る。全ページが透明なドットには何も書かない
+    // (out の元の内容が残る)。背後の面を先に描いてからこれを呼べば
+    // 面どうしの重ね合わせになる。
     static void render(const u8* vram, const VideoController& video, u32 srcX, u32 srcY, u32 width,
                        u32 height, u16* out, u32 outStride);
 

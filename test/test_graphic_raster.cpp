@@ -310,6 +310,167 @@ TEST_CASE("複数ページが許可されているときは GP3-GP0 が手前を
     CHECK(out[0] == VideoController::toRgb565(blue));
 }
 
+// --- ページどうしの重ね合わせ -----------------------------------------------
+//
+// 保証すること: 手前のページの透明ドット (パレット番号 0) では、その後ろの
+// ページの色が出る。実機のグラフィック 4 ページは合成されるプレーンではなく
+// 独立した画面で、透明ドットのぶんだけ後ろが透ける。
+
+TEST_CASE("16 色モードで手前のページが透明なら後ろのページが透ける")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+
+    const x68k::u16 red = static_cast<x68k::u16>(31u << 6);
+    const x68k::u16 blue = static_cast<x68k::u16>(31u << 1);
+    video.write(kGraphicPaletteOffset + 1 * 2, red);
+    video.write(kGraphicPaletteOffset + 2 * 2, blue);
+
+    // x=0: ページ 0 = 色 1 (赤)、ページ 1 = 色 2 (青)  → 手前 (ページ 0) が勝つ
+    // x=1: ページ 0 = 透明、    ページ 1 = 色 2 (青)  → 後ろのページ 1 が出る
+    writeWord(vram, 0, 0, 0x0021);
+    writeWord(vram, 1, 0, 0x0020);
+
+    video.write(kPriorityOffset, 0x06E4);     // GP0=0, GP1=1 でページ 0 が手前
+    video.write(kDisplayCtrlOffset, 0x0003);  // ページ 0 と 1 を表示
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+
+    CHECK(out[0] == VideoController::toRgb565(red));
+    CHECK(out[1] == VideoController::toRgb565(blue));
+}
+
+TEST_CASE("16 色モードの 4 ページは GP3-GP0 の順に透けていく")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+
+    // 色 1-4 をそれぞれ別の値にして、どのページの色が出たか区別できるようにする。
+    for (x68k::u16 i = 1; i <= 4; ++i)
+    {
+        video.write(kGraphicPaletteOffset + i * 2, static_cast<x68k::u16>(i << 6));
+    }
+    const auto colorOf = [](x68k::u16 index)
+    { return VideoController::toRgb565(static_cast<x68k::u16>(index << 6)); };
+
+    // 4 ページすべてを表示し、GP を逆順にしてページ 3 を最も手前にする。
+    video.write(kDisplayCtrlOffset, 0x000F);
+    video.write(kPriorityOffset, 0x001B);  // GP3=0, GP2=1, GP1=2, GP0=3
+
+    // x=0: 全ページ不透明 (page0=1, page1=2, page2=3, page3=4)
+    //      → 手前のページ 3 の色 4 が出る。ページ番号順なら色 1 になってしまう。
+    // x=1: ページ 3 だけ透明 → 次に手前のページ 2 の色 3。
+    // x=2: ページ 3 と 2 が透明 → ページ 1 の色 2。
+    // x=3: ページ 1 だけ不透明 → 色 2。
+    writeWord(vram, 0, 0, 0x4321);
+    writeWord(vram, 1, 0, 0x0321);
+    writeWord(vram, 2, 0, 0x0021);
+    writeWord(vram, 3, 0, 0x0020);
+
+    constexpr x68k::u32 kW = 4;
+    std::vector<x68k::u16> out(kW, 0);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+
+    CHECK(out[0] == colorOf(4));
+    CHECK(out[1] == colorOf(3));
+    CHECK(out[2] == colorOf(2));
+    CHECK(out[3] == colorOf(2));
+}
+
+TEST_CASE("256 色モードでも手前のページが透明なら後ろのページが透ける")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0001);  // 256 色 (2 ページ)
+
+    // 8bit ぜんぶが番号になることが分かる値にする。
+    const x68k::u16 red = static_cast<x68k::u16>(31u << 6);
+    const x68k::u16 blue = static_cast<x68k::u16>(31u << 1);
+    video.write(kGraphicPaletteOffset + 0x12 * 2, red);
+    video.write(kGraphicPaletteOffset + 0x34 * 2, blue);
+
+    // x=0: ページ 0 = $12、ページ 1 = $34 → 手前のページ 0 が勝つ
+    // x=1: ページ 0 = 透明、ページ 1 = $34 → ページ 1 が透ける
+    writeWord(vram, 0, 0, 0x3412);
+    writeWord(vram, 1, 0, 0x3400);
+
+    // 256 色のページ許可は 2bit ずつ。$0F で両ページを表示。
+    video.write(kDisplayCtrlOffset, 0x000F);
+    video.write(kPriorityOffset, 0x06E4);  // GP0=0, GP1=1
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+
+    CHECK(out[0] == VideoController::toRgb565(red));
+    CHECK(out[1] == VideoController::toRgb565(blue));
+}
+
+TEST_CASE("ページの重なり順はページ番号ではなく GP3-GP0 で決まる")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+
+    const x68k::u16 blue = static_cast<x68k::u16>(31u << 1);
+    const x68k::u16 green = static_cast<x68k::u16>(31u << 11);
+    video.write(kGraphicPaletteOffset + 2 * 2, blue);
+    video.write(kGraphicPaletteOffset + 3 * 2, green);
+
+    // ページ 0 は透明、ページ 1 = 色 2 (青)、ページ 2 = 色 3 (緑)。
+    writeWord(vram, 0, 0, 0x0320);
+    video.write(kDisplayCtrlOffset, 0x0007);  // ページ 0-2 を表示
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0);
+
+    // 既定の並びではページ 1 がページ 2 より手前 → 透明なページ 0 を抜けて青。
+    video.write(kPriorityOffset, 0x06E4);  // GP0=0, GP1=1, GP2=2
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+    CHECK(out[0] == VideoController::toRgb565(blue));
+
+    // GP2 をページ 1 より手前にすると、VRAM を触らずに緑へ変わる。
+    // ページ番号順に重ねる実装だとここが青のままになる。
+    out[0] = 0;
+    // GP3=3, GP2=1, GP1=2, GP0=0 → $E4 の GP1/GP2 を入れ替えた $D8。
+    video.write(kPriorityOffset, 0x06D8);
+    REQUIRE(video.graphicPagePriority(0) == 0);
+    REQUIRE(video.graphicPagePriority(1) == 2);
+    REQUIRE(video.graphicPagePriority(2) == 1);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+    CHECK(out[0] == VideoController::toRgb565(green));
+}
+
+TEST_CASE("全ページが透明なドットには何も書かれない")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+    video.write(kDisplayCtrlOffset, 0x000F);  // 4 ページすべて表示
+    video.write(kPriorityOffset, 0x06E4);
+    // パレット 0 に色を入れても透明の扱いは変わらない。
+    video.write(kGraphicPaletteOffset + 0 * 2, 0xFFFF);
+
+    // ワードが 0 なので 4 ページとも色番号 0 = 透明。
+    constexpr x68k::u32 kW = 4;
+    std::vector<x68k::u16> out(kW, 0x1234);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+
+    for (const auto pixel : out)
+    {
+        CHECK(pixel == 0x1234);
+    }
+}
+
 TEST_CASE("どのページも許可されていなければ何も描かれない")
 {
     auto vram = makeGvram();
@@ -578,6 +739,27 @@ TEST_CASE("表示が禁止された面は重ね合わせに出ない")
     f.video.write(kDisplayCtrlOffset, 0x0000);
     GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
     CHECK(out[0] == 0);
+}
+
+TEST_CASE("グラフィックの全ページが透明ならテキストが見えて残りは黒になる")
+{
+    CompositeFixture f;
+
+    // グラフィック 4 ページすべてを表示し、グラフィックを手前に置く。
+    f.video.write(kDisplayCtrlOffset, 0x002F);  // テキスト + ページ 0-3
+    f.video.write(kPriorityOffset, 0x08E4);     // graphic=0, text=2
+
+    // グラフィックはどのページも書かない (全ドット透明)。テキストだけ置く。
+    setTextPixel(f.tvram, 0, 0, 1);
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0x5A5A);
+    GraphicRaster::composite(f.gvram.data(), f.tvram.data(), f.video, 0, 0, kW, 1, out.data(), kW);
+
+    // 手前のグラフィックが全ページ透明なので、後ろのテキストが出る。
+    CHECK(out[0] == VideoController::toRgb565(CompositeFixture::kBlue));
+    // どちらの面も出ない位置は黒。
+    CHECK(out[1] == 0);
 }
 
 TEST_CASE("どちらの面も出ない位置は黒で埋まる")

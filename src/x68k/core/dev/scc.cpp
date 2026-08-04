@@ -403,12 +403,12 @@ void Scc::pushRxByte(u32 channel, u8 value)
     refreshRxInterrupt(channel);
 }
 
-void Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
+bool Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 {
     // 無効化中は積まない。有効化した瞬間に古い動きが流れ込むのを避ける。
     if (!isMouseEnabled())
     {
-        return;
+        return false;
     }
 
     // レポートは 3 バイト揃って初めて意味を持つので、全部入らないなら
@@ -422,7 +422,7 @@ void Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
     const u32 freeSlots = kRxFifoSize - ch_[kChannelB].rxCount;
     if (freeSlots < kMouseReportBytes)
     {
-        return;
+        return false;
     }
 
     u8 buttons = 0;
@@ -440,6 +440,7 @@ void Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
     pushRxByte(kChannelB, buttons);
     pushRxByte(kChannelB, saturateDelta(dx));
     pushRxByte(kChannelB, saturateDelta(dy));
+    return true;
 }
 
 bool Scc::hasPendingInterrupt() const

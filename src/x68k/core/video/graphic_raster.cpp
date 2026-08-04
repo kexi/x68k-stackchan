@@ -45,7 +45,25 @@ inline ScreenSize screenSizeOf(const VideoController& video)
     return {kGvramPageWidth, kGvramPageHeight};
 }
 
-// 表示が許可されたページのうち、最も手前のものを返す。見つからなければ -1。
+// 表示が許可されたページを手前から順に並べたもの。
+//
+// 実機の 16 色モードは 4 ページが独立した画面で、$E82600 の GS3-GS0 で
+// 個別に表示を切り替える。手前のページの透明ドット (パレット番号 0) の
+// 位置だけ、その後ろのページが見える。だから「最も手前の 1 ページ」ではなく
+// 順番付きの一覧が要る。
+//
+// Why not プレーンを合成して 1 つの色番号にしないか (テキスト画面のやり方):
+// テキスト画面は 4 プレーンの同じビットを集めて 1 ドット 4bit を作るが、
+// グラフィック画面のページは合成対象ではなく独立した画面で、
+// 各ページがそれ自身で 4bit の色番号を持つ。集めるとまったく違う絵になる。
+struct PageOrder
+{
+    // 手前から順のページ番号。count 個だけ有効。
+    u8 pages[4];
+    u32 count;
+};
+
+// 表示が許可されたページを手前から順に集める。
 //
 // 手前かどうかは $E82500 の GP3-GP0 が決める (値が小さいほど手前)。
 // 同じ順位が複数のページに設定されていたら、番号の小さいページを手前とする。
@@ -56,14 +74,13 @@ inline ScreenSize screenSizeOf(const VideoController& video)
 // ウィンドウの重なりと裏画面の切り替えを行うので、番号順に固定すると
 // 常に同じページが見えたままになる。
 //
-// Why not 4 ページを重ね合わせて 1 枚にしないか: 実機の 16 色モードでは
-// 4 ページが独立した画面で、$E82600 の GS3-GS0 で個別に表示を切り替える。
-// 透明ドットの位置だけ後ろのページが見える。プレーンを合成して 1 つの
-// 色番号にする (テキスト画面のやり方) とまったく違う絵になる。
-inline int frontmostEnabledPage(const VideoController& video)
+// Why not std::sort を使わないか: 要素は最大 4 個で、ESP32-S3 では
+// <algorithm> を引き込むコード量のほうが効く。挿入ソートなら比較は
+// 最大 6 回で済み、安定 (同順位なら番号順) という要件もそのまま満たせる。
+inline PageOrder enabledPagesFrontToBack(const VideoController& video)
 {
-    int front = -1;
-    u8 frontPriority = 0;
+    PageOrder order{{0, 0, 0, 0}, 0};
+    u8 priorities[4] = {0, 0, 0, 0};
 
     for (u32 page = 0; page < 4; ++page)
     {
@@ -73,15 +90,21 @@ inline int frontmostEnabledPage(const VideoController& video)
         }
 
         const u8 pagePriority = video.graphicPagePriority(page);
-        const bool isFrontmost = front < 0 || pagePriority < frontPriority;
-        if (isFrontmost)
+
+        // 手前 (順位が小さい) ほど前に来るよう挿入する。
+        u32 slot = order.count;
+        while (slot > 0 && priorities[slot - 1] > pagePriority)
         {
-            front = static_cast<int>(page);
-            frontPriority = pagePriority;
+            order.pages[slot] = order.pages[slot - 1];
+            priorities[slot] = priorities[slot - 1];
+            --slot;
         }
+        order.pages[slot] = static_cast<u8>(page);
+        priorities[slot] = pagePriority;
+        ++order.count;
     }
 
-    return front;
+    return order;
 }
 
 }  // namespace
@@ -196,7 +219,7 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     const bool isLarge =
         mode == VideoController::GraphicColorMode::k16Color && video.isGraphic1024();
 
-    // 表示が許可された最も手前のページを描く。
+    // 表示が許可されたページを手前から順に重ねる。
     //
     // Why not ページ 0 を決め打ちにしないか: Human68k も SX-Window も
     // ページを切り替えて裏画面を作る。$E82600 を無視すると、描き途中の
@@ -205,17 +228,43 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     // Why not 16 色モードだけ調べないか: 256 色モードも 2 ページあり、
     // GS3-GS0 は 2bit ずつで同じように表示を切り替えられる。1024x1024 は
     // 4 ページを 1 枚として使うのでページ選択そのものが無い。
-    int page = 0;
+    //
+    // ページ番号ではなくビットシフト量に畳んでおく。16 色は 4bit ずつ、
+    // 256 色は 8bit ずつで、ループの中では「ワードを何ビット右へずらすか」
+    // しか要らない。色数モードの分岐をここで済ませておけば、ドットごとに
+    // mode を見比べずに済む。
+    u32 shifts[4] = {0, 0, 0, 0};
+    u32 pageCount = 1;
+    u32 indexMask = 0x0Fu;
+
     if (!isLarge)
     {
-        page = frontmostEnabledPage(video);
-        if (page < 0)
+        const PageOrder order = enabledPagesFrontToBack(video);
+        if (order.count == 0)
         {
             // どのページも表示が許可されていない。全面が透明。
             return;
         }
+
+        const bool is16Color = mode == VideoController::GraphicColorMode::k16Color;
+        const u32 bitsPerPage = is16Color ? 4u : 8u;
+        indexMask = is16Color ? 0x0Fu : 0xFFu;
+        pageCount = order.count;
+        for (u32 i = 0; i < order.count; ++i)
+        {
+            const u32 page = is16Color ? (order.pages[i] & 3u) : (order.pages[i] & 1u);
+            shifts[i] = page * bitsPerPage;
+        }
     }
-    const u32 pageIndex = static_cast<u32>(page);
+
+    // 表示ページが 1 枚だけなら重ね合わせの走査そのものが要らない。
+    //
+    // Why not 常に一般経路へ通さないか: 実際に動くソフトのほとんどは
+    // 1 ページだけを表示していて (Human68k のコンソールも 256 色ソフトも
+    // そうなる)、ESP32-S3 の実効 3MHz ではドットあたりの追加分岐が
+    // そのままフレームレートに効く。1 枚のときの経路は元のまま残す。
+    const bool isSinglePage = isLarge || pageCount == 1;
+    const u32 singleShift = shifts[0];
 
     for (u32 y = 0; y < height; ++y)
     {
@@ -238,6 +287,10 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
             if (isDirectColor)
             {
                 // 65536 色モードは色コードが直接並ぶ。$0000 を透明とみなす。
+                //
+                // Why not ここでもページを重ねないか: 65536 色モードの表示
+                // ページは 1 枚しかない (IPL-ROM は $FFB30C で GS3-GS0 を
+                // moveq #$F と一括で立てる)。重ねる相手が存在しない。
                 const u16 color = readWord(vram, wordIndexOf(vx, vy));
                 if (color != 0)
                 {
@@ -248,29 +301,49 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
 
             // pixelIndex() を呼ばずここで展開する。1 ドットごとの関数呼び出しは
             // 変換全体の支配的なコストになる (text_raster.cpp と同じ理由)。
-            u32 index;
             if (isLarge)
             {
                 const u32 largePage =
                     ((vy >= kGvramPageHeight) ? 2u : 0u) | ((vx >= kGvramPageWidth) ? 1u : 0u);
                 const u16 word = readWord(
                     vram, wordIndexOf(vx & (kGvramPageWidth - 1u), vy & (kGvramPageHeight - 1u)));
-                index = (word >> (largePage * 4u)) & 0x0Fu;
-            }
-            else if (mode == VideoController::GraphicColorMode::k16Color)
-            {
-                const u16 word = readWord(vram, wordIndexOf(vx, vy));
-                index = (word >> (pageIndex * 4u)) & 0x0Fu;
-            }
-            else
-            {
-                const u16 word = readWord(vram, wordIndexOf(vx, vy));
-                index = (word >> ((pageIndex & 1u) * 8u)) & 0xFFu;
+                const u32 index = (word >> (largePage * 4u)) & 0x0Fu;
+                if (index != kTransparentIndex)
+                {
+                    row[x] = palette[index];
+                }
+                continue;
             }
 
-            if (index != kTransparentIndex)
+            // 全ページのドットが同じワードに詰まっているので、VRAM の読みは
+            // ページ数によらず 1 回で済む。あとはシフトを変えて取り出すだけ。
+            const u16 word = readWord(vram, wordIndexOf(vx, vy));
+
+            if (isSinglePage)
             {
-                row[x] = palette[index];
+                const u32 index = (word >> singleShift) & indexMask;
+                if (index != kTransparentIndex)
+                {
+                    row[x] = palette[index];
+                }
+                continue;
+            }
+
+            // 手前から見て最初の不透明ドットが勝つ。
+            //
+            // Why not 奥から手前へ順に書かないか (composite() の面の重ね方):
+            // 面どうしと違い、ここは同じ 1 ワードから取り出す複数の値なので、
+            // 手前から見て最初に見つかった時点で残りは覆い隠されて確定する。
+            // 奥から書くと透明でないドットのぶんだけ palette 引きと
+            // ストアが増え、ESP32-S3 では出力バッファへの無駄な書き込みになる。
+            for (u32 i = 0; i < pageCount; ++i)
+            {
+                const u32 index = (word >> shifts[i]) & indexMask;
+                if (index != kTransparentIndex)
+                {
+                    row[x] = palette[index];
+                    break;
+                }
             }
         }
     }

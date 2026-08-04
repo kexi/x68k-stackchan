@@ -145,8 +145,13 @@ public:
     // pressKey と同じく、ホストや platform 層が外から入力を注入する口。
     // dx/dy は前回からの相対移動量 (X68000 のマウスは絶対座標を持たない)。
     //
-    // IOCS がマウスを有効化していない間の呼び出しは捨てられる。
-    void moveMouse(int dx, int dy, bool leftButton, bool rightButton);
+    // IOCS がマウスを有効化していない間の呼び出しは捨てられる。SCC の受信
+    // FIFO が埋まっている間の呼び出しも同じく捨てられる (レポートは 3 バイト
+    // 揃って初めて意味を持つので、途中まで積むことはしない)。
+    //
+    // 積めたら true、捨てたら false。呼び出し側が送り直しを判断できるように
+    // する (Scc::moveMouse のコメントに理由を書いた)。
+    bool moveMouse(int dx, int dy, bool leftButton, bool rightButton);
 
     // CPU が停止しているか (未実装命令に当たった等)。
     [[nodiscard]] bool isHalted() const

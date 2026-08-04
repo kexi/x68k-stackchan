@@ -123,12 +123,26 @@ add_executable(x68k_tests
   test_mfp.cpp
   test_fdc.cpp
   test_scc.cpp
+  test_mouse_queue.cpp
+  ${X68K_ROOT}/src/x68k/platform/key_queue.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 # sram_persist.h は platform/ にあるが ESP-IDF に触らないヘッダオンリーなので、
 # ホストのテストから直接読める。sram.dat の保存/復元の方針はここにしか無く、
 # 電源断の隙間を疑似ファイルシステムで再現して検査する必要がある。
 target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/src/x68k/platform)
+
+# key_queue.cpp (MouseQueue) を core/ のテストと一緒にビルドするための代役ヘッダ。
+#
+# MouseQueue は FreeRTOS のキューとミューテックスしか実機依存を持たない。
+# freertos_shim/ に同名のヘッダを置いてインクルードパスを通せば、そのまま
+# ホストでコンパイルできる。
+#
+# Why not platform/ 全体をテスト対象にしないか: display_lcd.cpp などは
+# M5Unified と LovyanGFX を直接叩くので代役では済まない。MouseQueue は
+# 「SCC に断られたレポートを差し戻して送り直す」という、実機に焼かないと
+# 確かめられないと壊れたままになる判断を持つので、ここだけを引き上げる。
+target_include_directories(x68k_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/freertos_shim)
 add_test(NAME x68k_tests COMMAND x68k_tests)
 
 # --- ホストのエミュレータランナー -------------------------------------------
