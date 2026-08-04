@@ -443,11 +443,6 @@ bool Scc::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
     return true;
 }
 
-bool Scc::hasPendingInterrupt() const
-{
-    return ch_[kChannelA].rxInterruptPending || ch_[kChannelB].rxInterruptPending;
-}
-
 u32 Scc::acknowledgeInterrupt()
 {
     if (!hasPendingInterrupt())

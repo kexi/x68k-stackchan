@@ -161,7 +161,15 @@ public:
     [[nodiscard]] bool isMouseEnabled() const;
 
     // 保留中の受信割り込みがあるか。
-    [[nodiscard]] bool hasPendingInterrupt() const;
+    //
+    // Machine::serviceInterrupts() から **毎命令** 呼ばれる。中身は bool 2 つの
+    // OR しか無いので、.cpp 側に置くと実体より呼び出しの方が高くつく。
+    // ESP32-S3 では呼び出し回数がそのまま実効クロックに効く (MFP の保留判定を
+    // 同じ理由でインラインへ出して +2.6%)。
+    [[nodiscard]] bool hasPendingInterrupt() const
+    {
+        return ch_[kChannelA].rxInterruptPending || ch_[kChannelB].rxInterruptPending;
+    }
 
     // 割り込みを受理する。ベクタ番号を返し、保留を落とす。
     // 保留が無ければ 0 を返す。
