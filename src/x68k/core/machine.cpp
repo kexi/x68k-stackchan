@@ -152,6 +152,15 @@ void Machine::reset()
     sasi_.buffer = sasiBuffer;
     dmac_.reset();
 
+    // まだデバイスへ渡していないサイクルを捨てる。
+    //
+    // 各デバイスの内部カウンタ (crtc_ の frameCycles_ など) は上の reset() で
+    // 0 になるが、ここに溜まっている分を残すとリセット後の最初の tick に
+    // 混ざり、位相がその分だけ進む。リセットの意味が「時間も 0 から」なので
+    // 保留も一緒に捨てる。
+    pendingDeviceCycles_ = 0;
+    rtcPendingCycles_ = 0;
+
     // リセット直後は IPL-ROM が $000000 に写像されている。
     // これがないとリセットベクタが読めない。
     bus_.setRomMappedAtZero(true);
@@ -220,12 +229,9 @@ void Machine::tickDevices(u32 cycles)
     // 無い呼び出しで、プロファイル上 tickDevices は step 全体の 36.2% を
     // 占めていた。
     //
-    // Why not 安全か: Rtc は受け取ったサイクルを cycleAccumulator_ へ足し、
-    // kCyclesPerSecond を超えた回数だけ秒を進めるだけ。この累算器は
-    // tick() の外から一切読まれない (reset で 0 にする以外の参照が無い)。
-    // よってまとめて渡しても、秒が進むタイミングも読み出せる値も変わらない。
-    //
-    // CRTC も同じ形だが、帰線の境界が観測されるので刻みを分ける (下記)。
+    // まとめると秒の境界はその分だけ後ろへずれるので、刻みは RTC の
+    // 分解能 (1 秒) に対して無視できる大きさに留める
+    // (kRtcTickQuantum の説明を参照)。
     rtcPendingCycles_ += cycles;
     const bool rtcQuantumReached = rtcPendingCycles_ >= kRtcTickQuantum;
     if (rtcQuantumReached)
@@ -234,17 +240,17 @@ void Machine::tickDevices(u32 cycles)
         rtcPendingCycles_ = 0;
     }
 
-    // CRTC も同じくまとめる。刻みは RTC より細かく取る (帰線の境界が
-    // 観測されるため。kCrtcTickQuantum の説明を参照)。
-    crtcPendingCycles_ += cycles;
-    const bool crtcQuantumReached = crtcPendingCycles_ >= kCrtcTickQuantum;
-    if (!crtcQuantumReached)
-    {
-        return;
-    }
-    const u32 crtcCycles = crtcPendingCycles_;
-    crtcPendingCycles_ = 0;
-    if (crtc_.tick(crtcCycles))
+    // CRTC はまとめない。
+    //
+    // 一度 64 サイクル (1 ラスタ 317 の 1/5) 単位でまとめたが、垂直帰線の
+    // 開始が **24 サイクル遅れて観測される** ことを実測した
+    // (scratchpad の vblank_probe で 162344 -> 162368)。
+    //
+    // RTC と違い、inVerticalBlank() は GPIP4 ($E88001) としてゲストから
+    // 命令単位でポーリングできる。IERB/IMRB が許可されていれば垂直帰線
+    // 割り込みの発生も同じだけ遅れる。「1 ラスタ未満なら観測できない」は
+    // 成り立たない。得られたのは +0.25% で、割に合わない。
+    if (crtc_.tick(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
     }

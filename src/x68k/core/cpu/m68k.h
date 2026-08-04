@@ -211,6 +211,21 @@ private:
 
         // PC は既に「次に読むアドレス」を指している。
         const u32 a = st_.pc & kAddrMask;
+
+        // 奇数アドレスからのワード読みはアドレスエラー。
+        //
+        // Why 窓の判定より前に置くか: 下の直接経路は read16 を通らないので、
+        // ここで見ないとアドレスエラーが起きないまま奇数番地から命令語を
+        // 組み立ててしまう。通常は refillPrefetch が奇数分岐を弾くので
+        // 到達しにくいが、loadStateForTest で奇数 PC を流し込むと差が出る
+        // (インライン化前は read16 の中で必ず判定していた)。
+        if ((a & 1) != 0)
+        {
+            st_.irc = read16(a);
+            st_.pc = st_.pc + 2;
+            return value;
+        }
+
         if (fastRamReadable_ && fastRam_ != nullptr && a + 1 < fastRamLimit_)
         {
             st_.irc = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
