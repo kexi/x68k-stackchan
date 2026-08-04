@@ -132,6 +132,18 @@ public:
     // その 0.1% も cycleAccumulator_ に溜まるので累積誤差にはならない。
     static constexpr u32 kRtcTickQuantum = 10000;
 
+    // CRTC へ時間を渡す最小単位 (CPU サイクル)。
+    //
+    // CRTC も加算アキュムレータ (frameCycles_) なので、まとめても
+    // フレーム内の位置は変わらない。ただし RTC と違い、垂直帰線の状態を
+    // ゲストが $E80028 や GPIP4 で**観測する**ので、刻みを粗くすると
+    // 帰線の開始/終了がその分だけ遅れて見える。
+    //
+    // 1 ラスタは kCyclesPerFrame / 568 = 317 サイクル。64 ならその 1/5 で、
+    // ラスタ番号は最大 0.2 本ぶんしかずれない。垂直帰線の境界も同じ精度で
+    // 保たれる。走査線単位で同期を取るコードでも観測できる差にならない。
+    static constexpr u32 kCrtcTickQuantum = 64;
+
     [[nodiscard]] M68k& cpu()
     {
         return cpu_;
@@ -364,6 +376,9 @@ private:
 
     // tickDevices が溜めている、まだ RTC へ渡していない CPU サイクル。
     u32 rtcPendingCycles_ = 0;
+
+    // tickDevices が溜めている、まだ CRTC へ渡していない CPU サイクル。
+    u32 crtcPendingCycles_ = 0;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
     struct SasiState

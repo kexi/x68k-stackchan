@@ -225,10 +225,7 @@ void Machine::tickDevices(u32 cycles)
     // tick() の外から一切読まれない (reset で 0 にする以外の参照が無い)。
     // よってまとめて渡しても、秒が進むタイミングも読み出せる値も変わらない。
     //
-    // Why not CRTC も同じ扱いにしないか: あちらは垂直帰線の状態を
-    // 持っていて、ゲストが $E80028 やGPIP4 で**観測する**。粗くすると
-    // 帰線の開始/終了が最大で quantum ぶんずれ、画面同期を待つコードの
-    // 挙動が変わる。RTC と違って観測可能なので、刻みは変えない。
+    // CRTC も同じ形だが、帰線の境界が観測されるので刻みを分ける (下記)。
     rtcPendingCycles_ += cycles;
     const bool rtcQuantumReached = rtcPendingCycles_ >= kRtcTickQuantum;
     if (rtcQuantumReached)
@@ -237,7 +234,17 @@ void Machine::tickDevices(u32 cycles)
         rtcPendingCycles_ = 0;
     }
 
-    if (crtc_.tick(cycles))
+    // CRTC も同じくまとめる。刻みは RTC より細かく取る (帰線の境界が
+    // 観測されるため。kCrtcTickQuantum の説明を参照)。
+    crtcPendingCycles_ += cycles;
+    const bool crtcQuantumReached = crtcPendingCycles_ >= kCrtcTickQuantum;
+    if (!crtcQuantumReached)
+    {
+        return;
+    }
+    const u32 crtcCycles = crtcPendingCycles_;
+    crtcPendingCycles_ = 0;
+    if (crtc_.tick(crtcCycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
     }
