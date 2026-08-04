@@ -158,8 +158,6 @@ void Machine::reset()
     // 0 になるが、ここに溜まっている分を残すとリセット後の最初の tick に
     // 混ざり、位相がその分だけ進む。リセットの意味が「時間も 0 から」なので
     // 保留も一緒に捨てる。
-    pendingDeviceCycles_ = 0;
-    rtcPendingCycles_ = 0;
 
     // リセット直後は IPL-ROM が $000000 に写像されている。
     // これがないとリセットベクタが読めない。
@@ -198,25 +196,9 @@ u32 Machine::run(u32 cycles)
         }
         spent += used;
 
-        // デバイスの時間は quantum 単位でまとめて渡す。
-        // 3 つとも加算アキュムレータなので、まとめても値は変わらない
-        // (kDeviceTickQuantum の説明を参照)。
-        pendingDeviceCycles_ += used;
-        const bool reachedQuantum = pendingDeviceCycles_ >= kDeviceTickQuantum;
-        if (reachedQuantum)
-        {
-            tickDevices(pendingDeviceCycles_);
-            pendingDeviceCycles_ = 0;
-        }
+        tickDevices(used);
     }
 
-    // 溜めたぶんを残したまま返さない。呼び出し側が run() を細切れに呼んでも、
-    // step() と混ぜても、デバイスへ渡る総サイクル数が変わらないようにする。
-    if (pendingDeviceCycles_ != 0)
-    {
-        tickDevices(pendingDeviceCycles_);
-        pendingDeviceCycles_ = 0;
-    }
     return spent;
 }
 
@@ -224,32 +206,20 @@ void Machine::tickDevices(u32 cycles)
 {
     mfp_.tick(cycles);
 
-    // RTC は 1 秒 (10,000,000 サイクル) ごとにしか状態が変わらないのに、
-    // MFP と同じ 8 サイクル刻みで呼ばれていた。125 万回に 1 回しか仕事が
-    // 無い呼び出しで、プロファイル上 tickDevices は step 全体の 36.2% を
-    // 占めていた。
+    // RTC も CRTC もまとめない。
     //
-    // まとめると秒の境界はその分だけ後ろへずれるので、刻みは RTC の
-    // 分解能 (1 秒) に対して無視できる大きさに留める
-    // (kRtcTickQuantum の説明を参照)。
-    rtcPendingCycles_ += cycles;
-    const bool rtcQuantumReached = rtcPendingCycles_ >= kRtcTickQuantum;
-    if (rtcQuantumReached)
-    {
-        rtc_.tick(rtcPendingCycles_);
-        rtcPendingCycles_ = 0;
-    }
+    // 一度は「RTC は 1 秒単位でしか変わらないから粗くてよい」「CRTC の
+    // ずれは 1 ラスタ未満だから見えない」として quantum を入れたが、
+    // どちらも実測で観測可能なずれが出た:
+    //   CRTC 64 サイクル -> 垂直帰線の開始が 24 サイクル遅れる
+    //   RTC 10000 サイクル -> 秒の境界が最大 1998 サイクル遅れる
+    //   MFP 8 サイクル -> 分周器の位相次第で割り込みが 4 サイクル遅れる
+    //
+    // いずれもゲストが命令単位でポーリングできる値なので、「分解能より
+    // 細かいから見えない」は成り立たない。ポーリングループの反復回数
+    // として観測できる。速度のために正しさを崩す取引だったので戻した。
+    rtc_.tick(cycles);
 
-    // CRTC はまとめない。
-    //
-    // 一度 64 サイクル (1 ラスタ 317 の 1/5) 単位でまとめたが、垂直帰線の
-    // 開始が **24 サイクル遅れて観測される** ことを実測した
-    // (scratchpad の vblank_probe で 162344 -> 162368)。
-    //
-    // RTC と違い、inVerticalBlank() は GPIP4 ($E88001) としてゲストから
-    // 命令単位でポーリングできる。IERB/IMRB が許可されていれば垂直帰線
-    // 割り込みの発生も同じだけ遅れる。「1 ラスタ未満なら観測できない」は
-    // 成り立たない。得られたのは +0.25% で、割に合わない。
     if (crtc_.tick(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());

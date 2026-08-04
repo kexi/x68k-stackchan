@@ -116,6 +116,7 @@ add_executable(x68k_tests
   # メインメモリを仮想関数抜きで触る直接経路。速度のためだけに入れた経路なので、
   # バス経由と結果が変わらないことを実際の命令実行で押さえる。
   test_m68k_fastram.cpp
+  test_device_timing.cpp
   test_sram.cpp
   test_sram_persist.cpp
   test_bus.cpp
