@@ -38,6 +38,56 @@ u32 M68k::groupMisc(u16 op)
     const u32 mode = (op >> 3) & 7u;
     const u32 reg = op & 7u;
 
+    // --- 最頻の 2 系統だけ先に振り分ける ------------------------------------
+    //
+    // このグループ (0100) は全命令の 25.2% を占める最頻グループだが、実装は
+    // 固定パターンから順に見る if の直列で末尾まで 26 段ある。命令語ごとに
+    // 実測したところ (200M サイクル / groupMisc 到達 5179411 回):
+    //
+    //   単項演算 (NEGX/CLR/NEG/NOT/TST)  47.4%  <- チェーン最末尾 (26 段目)
+    //   MOVEM                            29.6%  <- 22 段目
+    //   LEA                              11.7%
+    //   JSR                               3.6%
+    //   その他                            7.7%
+    //
+    // **77% が 22 段以上の失敗比較を歩いてから**実体に着いていた。
+    //
+    // Why not switch へ書き直さないか: この関数は 600 行あり、TAS と ILLEGAL
+    // ($4AFC)、EXT.W と NBCD ($4880 / $4800) のように「手前で捕まること」が
+    // 正しさの前提になっている組が複数ある。全体を組み替えると、その順序
+    // 依存を 1 つ取り落としただけで別命令として実行される。
+    //
+    // Why not 本体をここへ移動しないか: 移動は差分が大きく、移動漏れや
+    // 変数の捕捉ミスが混ざる余地がある。goto で**既存の本体へ飛ぶ**なら、
+    // 実行される命令列は今までと 1 命令も変わらない。
+    //
+    // 先取りしてよいことは op = $4000-$4FFF の全数で確かめた:
+    //   opField ∈ {0,2,4,6,A} かつ sizeField != 3 の 960 個は、手前の分岐に
+    //   **1 つも捕まらない**。よって飛ばしても到達先は変わらない。
+    //   MOVEM ($FB80 マスク) も同じ条件で手前と重ならない。
+    {
+        const u32 opFieldFast = (op >> 8) & 0xFu;
+        const bool isUnaryOpField = opFieldFast == 0x0u || opFieldFast == 0x2u ||
+                                    opFieldFast == 0x4u || opFieldFast == 0x6u ||
+                                    opFieldFast == 0xAu;
+        const bool isUnaryFast = ((op >> 6) & 3u) != 3u && isUnaryOpField;
+        if (isUnaryFast)
+        {
+            goto unary_ops;
+        }
+        // MOVEM は mode 0 (Dn 直接) を取らない。EXT.W ($4880-$4887) と
+        // EXT.L ($48C0-$48C7) がこのマスクに入ってしまい、手前で捕まるべき
+        // 16 個をここで奪ってしまうため、mode 0 を外す。
+        //
+        // 最初に mode の除外を書かずに通したところ、EXT.L D1 ($48C1) が
+        // MOVEM として実行されて適合性ベクタが 105 件落ちた。
+        const bool isMovemFast = (op & 0xFB80u) == 0x4880u && mode != 0;
+        if (isMovemFast)
+        {
+            goto movem_op;
+        }
+    }
+
     // --- 固定パターンの命令から先に判定する ---------------------------------
 
     if (op == 0x4E71u)  // NOP
@@ -247,8 +297,6 @@ u32 M68k::groupMisc(u16 op)
 
     // --- パターンで分ける命令 -----------------------------------------------
 
-    const u32 opField = (op >> 8) & 0xFu;
-
     // LEA <ea>,An : op = 0100 rrr 111 mmm rrr
     if ((op & 0x01C0u) == 0x01C0u)
     {
@@ -338,6 +386,7 @@ u32 M68k::groupMisc(u16 op)
     }
 
     // MOVEM : 0100 1d00 1s mmm rrr
+movem_op:
     if ((op & 0xFB80u) == 0x4880u)
     {
         const bool memoryToRegister = (op & 0x0400u) != 0;
@@ -482,9 +531,14 @@ u32 M68k::groupMisc(u16 op)
     // $4AFC (mode 7 / reg 4) だけは TAS ではなく ILLEGAL 命令。
     // 実効アドレスとして意味を持たない組み合わせをその 1 つに割り当てて
     // あるので、ここで先に弾かないと ILLEGAL を TAS として実行してしまう。
-    const bool isIllegalOpcode = op == 0x4AFCu;
-    const bool isTas = !isIllegalOpcode && (op & 0xFFC0u) == 0x4AC0u;
-    if (isTas)
+    {
+        const bool isIllegalOpcode = op == 0x4AFCu;
+        const bool isTas = !isIllegalOpcode && (op & 0xFFC0u) == 0x4AC0u;
+        if (!isTas)
+        {
+            goto unary_ops;
+        }
+    }
     {
         u32 addr = 0;
         const u32 value = readEaForModify(mode, reg, kByte, addr);
@@ -495,12 +549,12 @@ u32 M68k::groupMisc(u16 op)
     }
 
     // 単項演算: NEGX/CLR/NEG/NOT/TST : 0100 ooo 0 ss mmm rrr
-    const u32 sizeField = (op >> 6) & 3u;
-    if (sizeField != 3)
+unary_ops:
+    if (((op >> 6) & 3u) != 3)
     {
-        const u32 size = sizeFromField(sizeField);
+        const u32 size = sizeFromField((op >> 6) & 3u);
 
-        switch (opField)
+        switch ((op >> 8) & 0xFu)
         {
             case 0x0:  // NEGX
             {
