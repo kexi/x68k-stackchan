@@ -523,18 +523,9 @@ u32 M68k::effectiveAddress(u32 mode, u32 reg, u32 size)
     return 0;
 }
 
-u32 M68k::readEa(u32 mode, u32 reg, u32 size)
+u32 M68k::readEaSlow(u32 mode, u32 reg, u32 size)
 {
-    if (mode == 0)
-    {
-        return truncate(st_.d[reg], size);
-    }
-    if (mode == 1)
-    {
-        // An はワード指定でも符号拡張された 32bit として読まれる。
-        return size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(st_.a[reg])))
-                             : st_.a[reg];
-    }
+    // mode 0/1 (Dn/An 直接) はヘッダ側で捌き済み。ここには来ない。
     if (mode == 7 && reg == 4)
     {
         // #immediate
@@ -561,33 +552,9 @@ u32 M68k::readEa(u32 mode, u32 reg, u32 size)
     return read32(addr);
 }
 
-void M68k::writeEa(u32 mode, u32 reg, u32 size, u32 value)
+void M68k::writeEaSlow(u32 mode, u32 reg, u32 size, u32 value)
 {
-    if (mode == 0)
-    {
-        // Dn への書き込みはサイズぶんだけを差し替える。上位は保存される。
-        if (size == kByte)
-        {
-            st_.d[reg] = (st_.d[reg] & 0xFFFFFF00u) | (value & 0xFFu);
-        }
-        else if (size == kWord)
-        {
-            st_.d[reg] = (st_.d[reg] & 0xFFFF0000u) | (value & 0xFFFFu);
-        }
-        else
-        {
-            st_.d[reg] = value;
-        }
-        return;
-    }
-    if (mode == 1)
-    {
-        // An への書き込みは常に 32bit。ワード指定なら符号拡張される。
-        st_.a[reg] =
-            size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
-        return;
-    }
-
+    // mode 0/1 (Dn/An 直接) はヘッダ側で捌き済み。ここには来ない。
     const u32 addr = effectiveAddress(mode, reg, size);
     writeEaToAddr(mode, reg, size, addr, value);
 }

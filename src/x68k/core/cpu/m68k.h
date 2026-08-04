@@ -224,8 +224,83 @@ private:
     // mode/reg から実効アドレスを計算する。size はディスプレースメント計算と
     // -(An)/(An)+ の増減幅に効く (バイトで A7 を触ると 2 増減する特例がある)。
     X68K_HOT_PATH u32 effectiveAddress(u32 mode, u32 reg, u32 size);
-    X68K_HOT_PATH u32 readEa(u32 mode, u32 reg, u32 size);
-    X68K_HOT_PATH void writeEa(u32 mode, u32 reg, u32 size, u32 value);
+    // レジスタ直接 (mode 0/1) だけをここで捌き、それ以外は .cpp の
+    // 実効アドレス計算へ回す。
+    //
+    // MOVE は全命令の 19.2% で、その転送元・転送先はレジスタ直接が最頻。
+    // プロファイルでは groupMove の readEa 行 (179) と writeEa 行 (151) が
+    // 命令実装の中で最大の 2 項目だった。どちらも .cpp 側にあり、
+    // ESP32-S3 では実呼び出しになる。
+    //
+    // Why not 全部インラインにしないか: mode 2-7 は拡張ワードの読み出しや
+    // ポインタの増減を含み、展開すると呼び出し側 (各命令グループ) が
+    // 一斉に膨らむ。I-cache を押し出して逆効果になりうる。
+    // レジスタ直接は「配列を 1 つ引いて型を切る」だけなので、
+    // 呼び出しの方が高くつく。
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // ここは m68k_alu.h を include せずに済ませたいので数値で書くが、
+    // **0/1/2 ではない**。一度そう思い込んで書き、適合性ベクタが
+    // 25 件落ちた (MOVE.b の転送元が常に 0 になった)。
+    u32 readEa(u32 mode, u32 reg, u32 size)
+    {
+        if (mode == 0)
+        {
+            const u32 v = st_.d[reg];
+            if (size == 1)  // kByte
+            {
+                return v & 0xFFu;
+            }
+            if (size == 2)  // kWord
+            {
+                return v & 0xFFFFu;
+            }
+            return v;
+        }
+        if (mode == 1)
+        {
+            // An はワード指定でも符号拡張された 32bit として読まれる。
+            const u32 v = st_.a[reg];
+            if (size == 2)  // kWord
+            {
+                return static_cast<u32>(static_cast<s32>(static_cast<s16>(v)));
+            }
+            return v;
+        }
+        return readEaSlow(mode, reg, size);
+    }
+
+    void writeEa(u32 mode, u32 reg, u32 size, u32 value)
+    {
+        if (mode == 0)
+        {
+            // Dn への書き込みはサイズぶんだけを差し替える。上位は保存される。
+            u32& d = st_.d[reg];
+            if (size == 1)  // kByte
+            {
+                d = (d & 0xFFFFFF00u) | (value & 0xFFu);
+                return;
+            }
+            if (size == 2)  // kWord
+            {
+                d = (d & 0xFFFF0000u) | (value & 0xFFFFu);
+                return;
+            }
+            d = value;
+            return;
+        }
+        if (mode == 1)
+        {
+            // An への書き込みは常に 32bit。ワード指定なら符号拡張される。
+            st_.a[reg] =
+                size == 2 ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
+            return;
+        }
+        writeEaSlow(mode, reg, size, value);
+    }
+
+    X68K_HOT_PATH u32 readEaSlow(u32 mode, u32 reg, u32 size);
+    X68K_HOT_PATH void writeEaSlow(u32 mode, u32 reg, u32 size, u32 value);
     // 書き込み先の実効アドレスを一度だけ計算して使い回すための版。
     // ADD.b (An)+,D0 のように「読んでから同じ場所へ書く」命令で、
     // ポインタを二重に進めてしまう事故を防ぐ。
