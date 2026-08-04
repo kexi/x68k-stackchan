@@ -101,6 +101,25 @@ public:
     // 1 命令だけ実行する。トレース用。
     u32 step();
 
+    // デバイスの時間を進める最小単位 (CPU サイクル)。
+    //
+    // run() は 1 命令ごとに mfp_/rtc_/crtc_ を呼ばず、この量が溜まってから
+    // まとめて渡す。3 デバイス x 1 命令 (平均 4 サイクル) の呼び出しが、
+    // プロファイルで Machine::step 全体の約 30% を占めていた。
+    //
+    // Why not 近似にならないか: 3 つとも「受け取ったサイクルを内部の
+    // アキュムレータへ足し、閾値を超えた回数だけ進む」形をしている
+    // (Mfp::tickTimer の prescaleCounter_、Rtc の cycleAccumulator_、
+    // Crtc の frameCycles_)。加算は結合するので、4 を 4 回渡すのと
+    // 16 を 1 回渡すのは算術的に同じ値になる。丸めではない。
+    //
+    // Why not もっと大きくしないか: MFP の最小分周は 4 MFP サイクル =
+    // 8 CPU サイクル (kPrescaleTable[1]、CPU→MFP は 1/2 換算)。ここを
+    // 超えると「1 回で複数回ぶん減る」のは同じでも、割り込みが上がる
+    // タイミングが最大で quantum ぶん遅れる。8 なら最短のタイマでも
+    // 1 周期以内に必ず 1 度は見るので、観測できるずれが出ない。
+    static constexpr u32 kDeviceTickQuantum = 8;
+
     [[nodiscard]] M68k& cpu()
     {
         return cpu_;
@@ -270,6 +289,9 @@ private:
     u8 sccRead(u32 addr);
     void sccWrite(u32 addr, u8 value);
 
+    // 時間で動くデバイスへ経過サイクルを渡す。step() と run() の共通路。
+    void tickDevices(u32 cycles);
+
     Sram sram_;
     SystemBus bus_;
     M68k cpu_;
@@ -286,6 +308,10 @@ private:
     Dmac dmac_;
     FdcDmaPort fdcDmaPort_{fdc_};
     DiskImage* disk_ = nullptr;
+
+    // run() が溜めている、まだデバイスへ渡していない CPU サイクル。
+    // 常に kDeviceTickQuantum 未満に保つ。
+    u32 pendingDeviceCycles_ = 0;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
     struct SasiState

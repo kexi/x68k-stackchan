@@ -170,12 +170,7 @@ u32 Machine::step()
         return 0;
     }
 
-    mfp_.tick(cycles);
-    rtc_.tick(cycles);
-    if (crtc_.tick(cycles))
-    {
-        mfp_.setVerticalBlank(crtc_.inVerticalBlank());
-    }
+    tickDevices(cycles);
 
     return cycles;
 }
@@ -185,14 +180,45 @@ u32 Machine::run(u32 cycles)
     u32 spent = 0;
     while (spent < cycles)
     {
-        const u32 used = step();
+        serviceInterrupts();
+
+        const u32 used = cpu_.step();
         if (used == 0)
         {
             break;  // 停止した
         }
         spent += used;
+
+        // デバイスの時間は quantum 単位でまとめて渡す。
+        // 3 つとも加算アキュムレータなので、まとめても値は変わらない
+        // (kDeviceTickQuantum の説明を参照)。
+        pendingDeviceCycles_ += used;
+        const bool reachedQuantum = pendingDeviceCycles_ >= kDeviceTickQuantum;
+        if (reachedQuantum)
+        {
+            tickDevices(pendingDeviceCycles_);
+            pendingDeviceCycles_ = 0;
+        }
+    }
+
+    // 溜めたぶんを残したまま返さない。呼び出し側が run() を細切れに呼んでも、
+    // step() と混ぜても、デバイスへ渡る総サイクル数が変わらないようにする。
+    if (pendingDeviceCycles_ != 0)
+    {
+        tickDevices(pendingDeviceCycles_);
+        pendingDeviceCycles_ = 0;
     }
     return spent;
+}
+
+void Machine::tickDevices(u32 cycles)
+{
+    mfp_.tick(cycles);
+    rtc_.tick(cycles);
+    if (crtc_.tick(cycles))
+    {
+        mfp_.setVerticalBlank(crtc_.inVerticalBlank());
+    }
 }
 
 void Machine::serviceInterrupts()
