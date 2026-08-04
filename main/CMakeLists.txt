@@ -39,11 +39,17 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/platform/frame_channel.cpp"
         "${X68K_ROOT}/src/x68k/platform/key_queue.cpp"
         "${X68K_ROOT}/src/x68k/platform/input_touch.cpp"
+        # 音声の受け渡し。ESP-IDF に触らないのでホストのテストと実体を共有する
+        # (M5Unified を叩くのはヘッダオンリーの speaker_m5.h)。
+        "${X68K_ROOT}/src/x68k/platform/audio.cpp"
         # --- スタックチャン: 顔 ⇄ X68000 の切り替え ---
-        # app_mode.cpp は ESP-IDF に触らない (ホストのテストと実体を共有する)。
-        # servo.h はヘッダオンリー。avatar.cpp は仮の実装 (avatar.h を見よ)。
+        # app_mode.cpp と avatar.cpp は ESP-IDF に触らない (ホストのテストと
+        # 実体を共有する)。顔は RGB565 の配列へ画素を置くだけで、LCD へ送るのは
+        # DisplayLcd::pushFrame (avatar.h の冒頭を見よ)。
+        # servo.cpp だけが ESP-IDF (LEDC) を必要とする。
         "${X68K_ROOT}/src/x68k/platform/app_mode.cpp"
         "${X68K_ROOT}/src/x68k/platform/avatar.cpp"
+        "${X68K_ROOT}/src/x68k/platform/servo.cpp"
     INCLUDE_DIRS
         "."
         "${X68K_ROOT}/src/x68k/core"
@@ -57,4 +63,7 @@ idf_component_register(
         esp_driver_spi
         # シリアルコンソール (ホストから X68000 へキーを送る)。
         esp_driver_usb_serial_jtag
+        # 首振りサーボの PWM (servo.cpp)。
+        esp_driver_ledc
+        esp_driver_gpio
 )

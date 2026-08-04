@@ -93,6 +93,10 @@ Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
     // バスがモードを引けるようにここで繋ぐ。
     bus_.setVideoController(&video_);
 
+    // メインメモリへのアクセスを仮想関数抜きで通せるようにする。
+    // 以後、実体・ROM 写像・ウォッチが変わるたびにバスが CPU へ教え直す。
+    bus_.attachFastPathCpu(&cpu_);
+
     // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
     // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
     // Machine が受け取って処理する。
@@ -281,13 +285,31 @@ bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 //
 // FM (OPM) と ADPCM を足してモノラルで返す。実機は両者を独立した経路で
 // アナログ的に混ぜるが、ここでは合成後に加算する。
-//
-// 現時点でこれを実機のリアルタイムループから呼んではいけない。理由は
-// machine.h の renderAudio の宣言に書いた (実効クロックが足りない)。
 void Machine::renderAudio(std::int16_t* out, std::size_t frames)
 {
     if (out == nullptr)
     {
+        return;
+    }
+
+    // 両方とも鳴っていなければ、合成そのものを省いてゼロで埋める。
+    //
+    // これが実機で音源を常時 ON にできるかどうかを分ける。X68000 を
+    // 触っている時間の大半 (起動中、コマンド入力待ち) は音が鳴っておらず、
+    // そこで 8ch x 4op を回すのは丸ごと無駄になる。Opm::renderSamples は
+    // 同じ早期リターンを持つが、ここは 1 サンプルずつ混ぜる都合で
+    // renderOneSample を呼ぶため、その恩恵を受けられない。
+    //
+    // Why not isSilent の判定を毎サンプル行わないか: エンベロープは
+    // 1 ブロックの途中で切れうるが、鳴り終わった残りをゼロで埋めるか
+    // 減衰しきった値で埋めるかの差しかない。ブロックの頭で 1 回だけ見る。
+    const bool isQuiet = opm_.isSilent() && !adpcm_.isPlaying();
+    if (isQuiet)
+    {
+        for (std::size_t i = 0; i < frames; ++i)
+        {
+            out[i] = 0;
+        }
         return;
     }
 

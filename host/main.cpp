@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "io/ascii_keymap.h"
+#include "gui_demo.h"
 #include "machine.h"
 #include "video/cgrom_fallback.h"
 #include "video/graphic_raster.h"
@@ -390,172 +391,47 @@ private:
 
 // --- GUI 経路のデモ ---------------------------------------------------------
 //
-// SX-Window が使うのと同じ手順 (画面モード → パレット → プライオリティ →
-// $C00000 の窓へ描画 → テキスト VRAM) を踏む小さな 68000 プログラムを
-// 走らせて、合成結果を PPM に落とす。
+// 実体は host/gui_demo.cpp。ここは PPM への書き出しと報告だけを持つ。
 //
-// これは test/test_gui_smoke.cpp と同じ経路を人間の目で確かめるための入口。
-// テストは色の値を数値で検査するが、「絵として破綻していないか」は
-// 見ないと分からない。IPL-ROM を必要としないので、ROM が無い環境でも
-// グラフィック経路だけを確かめられる。
-//
-// Why not test 側のプログラムを共有しないか: test/ はホストのテスト
-// バイナリにしか入らず、ランナーから参照すると test/ がランナーの
-// 依存になる。プログラム自体は 30 行ほどで、二重に持つ方が依存が素直。
-// 検査の本体はテスト側にあり、こちらは目視用と割り切る。
+// なぜ生成をこのファイルから追い出したか: 同じ絵をテスト
+// (test/test_gui_demo.cpp) がピクセル単位で検査する。生成が 2 箇所にあると
+// 「目視した絵」と「テストが見た絵」が別物になりうる。
 
-// MOVE.W #imm,(xxx).L を吐く。IPL-ROM $FF642E と同じ形。
-void emitMoveWordImmToAbs(std::vector<x68k::u8>& code, x68k::u16 imm, x68k::u32 addr)
-{
-    const x68k::u16 words[] = {0x33FC, imm, static_cast<x68k::u16>(addr >> 16),
-                               static_cast<x68k::u16>(addr & 0xFFFFu)};
-    for (const x68k::u16 w : words)
-    {
-        code.push_back(static_cast<x68k::u8>(w >> 8));
-        code.push_back(static_cast<x68k::u8>(w & 0xFFu));
-    }
-}
-
-// 矩形を 1 ドットずつ MOVE.W で塗る。
-//
-// ループを組まずに全ドットを展開する。実行するのはホストで一度きりなので
-// コード長より読みやすさを優先する (テスト側はループを組んでいる)。
-void emitFillRectUnrolled(std::vector<x68k::u8>& code, x68k::u32 page, x68k::u32 rx, x68k::u32 ry,
-                          x68k::u32 w, x68k::u32 h, x68k::u16 color)
-{
-    for (x68k::u32 y = 0; y < h; ++y)
-    {
-        for (x68k::u32 x = 0; x < w; ++x)
-        {
-            const x68k::u32 addr = x68k::kGvramBase + page * 0x80000u +
-                                   (ry + y) * x68k::kGvramBytesPerLine + (rx + x) * 2u;
-            emitMoveWordImmToAbs(code, color, addr);
-        }
-    }
-}
-
-// GUI のデモを走らせて PPM を書く。成功したら true。
 bool runGuiDemo(const std::string& ppmPath)
 {
-    constexpr x68k::u32 kOrigin = 0x010000u;
-    constexpr x68k::u16 kBack = 1;
-    constexpr x68k::u16 kFront = 2;
+    std::vector<x68k::u16> pixels(
+        static_cast<std::size_t>(x68k::guidemo::kScreenWidth) * x68k::guidemo::kScreenHeight, 0);
 
-    std::vector<x68k::u8> code;
-
-    // 16 色 512x512。
-    emitMoveWordImmToAbs(code, 0x0000, 0xE82400);
-    // グラフィックパレット: 0=透明(黒) / 1=赤 / 2=青。
-    emitMoveWordImmToAbs(code, 0x0000, 0xE82000);
-    emitMoveWordImmToAbs(code, 0x07C0, 0xE82000 + kBack * 2);
-    emitMoveWordImmToAbs(code, 0x003E, 0xE82000 + kFront * 2);
-    // テキストパレット 1 = 白。
-    emitMoveWordImmToAbs(code, 0xFFFF, 0xE82202);
-    // プライオリティ: TX=1 (奥) / GR=0 (手前) / GP1=1 / GP0=0。
-    emitMoveWordImmToAbs(code, 0x0404, 0xE82500);
-    // 表示: テキスト + グラフィック (ページ 0/1)。
-    emitMoveWordImmToAbs(code, 0x0033, 0xE82600);
-
-    // 奥 (ページ 1) と手前 (ページ 0) の矩形を一部重ねる。
-    emitFillRectUnrolled(code, 1, 40, 40, 120, 90, kBack);
-    emitFillRectUnrolled(code, 0, 100, 85, 120, 90, kFront);
-
-    // 手前に透明の穴を開ける。背後の赤が覗くはず。
-    for (x68k::u32 y = 0; y < 20; ++y)
+    const x68k::guidemo::Result r = x68k::guidemo::run(pixels.data());
+    if (!r.ok)
     {
-        for (x68k::u32 x = 0; x < 20; ++x)
+        std::fprintf(stderr, "[gui-demo] 失敗: %s", r.failure != nullptr ? r.failure : "不明");
+        if (r.haltedOpcode != 0)
         {
-            const x68k::u32 addr =
-                x68k::kGvramBase + (120 + y) * x68k::kGvramBytesPerLine + (130 + x) * 2u;
-            emitMoveWordImmToAbs(code, 0x0000, addr);
+            std::fprintf(stderr, " (opcode %04X)", r.haltedOpcode);
         }
-    }
-
-    // テキスト VRAM に横線を引く。テキスト面が合成されている印。
-    for (x68k::u32 i = 0; i < 20; ++i)
-    {
-        emitMoveWordImmToAbs(code, 0xFFFF, x68k::kTvramBase + 8 * x68k::kTvramBytesPerLine + i * 2);
-    }
-
-    // STOP #$2700 で終わり。
-    code.push_back(0x4E);
-    code.push_back(0x72);
-    code.push_back(0x27);
-    code.push_back(0x00);
-
-    std::vector<x68k::u8> mainRam(x68k::kMainRamSize, 0);
-    std::vector<x68k::u8> textVram(x68k::kTvramSize, 0);
-    std::vector<x68k::u8> graphicVram(x68k::kTvramSize, 0);
-
-    for (std::size_t i = 0; i < code.size(); ++i)
-    {
-        mainRam[kOrigin + i] = code[i];
-    }
-
-    // リセットベクタ。$000000 = SSP、$000004 = 初期 PC。
-    const x68k::u32 vectors[2] = {x68k::kResetSsp, kOrigin};
-    for (int v = 0; v < 2; ++v)
-    {
-        for (int b = 0; b < 4; ++b)
-        {
-            mainRam[static_cast<std::size_t>(v) * 4 + static_cast<std::size_t>(b)] =
-                static_cast<x68k::u8>(vectors[v] >> ((3 - b) * 8));
-        }
-    }
-
-    x68k::Machine machine;
-    x68k::MemoryMap memory;
-    memory.mainRam = mainRam.data();
-    memory.textVram = textVram.data();
-    memory.graphicVram = graphicVram.data();
-    machine.setMemory(memory);
-    machine.bus().setRomMappedAtZero(false);
-    machine.reset();
-
-    // STOP に達するまで回す。
-    constexpr x68k::u32 kMaxInstructions = 2000000;
-    x68k::u32 executed = 0;
-    while (executed < kMaxInstructions && !machine.cpu().state().stopped && !machine.isHalted())
-    {
-        machine.step();
-        ++executed;
-    }
-
-    if (machine.isHalted())
-    {
-        std::fprintf(stderr, "[gui-demo] 未実装命令 %04X で停止しました\n", machine.haltedOpcode());
-        return false;
-    }
-    if (!machine.cpu().state().stopped)
-    {
-        std::fprintf(stderr, "[gui-demo] STOP に到達しませんでした\n");
+        std::fputc('\n', stderr);
         return false;
     }
 
-    std::printf("[gui-demo] %u 命令を実行しました\n", executed);
+    std::printf("[gui-demo] %u 命令を実行しました\n", r.instructions);
+    std::printf("[gui-demo] マウス: SCC 有効=%d レポート受理=%d\n", r.mouseEnabled ? 1 : 0,
+                r.mouseAccepted ? 1 : 0);
+    std::printf("[gui-demo] ゲストが計算したカーソル位置: (%u, %u)\n", r.cursorX, r.cursorY);
 
-    // マウスも動かしてみる。ゲストが SCC を設定していないので断られるのが
-    // 正しい挙動。有効/無効の別を出しておくと、実機で「カーソルが出ない」
-    // ときの切り分けに使える。
-    const bool mouseAccepted = machine.moveMouse(10, 5, true, false);
-    std::printf("[gui-demo] マウス: 有効=%d 受理=%d (ゲストが SCC を設定していなければ両方 0)\n",
-                machine.scc().isMouseEnabled() ? 1 : 0, mouseAccepted ? 1 : 0);
-
-    constexpr x68k::u32 kWidth = 512;
-    constexpr x68k::u32 kHeight = 512;
-    std::vector<x68k::u16> pixels(static_cast<std::size_t>(kWidth) * kHeight, 0);
-    x68k::GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0, 0,
-                                   kWidth, kHeight, pixels.data(), kWidth);
-
-    if (!writePpm(ppmPath, pixels.data(), kWidth, kHeight))
+    if (!writePpm(ppmPath, pixels.data(), x68k::guidemo::kScreenWidth,
+                  x68k::guidemo::kScreenHeight))
     {
         std::fprintf(stderr, "PPM を書けません: %s\n", ppmPath.c_str());
         return false;
     }
-    std::printf("[gui-demo] %s に書き出しました (%ux%u)\n", ppmPath.c_str(), kWidth, kHeight);
+    std::printf("[gui-demo] %s に書き出しました (%ux%u)\n", ppmPath.c_str(),
+                x68k::guidemo::kScreenWidth, x68k::guidemo::kScreenHeight);
     std::printf(
-        "[gui-demo] 注意: これは SX-Window の起動を示すものではありません。\n"
-        "           SX-Window が使うハードウェア経路が繋がっていることの目視確認です。\n");
+        "[gui-demo] 注意: これは SX-Window ではありません。SX-Window の起動を\n"
+        "           示すものでもありません。SX-Window が使うのと同じハードウェア\n"
+        "           経路 (G-VRAM / パレット / プライオリティ合成 / SCC マウス) を\n"
+        "           自前の 68000 プログラムで叩いた結果です。\n");
     return true;
 }
 

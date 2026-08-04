@@ -142,16 +142,44 @@ void M68k::refillPrefetch(u32 newPc)
     // IOCS 側はそこで「不正ベクタ」として処理する仕組み。
     // PC 自体を丸めてしまうとテストベクタ (32bit の PC を期待する) が
     // 落ちるので、丸めるのはアクセスの瞬間だけにする。
-    st_.ir = bus_.read16(newPc & kAddrMask);
+    const u32 a = newPc & kAddrMask;
+    // 分岐のたびに 2 ワード読む。ここも直接経路を通す。
+    // 4 バイトとも窓に収まるときだけ (またぐ場合は下の一般路が境界を見る)。
+    if (fastRamReadable_ && fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    {
+        st_.ir = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+        st_.irc = static_cast<u16>((fastRam_[a + 2] << 8) | fastRam_[a + 3]);
+        st_.pc = newPc + 4;
+        return;
+    }
+
+    st_.ir = bus_.read16(a);
     st_.irc = bus_.read16((newPc + 2) & kAddrMask);
     st_.pc = newPc + 4;
 }
 
 // --- メモリアクセス --------------------------------------------------------
 
+// 直接経路 (fastRam_) について:
+//   SystemBus::read16 は virtual なので、命令フェッチもオペランド読みも
+//   vtable 経由の間接呼び出しになる。呼び先が確定しないためインライン展開が
+//   効かず、実体は「配列から 2 バイト読む」だけなのに呼び出しの分を必ず払う。
+//   実行の大半はメインメモリに当たるので、そこだけを先に判定して素通しにする。
+//
+//   fastRam_ は bus_ が持つメインメモリと同じ実体を指す (写しではない)。
+//   DMAC はバス経由で触るが、同じ配列に当たるのでコヒーレンシの問題は無い。
+//
+//   バスエラーの扱い: メインメモリは応答しない領域ではないので、直接経路を
+//   通ったアクセスは必ず成功する。faulted_ を見に行く必要が無い。
+
 u8 M68k::read8(u32 addr)
 {
-    return bus_.read8(addr & kAddrMask);
+    const u32 a = addr & kAddrMask;
+    if (fastRamReadable_ && fastRamHasByte(a))
+    {
+        return fastRam_[a];
+    }
+    return bus_.read8(a);
 }
 
 u16 M68k::read16(u32 addr)
@@ -161,6 +189,12 @@ u16 M68k::read16(u32 addr)
     {
         takeAddressError(a, true);
         return 0;
+    }
+    if (fastRamReadable_ && fastRamHasWord(a))
+    {
+        // 68000 はビッグエンディアン。ホストのエンディアンに依存しないよう
+        // バイトから組む (SystemBus::read16 と同じ形)。
+        return static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
     }
     const u16 value = bus_.read16(a);
     if (bus_.lastAccessFaulted())
@@ -181,6 +215,13 @@ u32 M68k::read32(u32 addr)
         takeAddressError(a, true);
         return 0;
     }
+    // ロングは 4 バイトとも窓に収まるときだけ直接読む。
+    // またぐ場合は下の 2 回に分ける経路がそれぞれ境界を見る。
+    if (fastRamReadable_ && fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    {
+        return (static_cast<u32>(fastRam_[a]) << 24) | (static_cast<u32>(fastRam_[a + 1]) << 16) |
+               (static_cast<u32>(fastRam_[a + 2]) << 8) | fastRam_[a + 3];
+    }
     // 68000 のバスは 16bit なのでロングは 2 回に分かれる。上位が先。
     const u32 hi = bus_.read16(a);
     const bool hiFaulted = bus_.lastAccessFaulted();
@@ -193,9 +234,19 @@ u32 M68k::read32(u32 addr)
     return (hi << 16) | lo;
 }
 
+// 書き込みの直接経路は ROM 写像の有無に関係なく通してよい。
+//
+// Why: 写像中でも $000000-$1FFFFF への書き込み先は RAM 側で、ROM は書けない
+// (SystemBus::write8 も同じく mainRam へ書く)。読み出しだけが ROM に化ける。
 void M68k::write8(u32 addr, u8 value)
 {
-    bus_.write8(addr & kAddrMask, value);
+    const u32 a = addr & kAddrMask;
+    if (fastRamHasByte(a))
+    {
+        fastRam_[a] = value;
+        return;
+    }
+    bus_.write8(a, value);
 }
 
 void M68k::write16(u32 addr, u16 value)
@@ -204,6 +255,12 @@ void M68k::write16(u32 addr, u16 value)
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
+        return;
+    }
+    if (fastRamHasWord(a))
+    {
+        fastRam_[a] = static_cast<u8>(value >> 8);
+        fastRam_[a + 1] = static_cast<u8>(value & 0xFFu);
         return;
     }
     bus_.write16(a, value);
@@ -215,6 +272,14 @@ void M68k::write32(u32 addr, u32 value)
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
+        return;
+    }
+    if (fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    {
+        fastRam_[a] = static_cast<u8>(value >> 24);
+        fastRam_[a + 1] = static_cast<u8>(value >> 16);
+        fastRam_[a + 2] = static_cast<u8>(value >> 8);
+        fastRam_[a + 3] = static_cast<u8>(value & 0xFFu);
         return;
     }
     bus_.write16(a, static_cast<u16>(value >> 16));

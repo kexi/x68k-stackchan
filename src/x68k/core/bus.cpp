@@ -3,6 +3,8 @@
 
 #include "bus.h"
 
+#include "cpu/m68k.h"
+
 namespace x68k
 {
 namespace
@@ -43,6 +45,24 @@ constexpr u32 kGvramWindowSize = 0x80000u;
 constexpr u32 kGvramWindowMask = kGvramWindowSize - 1u;
 
 }  // namespace
+
+void SystemBus::publishFastRam()
+{
+    if (fastPathCpu_ == nullptr)
+    {
+        return;
+    }
+
+    // ウォッチが張られている間は直接経路を止める。
+    // 素通りされると監視対象への書き込みが notifyWatch を通らない。
+    const bool watching = watchCallback_ != nullptr;
+    u8* const base = watching ? nullptr : mem_.mainRam;
+    fastPathCpu_->setFastRam(base, kMainRamSize);
+
+    // 読み出しを直接経路に流してよいのは ROM 写像が外れてからだけ。
+    // 写像中の $000000-$00FFFF は RAM ではなく IPL-ROM の $FF0000 側が見える。
+    fastPathCpu_->setFastRamReadable(!romAtZero_);
+}
 
 SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
 {

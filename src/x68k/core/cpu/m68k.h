@@ -100,7 +100,59 @@ public:
     // 完全に指定したいので、setSr のような副作用を挟まない。
     void loadStateForTest(const M68kState& s);
 
+    // 仮想関数を通さずに直接触ってよいメインメモリの窓を教える。
+    //
+    // Why これが要るか: Bus::read16 は virtual なので、命令フェッチとオペランド
+    // 読みのたびに vtable 経由の間接呼び出しになる。呼び先が確定しないため
+    // インライン展開もできず、短い関数なのに呼び出し規約の分だけ必ず払う。
+    // CoreS3 の実測ではスライスの 80% が run() の中で、その大半がこの経路。
+    //
+    // 窓は「先頭から length バイトが base の指す配列そのもの」であること。
+    // SystemBus が同じ配列を指しているので、DMA (Machine::dmaMemRead) が
+    // バス経由で触っても同じ実体に当たる。写しではないのでコヒーレンシの
+    // 問題が起きない。
+    //
+    // Why not CPU に写しを持たせないか: DMAC と CPU が同じ番地を触るので、
+    // 写しにすると SASI の転送結果が CPU から見えない (あるいはその逆)。
+    // ポインタを共有する形なら、そもそも同期する対象が無い。
+    //
+    // Why not M68k をバス型でテンプレート化しないか: テストベクタの検証は
+    // 疎な連想配列のバス実装を渡して回している (test/test_m68k_vectors.cpp)。
+    // テンプレート化すると CPU コアのインスタンスがバス実装ごとに増え、
+    // 「CPU だけを切り離して検証する」という Bus の存在意義が薄れる。
+    // 窓を教えるだけなら、教えなければ今までどおり全部が仮想関数を通る。
+    //
+    // romAtZero は「$000000 に IPL-ROM が写像されている」間 true。写像中は
+    // 窓の読み出しが RAM ではなく ROM 側に当たるので、fast path を止める。
+    void setFastRam(u8* base, u32 length)
+    {
+        fastRam_ = base;
+        fastRamLimit_ = base != nullptr ? length : 0;
+    }
+
+    // $000000 の ROM 写像が外れたかどうかを伝える。
+    //
+    // 写像中は読み出しが ROM に当たるため、RAM の窓を使ってはいけない。
+    // SystemBus::setRomMappedAtZero と必ず対で呼ぶ。
+    void setFastRamReadable(bool readable)
+    {
+        fastRamReadable_ = readable;
+    }
+
 private:
+    // fast path を通してよいアクセスか。
+    //
+    // 2 バイトとも窓に収まることを見る。境界をまたぐワードは
+    // 配列の外を触るので、必ず遅い経路 (バス) に落とす。
+    [[nodiscard]] bool fastRamHasWord(u32 a) const
+    {
+        return fastRam_ != nullptr && a + 1 < fastRamLimit_;
+    }
+    [[nodiscard]] bool fastRamHasByte(u32 a) const
+    {
+        return fastRam_ != nullptr && a < fastRamLimit_;
+    }
+
     // --- プリフェッチ --------------------------------------------------------
     // 命令語を 1 ワード取り出し、キューを 1 つ進める。
     X68K_HOT_PATH u16 fetch();
@@ -181,6 +233,11 @@ private:
     u32 unimplemented(u16 op);
 
     Bus& bus_;
+    // 仮想関数を通さずに触れるメインメモリ。所有しない (bus_ と同じ実体を指す)。
+    u8* fastRam_ = nullptr;
+    u32 fastRamLimit_ = 0;
+    // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
+    bool fastRamReadable_ = false;
     M68kState st_;
     // 保留中の割り込みレベル (0 = なし)。
     u32 pendingIrq_ = 0;

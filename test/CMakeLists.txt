@@ -132,15 +132,35 @@ add_executable(x68k_tests
   test_opm.cpp
   test_adpcm.cpp
   test_gui_smoke.cpp
+  test_gui_demo.cpp
   test_app_mode.cpp
+  test_avatar.cpp
+  test_audio.cpp
   ${X68K_ROOT}/src/x68k/platform/key_queue.cpp
+  # 音声の受け渡し。platform/ にあるが ESP-IDF に触らないのでホストで
+  # ビルドできる (M5Unified を叩くのは speaker_m5.h の方)。実機では音を
+  # 耳でしか確かめられないので、「キーオンしたら出口へ非無音のサンプルが
+  # 届く」という完了条件の芯はここで検査する。
+  ${X68K_ROOT}/src/x68k/platform/audio.cpp
   # 顔 ⇄ X68000 の切り替え FSM。platform/ にあるが ESP-IDF に触らないので
   # そのままホストでビルドできる (app_mode.h の冒頭を見よ)。
   # 切り替えの副作用 (マウスのボタンを離す、画面を作り直す) は実機に焼くと
-  # 見落とすので、全遷移をここで回す。servo.h はヘッダオンリーで実体は要らない。
+  # 見落とすので、全遷移をここで回す。
   ${X68K_ROOT}/src/x68k/platform/app_mode.cpp
+  # 顔の描画。platform/ にあるが M5GFX には触らず RGB565 の配列へ画素を
+  # 置くだけなので、ホストでビルドできる (avatar.h の冒頭を見よ)。
+  # 実機の LCD は直接見られないため、まばたきと表情が絵として出ているかを
+  # 画素で検査できることがこの設計の目的。
+  #
+  # servo.h はヘッダオンリーの部分 (角度→パルス幅→デューティの変換) だけを
+  # 使う。LEDC を叩く servo.cpp は ESP-IDF が要るのでここには入れない。
+  ${X68K_ROOT}/src/x68k/platform/avatar.cpp
+  # GUI デモの生成器。ランナー (--gui-demo) と同じ絵をテストが検査するため、
+  # 実体を共有する。別々に持つと「目視した絵」と「テストが見た絵」がずれる。
+  ${X68K_ROOT}/host/gui_demo.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
+target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/host)
 # sram_persist.h は platform/ にあるが ESP-IDF に触らないヘッダオンリーなので、
 # ホストのテストから直接読める。sram.dat の保存/復元の方針はここにしか無く、
 # 電源断の隙間を疑似ファイルシステムで再現して検査する必要がある。
@@ -162,5 +182,6 @@ add_test(NAME x68k_tests COMMAND x68k_tests)
 # --- ホストのエミュレータランナー -------------------------------------------
 # 実機に焼かずに IPL-ROM と Human68k の起動をデバッグするための入口。
 # core/ が ESP32 非依存だからこそ成立する。
-add_executable(x68k-run ${X68K_ROOT}/host/main.cpp)
+add_executable(x68k-run ${X68K_ROOT}/host/main.cpp ${X68K_ROOT}/host/gui_demo.cpp)
 target_link_libraries(x68k-run PRIVATE x68k_core)
+target_include_directories(x68k-run PRIVATE ${X68K_ROOT}/host)

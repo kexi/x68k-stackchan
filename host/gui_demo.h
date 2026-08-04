@@ -76,10 +76,16 @@ inline constexpr WindowRect kFrontWindow = {160, 190, 260, 190};
 // マウスカーソルの初期位置と、moveMouse で与える移動量。
 // ゲスト側が SCC から読んだ移動量でカーソルを描き直すので、
 // この値がそのまま絵に出る。
+//
+// 移動量が ±127 に収まる値なのは Scc::saturateDelta の飽和を避けるため。
+// 1 レポートの移動量は符号付き 8bit なので、128 を渡すと 127 に丸められ、
+// ホストが描いた位置とゲストが計算した位置が 1 ドットずれる。
+// そのずれは「カーソルが出ている」だけ見ていると気付けないので、
+// 最初から飽和しない値を選ぶ。
 inline constexpr u32 kCursorStartX = 200;
 inline constexpr u32 kCursorStartY = 140;
 inline constexpr int kMouseDx = 96;
-inline constexpr int kMouseDy = 128;
+inline constexpr int kMouseDy = 120;
 
 // デモの実行結果。
 struct Result
