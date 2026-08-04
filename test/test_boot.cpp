@@ -226,8 +226,16 @@ TEST_CASE("未実装命令に当たったら停止して命令語が分かる")
     f.builder.putLong(RomBuilder::kFF0000 + 0, x68k::kResetSsp);
     f.builder.putLong(RomBuilder::kFF0000 + 4, x68k::kResetPc);
     f.builder.setEmitPos(RomBuilder::kFF0000 + 0x10);
-    // 未定義のビットパターン。実装済みのどのグループにも当たらない。
-    f.builder.emitWord(0x4AFC);  // ILLEGAL 相当
+    // 未実装のビットパターン。
+    //
+    // Why not $4AFC を使わないか: あれは ILLEGAL という**定義された命令**で、
+    // 実機は不当命令例外 (ベクタ 4) を起こす。停止させるのは誤り。
+    // ここで見たいのは「まだ実装していない命令に当たったとき、開発者が
+    // 命令語を知れる」ことなので、本当に未実装のものを使う。
+    //
+    // $4E7A は MOVEC (68010 以降)。68000 には無く、本エミュレータも
+    // 実装していない。
+    f.builder.emitWord(0x4E7A);
 
     f.start();
     f.machine.step();
@@ -236,6 +244,39 @@ TEST_CASE("未実装命令に当たったら停止して命令語が分かる")
     // 停止したこと自体は異常ではない。
     if (f.machine.isHalted())
     {
-        CHECK(f.machine.haltedOpcode() == 0x4AFC);
+        CHECK(f.machine.haltedOpcode() == 0x4E7A);
     }
+}
+
+TEST_CASE("ILLEGAL ($4AFC) は停止ではなく不当命令例外へ入る")
+{
+    // 保証すること: $4AFC は定義された命令 (ILLEGAL) で、実機はベクタ 4 の
+    // 例外を起こす。エミュレータを停止させてはいけない。ゲストが意図して
+    // 置いた ILLEGAL (デバッガのブレークポイント等) でエミュレータごと
+    // 止まると、そこから先を調べられない。
+    BootFixture f;
+    f.builder.putLong(RomBuilder::kFF0000 + 0, x68k::kResetSsp);
+    f.builder.putLong(RomBuilder::kFF0000 + 4, x68k::kResetPc);
+    // ベクタ 4 (不当命令) のハンドラを $FF0100 へ向ける。
+    //
+    // リセット直後は IPL-ROM が $000000 に写像されているので、ベクタ表は
+    // ROM の先頭 (オフセット 0) から見える。格納するのは CPU から見た
+    // アドレスなので $FF0100。
+    f.builder.putLong(4 * 4, 0xFF0100u);
+    f.builder.setEmitPos(RomBuilder::kFF0000 + 0x10);
+    // 先頭に NOP を置く。リセット直後の pc は kResetPc + 4 (プリフェッチが
+    // 2 ワード先読みしている) なので、最初の step() が実行するのは
+    // $FF0010 の命令。ILLEGAL はその次に置く。
+    f.builder.emitWord(0x4E71);  // NOP
+    f.builder.emitWord(0x4AFC);  // ILLEGAL
+    f.builder.setEmitPos(RomBuilder::kFF0000 + 0x100);
+    f.builder.emitWord(0x4E71);  // ハンドラ本体 (NOP)
+
+    f.start();
+    f.machine.step();  // NOP
+    f.machine.step();  // ILLEGAL
+
+    // 停止していないこと。ここが本題で、停止すると ILLEGAL を置いた
+    // ゲストコードから先を調べられない。
+    CHECK_FALSE(f.machine.isHalted());
 }

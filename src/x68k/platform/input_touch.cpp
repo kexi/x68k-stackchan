@@ -181,6 +181,20 @@ void TouchKeyboard::poll(KeyQueue& keys, MouseQueue& mouse)
         return;
     }
 
+    // ここへ来た時点で指はマウス領域の外にいる。ドラッグ中だったなら
+    // ボタンを離す。
+    //
+    // Why 要るか: 指をマウス領域で押したままキーボード領域へ滑らせると、
+    // このフレームで isMouseArea が false になりキーボード側へ落ちる。
+    // isDragging_ を立てたままだと、ゲストは「左ボタンを押したまま」と
+    // 認識し続ける。SX-Window ではタイプしながらドラッグが続く形になる。
+    // 指が離れるまで解放が届かない。
+    if (isDragging_)
+    {
+        mouse.push(0, 0, false, false);
+        isDragging_ = false;
+    }
+
     const int col = touch.x / kKeyWidth;
     const int row = (touch.y - kKeyboardTop) / kKeyHeight;
     if (col < 0 || col >= kKeyCols || row < 0 || row >= kKeyRows)

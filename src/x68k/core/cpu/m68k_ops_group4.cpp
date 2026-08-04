@@ -529,9 +529,24 @@ movem_op:
     // $4AFC (mode 7 / reg 4) だけは TAS ではなく ILLEGAL 命令。
     // 実効アドレスとして意味を持たない組み合わせをその 1 つに割り当てて
     // あるので、ここで先に弾かないと ILLEGAL を TAS として実行してしまう。
+    if (op == 0x4AFCu)
     {
-        const bool isIllegalOpcode = op == 0x4AFCu;
-        const bool isTas = !isIllegalOpcode && (op & 0xFFC0u) == 0x4AC0u;
+        // ILLEGAL。実機は不当命令例外 (ベクタ 4) を起こす。
+        //
+        // Why not 下の unary_ops へ流さないか: $4AFC は sizeField=3 なので
+        // 単項演算の条件に入らず、末尾の unimplemented() まで落ちる。
+        // あれは「まだ実装していない命令に当たった」ことを開発者へ知らせる
+        // ための停止で、実機には無い状態。ゲストが意図して ILLEGAL を
+        // 置いた場合 (デバッガのブレークポイント等) にエミュレータごと
+        // 止まってしまう。
+        //
+        // 積む PC は命令そのもの (faulting = true)。RTE で戻ると同じ
+        // 命令を再実行するのが実機の振る舞い。
+        takeException(vector::kIllegalInstruction, true);
+        return 34;
+    }
+    {
+        const bool isTas = (op & 0xFFC0u) == 0x4AC0u;
         if (!isTas)
         {
             goto unary_ops;
