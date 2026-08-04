@@ -274,7 +274,35 @@ private:
         Fdc& fdc_;
     };
 
-    void serviceInterrupts();
+    // 割り込みを 1 つだけ受理する。毎命令通る。
+    //
+    // 3 つのデバイスすべてに保留が無い状態が圧倒的に多いので、その判定を
+    // ここでインラインに済ませ、何か上がっているときだけ .cpp 側の
+    // 優先度付き処理 (serviceInterruptsSlow) を呼ぶ。
+    //
+    // Why not それぞれの service*Interrupt をそのまま呼ぶか: あちらは
+    // 「保留があるか」「CPU が受け付けられるか」「ベクタ番号は何か」を
+    // 順に見る本体で、.cpp 側にあるので ESP32-S3 では実呼び出しになる。
+    // プロファイルで serviceIoScInterrupt / serviceMfpInterrupt だけで
+    // 400 サンプル近くを占めていた。
+    //
+    // FDC の線はバスアクセス以外の契機 (DMA 完了など) でも変わるので、
+    // 判定の前に必ず取り直す。ここは inline な setFdcLine 1 回で済む。
+    void serviceInterrupts()
+    {
+        updateFdcInterruptLine();
+        const bool anyPending =
+            mfp_.hasPendingInterrupt() || scc_.hasPendingInterrupt() || iosc_.hasPendingInterrupt();
+        if (!anyPending)
+        {
+            return;
+        }
+        serviceInterruptsSlow();
+    }
+
+    // serviceInterrupts() の遅い側。どれか 1 つでも保留があるときだけ呼ばれ、
+    // MFP (6) > SCC (5) > I/O コントローラ (1) の順に受理を試す。
+    void serviceInterruptsSlow();
     // 保留していた割り込みを CPU へ渡せたら true。
     // 優先度の高い方から順に試し、1 つ通ったらそこで止めるために戻り値を使う。
     bool serviceMfpInterrupt();
@@ -283,7 +311,16 @@ private:
     // FDC の割り込み線を I/O コントローラへ反映する。
     // FDC 自身は自分がどのコントローラに繋がっているかを知らないので、
     // 線の橋渡しは Machine が持つ。
-    void updateFdcInterruptLine();
+    // FDC の割り込み線を I/O コントローラへ反映する。毎命令通るので inline。
+    //
+    // Why not Fdc から直接 IoSc を叩かないか: Fdc が IoSc を知ると、FDC 単体の
+    // テストに割り込みコントローラを連れてくる必要が出る。実機でも「線が
+    // 繋がっている」だけで FDC はコントローラの存在を知らないので、配線を
+    // 持つのは両者を組み立てる Machine の責務にしてある。
+    void updateFdcInterruptLine()
+    {
+        iosc_.setFdcLine(fdc_.hasInterrupt());
+    }
     u8 sasiRead(u32 addr);
     void sasiWrite(u32 addr, u8 value);
     u8 sccRead(u32 addr);

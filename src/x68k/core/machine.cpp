@@ -221,7 +221,7 @@ void Machine::tickDevices(u32 cycles)
     }
 }
 
-void Machine::serviceInterrupts()
+void Machine::serviceInterruptsSlow()
 {
     // MFP (レベル 6) を先に見る。SCC (レベル 5) より優先度が高いので、
     // 両方保留していたら MFP が勝つ。
@@ -237,23 +237,9 @@ void Machine::serviceInterrupts()
     }
 }
 
-// FDC の割り込み線を I/O コントローラの bit0 へ反映する。
-//
-// Why not FDC から直接 IoSc を叩かないか: Fdc が IoSc を知ると、FDC 単体の
-// テストに割り込みコントローラを連れてくる必要が出る。実機でも「線が
-// 繋がっている」だけで FDC はコントローラの存在を知らないので、
-// 配線を持つのは両者を組み立てる Machine の責務にしてある。
-void Machine::updateFdcInterruptLine()
-{
-    iosc_.setFdcLine(fdc_.hasInterrupt());
-}
-
 bool Machine::serviceIoScInterrupt()
 {
-    // FDC の保留状態は DMA 完了などバスアクセス以外の契機でも変わるので、
-    // 判定の直前に線を取り直す。
-    updateFdcInterruptLine();
-
+    // 線は serviceInterrupts() が呼ぶ前に取り直してある。
     if (!iosc_.hasPendingInterrupt())
     {
         return false;
