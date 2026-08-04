@@ -219,7 +219,7 @@ void Machine::serviceInterrupts()
 // 配線を持つのは両者を組み立てる Machine の責務にしてある。
 void Machine::updateFdcInterruptLine()
 {
-    iosc_.setSource(IoSc::kDeviceFdc, fdc_.hasInterrupt());
+    iosc_.setFdcLine(fdc_.hasInterrupt());
 }
 
 bool Machine::serviceIoScInterrupt()

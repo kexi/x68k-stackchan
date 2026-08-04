@@ -108,6 +108,26 @@ public:
     // ハンドラが無限に呼ばれる。
     void setSource(u8 device, bool asserted);
 
+    // FDC の線だけを直に張り替える。
+    //
+    // Why not setSource(kDeviceFdc, ...) で済ませないか: Machine は
+    // **毎命令** FDC の線を取り直す (DMA 完了など、バスアクセス以外の契機でも
+    // 状態が変わるため)。setSource は別 TU の関数呼び出しで、中で
+    // statusMaskOf() の switch を引く。ここが 1 命令ごとに乗ると実効クロックに
+    // 効く — 実測で保留判定をインライン化しただけでも 18% → 9% まで戻った。
+    //
+    // FDC は 1 本しか無く、ビットも定数なので、番号からマスクを引く必要が無い。
+    // 汎用の口 (setSource) は他のデバイスのために残す。
+    void setFdcLine(bool asserted)
+    {
+        if (asserted)
+        {
+            status_ = static_cast<u8>(status_ | kStatusFdc);
+            return;
+        }
+        status_ = static_cast<u8>(status_ & static_cast<u8>(~kStatusFdc));
+    }
+
     // 許可されていて、かつ上がっているデバイスがあるか。
     //
     // ここはインライン。**毎命令通る経路**なので、関数呼び出しと
