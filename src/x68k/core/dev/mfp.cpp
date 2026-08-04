@@ -8,10 +8,6 @@ namespace x68k
 namespace
 {
 
-// タイマ制御レジスタの下位 3bit が分周比を表す。
-// 0 は停止、1-7 が それぞれ 4/10/16/50/64/100/200 分周。
-constexpr u32 kPrescaleTable[8] = {0, 4, 10, 16, 50, 64, 100, 200};
-
 // GPIP4 (垂直帰線) のビット位置。
 constexpr u8 kGpipVDisp = 0x10;
 
@@ -242,7 +238,7 @@ u32 Mfp::timerPrescale(u8 control) const
     {
         return 0;
     }
-    return kPrescaleTable[control & 7u];
+    return Mfp::kPrescaleTable[control & 7u];
 }
 
 void Mfp::loadTimerIfStopped(int index, u8 control, u8 value)
@@ -279,17 +275,8 @@ void Mfp::raise(bool groupA, u8 bit)
     reg_[iprIndex] |= bit;
 }
 
-void Mfp::tickTimer(int index, u8 control, u32 cycles)
+void Mfp::tickTimerCounted(int index, u32 prescale)
 {
-    const u32 prescale = timerPrescale(control);
-    if (prescale == 0)
-    {
-        // 停止中か、TAI/TBI を要するモード。後者は入力を実装していないので、
-        // 経過サイクルだけでは進めようがない。
-        return;
-    }
-
-    prescaleCounter_[static_cast<std::size_t>(index)] += cycles;
     while (prescaleCounter_[static_cast<std::size_t>(index)] >= prescale)
     {
         prescaleCounter_[static_cast<std::size_t>(index)] -= prescale;

@@ -84,6 +84,10 @@ public:
     static constexpr u8 kIntGpip1 = 0x02;
     static constexpr u8 kIntGpip0 = 0x01;
 
+    // タイマ制御レジスタの下位 3bit が表す分周比。
+    // 0 は停止、1-7 が 4/10/16/50/64/100/200 分周 (MC68901 の仕様)。
+    static constexpr u32 kPrescaleTable[8] = {0, 4, 10, 16, 50, 64, 100, 200};
+
     void reset();
 
     // レジスタを読む。
@@ -127,24 +131,46 @@ public:
         const u8 tcdcr = reg_[kTcdcr];
         const u8 tccr = static_cast<u8>((tcdcr >> 4) & 7u);
         const u8 tdcr = static_cast<u8>(tcdcr & 7u);
-        if ((tacr & 7u) != 0)
-        {
-            tickTimer(0, tacr, mfpCycles);
-        }
-        if ((tbcr & 7u) != 0)
-        {
-            tickTimer(1, tbcr, mfpCycles);
-        }
-        if (tccr != 0)
-        {
-            tickTimer(2, tccr, mfpCycles);
-        }
-        if (tdcr != 0)
-        {
-            tickTimer(3, tdcr, mfpCycles);
-        }
+        tickOne(0, tacr, mfpCycles);
+        tickOne(1, tbcr, mfpCycles);
+        tickOne(2, tccr, mfpCycles);
+        tickOne(3, tdcr, mfpCycles);
     }
 
+private:
+    // タイマ 1 本を進める。分周に満たない間は累算するだけ。
+    //
+    // 実行時間の大半は「累算しただけで閾値に届かない」状態。X68000 が
+    // 動かすタイマ B は分周 4 (MFP サイクル) なので、8 CPU サイクルの
+    // quantum で渡される 4 MFP サイクルでは 1 回おきにしか減らない。
+    // その空振りのために .cpp 側の tickTimer を呼び、中で timerPrescale()
+    // まで引いていた (プロファイルで 819 サンプル)。
+    //
+    // 分周値はここで引く。kPrescaleTable と同じ表をヘッダに持たせると
+    // 二重定義になるので、bit3 (外部入力モード) の除外と 3bit の索引だけを
+    // 直接書く。値は MC68901 の仕様どおり 4/10/16/50/64/100/200。
+    void tickOne(int index, u8 control, u32 mfpCycles)
+    {
+        const bool needsExternalInput = (control & 0x08u) != 0;
+        if (needsExternalInput)
+        {
+            return;
+        }
+        const u32 prescale = kPrescaleTable[control & 7u];
+        if (prescale == 0)
+        {
+            return;
+        }
+        u32& counter = prescaleCounter_[static_cast<std::size_t>(index)];
+        counter += mfpCycles;
+        if (counter < prescale)
+        {
+            return;  // まだ 1 回も減らない。ここが最頻。
+        }
+        tickTimerCounted(index, prescale);
+    }
+
+public:
     // 垂直帰線の開始/終了を通知する。GPIP4 の状態が変わり、
     // 設定によっては割り込みが上がる。
     void setVerticalBlank(bool active);
@@ -214,7 +240,9 @@ private:
     // タイマを停止させたら、プリスケーラの端数を捨てる。
     // 実機はメインカウンタを保つ一方、プリスケーラの残量は失う。
     void clearPrescalerIfStopped(int index, u8 control);
-    void tickTimer(int index, u8 control, u32 cycles);
+    // 分周の閾値に達したぶんだけカウンタを減らし、必要なら割り込みを上げる。
+    // 累算は呼び出し側 (tickOne) が済ませてある。
+    void tickTimerCounted(int index, u32 prescale);
 
     std::array<u8, kRegCount> reg_{};
     // 各タイマの分周カウンタ。実機の分周器に相当する。
