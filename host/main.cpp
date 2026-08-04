@@ -643,12 +643,43 @@ int main(int argc, char** argv)
         while (mouseIndex < mouseScript.size() && spent >= mouseScript[mouseIndex].atCycle)
         {
             const MouseEvent& event = mouseScript[mouseIndex];
-            machine.moveMouse(event.dx, event.dy, event.leftButton, event.rightButton);
+            const bool accepted =
+                machine.moveMouse(event.dx, event.dy, event.leftButton, event.rightButton);
             if (traceDisk)
             {
-                std::printf("[mouse] %zu/%zu dx=%d dy=%d L=%d R=%d (有効=%d)\n", mouseIndex + 1,
-                            mouseScript.size(), event.dx, event.dy, event.leftButton ? 1 : 0,
-                            event.rightButton ? 1 : 0, machine.scc().isMouseEnabled() ? 1 : 0);
+                std::printf("[mouse] %zu/%zu dx=%d dy=%d L=%d R=%d (有効=%d 受理=%d)\n",
+                            mouseIndex + 1, mouseScript.size(), event.dx, event.dy,
+                            event.leftButton ? 1 : 0, event.rightButton ? 1 : 0,
+                            machine.scc().isMouseEnabled() ? 1 : 0, accepted ? 1 : 0);
+            }
+            // FIFO が埋まって断られたら台本を進めない。次のステップで送り直す。
+            //
+            // Why not 進めてしまわないか: SCC は FIFO に 3 バイトの空きが無いと
+            // レポートを丸ごと捨てる。ここで進めると、実機側 (MouseQueue) で
+            // 直したのと同じ取りこぼしがホストでだけ残る。同じサイクルに
+            // 押下・移動・解放を並べると解放が消え、ゲストはボタンを
+            // 押しっぱなしと見なし続ける。台本でドラッグを再現しようとして
+            // 「実機では動くのにホストでは終わらない」という、原因の分かりにくい
+            // 食い違いになる。
+            //
+            // 進めないので while はここで抜ける。FIFO はゲストが引き取らないと
+            // 空かないため、同じステップで再試行しても必ずまた断られる。
+            //
+            // Why not 無効化中も送り直さないか: moveMouse() は「FIFO が満杯」と
+            // 「マウスが無効」の両方で false を返すが、意味が違う。無効なのは
+            // IOCS がまだマウスを有効化していない (起動直後) か、意図して
+            // 切っている状態で、待っても解消するとは限らない。ここで止めると
+            // 有効化前に置いた台本で永久に足踏みし、以降のイベントが一つも
+            // 流れない。無効化中に積まないのは SCC 側の判断 (有効化した瞬間に
+            // 古い動きが流れ込むのを防ぐ) なので、台本はそのまま先へ進める。
+            if (!accepted)
+            {
+                if (machine.scc().isMouseEnabled())
+                {
+                    break;  // 満杯。次のステップで同じイベントを送り直す
+                }
+                ++mouseIndex;  // 無効。このイベントは捨てて先へ進む
+                continue;
             }
             ++mouseIndex;
         }
