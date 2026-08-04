@@ -85,10 +85,14 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/dev/dmac.cpp
   ${X68K_ROOT}/src/x68k/core/dev/fdc.cpp
   ${X68K_ROOT}/src/x68k/core/dev/scc.cpp
+  ${X68K_ROOT}/src/x68k/core/dev/opm.cpp
+  ${X68K_ROOT}/src/x68k/core/dev/adpcm.cpp
+  ${X68K_ROOT}/src/x68k/core/dev/sprite.cpp
   ${X68K_ROOT}/src/x68k/core/dev/video.cpp
   ${X68K_ROOT}/src/x68k/core/io/ascii_keymap.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/sprite_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
@@ -114,6 +118,7 @@ add_executable(x68k_tests
   test_gvram_bus.cpp
   test_text_raster.cpp
   test_graphic_raster.cpp
+  test_sprite.cpp
   test_text_scrape.cpp
   test_cgrom_fallback.cpp
   test_boot.cpp
@@ -124,7 +129,16 @@ add_executable(x68k_tests
   test_fdc.cpp
   test_scc.cpp
   test_mouse_queue.cpp
+  test_opm.cpp
+  test_adpcm.cpp
+  test_gui_smoke.cpp
+  test_app_mode.cpp
   ${X68K_ROOT}/src/x68k/platform/key_queue.cpp
+  # 顔 ⇄ X68000 の切り替え FSM。platform/ にあるが ESP-IDF に触らないので
+  # そのままホストでビルドできる (app_mode.h の冒頭を見よ)。
+  # 切り替えの副作用 (マウスのボタンを離す、画面を作り直す) は実機に焼くと
+  # 見落とすので、全遷移をここで回す。servo.h はヘッダオンリーで実体は要らない。
+  ${X68K_ROOT}/src/x68k/platform/app_mode.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
 # sram_persist.h は platform/ にあるが ESP-IDF に触らないヘッダオンリーなので、

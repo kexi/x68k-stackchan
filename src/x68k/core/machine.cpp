@@ -133,6 +133,7 @@ void Machine::reset()
     rtc_.reset();
     fdc_.reset();
     scc_.reset();
+    sprite_.reset();
     // 転送バッファは外から与えられた設定なので、リセットで消さない。
     // ここを丸ごと初期化すると nullptr に戻り、SASI が 1 バイトも
     // 受け取れなくなる。
@@ -276,14 +277,83 @@ bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
     return scc_.moveMouse(dx, dy, leftButton, rightButton);
 }
 
+// --- 音声 --------------------------------------------------------------------
+//
+// FM (OPM) と ADPCM を足してモノラルで返す。実機は両者を独立した経路で
+// アナログ的に混ぜるが、ここでは合成後に加算する。
+//
+// 現時点でこれを実機のリアルタイムループから呼んではいけない。理由は
+// machine.h の renderAudio の宣言に書いた (実効クロックが足りない)。
+void Machine::renderAudio(std::int16_t* out, std::size_t frames)
+{
+    if (out == nullptr)
+    {
+        return;
+    }
+
+    for (std::size_t i = 0; i < frames; ++i)
+    {
+        const std::int32_t fm = opm_.renderOneSample();
+        const std::int32_t pcm = adpcm_.renderOneSample();
+
+        // Why not それぞれ 1/2 にしてから足すか: 実機でも FM と ADPCM が
+        // 同時に最大振幅になることはまずない。常時半分にすると、片方しか
+        // 鳴っていない大半の時間で音量を 6dB 損する。飽和で受ける。
+        std::int32_t mix = fm + pcm;
+        constexpr std::int32_t kMin = -32768;
+        constexpr std::int32_t kMax = 32767;
+        if (mix < kMin)
+        {
+            mix = kMin;
+        }
+        if (mix > kMax)
+        {
+            mix = kMax;
+        }
+        out[i] = static_cast<std::int16_t>(mix);
+    }
+}
+
 // --- I/O ディスパッチ --------------------------------------------------------
+
+namespace
+{
+
+// スプライト VRAM ($EB8000-$EBFFFF) に当たるか。
+//
+// Why not ioRead8 の switch (base = addr & $FFE000) に混ぜないか:
+// スプライト VRAM は 32KB あり、$FFE000 でマスクすると $EB8000 / $EBA000 /
+// $EBC000 / $EBE000 の 4 つの case に散る。$EBC000 と $EBE000 は BG の
+// ネームテーブルで、PCG と連続した 1 つの実体として扱う必要がある
+// (dev/sprite.h の冒頭を参照)。範囲判定 1 つにまとめたほうが、
+// 実体が連続しているという性質がコードにそのまま出る。
+inline bool isSpriteVram(u32 addr)
+{
+    return addr >= kSpriteVramBase && addr < kSpriteVramEnd;
+}
+
+}  // namespace
 
 u8 Machine::ioRead8(u32 addr)
 {
     const u32 base = addr & 0xFFE000u;
 
+    // スプライト VRAM は 4 つの base にまたがるので switch より先に見る。
+    if (isSpriteVram(addr))
+    {
+        return sprite_.vramRead8(addr - kSpriteVramBase);
+    }
+
     switch (base)
     {
+        case kSpriteRegBase:
+        {
+            // レジスタはワード単位。バイトアクセスは上下を切り出す。
+            // ワード境界へ丸めてから読み、奇数アドレスなら下位バイトを返す。
+            const u16 value = sprite_.read((addr - kSpriteRegBase) & ~1u);
+            return static_cast<u8>((addr & 1) != 0 ? (value & 0xFFu) : (value >> 8));
+        }
+
         case kCrtcBase:
             // CRTC はワード単位。バイトアクセスは上下を切り出す。
             {
@@ -343,9 +413,25 @@ u8 Machine::ioRead8(u32 addr)
             return 0u;
 
         case kOpmBase:
-            // YM2151。ステータスレジスタは bit7 = BUSY。
-            // 常に「準備完了」(bit7 = 0) を返さないと IOCS の初期化ループが
-            // 終わらない。
+            // YM2151。ステータスは $E90003 に現れる (奇数側の $E90001 は
+            // レジスタ番号の書き込み専用)。
+            //
+            // IPL-ROM の待ちループ ($FF9C9C: TST.B $E90003 / BMI.S) は
+            // bit7 (BUSY) が落ちるまで回り、タイムアウトを持たない。
+            // Opm::readStatus は常に bit7 = 0 を返す。
+            if ((addr & 0x0Fu) == 0x03)
+            {
+                return opm_.readStatus();
+            }
+            return 0u;
+
+        case kAdpcmBase:
+            // MSM6258V。$E92001 がステータス、$E92003 がデータ。
+            // データ側は書き込み専用なので読んでも 0。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                return adpcm_.readStatus();
+            }
             return 0u;
 
         case kFdcBase:
@@ -368,7 +454,6 @@ u8 Machine::ioRead8(u32 addr)
         case kSccBase:
             return sccRead(addr);
 
-        case kAdpcmBase:
         case kPpiBase:
         case kIoScBase:
         case kPrinterBase:
@@ -384,8 +469,25 @@ void Machine::ioWrite8(u32 addr, u8 value)
 {
     const u32 base = addr & 0xFFE000u;
 
+    if (isSpriteVram(addr))
+    {
+        sprite_.vramWrite8(addr - kSpriteVramBase, value);
+        return;
+    }
+
     switch (base)
     {
+        case kSpriteRegBase:
+        {
+            // ワード単位のレジスタへのバイト書き込み。読んで片側だけ差し替える。
+            const u32 offset = (addr - kSpriteRegBase) & ~1u;
+            const u16 old = sprite_.read(offset);
+            const u16 next = (addr & 1) != 0 ? static_cast<u16>((old & 0xFF00u) | value)
+                                             : static_cast<u16>((old & 0x00FFu) | (value << 8));
+            sprite_.write(offset, next);
+            return;
+        }
+
         case kCrtcBase:
         {
             const u32 reg = (addr - kCrtcBase) / 2;
@@ -446,6 +548,33 @@ void Machine::ioWrite8(u32 addr, u8 value)
             }
             return;
 
+        case kOpmBase:
+            // YM2151。$E90001 にレジスタ番号、$E90003 に値。
+            // IPL-ROM の書き込み手順 ($FF9C8A -> $FF9C94) がこの順に叩く。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                opm_.writeAddress(value);
+            }
+            else if ((addr & 0x0Fu) == 0x03)
+            {
+                opm_.writeData(value);
+            }
+            return;
+
+        case kAdpcmBase:
+            // MSM6258V。$E92001 がコマンド、$E92003 がデータ。
+            // IPL-ROM は $E92001 に #$04 (停止) / #$02 (再生) を書く
+            // ($FF9A68 / $FF9A8C)。
+            if ((addr & 0x0Fu) == 0x01)
+            {
+                adpcm_.writeCommand(value);
+            }
+            else if ((addr & 0x0Fu) == 0x03)
+            {
+                adpcm_.writeData(value);
+            }
+            return;
+
         case kAreaSetBase:
             // エリアセットへの書き込みで ROM の $000000 写像が解除される。
             // これで通常のメモリ配置になり、以降 $000000 は RAM を指す。
@@ -472,6 +601,12 @@ u16 Machine::ioRead16(u32 addr)
     {
         return video_.read(addr - kVideoCtrlBase);
     }
+    // スプライトレジスタはワードが最小単位。read8 を 2 回に分けると、
+    // 丸めたオフセットから同じワードを 2 度切り出すことになる。
+    if (base == kSpriteRegBase)
+    {
+        return sprite_.read(addr - kSpriteRegBase);
+    }
 
     return static_cast<u16>((ioRead8(addr) << 8) | ioRead8(addr + 1));
 }
@@ -488,6 +623,13 @@ void Machine::ioWrite16(u32 addr, u16 value)
     if (base == kVideoCtrlBase)
     {
         video_.write(addr - kVideoCtrlBase, value);
+        return;
+    }
+    // ワードでまとめて書く。バイト 2 回に分けると、上位バイトだけ書いた
+    // 途中の値でプライオリティの数え直しが走る。
+    if (base == kSpriteRegBase)
+    {
+        sprite_.write(addr - kSpriteRegBase, value);
         return;
     }
 

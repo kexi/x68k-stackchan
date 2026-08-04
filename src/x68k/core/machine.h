@@ -10,15 +10,19 @@
 #ifndef X68K_CORE_MACHINE_H
 #define X68K_CORE_MACHINE_H
 
+#include <cstddef>
 #include <cstdint>
 
 #include "bus.h"
 #include "cpu/m68k.h"
+#include "dev/adpcm.h"
 #include "dev/dmac.h"
 #include "dev/fdc.h"
 #include "dev/mfp.h"
+#include "dev/opm.h"
 #include "dev/rtc.h"
 #include "dev/scc.h"
+#include "dev/sprite.h"
 #include "dev/sram.h"
 #include "dev/video.h"
 
@@ -136,6 +140,35 @@ public:
     {
         return scc_;
     }
+    [[nodiscard]] Sprite& sprite()
+    {
+        return sprite_;
+    }
+    [[nodiscard]] const Sprite& sprite() const
+    {
+        return sprite_;
+    }
+    [[nodiscard]] Opm& opm()
+    {
+        return opm_;
+    }
+    [[nodiscard]] Adpcm& adpcm()
+    {
+        return adpcm_;
+    }
+
+    // 音声を frames サンプルぶんモノラルで合成して out へ書く (pull 型)。
+    //
+    // platform 層が「必要になったときに必要な分だけ」取りに来る形にしてある。
+    // Why not エミュレータ側から push するか: 出力側 (M5Unified のスピーカー)
+    // のバッファが空くタイミングは platform 層しか知らない。push にすると
+    // core/ が出力レートとバッファ長を知る必要が出て、ESP32 非依存でなくなる。
+    //
+    // 重要: 現時点でこれを実機のリアルタイムループから呼んではいけない。
+    // 実効クロックは 3.19MHz (実機比 32%) しか出ておらず、合成を足すと
+    // さらに落ちる (issue #8 の「検討事項」と #4 を参照)。今は core/ の
+    // 中で完結させ、ホストのテストでのみ叩く。
+    void renderAudio(std::int16_t* out, std::size_t frames);
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
@@ -191,6 +224,9 @@ private:
     Rtc rtc_;
     Fdc fdc_;
     Scc scc_;
+    Opm opm_;
+    Adpcm adpcm_;
+    Sprite sprite_;
     Dmac dmac_;
     DiskImage* disk_ = nullptr;
 

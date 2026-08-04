@@ -23,10 +23,14 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/dev/dmac.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/fdc.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/scc.cpp"
+        "${X68K_ROOT}/src/x68k/core/dev/sprite.cpp"
+        "${X68K_ROOT}/src/x68k/core/dev/opm.cpp"
+        "${X68K_ROOT}/src/x68k/core/dev/adpcm.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/video.cpp"
         "${X68K_ROOT}/src/x68k/core/io/ascii_keymap.cpp"
         "${X68K_ROOT}/src/x68k/core/video/text_raster.cpp"
         "${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp"
+        "${X68K_ROOT}/src/x68k/core/video/sprite_raster.cpp"
         "${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp"
         "${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp"
         # --- platform: ESP32 専用 ---
@@ -35,6 +39,11 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/platform/frame_channel.cpp"
         "${X68K_ROOT}/src/x68k/platform/key_queue.cpp"
         "${X68K_ROOT}/src/x68k/platform/input_touch.cpp"
+        # --- スタックチャン: 顔 ⇄ X68000 の切り替え ---
+        # app_mode.cpp は ESP-IDF に触らない (ホストのテストと実体を共有する)。
+        # servo.h はヘッダオンリー。avatar.cpp は仮の実装 (avatar.h を見よ)。
+        "${X68K_ROOT}/src/x68k/platform/app_mode.cpp"
+        "${X68K_ROOT}/src/x68k/platform/avatar.cpp"
     INCLUDE_DIRS
         "."
         "${X68K_ROOT}/src/x68k/core"

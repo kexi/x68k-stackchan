@@ -59,10 +59,34 @@ public:
         return visible_;
     }
 
+    // タッチを X68000 へ流すか。顔モードの間は false にする。
+    //
+    // Why not visible_ で兼ねるか: 別の関心事。visible_ は「仮想
+    // キーボードを描いているか」で、false でも画面全体がマウス領域として
+    // 生きる (main.cpp が今そうしている)。顔モードで止めたいのはマウスも
+    // 含めた X68000 への経路すべてなので、兼ねると顔を触った指が
+    // カーソルを動かす。
+    //
+    // Why not poll() の呼び出しを main.cpp 側で止めないか: 止めると
+    // 「顔モードの間に指を離した」ことが分からなくなる。押したまま顔へ
+    // 切り替えて顔モード中に離すと、isDragging_ が true のまま残り、
+    // X68K へ戻って触った瞬間に前回の座標との差が巨大な移動量として
+    // 流れる。poll は回し続け、送る直前で捨てる方が状態が壊れない。
+    void setX68kInputEnabled(bool enabled);
+
+    [[nodiscard]] bool isX68kInputEnabled() const
+    {
+        return isX68kInputEnabled_;
+    }
+
 private:
     // 押しっぱなしで連打にならないよう、離すまで次を送らない。
     int lastKeyIndex_ = -1;
     bool visible_ = true;
+
+    // 既定は true。X68K モードから始まるので (app_mode.h の AppModeMachine)、
+    // 初期値もそちらに揃える。
+    bool isX68kInputEnabled_ = true;
 
     // --- マウス ---
     //

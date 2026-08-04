@@ -24,10 +24,13 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "app_mode.h"
+#include "avatar.h"
 #include "display_lcd.h"
 #include "frame_channel.h"
 #include "input_touch.h"
 #include "key_queue.h"
+#include "servo.h"
 #include "io/ascii_keymap.h"
 #include "machine.h"
 #include "storage_sd.h"
@@ -67,6 +70,49 @@ x68k_platform::FrameChannel g_frames;
 x68k_platform::KeyQueue g_keys;
 x68k_platform::MouseQueue g_mouse;
 
+// --- スタックチャン (顔 ⇄ X68000) ---
+//
+// FSM を触るのは表示コア (Core0) だけ。エミュレーションコアへは下の
+// atomic 1 つだけを渡す (app_mode.h の AppModeMachine のコメントを見よ)。
+x68k_platform::AppModeMachine g_mode;
+x68k_platform::Avatar g_avatar;
+
+// サーボは付いていない前提。NullServo は指示を捨てる (servo.h を見よ)。
+// 実物を付けるときはここを差し替える。
+x68k_platform::NullServo g_servo;
+
+// 1 スライスで進めてよいサイクル数。表示コアが書き、エミュレーションコアが読む。
+//
+// 0 は「顔モードで止める」(EmulationPolicy::Paused)。
+//
+// Why not エミュレーションコアから g_mode を読ませないか: AppModeMachine は
+// mode_ と policy_ の 2 つを持ち、遷移はその両方にまたがる。ロック無しで
+// 別コアから読むと、切り替えの途中の食い違った組を見うる。表示コアが
+// 決めた結果を 1 つの値へ落としてから渡せば、読む側は組の一貫性を
+// 気にせずに済む (g_desiredZoom が同じ形をしている)。
+std::atomic<x68k::u32> g_allowedSliceCycles{0};
+
+// 1 回の run で進める量 (X68K モードでの値)。1 フレーム (約 180,000 サイクル)
+// より細かくして、画面更新と入力の応答が鈍くならないようにする。
+//
+// Why not emulatorTask の中に置いたままにしないか: 表示コアが
+// AppModeMachine::sliceCycles(kSliceCycles) を呼んで g_allowedSliceCycles を
+// 決めるので、両方のコアから見える必要がある。2 か所に書くと、
+// 片方だけ変えたときに顔モードとの比が意図せず変わる。
+constexpr x68k::u32 kSliceCycles = 20000;
+
+// X68000 へ戻ったので画面を作り直してほしい。表示コアが立て、
+// エミュレーションコアが消す。
+//
+// Why not 表示コアから DisplayLcd::invalidateAll を直接呼ばないか:
+// forceFullRedraw_ を読んで消すのは renderTo で、それはエミュレーション
+// コアが回している (display_lcd.h が「エミュレーションコアから呼ぶ」と
+// 明記している)。表示コアから立てると、renderTo がフラグを消す瞬間と
+// ぶつかって全画面の描き直しが 1 回消える。顔の残った画面が次に VRAM が
+// 変わるまで残ってしまう。要求だけ立てて、実行は所有者に任せる
+// (g_dumpRequested と同じ形)。
+std::atomic<bool> g_redrawRequested{false};
+
 void reportMemory(const char* phase)
 {
     ESP_LOGI(kTag, "[mem:%s] internal free=%u largest=%u | psram free=%u largest=%u", phase,
@@ -83,6 +129,9 @@ void reportMemory(const char* phase)
 // キャッシュを超えるアクセスは素の速度まで落ちる。取れなければ PSRAM へ
 // フォールバックする (動くが遅くなる)。
 x68k::u8* g_sasiBuffer = nullptr;
+
+// 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
+x68k::u16* g_avatarSprite = nullptr;
 
 bool reserveMemory()
 {
@@ -125,6 +174,23 @@ bool reserveMemory()
     else
     {
         ESP_LOGI(kTag, "IPL-ROM を内部 SRAM に配置しました");
+    }
+
+    // 顔のスプライト (320x240 の RGB565 = 150KB)。
+    //
+    // ここで押さえるのは、後から取ると PSRAM が断片化していて連続領域が
+    // 取れないため (このファイル冒頭の方針)。顔を最初に出すのは
+    // 切り替えた後なので「使うときに取る」でも動きそうに見えるが、
+    // そのときには 2MB のメインメモリと CGROM が既に PSRAM を分断している。
+    //
+    // 取れなくても起動する。仮の実装は M5.Display へ直接描いており
+    // (avatar.cpp)、スプライトが無くても顔は出る。本物の Avatar へ
+    // 差し替えたときに要るぶんを、今の段階から実測で押さえておく。
+    g_avatarSprite = static_cast<x68k::u16*>(heap_caps_calloc(
+        1, x68k_platform::Avatar::kSpriteBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (g_avatarSprite == nullptr)
+    {
+        ESP_LOGW(kTag, "顔のスプライトを確保できません。仮の顔は出ますが Avatar は載せられません");
     }
 
     // グラフィック VRAM は最後。取れなくても起動する。
@@ -233,6 +299,10 @@ bool loadRoms()
 void followCursor();
 void dumpScreen();
 
+// シリアルコンソール (SerialConsole) から使うが、定義は下にある。
+// FSM の決定を周辺へ反映する。
+void applyModeTransition(const x68k_platform::ModeTransition& transition);
+
 // シリアルから画面ダンプを求められたら立つ。
 //
 // Why not SerialConsole の中に持たせるか: そうすると SerialConsole を
@@ -272,9 +342,6 @@ std::atomic<bool> g_halted{false};
 // 配置されるため。エミュレーションのホットループを侵されたくない。
 void emulatorTask(void* /*arg*/)
 {
-    // 1 回の run で進める量。1 フレーム (約 180,000 サイクル) より細かくして、
-    // 画面更新と入力の応答が鈍くならないようにする。
-    constexpr x68k::u32 kSliceCycles = 20000;
     constexpr std::uint32_t kReportIntervalMs = 5000;
 
     // SRAM を SD へ書き戻す間隔。
@@ -310,8 +377,22 @@ void emulatorTask(void* /*arg*/)
             return;
         }
 
-        g_machine.run(kSliceCycles);
-        totalCycles += kSliceCycles;
+        // 顔モードの扱いは表示コアが決めて、進めてよい量だけを渡してくる。
+        //
+        // 既定 (KeepRunning) では kSliceCycles がそのまま来るので、
+        // ここは X68K モードと変わらない。Throttled なら細く、
+        // Paused なら 0 (run を飛ばす)。
+        //
+        // Why not 0 のときに長く眠らないか: このループは run 以外にも
+        // SRAM の書き戻しと停止の検出を持つ。眠りを伸ばすとそちらの
+        // 反応まで鈍る。停止中は下の vTaskDelay(1) を毎周回すので、
+        // 止めている間の CPU は run を飛ばすだけで十分に空く。
+        const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
+        if (sliceCycles > 0)
+        {
+            g_machine.run(sliceCycles);
+            totalCycles += sliceCycles;
+        }
 
         // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
         g_keys.drain(g_machine);
@@ -327,6 +408,13 @@ void emulatorTask(void* /*arg*/)
         if (g_dumpRequested.exchange(false))
         {
             dumpScreen();
+        }
+
+        // X68000 へ戻ったなら全画面を作り直す。顔が描いた内容が
+        // 残っているので、ダーティ行だけでは消えない。
+        if (g_redrawRequested.exchange(false))
+        {
+            g_display.invalidateAll();
         }
 
         // 希望の拡大率が今と違えば、変換の前に合わせる。
@@ -386,8 +474,43 @@ void emulatorTask(void* /*arg*/)
             }
         }
 
-        // ウォッチドッグに殺されないよう必ず譲る。
-        vTaskDelay(1);
+        // ウォッチドッグに殺されないよう定期的に譲る。
+        //
+        // 毎スライス譲ると、1 tick (1ms) が 1 スライスの実時間 (実測 6.1ms)
+        // に対して無視できない。実測では毎回譲ると 2760kHz、8 スライスに
+        // 1 回にすると 3200kHz で、譲る回数を減らした分がそのまま速度になる。
+        //
+        // Why not 譲るのをやめるか: docs/knowledge/cores3-emulator-runtime.md に
+        // ある通り、taskYIELD() で済ませようとしてリセットループに入った。
+        // アイドルタスクは優先度 0 なので、ブロックしない限り回ってこない。
+        // ESP-IDF のタスクウォッチドッグはアイドルタスクが 5 秒走らないことを
+        // 見て落とすので、譲る口自体は必ず残す必要がある。
+        //
+        // Why 8 か: 譲る間隔 = 8 スライス x 6.1ms ≒ 49ms。ウォッチドッグの
+        // 5 秒に対して 100 倍の余裕がある。合成 ON で変換が最も重いとき
+        // (実測 23.5ms/スライス) でも 235ms で、まだ 21 倍の余裕が残る。
+        // これ以上伸ばしても速度は頭打ちで (N=16 で +1.5% の計算)、
+        // 余裕を削るだけなので割に合わない。
+        //
+        // Why not 「N スライスごと」ではなく経過時間で判断しないか:
+        // 時間を測るには esp_timer を毎周読むことになる。譲る条件が
+        // 数え上げで足りるうちは、余計な計測を入れない方がホットループが軽い。
+        constexpr int kSlicesPerYield = 8;
+        static int slicesSinceYield = 0;
+
+        // 停止中 (sliceCycles == 0) は毎周譲る。
+        //
+        // Why: 停止中は run を飛ばすのでループが一瞬で回りきる。数え上げだけで
+        // 間引くと、8 周回るのに掛かる時間がほぼ 0 になり、譲らないまま
+        // 空回りし続ける。それは taskYIELD() で踏んだのと同じ
+        // 「アイドルタスクが回らない」状態で、ウォッチドッグに落とされる。
+        const bool isPaused = sliceCycles == 0;
+        const bool isYieldDue = ++slicesSinceYield >= kSlicesPerYield;
+        if (isPaused || isYieldDue)
+        {
+            slicesSinceYield = 0;
+            vTaskDelay(1);
+        }
     }
 }
 
@@ -463,10 +586,92 @@ private:
             return;
         }
 
+        // Tab で顔 ⇄ X68000 を切り替える。
+        //
+        // Why not 印字できる文字を使わないか: 顔モードでも X68K モードでも
+        // 押せる必要があるが、X68K モードでは打った文字が Human68k へ
+        // 流れる。'f' のような文字を充てると、コマンドを打つたびに
+        // モードが変わる。Tab は Human68k のプロンプトで使い道が薄く、
+        // 取り上げても困らない。
+        //
+        // Why not タッチで切り替えないか: 画面全体が X68000 のマウス領域に
+        // なっている (main.cpp の setVisible(false) を見よ)。切り替え用の
+        // 領域を切ると、そこだけカーソルが動かせなくなる。物理ボタンの
+        // 無い CoreS3 でこれを解くには、長押しやジェスチャの判定が要る。
+        // まずシリアルから切り替えられれば、FSM と入力の遮断は確かめられる。
+        const bool isModeToggle = c == '\t';
+        if (isModeToggle)
+        {
+            applyModeTransition(g_mode.request(x68k_platform::ModeRequest::Toggle));
+            return;
+        }
+
+        // 顔モードの間は X68000 へ文字を送らない。
+        //
+        // タッチと揃える。顔を出している間に打った文字が溜まって、
+        // 戻った瞬間に一気に流れ込むのを防ぐ。
+        if (!g_mode.isX68kInputEnabled())
+        {
+            return;
+        }
+
         // 残りは X68000 へ。押下と解放に分ける仕事は KeyQueue が持つ。
         g_keys.push(c);
     }
 };
+
+// FSM の決定を実際の周辺へ反映する。表示コアから呼ぶ。
+//
+// Why not AppModeMachine の中でやらないか: ここで触るのは M5.Display と
+// MouseQueue と atomic で、どれも ESP-IDF に依存する。FSM に持たせると
+// ホストのテストから外れる。FSM は「何をすべきか」を値で返すだけにして、
+// 実行はこの関数に集める (app_mode.h の ModeTransition のコメントを見よ)。
+void applyModeTransition(const x68k_platform::ModeTransition& transition)
+{
+    // 進めてよい量を更新する。モードが変わっていなくても、ポリシーの
+    // 差し替え直後に呼ばれることがあるので毎回書く。
+    g_allowedSliceCycles = g_mode.sliceCycles(kSliceCycles);
+
+    // 入力の経路を開け閉めする。顔モードではタッチが X68000 へ届かない。
+    g_keyboard.setX68kInputEnabled(g_mode.isX68kInputEnabled());
+
+    if (!transition.changed)
+    {
+        return;
+    }
+
+    // 押したまま切り替えた指のボタンを離しておく。
+    //
+    // 顔モードの間タッチは届かないので、押しっぱなしのままだと
+    // ゲストはボタンが押されたままと見なし続ける。
+    if (transition.shouldReleaseMouseButtons)
+    {
+        g_mouse.push(0, 0, false, false);
+    }
+
+    if (transition.to == x68k_platform::AppMode::Face)
+    {
+        // 【仮】placeholder の顔を描く (avatar.h を見よ)。
+        g_avatar.draw();
+        // サーボが付いていれば正面へ戻す。NullServo は捨てる。
+        g_servo.setPose({});
+    }
+    else
+    {
+        // X68000 へ戻る。顔が描いた内容が画面に残っているので、
+        // ダーティ行だけを送る通常の経路では消えない。全画面を
+        // 作り直させる (実行はエミュレーションコア)。
+        if (transition.shouldRedraw)
+        {
+            g_redrawRequested = true;
+        }
+        // 首の保持をやめる。X68000 を触っている間サーボに力を入れ続けると
+        // 電流を食い、安物のサーボは唸りが出る。
+        g_servo.detach();
+    }
+
+    ESP_LOGI(kTag, "モード: %s", transition.to == x68k_platform::AppMode::Face ? "顔" : "X68000");
+}
 
 // テキスト画面を ASCII に逆引きしてシリアルへ出す。
 //
@@ -636,6 +841,27 @@ extern "C" void app_main(void)
     g_keyboard.setVisible(false);
     g_keyboard.begin();
 
+    // 顔 ⇄ X68000 の切り替えを用意する。
+    //
+    // 既定は X68K モード (app_mode.h)。起動直後に見たいのは Human68k が
+    // 立ち上がったかどうかで、顔から始めると確かめるのに切り替えが要る。
+    //
+    // ここで applyModeTransition を通すのは、g_allowedSliceCycles を
+    // 初期化するため。0 のまま残すとエミュレーションが 1 命令も進まず、
+    // 利用者にはフリーズとしか見えない。
+    // 起動直後に押さえたスプライトを渡す。nullptr でもよい (仮の実装は使わない)。
+    g_avatar.setSpriteBuffer(g_avatarSprite);
+
+    g_servo.begin();
+    if (!g_servo.isAttached())
+    {
+        // 異常ではない。サーボが付いていない CoreS3 単体でも顔と X68000 は
+        // 動く (servo.h の NullServo を見よ)。
+        ESP_LOGI(kTag, "サーボは付いていません。首は振りません");
+    }
+    applyModeTransition(g_mode.request(x68k_platform::ModeRequest::ToX68k));
+    ESP_LOGI(kTag, "Tab で顔 ⇄ X68000 を切り替えます");
+
     // シリアルからキーを拾えるようにする。
     //
     // ログ出力は VFS 経由のままにして、入力だけドライバから直接読む。
@@ -695,7 +921,21 @@ extern "C" void app_main(void)
         // ここへは完成した RGB565 が渡ってくる。
         if (x68k::u16* frame = g_frames.take(); frame != nullptr)
         {
-            g_display.pushFrame(frame);
+            // 顔モードの間は LCD へ送らない。
+            //
+            // Why not フレームを作らせないか: KeepRunning ではエミュレーションが
+            // 走り続けるので画面は変わり続ける。作るのをやめると、戻ったときに
+            // VRAM が次に変わるまで古い画面が残る (ダーティ行だけを送る仕組み
+            // なので、変化が無ければ何も送られない)。作らせておいて、
+            // 送る直前で捨てる方が復帰が速い。
+            //
+            // Why not take() ごと飛ばさないか: 飛ばすと公開済みのフレームが
+            // 返らず、エミュレーションコアは次の publish に失敗し続ける。
+            // 受け取って done() を返し、送らないだけにする。
+            if (g_mode.mode() == x68k_platform::AppMode::X68k)
+            {
+                g_display.pushFrame(frame);
+            }
             g_frames.done();
         }
 
