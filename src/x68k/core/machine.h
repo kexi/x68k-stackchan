@@ -120,6 +120,18 @@ public:
     // 1 周期以内に必ず 1 度は見るので、観測できるずれが出ない。
     static constexpr u32 kDeviceTickQuantum = 8;
 
+    // RTC へ時間を渡す最小単位 (CPU サイクル)。
+    //
+    // RTC は 1 秒 = 10,000,000 サイクルごとにしか状態が変わらないので、
+    // MFP と同じ 8 サイクル刻みで呼ぶ必要が無い。累算器は外から読まれない
+    // ため、まとめても秒の進み方は一切変わらない (tickDevices を参照)。
+    //
+    // Why not 1 秒ぶんそのままにしないか: 1 秒に満たない実行 (テストや
+    // 短いトレース) で RTC が 1 度も進まなくなるのは避けたい。10000 なら
+    // 1 秒あたり 1000 回は通るので、秒の境界が最大 0.1% ずれるだけで済む。
+    // その 0.1% も cycleAccumulator_ に溜まるので累積誤差にはならない。
+    static constexpr u32 kRtcTickQuantum = 10000;
+
     [[nodiscard]] M68k& cpu()
     {
         return cpu_;
@@ -349,6 +361,9 @@ private:
     // run() が溜めている、まだデバイスへ渡していない CPU サイクル。
     // 常に kDeviceTickQuantum 未満に保つ。
     u32 pendingDeviceCycles_ = 0;
+
+    // tickDevices が溜めている、まだ RTC へ渡していない CPU サイクル。
+    u32 rtcPendingCycles_ = 0;
 
     // SASI の状態機械。IPL-ROM がブートセクタを読むのに使う。
     struct SasiState

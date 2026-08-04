@@ -214,7 +214,29 @@ u32 Machine::run(u32 cycles)
 void Machine::tickDevices(u32 cycles)
 {
     mfp_.tick(cycles);
-    rtc_.tick(cycles);
+
+    // RTC は 1 秒 (10,000,000 サイクル) ごとにしか状態が変わらないのに、
+    // MFP と同じ 8 サイクル刻みで呼ばれていた。125 万回に 1 回しか仕事が
+    // 無い呼び出しで、プロファイル上 tickDevices は step 全体の 36.2% を
+    // 占めていた。
+    //
+    // Why not 安全か: Rtc は受け取ったサイクルを cycleAccumulator_ へ足し、
+    // kCyclesPerSecond を超えた回数だけ秒を進めるだけ。この累算器は
+    // tick() の外から一切読まれない (reset で 0 にする以外の参照が無い)。
+    // よってまとめて渡しても、秒が進むタイミングも読み出せる値も変わらない。
+    //
+    // Why not CRTC も同じ扱いにしないか: あちらは垂直帰線の状態を
+    // 持っていて、ゲストが $E80028 やGPIP4 で**観測する**。粗くすると
+    // 帰線の開始/終了が最大で quantum ぶんずれ、画面同期を待つコードの
+    // 挙動が変わる。RTC と違って観測可能なので、刻みは変えない。
+    rtcPendingCycles_ += cycles;
+    const bool rtcQuantumReached = rtcPendingCycles_ >= kRtcTickQuantum;
+    if (rtcQuantumReached)
+    {
+        rtc_.tick(rtcPendingCycles_);
+        rtcPendingCycles_ = 0;
+    }
+
     if (crtc_.tick(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
