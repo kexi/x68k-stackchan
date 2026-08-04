@@ -16,8 +16,6 @@ using alu::kByte;
 using alu::kLong;
 using alu::kWord;
 
-constexpr u32 kAddrMask = 0x00FFFFFFu;
-
 constexpr u32 sizeFromField(u32 field)
 {
     if (field == 0)

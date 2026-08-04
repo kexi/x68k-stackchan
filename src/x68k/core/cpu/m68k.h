@@ -55,6 +55,10 @@ class M68k
 public:
     explicit M68k(Bus& bus) : bus_(bus) {}
 
+    // 68000 の外部アドレスバスは 24bit。上位 8bit は出ないので、
+    // アドレス計算の結果は必ずここで折り返す。
+    static constexpr u32 kAddrMask = 0x00FFFFFFu;
+
     // ベクタ $000 から SSP、$004 から PC を読んで初期化する。
     void reset();
 
@@ -192,7 +196,36 @@ private:
 
     // --- プリフェッチ --------------------------------------------------------
     // 命令語を 1 ワード取り出し、キューを 1 つ進める。
-    X68K_HOT_PATH u16 fetch();
+    //
+    // **全命令が必ず 1 回以上通る**。中身はキューをずらして 1 ワード読むだけ
+    // なので、.cpp 側に置くと実体より呼び出しの方が高くつく。
+    //
+    // 読み出し先は IPL-ROM かメイン RAM のどちらか (実測で ROM 79% /
+    // RAM 17.7%)。その 2 つは窓が張ってあるので、ここで直接引く。
+    // 窓の外 (I/O やバスエラー領域) から命令を読むことは通常起きないが、
+    // 起きたときのために .cpp の read16 へ落とす。
+    u16 fetch()
+    {
+        const u16 value = st_.ir;
+        st_.ir = st_.irc;
+
+        // PC は既に「次に読むアドレス」を指している。
+        const u32 a = st_.pc & kAddrMask;
+        if (fastRamReadable_ && fastRam_ != nullptr && a + 1 < fastRamLimit_)
+        {
+            st_.irc = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+        }
+        else if (u32 off = 0; fastRomHas(a, 2, off))
+        {
+            st_.irc = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+        }
+        else
+        {
+            st_.irc = read16(a);
+        }
+        st_.pc = st_.pc + 2;
+        return value;
+    }
     // プリフェッチキューを PC の位置から埋め直す (分岐後など)。
     X68K_HOT_PATH void refillPrefetch(u32 newPc);
 

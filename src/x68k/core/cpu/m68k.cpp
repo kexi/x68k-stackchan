@@ -17,7 +17,6 @@ namespace
 // 外へ出るときに上位 8bit が捨てられるだけ)。レジスタ側でマスクすると
 // A0 に $F9C321E4 を入れて読み出したときに $00C321E4 が返るという
 // 実機と違う挙動になり、テストベクタが軒並み落ちる。
-constexpr u32 kAddrMask = 0x00FFFFFFu;
 
 // サイズ指定の内部表現。1/2/4 バイトをそのまま使う。
 constexpr u32 kByte = 1;
@@ -112,16 +111,6 @@ void M68k::loadStateForTest(const M68kState& s)
 //   テストベクタの pc は MAME の m_au 由来で同じ定義なので、これに合わせている。
 //   ここを 1 ワードずらすと、分岐先も PC 相対アドレッシングも全部ずれる。
 
-u16 M68k::fetch()
-{
-    const u16 value = st_.ir;
-    st_.ir = st_.irc;
-    // PC は既に「次に読むアドレス」なので、そこから読んで 1 ワード進める。
-    st_.irc = read16(st_.pc);
-    st_.pc = st_.pc + 2;
-    return value;
-}
-
 void M68k::refillPrefetch(u32 newPc)
 {
     // 奇数アドレスへの分岐はアドレスエラー。
@@ -142,7 +131,7 @@ void M68k::refillPrefetch(u32 newPc)
     // IOCS 側はそこで「不正ベクタ」として処理する仕組み。
     // PC 自体を丸めてしまうとテストベクタ (32bit の PC を期待する) が
     // 落ちるので、丸めるのはアクセスの瞬間だけにする。
-    const u32 a = newPc & kAddrMask;
+    const u32 a = newPc & M68k::kAddrMask;
     // 分岐のたびに 2 ワード読む。ここも直接経路を通す。
     // 4 バイトとも窓に収まるときだけ (またぐ場合は下の一般路が境界を見る)。
     if (fastRamReadable_ && fastRam_ != nullptr && a + 3 < fastRamLimit_)
@@ -162,7 +151,7 @@ void M68k::refillPrefetch(u32 newPc)
     }
 
     st_.ir = bus_.read16(a);
-    st_.irc = bus_.read16((newPc + 2) & kAddrMask);
+    st_.irc = bus_.read16((newPc + 2) & M68k::kAddrMask);
     st_.pc = newPc + 4;
 }
 
@@ -182,7 +171,7 @@ void M68k::refillPrefetch(u32 newPc)
 
 u8 M68k::read8(u32 addr)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if (fastRamReadable_ && fastRamHasByte(a))
     {
         return fastRam_[a];
@@ -196,7 +185,7 @@ u8 M68k::read8(u32 addr)
 
 u16 M68k::read16(u32 addr)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, true);
@@ -225,7 +214,7 @@ u16 M68k::read16(u32 addr)
 
 u32 M68k::read32(u32 addr)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, true);
@@ -247,7 +236,7 @@ u32 M68k::read32(u32 addr)
     // 68000 のバスは 16bit なのでロングは 2 回に分かれる。上位が先。
     const u32 hi = bus_.read16(a);
     const bool hiFaulted = bus_.lastAccessFaulted();
-    const u32 lo = bus_.read16((a + 2) & kAddrMask);
+    const u32 lo = bus_.read16((a + 2) & M68k::kAddrMask);
     if (hiFaulted || bus_.lastAccessFaulted())
     {
         takeBusError(a, true);
@@ -262,7 +251,7 @@ u32 M68k::read32(u32 addr)
 // (SystemBus::write8 も同じく mainRam へ書く)。読み出しだけが ROM に化ける。
 void M68k::write8(u32 addr, u8 value)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if (fastRamHasByte(a))
     {
         fastRam_[a] = value;
@@ -273,7 +262,7 @@ void M68k::write8(u32 addr, u8 value)
 
 void M68k::write16(u32 addr, u16 value)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
@@ -290,7 +279,7 @@ void M68k::write16(u32 addr, u16 value)
 
 void M68k::write32(u32 addr, u32 value)
 {
-    const u32 a = addr & kAddrMask;
+    const u32 a = addr & M68k::kAddrMask;
     if ((a & 1) != 0)
     {
         takeAddressError(a, false);
@@ -305,7 +294,7 @@ void M68k::write32(u32 addr, u32 value)
         return;
     }
     bus_.write16(a, static_cast<u16>(value >> 16));
-    bus_.write16((a + 2) & kAddrMask, static_cast<u16>(value & 0xFFFFu));
+    bus_.write16((a + 2) & M68k::kAddrMask, static_cast<u16>(value & 0xFFFFu));
 }
 
 // --- 例外 ------------------------------------------------------------------
