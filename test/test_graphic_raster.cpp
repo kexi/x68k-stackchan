@@ -449,6 +449,44 @@ TEST_CASE("ページの重なり順はページ番号ではなく GP3-GP0 で決
     CHECK(out[0] == VideoController::toRgb565(green));
 }
 
+TEST_CASE("GP が同値のページはページ番号の小さい方が手前になる")
+{
+    // 保証すること: 優先順位が並んだときの決め方。
+    //
+    // $E82500 は 2bit なので、4 ページに別々の順位を割り当てられない設定
+    // (全ページ 0 など) が普通に起こる。そのとき何が手前に来るかが決まって
+    // いないと、同じ画面が実行のたびに違って見える余地が残る。
+    //
+    // 実機は同値ならページ番号の小さい方を手前に置く。並べ替えを安定ソートに
+    // してあるので、挿入の判定を > から >= に変えるだけでこの順序が逆転する。
+    // それを検知できるテストが無かったので足す。
+    auto vram = makeGvram();
+    VideoController video;
+    video.reset();
+    video.write(kScreenModeOffset, 0x0000);
+
+    const x68k::u16 blue = static_cast<x68k::u16>(31u << 1);
+    const x68k::u16 green = static_cast<x68k::u16>(31u << 11);
+    video.write(kGraphicPaletteOffset + 2 * 2, blue);
+    video.write(kGraphicPaletteOffset + 3 * 2, green);
+
+    // ページ 0 = 色 2 (青)、ページ 1 = 色 3 (緑)。どちらも不透明。
+    writeWord(vram, 0, 0, 0x0032);
+    video.write(kDisplayCtrlOffset, 0x0003);  // ページ 0-1 を表示
+
+    // GP0 と GP1 を同じ値にする。$06E4 の GP1 (bit3-2) を 1 から 0 へ。
+    video.write(kPriorityOffset, 0x06E0);
+    REQUIRE(video.graphicPagePriority(0) == 0);
+    REQUIRE(video.graphicPagePriority(1) == 0);
+
+    constexpr x68k::u32 kW = 2;
+    std::vector<x68k::u16> out(kW, 0);
+    GraphicRaster::render(vram.data(), video, 0, 0, kW, 1, out.data(), kW);
+
+    // 同値ならページ 0 が勝つ。逆転していれば緑になる。
+    CHECK(out[0] == VideoController::toRgb565(blue));
+}
+
 TEST_CASE("全ページが透明なドットには何も書かれない")
 {
     auto vram = makeGvram();
