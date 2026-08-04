@@ -873,6 +873,37 @@ int main(int argc, char** argv)
     // 台本のどこまで送ったか。
     std::size_t mouseIndex = 0;
 
+    // トレースも統計もキー入力も要らないときは、実機と同じ run() を回す。
+    //
+    // Why これが要るか: 下の主ループは 1 命令ごとに machine.step() を呼ぶ。
+    // step() はデバイスの時間を**毎命令**進めるので、run() の quantum
+    // (8 サイクル) が効かない。プロファイルを取ると tickDevices が実機の
+    // 8 倍ほど重く見え、実機で効かない最適化を追うことになる。
+    //
+    // 実際そうなった。この経路を用意する前、ホストのプロファイルを根拠に
+    // MFP 周りへ 4 回続けて手を入れて、いずれも実機で 0.0% だった。
+    const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
+                               keys.empty() && mouseScript.empty() && watchAddr == 0;
+    if (canUseFastRun)
+    {
+        while (spent < cycleLimit)
+        {
+            // 1 回の run() で回す量。大きすぎると停止の検出が遅れる。
+            constexpr x68k::u32 kFastRunChunk = 100000;
+            const x68k::u32 chunk =
+                static_cast<x68k::u32>(std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent));
+            const x68k::u32 used = machine.run(chunk);
+            if (used == 0)
+            {
+                break;
+            }
+            spent += used;
+            // run() は命令数を返さない。サイクル数から概算する
+            // (統計を出さない経路なので、正確な命令数は要らない)。
+            instructions += used / 4;
+        }
+    }
+
     while (spent < cycleLimit)
     {
         const auto& s = machine.cpu().state();
@@ -1005,7 +1036,10 @@ int main(int argc, char** argv)
         stats.dump();
     }
 
-    if (showStats)
+    // SRAM と MFP の状態は --stats 無しでも出す。
+    // run() 経路と step() 経路が同じ結果になることを確かめるのに使う
+    // (--stats を付けると step() 経路へ落ちるので、付けた状態同士でしか
+    //  比べられないと意味が無い)。
     {
         std::printf("[sram] $ED0018=%04X $ED0058=%02X $ED0000=%02X%02X%02X%02X\n",
                     machine.sram().read16(0x18), machine.sram().read8(0x58),
