@@ -417,30 +417,11 @@ bool M68k::requirePrivilege()
 
 // --- 実効アドレス ----------------------------------------------------------
 
-u32 M68k::effectiveAddress(u32 mode, u32 reg, u32 size)
+u32 M68k::effectiveAddressSlow(u32 mode, u32 reg, u32 size)
 {
+    // mode 2/3/4 ((An) / (An)+ / -(An)) はヘッダ側で捌き済み。ここには来ない。
     switch (mode)
     {
-        case 2:  // (An)
-            return st_.a[reg];
-
-        case 3:  // (An)+
-        {
-            const u32 addr = st_.a[reg];
-            // A7 をバイト単位で触るときは 2 増減する。スタックポインタが
-            // 奇数になるとアドレスエラーになるための特例。
-            const u32 step = (reg == 7 && size == kByte) ? 2u : size;
-            st_.a[reg] = addr + step;
-            return addr;
-        }
-
-        case 4:  // -(An)
-        {
-            const u32 step = (reg == 7 && size == kByte) ? 2u : size;
-            st_.a[reg] = st_.a[reg] - step;
-            return st_.a[reg];
-        }
-
         case 5:  // (d16,An)
         {
             const s16 disp = static_cast<s16>(fetch());

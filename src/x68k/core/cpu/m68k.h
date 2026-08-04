@@ -256,7 +256,38 @@ private:
     // --- 実効アドレス --------------------------------------------------------
     // mode/reg から実効アドレスを計算する。size はディスプレースメント計算と
     // -(An)/(An)+ の増減幅に効く (バイトで A7 を触ると 2 増減する特例がある)。
-    X68K_HOT_PATH u32 effectiveAddress(u32 mode, u32 reg, u32 size);
+    // mode 2/3/4 ((An) / (An)+ / -(An)) はレジスタの読み書きだけで済むので
+    // ここで捌く。拡張ワードを読む mode 5-7 は .cpp 側へ回す。
+    //
+    // この 3 つはメモリを触る命令で最も多い形。展開しても分岐 2 つと
+    // 加減算 1 つにしかならない。
+    //
+    // size は m68k_alu.h の kByte=1 / kWord=2 / kLong=4 (バイト数)。
+    // そのまま増減幅になる。A7 をバイトで触るときだけ 2 にする特例は、
+    // スタックポインタが奇数になるとアドレスエラーになるため。
+    u32 effectiveAddress(u32 mode, u32 reg, u32 size)
+    {
+        if (mode == 2)  // (An)
+        {
+            return st_.a[reg];
+        }
+        if (mode == 3)  // (An)+
+        {
+            const u32 addr = st_.a[reg];
+            const u32 step = (reg == 7 && size == 1) ? 2u : size;
+            st_.a[reg] = addr + step;
+            return addr;
+        }
+        if (mode == 4)  // -(An)
+        {
+            const u32 step = (reg == 7 && size == 1) ? 2u : size;
+            st_.a[reg] = st_.a[reg] - step;
+            return st_.a[reg];
+        }
+        return effectiveAddressSlow(mode, reg, size);
+    }
+
+    X68K_HOT_PATH u32 effectiveAddressSlow(u32 mode, u32 reg, u32 size);
     // レジスタ直接 (mode 0/1) だけをここで捌き、それ以外は .cpp の
     // 実効アドレス計算へ回す。
     //
