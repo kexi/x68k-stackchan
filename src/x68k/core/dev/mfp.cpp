@@ -438,7 +438,7 @@ u8 Mfp::serviceBlockMask(bool groupA) const
     return allowed;
 }
 
-bool Mfp::hasPendingInterrupt() const
+bool Mfp::hasPendingInterruptBlocked() const
 {
     const u8 pendingA = static_cast<u8>(reg_[kIpra] & reg_[kImra] & serviceBlockMask(true));
     const u8 pendingB = static_cast<u8>(reg_[kIprb] & reg_[kImrb] & serviceBlockMask(false));

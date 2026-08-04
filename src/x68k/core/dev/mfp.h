@@ -119,13 +119,37 @@ public:
     }
 
     // 保留中で、マスクされていない割り込みがあるか。
-    [[nodiscard]] bool hasPendingInterrupt() const;
+    //
+    // ここは **毎命令通る**。実行時間の大半は「保留が 1 つも無い」状態なので、
+    // その判定だけをインラインに置き、実際に保留があるときだけ .cpp 側の
+    // 完全な判定 (serviceBlockMask を含む) を呼ぶ。
+    //
+    // IPR & IMR が 0 なら、どんなマスクを掛けても 0 のまま。つまり
+    // serviceBlockMask を見るまでもなく「保留無し」が確定する。
+    //
+    // Why not 全部インラインにしないか: serviceBlockMask は ISR を走査する
+    // ループを含み、展開すると命令フェッチの熱い経路を押し出す。ESP32-S3 の
+    // I-cache では、この経路を小さく保つこと自体が効く (デバイス tick の
+    // まとめ込みが実機だけで +12.8% だったのと同じ理由)。
+    [[nodiscard]] bool hasPendingInterrupt() const
+    {
+        const bool anyPending = ((reg_[kIpra] & reg_[kImra]) | (reg_[kIprb] & reg_[kImrb])) != 0;
+        if (!anyPending)
+        {
+            return false;
+        }
+        return hasPendingInterruptBlocked();
+    }
 
     // 最も優先度の高い保留割り込みのベクタ番号を返し、その割り込みを
     // サービス中へ移す。保留が無ければ 0 を返す。
     u32 acknowledgeInterrupt();
 
 private:
+    // hasPendingInterrupt() の遅い側。IPR & IMR に何か立っているときだけ
+    // 呼ばれ、Software EOI の抑止を含めて判定する。
+    [[nodiscard]] bool hasPendingInterruptBlocked() const;
+
     void raise(bool groupA, u8 bit);
 
     // Software EOI でサービス中のチャネルより下位を抑止するマスク。
