@@ -126,48 +126,64 @@ public:
         {
             return;
         }
-        const u8 tacr = reg_[kTacr];
-        const u8 tbcr = reg_[kTbcr];
-        const u8 tcdcr = reg_[kTcdcr];
-        const u8 tccr = static_cast<u8>((tcdcr >> 4) & 7u);
-        const u8 tdcr = static_cast<u8>(tcdcr & 7u);
-        tickOne(0, tacr, mfpCycles);
-        tickOne(1, tbcr, mfpCycles);
-        tickOne(2, tccr, mfpCycles);
-        tickOne(3, tdcr, mfpCycles);
+        // 動いているタイマだけを詰めた表を引く。本数と分周値は制御
+        // レジスタが書かれたときにしか変わらない。
+        //
+        // Why キャッシュするか: この関数は quantum (8 CPU サイクル) ごとに
+        // 必ず通る。毎回 3 本のレジスタを読み、ビットを切り出し、止まって
+        // いる本数ぶん空振りするのは、変わらない答えを繰り返し計算して
+        // いることになる。実機と同じ run() 経路のプロファイルでは
+        // Mfp::tick の前置きだけで約 330 サンプル (全体の 6%)。
+        //
+        // 一度この最適化を **step() 経路のプロファイルを見て** 試して
+        // 0.0% だったが、あれは毎命令 tick する経路で測っていたための
+        // 誤りだった (aed4797 参照)。
+        for (u32 i = 0; i < runningCount_; ++i)
+        {
+            const RunningTimer& t = running_[i];
+            u32& counter = prescaleCounter_[t.index];
+            counter += mfpCycles;
+            if (counter < t.prescale)
+            {
+                continue;  // まだ 1 回も減らない。ここが最頻。
+            }
+            tickTimerCounted(static_cast<int>(t.index), t.prescale);
+        }
     }
 
 private:
-    // タイマ 1 本を進める。分周に満たない間は累算するだけ。
-    //
-    // 実行時間の大半は「累算しただけで閾値に届かない」状態。X68000 が
-    // 動かすタイマ B は分周 4 (MFP サイクル) なので、8 CPU サイクルの
-    // quantum で渡される 4 MFP サイクルでは 1 回おきにしか減らない。
-    // その空振りのために .cpp 側の tickTimer を呼び、中で timerPrescale()
-    // まで引いていた (プロファイルで 819 サンプル)。
-    //
-    // 分周値はここで引く。kPrescaleTable と同じ表をヘッダに持たせると
-    // 二重定義になるので、bit3 (外部入力モード) の除外と 3bit の索引だけを
-    // 直接書く。値は MC68901 の仕様どおり 4/10/16/50/64/100/200。
-    void tickOne(int index, u8 control, u32 mfpCycles)
+    // 動作中のタイマ 1 本ぶんの決まりきった情報。
+    struct RunningTimer
     {
-        const bool needsExternalInput = (control & 0x08u) != 0;
-        if (needsExternalInput)
+        std::size_t index = 0;  // 0-3
+        u32 prescale = 0;       // MFP サイクル単位
+    };
+
+    // 制御レジスタから running_ を組み直す。制御レジスタを書いたときに呼ぶ。
+    void refreshRunningTimers()
+    {
+        const u8 tcdcr = reg_[kTcdcr];
+        const u8 ctl[4] = {reg_[kTacr], reg_[kTbcr], static_cast<u8>((tcdcr >> 4) & 7u),
+                           static_cast<u8>(tcdcr & 7u)};
+        runningCount_ = 0;
+        for (std::size_t i = 0; i < 4; ++i)
         {
-            return;
+            // bit3 が立つモードは外部入力 TAI/TBI を要する。未実装なので
+            // 経過サイクルだけでは進められない (timerPrescale と同じ判定)。
+            const bool needsExternalInput = (ctl[i] & 0x08u) != 0;
+            if (needsExternalInput)
+            {
+                continue;
+            }
+            const u32 prescale = kPrescaleTable[ctl[i] & 7u];
+            if (prescale == 0)
+            {
+                continue;
+            }
+            running_[runningCount_].index = i;
+            running_[runningCount_].prescale = prescale;
+            ++runningCount_;
         }
-        const u32 prescale = kPrescaleTable[control & 7u];
-        if (prescale == 0)
-        {
-            return;
-        }
-        u32& counter = prescaleCounter_[static_cast<std::size_t>(index)];
-        counter += mfpCycles;
-        if (counter < prescale)
-        {
-            return;  // まだ 1 回も減らない。ここが最頻。
-        }
-        tickTimerCounted(index, prescale);
     }
 
 public:
@@ -249,6 +265,9 @@ private:
     std::array<u32, 4> prescaleCounter_{};
     // タイマの現在値。データレジスタ書き込みでリロードされる。
     std::array<u8, 4> timerValue_{};
+    // 動作中のタイマだけを詰めた表。refreshRunningTimers() が作る。
+    std::array<RunningTimer, 4> running_{};
+    u32 runningCount_ = 0;
 };
 
 }  // namespace x68k

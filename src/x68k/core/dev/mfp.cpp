@@ -45,6 +45,9 @@ void Mfp::reset()
     // 本エミュレータは送信を即座に完了したものとして扱うので、
     // 常に空いていることにする。
     reg_[kTsr] = kTsrBufferEmpty;
+
+    // 制御レジスタを 0 にしたので動作中タイマの表も空にする。
+    refreshRunningTimers();
 }
 
 u8 Mfp::read(u32 regIndex)
@@ -159,16 +162,19 @@ void Mfp::write(u32 regIndex, u8 value)
         case kTacr:
             reg_[kTacr] = value;
             clearPrescalerIfStopped(0, value);
+            refreshRunningTimers();
             return;
         case kTbcr:
             reg_[kTbcr] = value;
             clearPrescalerIfStopped(1, value);
+            refreshRunningTimers();
             return;
         case kTcdcr:
             reg_[kTcdcr] = value;
             // C は上位 3bit、D は下位 3bit。別々に見る。
             clearPrescalerIfStopped(2, static_cast<u8>((value >> 4) & 7u));
             clearPrescalerIfStopped(3, static_cast<u8>(value & 7u));
+            refreshRunningTimers();
             return;
 
         // ベクタレジスタ。S を落としたら ISR を捨てる。
