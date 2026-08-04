@@ -109,7 +109,37 @@ public:
     void setSource(u8 device, bool asserted);
 
     // 許可されていて、かつ上がっているデバイスがあるか。
-    [[nodiscard]] bool hasPendingInterrupt() const;
+    //
+    // ここはインライン。**毎命令通る経路**なので、関数呼び出しと
+    // デバイス 4 個のループがそのまま実効クロックに効く。
+    //
+    // Why not pendingDevice() をそのまま呼ばないか: あちらは
+    // 「どのデバイスか」を返すために 4 回回り、1 回ごとに
+    // enableMaskOf/statusMaskOf を呼ぶ。実際にはどちらのビットも
+    // 立っていない状態が圧倒的に多く、その判定は
+    // 「許可と状態の積が 0 か」を 1 回見れば済む。
+    //
+    // ループを素直に呼ぶ形にしていたところ、ホストのスループットが
+    // 1.26s → 1.49s へ落ちた (400M サイクルの起動を交互に 6 回ずつ、実測)。
+    // **18% の低下**で、issue #4 の目標に真っ向から反する大きさだった。
+    //
+    // Why not 状態を 4bit 右へ寄せて許可と重ねないか: 許可と状態は
+    // **対応するビット位置が揃っていない**。
+    //   FDC : 許可 $04 / 状態 $80
+    //   FDD : 許可 $02 / 状態 $40
+    //   HDD : 許可 $08 / 状態 $10
+    // 一律のシフトでは対応しない (一度そう書いて、FDC の許可を
+    // 別のデバイスのビットで判定するところだった)。組ごとに書く。
+    //
+    // プリンタは status 側が BUSY 信号で割り込み要因ではないので、
+    // statusMaskOf が 0 を返す = ここでも対象外。
+    [[nodiscard]] bool hasPendingInterrupt() const
+    {
+        const bool fdc = (enable_ & kEnableFdc) != 0 && (status_ & kStatusFdc) != 0;
+        const bool fdd = (enable_ & kEnableFdd) != 0 && (status_ & kStatusFdd) != 0;
+        const bool hdd = (enable_ & kEnableHdd) != 0 && (status_ & kStatusHdd) != 0;
+        return fdc || fdd || hdd;
+    }
 
     // CPU が受理した。届けるベクタ番号を返す。0 なら届けるものが無い。
     //

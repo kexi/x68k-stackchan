@@ -154,11 +154,6 @@ int IoSc::pendingDevice() const
     return -1;
 }
 
-bool IoSc::hasPendingInterrupt() const
-{
-    return pendingDevice() >= 0;
-}
-
 u8 IoSc::acknowledgeInterrupt() const
 {
     const int device = pendingDevice();
