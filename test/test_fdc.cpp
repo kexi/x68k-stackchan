@@ -1349,3 +1349,32 @@ TEST_CASE("I/O コントローラが未初期化なら FDC の割り込みは配
     CHECK_FALSE(rig.machine.iosc().hasPendingInterrupt());
     CHECK(rig.machine.iosc().acknowledgeInterrupt() == 0);
 }
+
+TEST_CASE("READ DATA の実行フェーズは RQM を立てて CPU に読ませる")
+{
+    // 保証すること: 非 DMA モードで CPU がデータポートから読めること。
+    //
+    // IPL-ROM のフロッピー経路 ($FF89DE) は
+    //   MOVE.B $E94001,D0 / AND.B #$D0,D0 / CMP.B #$D0,D0 / BNE -16
+    // と RQM|DIO|CB ($D0) が揃うのを**タイムアウト無しで**待つ。
+    // RQM を伏せていた頃は status が $50 のまま変わらず、6 億サイクル
+    // 回しても抜けなかった (実測)。ここが $D0 にならないと ROM は永久に
+    // 止まるので、DMA を起動しない経路も成立させておく必要がある。
+    Rig rig;
+    FakeFloppy floppy;
+    rig.machine.setFloppyDisk(0, &floppy);
+
+    // DMAC を起動せずに READ DATA を投げる。
+    // MFM、ドライブ 0、C=0 H=0 R=1 N=3 EOT=8 GPL=$2A DTL=$FF
+    rig.sendFdcCommand({0x46, 0x00, 0x00, 0x00, 0x01, 0x03, 0x08, 0x2A, 0xFF});
+
+    // 実行フェーズで $D0 (RQM|DIO|CB) が立つ。
+    CHECK(rig.machine.ioRead8(kFdcStatusPort) == 0xD0);
+
+    // CPU が読める。1 セクタ配り切るまで RQM は立ったまま。
+    for (x68k::u32 i = 0; i < 16; ++i)
+    {
+        (void)rig.machine.ioRead8(kFdcDataPort);
+        CHECK((rig.machine.ioRead8(kFdcStatusPort) & 0x80u) != 0);
+    }
+}

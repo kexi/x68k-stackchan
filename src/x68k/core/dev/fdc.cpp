@@ -236,19 +236,30 @@ u8 Fdc::readStatus() const
             return kStatusRqm;
 
         case Phase::Execute:
-            // DMA 転送中。CB と、方向に応じた DIO を立てる。
+            // 実行フェーズ。CB と、方向に応じた DIO を立てる。
             //
-            // RQM は立てない。実機の非 DMA モードでは 1 バイトごとに RQM が
-            // 上下するが、本エミュレータの DMAC は起動された時点で一気に
-            // 転送し切るので、CPU から見て実行フェーズが観測されるのは
-            // 「DMAC を起動せずに READ DATA を投げた」異常時だけ。そこで
-            // RQM を立てると CPU がデータポートを読んでしまい、DMA で
-            // 流すはずのバイトが横から抜ける。
+            // RQM も立てる。**非 DMA モードでは CPU が自分でデータポートを
+            // 読む**ので、RQM が無いと 1 バイトも取れない。
+            //
+            // Why not 「DMA で流すぶんが横から抜ける」と考えて伏せないか:
+            // 以前そう書いて伏せていたが、実測で誤りだった。IPL-ROM の
+            // フロッピー起動経路 ($FF89DE) は
+            //   MOVE.B $E94001,D0 / AND.B #$D0,D0 / CMP.B #$D0,D0 / BNE -16
+            // と RQM|DIO|CB ($D0) が揃うのを**タイムアウト無しで**待つ。
+            // RQM を伏せると status が $50 のまま変わらず、ROM はここで
+            // 永久に回る (実測: 6 億サイクル回しても抜けない)。
+            //
+            // DMA と食い合う心配は要らない。DMAC が起動されていれば
+            // dmaRead() が先にバッファを空にして finishExecute() へ進むので、
+            // CPU がデータポートを読む機会はそもそも来ない。両方が同じ
+            // バイトを取りに来る状況は作れない。
             if (transfer_ == Transfer::Read)
             {
-                return static_cast<u8>(kStatusCb | kStatusDio);
+                return static_cast<u8>(kStatusRqm | kStatusCb | kStatusDio);
             }
-            return kStatusCb;
+            // 書き込みは CPU から届くのを待つ。DIO は落としたまま
+            // (CPU → FDC の向き) で RQM を立てる。
+            return static_cast<u8>(kStatusRqm | kStatusCb);
 
         case Phase::Result:
             // 結果を返す状態。IPL-ROM は RQM|DIO|CB ($D0) が揃うのを待つ
@@ -260,6 +271,43 @@ u8 Fdc::readStatus() const
 
 u8 Fdc::readData()
 {
+    // 非 DMA モード: 実行フェーズでは CPU が 1 バイトずつ取りに来る。
+    //
+    // IPL-ROM のフロッピー起動経路はこの形で読む。DMAC を起動せずに
+    // READ DATA を投げ、$FF89DE で RQM|DIO|CB を待ってからデータポートを
+    // 舐める。ここで返さないと 1 バイトも渡らず、ROM は永久に待つ。
+    //
+    // Why not DMA 経路と共通にしないか: DMA は dmaRead() が
+    // 「DMAC が要求した長さ」で駆動するのに対し、こちらは CPU が
+    // 好きなだけ読む。終了条件が違う (向こうは終端カウント、こちらは
+    // セクタを配り切ったら次のセクタを用意する) ので、同じ関数に
+    // 押し込むと両方の条件が絡んで読み解けなくなる。
+    if (phase_ == Phase::Execute && transfer_ == Transfer::Read)
+    {
+        if (sectorPos_ >= sectorBytes_)
+        {
+            return 0u;
+        }
+        const u8 value = sectorBuffer_[sectorPos_++];
+        if (sectorPos_ >= sectorBytes_)
+        {
+            // 1 セクタ配り切った。次のセクタを用意できれば続ける。
+            // 終わり方は dmaRead() と同じにする (EOT 超えは End of Cylinder)。
+            if (!advanceSector())
+            {
+                pendingSt0_ = static_cast<u8>(kSt0AbnormalTermination | unitSelect());
+                result_[1] = kSt1EndOfCylinder;
+                finishExecute();
+            }
+            else if (!loadCurrentSector())
+            {
+                pendingSt0_ = static_cast<u8>(kSt0AbnormalTermination | unitSelect());
+                finishExecute();
+            }
+        }
+        return value;
+    }
+
     if (phase_ != Phase::Result || resultPos_ >= resultLength_)
     {
         return 0u;
