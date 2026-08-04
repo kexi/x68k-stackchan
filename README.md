@@ -43,10 +43,14 @@ A>
 CoreS3 の LCD は 320x240、Human68k のコンソールは 768x512 なので、等倍で
 40 桁 x 15 行を切り出して表示します。書き込みが進むと表示位置がそこへ追従します。
 
-実効クロックは **3.3MHz**（実機 10MHz の 33%）。ただしこれは
-メインメモリ 1MB・テキスト画面のみだった頃の実測値です。その後
-2MB 化とグラフィック画面の重ね合わせを入れたぶん下がっているはずで、
-**再測定はまだしていません**（[#4](https://github.com/kexi/x68k-stackchan/issues/4)）。
+実効クロックは **4.8MHz**（実機 10MHz の 48%）。CoreS3 実機での実測値で、
+メインメモリ 2MB・グラフィック画面の重ね合わせ・音源を全部載せた状態です。
+
+一度 5.5MHz (55%) まで上げましたが、デバイスへ時間を渡す粒度を粗くした
+最適化が**垂直帰線やタイマ割り込みの観測タイミングをずらしていた**ため
+撤回しました。経緯は
+[docs/knowledge/cores3-emulator-runtime.md](docs/knowledge/cores3-emulator-runtime.md)
+にあります。
 
 USB シリアルからキーを打てます。`~` を送るとテキスト画面を ASCII に逆引きして
 返すので、LCD を見なくても画面の内容を確認できます。
@@ -64,18 +68,23 @@ just make-cgrom <東雲フォントの bdf ディレクトリ> sd/cgrom.dat
 
 ### 次の目標
 
-速度改善です。ホット命令の IRAM 配置と `vTaskDelay` の頻度調整で、実機比 50%
-を目指します。
+速度改善です。現在 **実機比 48%**（4842 kHz）で、目標の 50%（5000 kHz）まで
+あと 158 kHz です（[#4](https://github.com/kexi/x68k-stackchan/issues/4)）。
+
+「毎命令通る呼び出しを削る」型の最適化は枯れました。これ以上インライン化を
+進めると呼び出し元のコードが膨らんで逆に遅くなります（実測 -3.1%）。
+フラグ計算の遅延評価（上限 +0.3%）とデコード結果のキャッシュ（同 +0.15%）も
+上限を測ってあり、残るのは動的再コンパイルだけ、というところまで来ています。
 
 検証の状況:
 
 - 68000 コアは [SingleStepTests/m68000](https://github.com/SingleStepTests/m68000)
   の命令単位テストベクタで検証済み（`just test-vectors`）。
-  127 suites / 128,236 件が既知の失敗なしで通ります。除外しているのは
-  upstream が「検証できていない」と明記している TAS / TRAPV の 2 命令だけです
+  127 suites / **130,795 件が除外なしで通ります**。
+  かつて TAS を除外していましたが、原因は upstream ではなく自前の未実装でした
   （[#6](https://github.com/kexi/x68k-stackchan/issues/6)）
-- ホストの単体テストは 309 test cases / 1829 assertions が通る（`just test-host`）
-- 実機ファーム（ESP-IDF）のビルドが通る。バイナリは約 480KB
+- ホストの単体テストは 541 test cases / 26,181 assertions が通る（`just test-host`）
+- 実機ファーム（ESP-IDF）のビルドが通る。バイナリは約 535KB
 
 | 実装 | 状態 |
 |---|---|
@@ -87,8 +96,9 @@ just make-cgrom <東雲フォントの bdf ディレクトリ> sd/cgrom.dat
 | グラフィック画面（G-VRAM 16 / 256 / 65536 色、テキストとの重ね合わせ） | 実装済み。実機のソフトでの確認は未 |
 | SCC（Z8530）のマウス | 実装済み。実機のソフトでの確認は未 |
 | 実機バックエンド（SD / LCD / タッチ入力 / シリアル） | 実装済み。実機で Human68k が動く |
-| FM 音源・ADPCM・スプライト・BG | 未実装 |
-| スタックチャン統合（顔表示・サーボ） | 未実装 |
+| FM 音源（YM2151）・ADPCM（MSM6258V） | 実装済み。実機のスピーカーから鳴る |
+| スプライト・BG | 実装済み。実機のソフトでの確認は未 |
+| スタックチャン統合（顔表示・サーボ・モード切替） | 実装済み |
 
 ### SX-Window（Human68k の純正 GUI）について
 
@@ -108,7 +118,7 @@ GUI が使う経路 (G-VRAM / パレット / プライオリティ合成 / SCC �
 
 ```
 just build-host
-./build-host/x68k-run --iplrom rom/iplrom.dat --gui-demo /tmp/gui.ppm
+./build-host/x68k-run --gui-demo /tmp/gui.ppm   # IPL-ROM は要りません
 ```
 
 **これは SX-Window ではありません。** 足りないものは
