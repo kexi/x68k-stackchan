@@ -134,7 +134,7 @@ void M68k::refillPrefetch(u32 newPc)
     const u32 a = newPc & M68k::kAddrMask;
     // 分岐のたびに 2 ワード読む。ここも直接経路を通す。
     // 4 バイトとも窓に収まるときだけ (またぐ場合は下の一般路が境界を見る)。
-    if (fastRamReadable_ && fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    if (fastRamReadable_ && fastRamHasLong(a))
     {
         st_.ir = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
         st_.irc = static_cast<u16>((fastRam_[a + 2] << 8) | fastRam_[a + 3]);
@@ -222,7 +222,7 @@ u32 M68k::read32(u32 addr)
     }
     // ロングは 4 バイトとも窓に収まるときだけ直接読む。
     // またぐ場合は下の 2 回に分ける経路がそれぞれ境界を見る。
-    if (fastRamReadable_ && fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    if (fastRamReadable_ && fastRamHasLong(a))
     {
         return (static_cast<u32>(fastRam_[a]) << 24) | (static_cast<u32>(fastRam_[a + 1]) << 16) |
                (static_cast<u32>(fastRam_[a + 2]) << 8) | fastRam_[a + 3];
@@ -285,7 +285,7 @@ void M68k::write32(u32 addr, u32 value)
         takeAddressError(a, false);
         return;
     }
-    if (fastRam_ != nullptr && a + 3 < fastRamLimit_)
+    if (fastRamHasLong(a))
     {
         fastRam_[a] = static_cast<u8>(value >> 24);
         fastRam_[a + 1] = static_cast<u8>(value >> 16);

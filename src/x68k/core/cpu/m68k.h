@@ -176,6 +176,12 @@ private:
     {
         return fastRam_ != nullptr && a < fastRamLimit_;
     }
+    // ロングは 4 バイトとも窓に収まるときだけ。またぐアクセスは境界を
+    // 正しく見せるために遅い経路 (バス) へ落とす。
+    [[nodiscard]] bool fastRamHasLong(u32 a) const
+    {
+        return fastRam_ != nullptr && a + 3 < fastRamLimit_;
+    }
 
     // IPL-ROM の窓に size バイトとも収まるか。収まれば ROM 内オフセットを返す。
     // またぐアクセスは遅い経路 (バス) に落として境界を正しく見せる。
@@ -226,7 +232,7 @@ private:
             return value;
         }
 
-        if (fastRamReadable_ && fastRam_ != nullptr && a + 1 < fastRamLimit_)
+        if (fastRamReadable_ && fastRamHasWord(a))
         {
             st_.irc = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
         }

@@ -70,7 +70,7 @@ struct Tables
             const double value = std::sin(angle);
             // -log2(sin) を 1/256 単位で。実チップは 12bit に丸める。
             const double logValue = -std::log2(value) * 256.0;
-            u32 quantized = static_cast<u32>(logValue + 0.5);
+            u32 quantized = static_cast<u32>(std::lround(logValue));
             if (quantized > 0x0FFFu)
             {
                 quantized = 0x0FFFu;
@@ -84,7 +84,7 @@ struct Tables
             // 実チップは 2^(x/256) - 1 の形で 0..255 を引き、あとで
             // 暗黙の 1 を足す。ここでも同じ形にする。
             const double value = std::pow(2.0, -static_cast<double>(i) / 256.0);
-            exp[i] = static_cast<u16>(value * 2048.0 + 0.5);
+            exp[i] = static_cast<u16>(std::lround(value * 2048.0));
         }
     }
 };
