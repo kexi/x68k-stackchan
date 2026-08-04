@@ -12,10 +12,12 @@
 // なければならない。
 
 #include <utility>
+#include <vector>
 
 #include "dev/mfp.h"
 #include "dev/rtc.h"
 #include "dev/video.h"
+#include "machine.h"
 #include "doctest.h"
 
 namespace
@@ -109,9 +111,11 @@ TEST_SUITE("device-timing")
         // かつて入れていた 8 サイクル quantum では、分周器の位相が
         // 半分埋まった状態で割り込みが遅れた。この性質を固定しておく
         // (再び quantum を入れるなら、まずここが失敗する)。
-        const auto [fineAt, coarseAt] =
+        const auto [pastFineAt, delayedAt] =
             compareGranularity<x68k::Mfp>(setup, changed, 4, kPastMfpQuantum, 400, 4);
-        CHECK(coarseAt > fineAt);
+        REQUIRE(pastFineAt != 0);
+        REQUIRE(delayedAt != 0);
+        CHECK(delayedAt > pastFineAt);
     }
 
     // 垂直帰線の開始は、ゲストが GPIP4 として命令単位でポーリングできる。
@@ -127,9 +131,13 @@ TEST_SUITE("device-timing")
         CHECK(coarseAt == fineAt);
 
         // 64 サイクル単位でまとめると 24 サイクル遅れて見えた。
-        const auto [_, delayedAt] = compareGranularity<x68k::Crtc>(
+        // 比較は同じ呼び出しが返す組の中で行う (別の呼び出しの fine と
+        // 比べると、setup が状態を持つようになったとき誤判定する)。
+        const auto [pastFineAt, delayedAt] = compareGranularity<x68k::Crtc>(
             setup, changed, 4, kPastCrtcQuantum, x68k::Crtc::kCyclesPerFrame, 0);
-        CHECK(delayedAt > fineAt);
+        REQUIRE(pastFineAt != 0);
+        REQUIRE(delayedAt != 0);
+        CHECK(delayedAt > pastFineAt);
     }
 
     // RTC の秒が進む瞬間も、ポーリングループの反復回数として観測できる。
@@ -149,8 +157,38 @@ TEST_SUITE("device-timing")
         CHECK(coarseAt == fineAt);
 
         // 10000 サイクル単位でまとめると秒境界が最大 1998 サイクル遅れた。
-        const auto [_, delayedAt] =
+        const auto [pastFineAt, delayedAt] =
             compareGranularity<x68k::Rtc>(setup, changed, 6, kPastRtcQuantum, 10100000, 0);
-        CHECK(delayedAt > fineAt);
+        REQUIRE(pastFineAt != 0);
+        REQUIRE(delayedAt != 0);
+        CHECK(delayedAt > pastFineAt);
     }
+
+    // --- Machine レベルの回帰テストについて -------------------------------
+    //
+    // 「Machine が quantum を再導入したら落ちる」テストを 6 通り試して、
+    // **どれも quantum を戻した状態で通ってしまった**ので入れていない。
+    // 試したのは:
+    //   1. run() と step() の最終状態を比べる
+    //      -> run() が終了時に保留を flush するので一致する
+    //   2. 総サイクル数を quantum の倍数から外して比べる
+    //      -> 止めた位置で保留が 0 だと一致する
+    //   3. ラスタが変わるまでの run() 呼び出し回数を数える
+    //      -> quantum あり/なしとも 80 で同じだった
+    //   4. 1 フレームぶんのラスタ遷移回数を数える
+    //      -> CRTC の累算器が受け取る総量は同じなので同じ回数になる
+    //
+    // 理由ははっきりしている。**CRTC も RTC も MFP も加算アキュムレータ
+    // なので、渡す総量が同じなら最終状態は必ず一致する。** 違いが出るのは
+    // 「途中のある瞬間に外から覗いたとき」だけで、run() の外からはその
+    // 瞬間に触れない。
+    //
+    // 上の 3 つのデバイス単体テストは、まさにその「途中で覗く」形になって
+    // いる (tick を細かく呼びながら毎回 changed() を見る)。Machine 経由で
+    // 同じことをするには run() の内側にフックが要り、そのために製品コード
+    // へ計測用の口を開けるのは割に合わない。
+    //
+    // したがってここでの防御は「デバイス単体で、その粒度なら観測可能な
+    // ずれが出る」ことを固定するところまで。Machine が再び quantum を
+    // 入れるなら、上の 3 つが示す粒度を避けなければならない。
 }

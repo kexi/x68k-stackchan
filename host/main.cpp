@@ -875,13 +875,15 @@ int main(int argc, char** argv)
 
     // トレースも統計もキー入力も要らないときは、実機と同じ run() を回す。
     //
-    // Why これが要るか: 下の主ループは 1 命令ごとに machine.step() を呼ぶ。
-    // step() はデバイスの時間を**毎命令**進めるので、run() の quantum
-    // (8 サイクル) が効かない。プロファイルを取ると tickDevices が実機の
-    // 8 倍ほど重く見え、実機で効かない最適化を追うことになる。
+    // Why これが要るか: 実機は run() を呼ぶ (main/main.cpp)。プロファイルを
+    // 実機と違う経路で取ると、効く最適化を捨てたり効かない最適化を追ったり
+    // する。実際、step() 経路のプロファイルを根拠に MFP 周りへ 4 回続けて
+    // 手を入れて、いずれも実機で 0.0% だった。
     //
-    // 実際そうなった。この経路を用意する前、ホストのプロファイルを根拠に
-    // MFP 周りへ 4 回続けて手を入れて、いずれも実機で 0.0% だった。
+    // (かつて run() には 8 サイクルの quantum があり、その頃は step() 経路で
+    //  tickDevices が 8 倍重く見えていた。quantum は観測可能なずれを作ると
+    //  分かって撤廃したので、今は両経路の tick 粒度は同じ。それでも
+    //  「実機と同じ関数を回す」という原則は変わらない。)
     const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
                                keys.empty() && mouseScript.empty() && watchAddr == 0;
     if (canUseFastRun)

@@ -152,13 +152,6 @@ void Machine::reset()
     sasi_.buffer = sasiBuffer;
     dmac_.reset();
 
-    // まだデバイスへ渡していないサイクルを捨てる。
-    //
-    // 各デバイスの内部カウンタ (crtc_ の frameCycles_ など) は上の reset() で
-    // 0 になるが、ここに溜まっている分を残すとリセット後の最初の tick に
-    // 混ざり、位相がその分だけ進む。リセットの意味が「時間も 0 から」なので
-    // 保留も一緒に捨てる。
-
     // リセット直後は IPL-ROM が $000000 に写像されている。
     // これがないとリセットベクタが読めない。
     bus_.setRomMappedAtZero(true);
