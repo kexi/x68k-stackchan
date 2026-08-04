@@ -1,0 +1,19 @@
+# LeakSanitizer の抑制。
+#
+# doctest の TEST_SUITE は、静的初期化で
+#   setTestSuite(TestSuite() * decorators)
+# を呼び、スイート名の文字列を保持したままプロセス終了まで解放しない
+# (doctest.h の DOCTEST_TEST_SUITE_IMPL)。テストの実行に必要な情報を
+# 起動から終了まで持ち続ける作りなので、解放されないこと自体が設計。
+#
+# 実測では TEST_SUITE を使うファイル 1 つにつき 1 バイトが 1 件残る
+# (7 ファイル -> 7 件 / 計 7 バイト)。テスト本体の漏れではないので抑制する。
+#
+# Why not TEST_SUITE の使用をやめるか: スイート単位でテストを絞れる
+# (--test-suite=device-timing) のは調査で効く。1 ファイル 1 バイトと
+# 引き換えにする価値は無い。
+#
+# Why not 全体で leak 検出を切らないか: エミュレータ本体やテストが
+# 実際に漏らしたときは捕まえたい。抑制はこの 1 パターンに絞る。
+leak:doctest::detail::setTestSuite
+leak:doctest::String::String

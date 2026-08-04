@@ -50,7 +50,11 @@ test-san:
     cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
     cmake --build {{san_build}}
-    ctest --test-dir {{san_build}} --output-on-failure
+    # doctest の TEST_SUITE が静的初期化で確保する文字列は解放されない
+    # (設計上そうなっている)。テスト本体の漏れだけを見たいので抑制する。
+    # 詳細は test/lsan.supp に書いた。
+    LSAN_OPTIONS=suppressions={{justfile_directory()}}/test/lsan.supp \
+      ctest --test-dir {{san_build}} --output-on-failure
 
 [doc('ホストのエミュレータランナー x68k-run をビルドする')]
 build-host:
