@@ -152,6 +152,14 @@ void M68k::refillPrefetch(u32 newPc)
         st_.pc = newPc + 4;
         return;
     }
+    // 命令フェッチの最頻の行き先は IPL-ROM (実測で全アクセスの 79%)。
+    if (u32 off = 0; fastRomHas(a, 4, off))
+    {
+        st_.ir = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+        st_.irc = static_cast<u16>((fastRom_[off + 2] << 8) | fastRom_[off + 3]);
+        st_.pc = newPc + 4;
+        return;
+    }
 
     st_.ir = bus_.read16(a);
     st_.irc = bus_.read16((newPc + 2) & kAddrMask);
@@ -179,6 +187,10 @@ u8 M68k::read8(u32 addr)
     {
         return fastRam_[a];
     }
+    if (u32 off = 0; fastRomHas(a, 1, off))
+    {
+        return fastRom_[off];
+    }
     return bus_.read8(a);
 }
 
@@ -195,6 +207,10 @@ u16 M68k::read16(u32 addr)
         // 68000 はビッグエンディアン。ホストのエンディアンに依存しないよう
         // バイトから組む (SystemBus::read16 と同じ形)。
         return static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+    }
+    if (u32 off = 0; fastRomHas(a, 2, off))
+    {
+        return static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
     }
     const u16 value = bus_.read16(a);
     if (bus_.lastAccessFaulted())
@@ -221,6 +237,12 @@ u32 M68k::read32(u32 addr)
     {
         return (static_cast<u32>(fastRam_[a]) << 24) | (static_cast<u32>(fastRam_[a + 1]) << 16) |
                (static_cast<u32>(fastRam_[a + 2]) << 8) | fastRam_[a + 3];
+    }
+    if (u32 off = 0; fastRomHas(a, 4, off))
+    {
+        return (static_cast<u32>(fastRom_[off]) << 24) |
+               (static_cast<u32>(fastRom_[off + 1]) << 16) |
+               (static_cast<u32>(fastRom_[off + 2]) << 8) | fastRom_[off + 3];
     }
     // 68000 のバスは 16bit なのでロングは 2 回に分かれる。上位が先。
     const u32 hi = bus_.read16(a);

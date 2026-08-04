@@ -139,6 +139,26 @@ public:
         fastRamReadable_ = readable;
     }
 
+    // 仮想関数を通さずに読んでよい IPL-ROM の窓を教える。
+    //
+    // Why メイン RAM と別に持つか: CPU のメモリアクセスを実際に数えたら、
+    // IPL-ROM が全体の 79% で最頻だった (メイン RAM は 17.7%)。
+    // 内訳は docs/knowledge/cores3-emulator-runtime.md にある。
+    // 起動処理も IOCS も本体は ROM 内にあり、命令フェッチがそこへ集中する。
+    //
+    // ROM は書けないので読み出しだけを通す。busBase は「この窓の先頭が
+    // 68000 のアドレス空間のどこに見えるか」で、X68000 では $FE0000。
+    //
+    // Why not アドレスを m68k.h に定数で持たないか: 68000 コアは機種の
+    // アドレス配置 (memmap.h) を知らないでいるべきで、その独立性こそ
+    // Bus を挟んでいる理由。窓の位置は必ず SystemBus から教わる。
+    void setFastRom(const u8* base, u32 busBase, u32 length)
+    {
+        fastRom_ = base;
+        fastRomBase_ = busBase;
+        fastRomLength_ = base != nullptr ? length : 0;
+    }
+
 private:
     // fast path を通してよいアクセスか。
     //
@@ -151,6 +171,23 @@ private:
     [[nodiscard]] bool fastRamHasByte(u32 a) const
     {
         return fastRam_ != nullptr && a < fastRamLimit_;
+    }
+
+    // IPL-ROM の窓に size バイトとも収まるか。収まれば ROM 内オフセットを返す。
+    // またぐアクセスは遅い経路 (バス) に落として境界を正しく見せる。
+    [[nodiscard]] bool fastRomHas(u32 a, u32 size, u32& offsetOut) const
+    {
+        if (fastRom_ == nullptr || a < fastRomBase_)
+        {
+            return false;
+        }
+        const u32 off = a - fastRomBase_;
+        if (off + size > fastRomLength_)
+        {
+            return false;
+        }
+        offsetOut = off;
+        return true;
     }
 
     // --- プリフェッチ --------------------------------------------------------
@@ -236,6 +273,10 @@ private:
     // 仮想関数を通さずに触れるメインメモリ。所有しない (bus_ と同じ実体を指す)。
     u8* fastRam_ = nullptr;
     u32 fastRamLimit_ = 0;
+    // 仮想関数を通さずに読める IPL-ROM。所有しない。
+    const u8* fastRom_ = nullptr;
+    u32 fastRomBase_ = 0;
+    u32 fastRomLength_ = 0;
     // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
     bool fastRamReadable_ = false;
     M68kState st_;

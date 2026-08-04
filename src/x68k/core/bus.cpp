@@ -62,6 +62,14 @@ void SystemBus::publishFastRam()
     // 読み出しを直接経路に流してよいのは ROM 写像が外れてからだけ。
     // 写像中の $000000-$00FFFF は RAM ではなく IPL-ROM の $FF0000 側が見える。
     fastPathCpu_->setFastRamReadable(!romAtZero_);
+
+    // IPL-ROM ($FE0000-) は最頻のアクセス先 (実測で全体の 79%)。
+    // 書けないので読み出しだけを通す。ROM 写像の有無に関係なく
+    // $FE0000 側の窓は常に正しい (写像が変えるのは $000000 側の見え方だけ)。
+    //
+    // ウォッチは書き込みだけを見張る仕組みなので、読み出し専用のこの窓には
+    // 関係しない。止める必要が無い。
+    fastPathCpu_->setFastRom(mem_.iplRom, kIplromBase, kIplromSize);
 }
 
 SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
