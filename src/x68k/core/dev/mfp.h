@@ -149,6 +149,28 @@ public:
             {
                 continue;  // まだ 1 回も減らない。ここが最頻。
             }
+
+            // 閾値に届いた回のうち、圧倒的多数は「1 回だけ減って、まだ 0 に
+            // ならない」で終わる。タイムアウトはデータレジスタの値ぶんに
+            // 1 度しか来ないし (タイマ C の既定なら 200 回に 1 度)、
+            // 2 回以上減るのは 1 命令のサイクル数が分周値を超えたときだけ。
+            //
+            // その最頻の経路だけをここへ出す。tickTimerCounted は別 TU に
+            // あるので、ESP32-S3 では実呼び出しになる。RTC と CRTC で同じ形が
+            // 効いたのと同じ理由 (TU を跨ぐ呼び出しだけが削れる)。
+            //
+            // Why not 全部を展開しないか: タイムアウト側はリロードと raise()
+            // を含み、展開すると毎命令通るこのループが膨らむ。過去に即値と
+            // 絶対ロングの展開で -3.1% を実測している。分ける位置が要点。
+            const u32 remainder = counter - t.prescale;
+            u8& value = timerValue_[t.index];
+            const bool decrementsOnce = remainder < t.prescale && value > 1;
+            if (decrementsOnce)
+            {
+                counter = remainder;
+                --value;
+                continue;
+            }
             tickTimerCounted(static_cast<int>(t.index), t.prescale);
         }
     }
