@@ -9,9 +9,10 @@ sources:
   - docs/knowledge/x68000-sasi-boot.md
   - docs/knowledge/x68000-boot-sequence.md
   - docs/knowledge/cores3-emulator-runtime.md
+  - docs/knowledge/event-driven-devices.md
   - 実測（IPL-ROM EXPERT 用 v1.0、MD5 7fd4caabac1d9169e289f0f7bbf71d8e）
   - 実測（Human68k 3.02 の HUMAN.SYS、58496 バイト）
-updated: 2026-08-03
+updated: 2026-08-17
 ---
 
 # ナレッジ索引
@@ -30,6 +31,7 @@ X68000 の仕様と、このプロジェクトで実際に手を動かして分�
 | [X68000 エミュレータ実装の落とし穴](x68000-emulator-pitfalls.md) | `confirmed` | 実物の IPL-ROM を走らせて初めて露見したバグ。症状 → 原因 → 見分け方。ROM の読み違えで一度誤った結論に達した例も含む |
 | [X68000 の SASI 起動経路](x68000-sasi-boot.md) | `confirmed` | SASI から Human68k が起動するまでのレジスタ・プロトコル・ディスク構造、IOCS とキーボードのワーク。実物の ROM と HUMAN.SYS から読み取った値 |
 | [CoreS3 実機でエミュレータを動かすときの知見](cores3-emulator-runtime.md) | `confirmed` | ウォッチドッグ、シリアル経由のデバッグ、メモリ配置、LCD の見え方。ホストでは起きない種類の問題 |
+| [デバイスへ時間を渡す仕組みをイベント駆動にする](event-driven-devices.md) | `measured` | 律速は 68000 の命令実行ではなくデバイスの tick だった。JIT が上限 1.03 倍と測れた経緯と、代わりの設計 |
 
 ## X68000 の仕様（資料ベース + 一部実測）
 

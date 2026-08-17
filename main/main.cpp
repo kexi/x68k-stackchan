@@ -1024,6 +1024,24 @@ private:
             return;
         }
 
+        // '@' で MFP タイマの設定を出す。
+        //
+        // イベント駆動の設計は「次に状態が変わるまで何サイクルあるか」で
+        // 決まるので、ゲストが実際にどの分周でタイマを回しているかが
+        // そのまま効果を左右する。推測せずに実機から読む。
+        const bool isMfpDump = c == '@';
+        if (isMfpDump)
+        {
+            const auto& m = g_machine.mfp();
+            ESP_LOGI(kTag, "MFP TACR=%02X TBCR=%02X TCDCR=%02X", m.peek(x68k::Mfp::kTacr),
+                     m.peek(x68k::Mfp::kTbcr), m.peek(x68k::Mfp::kTcdcr));
+            ESP_LOGI(kTag, "MFP TADR=%02X TBDR=%02X TCDR=%02X TDDR=%02X", m.peek(x68k::Mfp::kTadr),
+                     m.peek(x68k::Mfp::kTbdr), m.peek(x68k::Mfp::kTcdr), m.peek(x68k::Mfp::kTddr));
+            ESP_LOGI(kTag, "MFP IERA=%02X IERB=%02X IMRA=%02X IMRB=%02X", m.peek(x68k::Mfp::kIera),
+                     m.peek(x68k::Mfp::kIerb), m.peek(x68k::Mfp::kImra), m.peek(x68k::Mfp::kImrb));
+            return;
+        }
+
         // '!' で OPM のテスト音を 3 秒鳴らす。
         //
         // 実機では音を耳で確かめられないので、これと 5 秒ごとの
