@@ -356,6 +356,70 @@ std::atomic<bool> g_redrawRequested{false};
 // # CONFIG_ESP_SYSTEM_MEMPROT_FEATURE is not set) で、実機で確かめたら
 // EXEC|32BIT で確保でき、生成したコードが正しく走った (2026-08-18)。
 // 前提が変わったら測り直すこと。
+// ネイティブ発行の上限を測る。**恒久的な機能ではない。**
+//
+// インタプリタは 1 ゲスト命令に約 85 CPU サイクル使っている (実測)。
+// これをネイティブコードにしたら何サイクルになりうるかを、
+// 「ゲスト命令 1 つぶんの仕事」を手書きの Xtensa で回して測る。
+//
+// ここで測るのは **床** であって、実際の JIT が出す値ではない。
+// 床がインタプリタと大差なければ、JIT を書いても意味が無い。
+[[maybe_unused]] void probeNativeCeiling()
+{
+    constexpr std::size_t kBytes = 256;
+    auto* code =
+        static_cast<std::uint8_t*>(heap_caps_malloc(kBytes, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT));
+    if (code == nullptr)
+    {
+        ESP_LOGW(kTag, "[native] 実行可能メモリを確保できない");
+        return;
+    }
+
+    // 生成するのは `int loop(int n) { while (n--) ; return 0; }` に
+    // ゲスト命令 1 つぶんの仕事を混ぜたもの。
+    //
+    // ゲストの MOVE.L D0,D1 に相当する最小の仕事:
+    //   - レジスタ配列から 1 ワード読む
+    //   - 別の位置へ書く
+    //   - フラグを更新する (N/Z の 2 ビット)
+    // Xtensa なら l32i + s32i + 数命令。**4-8 サイクル**が床になる。
+    //
+    // エンコーディングは推測しない。probeJitFeasibility のコメントに
+    // ある通り、自分で組み立てて 2 回落ちている。ここでは
+    // 「entry / 単純ループ / retw.n」だけに留め、既に検証済みの
+    // バイト列を組み合わせる。
+    //
+    //   004136  entry a1, 32
+    //   a20c    movi.n a2, 10      (戻り値)
+    //   f01d    retw.n
+    //
+    // ループは入れず、**呼び出しのコストだけ**を測る。
+    // 1 回の callx8 + entry + retw が何 ns かが分かれば、
+    // 「1 命令ごとにネイティブへ飛ぶ」形の下限が出る。
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(code);
+    word[0] = 0x0C004136u;
+    word[1] = 0x00F01DA2u;
+    asm volatile("isync" ::: "memory");
+
+    using Fn = int (*)();
+    auto fn = reinterpret_cast<Fn>(code);
+
+    // 1000 万回呼んで実時間を測る。
+    constexpr int kIters = 10000000;
+    const std::int64_t t0 = esp_timer_get_time();
+    int sink = 0;
+    for (int i = 0; i < kIters; ++i)
+    {
+        sink += fn();
+    }
+    const std::int64_t t1 = esp_timer_get_time();
+    const double nsPerCall = (double)(t1 - t0) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] 呼び出し 1 回 %.1f ns (%.1f CPU サイクル) sink=%d", nsPerCall,
+             nsPerCall * 0.24, sink);
+    ESP_LOGI(kTag, "[native] 参考: インタプリタは 1 ゲスト命令 約 85 CPU サイクル");
+    heap_caps_free(code);
+}
+
 [[maybe_unused]] void probeJitFeasibility()
 {
     constexpr std::size_t kProbeBytes = 64;
@@ -1250,6 +1314,20 @@ private:
             g_eventNullExec = on;
             g_machine.setNullExecInEvent(on);
             ESP_LOGI(kTag, "イベント駆動のまま命令を空回し: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'n' でネイティブ発行の上限を測る。恒久機能ではない。
+        //
+        // 「命令の意味を最速で実行したら何 ns か」を知りたい。
+        // 生成したネイティブコードを実行可能メモリに置いて、
+        // ゲスト 1 命令ぶんに相当する仕事 (レジスタ間 MOVE) を
+        // 大量に回して測る。インタプリタの 85 CPU サイクル/命令と
+        // 比べれば、ネイティブ化で何倍になりうるかが出る。
+        const bool isNativeProbe = c == 'n';
+        if (isNativeProbe)
+        {
+            probeNativeCeiling();
             return;
         }
 
