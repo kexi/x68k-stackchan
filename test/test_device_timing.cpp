@@ -242,10 +242,38 @@ TEST_SUITE("device-timing")
     // 速度の差ではなく **正しさの差** なので、実機の数字を見る前に直す。
     TEST_CASE("最適化スイッチの両側で状態が一致する")
     {
-        // 同じ入力を両側へ与え、時間で動くデバイスの見えるところを比べる。
-        const auto runWith = [](bool fastPath)
+        // NOP で埋めた RAM を Machine::run() で回す。
+        //
+        // Why not デバイスの tick を直接呼ばないか: それだと
+        // Machine::tickDevices() がスイッチを取り違えていても、あるいは
+        // 片方のデバイスへ渡し忘れていても通ってしまう。実機が通るのは
+        // run() 経路なので、配線ごと確かめる。
+        static std::vector<x68k::u8> ram(0x10000, 0);
+        const auto poke16 = [](x68k::u32 addr, x68k::u16 v)
         {
+            ram[addr] = static_cast<x68k::u8>(v >> 8);
+            ram[addr + 1] = static_cast<x68k::u8>(v & 0xFF);
+        };
+
+        const auto runWith = [&](bool fastPath)
+        {
+            std::fill(ram.begin(), ram.end(), 0);
+            poke16(0, 0x0000);
+            poke16(2, 0x8000);  // SSP
+            poke16(4, 0x0000);
+            poke16(6, 0x0400);  // PC = $400
+            // RAM 全体を NOP で埋める。1000 万サイクル回すので $8000 まで
+            // では足りず、PC が伸び続けても命令が尽きないようにする。
+            for (x68k::u32 a = 0x400; a < 0x10000; a += 2)
+            {
+                poke16(a, 0x4E71);  // NOP (4 サイクル)
+            }
+
             x68k::Machine m;
+            x68k::MemoryMap map{};
+            map.mainRam = ram.data();
+            m.setMemory(map);
+
             x68k::PerfSwitch sw;
             sw.inlineRtcTick = fastPath;
             sw.inlineCrtcTick = fastPath;
@@ -255,9 +283,8 @@ TEST_SUITE("device-timing")
 
             // タイマ C と D を動かす (X68000 が実際に使う 2 本)。
             // 分周は別々にして、片方だけの一致で通らないようにする。
-            // タイマ C/D の割り込みを許可する。IPRB が立たないと、下の
-            // 「素通りではない」確認が効かなくなる (IER を 0 のままにすると
-            // MC68901 は IPR も立てない)。
+            // 割り込みも許可する。IPRB が立たないと、下の「素通りでは
+            // ない」確認が効かなくなる (IER が 0 だと IPR も立たない)。
             const x68k::u8 timerCD =
                 static_cast<x68k::u8>(x68k::Mfp::kIntTimerC | x68k::Mfp::kIntTimerD);
             m.mfp().write(x68k::Mfp::kIerb, timerCD);
@@ -266,24 +293,27 @@ TEST_SUITE("device-timing")
             m.mfp().write(x68k::Mfp::kTcdr, 200);
             m.mfp().write(x68k::Mfp::kTddr, 3);
 
-            // 素数サイクルで刻む。分周値の倍数だと、閾値をちょうど跨ぐ
-            // 場合と跨がない場合の差が出ない。
-            for (int i = 0; i < 20000; ++i)
+            // RTC の 1 秒境界 (10,000,000) と CRTC の垂直帰線
+            // (162,342) を両方跨ぐだけ回す。ここに届かないと、
+            // 遅い側の繰り上がりが壊れていても気づけない。
+            //
+            // 1 スライスを素数にして、閾値をちょうど跨ぐ位相と跨がない
+            // 位相の両方を通す。
+            x68k::u64 spent = 0;
+            while (spent < 10500000)
             {
-                m.mfp().tick(7, fastPath);
-                m.rtc().tick(7, fastPath);
-                m.crtc().tick(7, fastPath);
+                spent += m.run(9973);
             }
 
-            // タイマの現在値、垂直帰線、秒、保留割り込みを一度に見る。
             return std::vector<x68k::u32>{
                 m.mfp().read(x68k::Mfp::kTcdr),
                 m.mfp().read(x68k::Mfp::kTddr),
                 m.mfp().peek(x68k::Mfp::kIprb),
                 static_cast<x68k::u32>(m.crtc().inVerticalBlank() ? 1 : 0),
                 m.crtc().rasterNumber(),
-                m.rtc().read(0),
-                m.rtc().read(1),
+                m.rtc().read(x68k::Rtc::kSecond1),
+                m.rtc().read(x68k::Rtc::kSecond10),
+                static_cast<x68k::u32>(spent),
             };
         };
 
@@ -291,10 +321,12 @@ TEST_SUITE("device-timing")
         const std::vector<x68k::u32> slow = runWith(false);
         CHECK(fast == slow);
 
-        // 素通りのテストになっていないこと。刻んだ結果、タイマが実際に
-        // 減っていて保留も立っているのを確かめる (全部 0 同士の一致では
-        // 何も守れない)。
-        REQUIRE(fast.size() == 7);
-        CHECK(fast[2] != 0);
+        // 素通りのテストになっていないこと。全部 0 同士の一致では
+        // 何も守れないので、実際に動いた証拠を個別に確かめる。
+        REQUIRE(fast.size() == 8);
+        CHECK(fast[2] != 0);  // タイマの割り込みが保留になっている
+        // RTC が 1 秒ぶん進んでいる (reset 直後は 0 秒)。
+        const x68k::u32 seconds = fast[6] * 10 + fast[5];
+        CHECK(seconds >= 1);
     }
 }

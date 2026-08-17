@@ -177,12 +177,43 @@ u32 Machine::step()
         return 0;
     }
 
-    tickDevices(cycles);
+    // step() はトレース用で、毎命令の速度が問題になる経路ではない。
+    // 最適化スイッチはここでも尊重する (ホストの --no-fast-tick が
+    // step() 経路でも同じ状態になることを確かめられるように)。
+    if (perf_.allEnabled())
+    {
+        tickDevices<true>(cycles);
+    }
+    else
+    {
+        tickDevices<false>(cycles);
+    }
 
     return cycles;
 }
 
 u32 Machine::run(u32 cycles)
+{
+    // 最適化スイッチはここで **1 回だけ** 見る。
+    //
+    // Why not tickDevices へ bool を渡さないか: それだと毎命令フラグを
+    // 読んで分岐することになり、測ろうとしている当のホットループに
+    // 計測器のコストが乗る。ESP32-S3 のオブジェクトを見ると、フラグ 3 つの
+    // ロードと分岐がそのまま残っていた (codex の指摘)。
+    //
+    // テンプレート引数にすれば、有効側は **スイッチを入れる前と同じ
+    // 生成コード** になる。定数畳み込みで分岐ごと消えるので、本番の姿に
+    // 計測用の細工が残らない。切り替えの代償はスライスごとの分岐 1 回で、
+    // 20000 サイクルに 1 度なので無視できる。
+    if (perf_.allEnabled())
+    {
+        return runWith<true>(cycles);
+    }
+    return runWith<false>(cycles);
+}
+
+template <bool FastTick>
+u32 Machine::runWith(u32 cycles)
 {
     u32 spent = 0;
     while (spent < cycles)
@@ -196,15 +227,16 @@ u32 Machine::run(u32 cycles)
         }
         spent += used;
 
-        tickDevices(used);
+        tickDevices<FastTick>(used);
     }
 
     return spent;
 }
 
+template <bool FastTick>
 void Machine::tickDevices(u32 cycles)
 {
-    mfp_.tick(cycles, perf_.inlineMfpTimer);
+    mfp_.tick<FastTick>(cycles);
 
     // RTC も CRTC もまとめない。
     //
@@ -218,13 +250,19 @@ void Machine::tickDevices(u32 cycles)
     // いずれもゲストが命令単位でポーリングできる値なので、「分解能より
     // 細かいから見えない」は成り立たない。ポーリングループの反復回数
     // として観測できる。速度のために正しさを崩す取引だったので戻した。
-    rtc_.tick(cycles, perf_.inlineRtcTick);
+    rtc_.tick<FastTick>(cycles);
 
-    if (crtc_.tick(cycles, perf_.inlineCrtcTick))
+    if (crtc_.tick<FastTick>(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
     }
 }
+
+// この 2 つは machine.cpp の中でしか呼ばれないので、明示的な実体化で足りる。
+// ヘッダへ定義を出すと、machine.h を読む全ての TU が SASI の状態機械まで
+// 抱えることになる。
+template u32 Machine::runWith<true>(u32);
+template u32 Machine::runWith<false>(u32);
 
 void Machine::serviceInterruptsSlow()
 {

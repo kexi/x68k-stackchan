@@ -325,7 +325,17 @@ private:
     void sccWrite(u32 addr, u8 value);
 
     // 時間で動くデバイスへ経過サイクルを渡す。step() と run() の共通路。
+    //
+    // FastTick はテンプレート引数。run() の入口で 1 回だけ決めるので、
+    // 有効側はスイッチを入れる前と同じ生成コードになる (perf_switch.h)。
+    // bool の引数にすると毎命令フラグを読んで分岐することになり、
+    // 測ろうとしているホットループに計測器のコストが乗る。
+    template <bool FastTick>
     void tickDevices(u32 cycles);
+
+    // run() の本体。FastTick ごとに 1 つずつ実体化する。
+    template <bool FastTick>
+    u32 runWith(u32 cycles);
 
     // 毎命令通る経路の最適化スイッチ。既定は全て有効で、無効側は
     // 実機の計測でだけ使う (perf_switch.h)。

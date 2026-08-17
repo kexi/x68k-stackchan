@@ -68,12 +68,15 @@ public:
     // 24 サイクル遅れるずれが観測できた
     // (docs/knowledge/cores3-emulator-runtime.md)。渡す量は変えず、
     // **呼び出しの間接性だけ**を消す。
-    // inlineFastPath を false にすると、この最適化を入れる前と同じ
-    // 「常に実呼び出し」へ戻る。実機で焼き直さずに効果を測るための口で、
-    // 状態遷移はどちらでも完全に同一 (perf_switch.h を見よ)。
-    bool tick(u32 cycles, bool inlineFastPath = true)
+    //
+    // FastPath=false にすると、この最適化を入れる前と同じ「常に実呼び出し」
+    // へ戻る。実機で焼き直さずに効果を測るための口 (perf_switch.h)。
+    // テンプレートにしてあるのは、有効側の生成コードをスイッチ導入前と
+    // 同一に保つため。bool の引数だと毎命令フラグを読んで分岐する。
+    template <bool FastPath = true>
+    bool tick(u32 cycles)
     {
-        const bool needsSlowPath = !inlineFastPath || cycles >= kCyclesPerFrame;
+        const bool needsSlowPath = !FastPath || cycles >= kCyclesPerFrame;
         if (needsSlowPath)
         {
             return tickSlow(cycles);  // 剰余が要る。ホストのまとめ呼びだけ

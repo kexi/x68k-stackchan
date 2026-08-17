@@ -119,11 +119,12 @@ public:
     // 近似にしてある (タイマ精度は Human68k の起動に影響しない)。
     static constexpr u32 kCpuToMfpShift = 1;
 
-    // inlineFastPath を false にすると、タイマの最頻経路を展開せず
-    // 常に tickTimerCounted を呼ぶ (この最適化を入れる前と同じ形)。
-    // 実機で焼き直さずに効果を測るための口で、状態遷移はどちらでも
-    // 完全に同一 (perf_switch.h を見よ)。
-    void tick(u32 cycles, bool inlineFastPath = true)
+    // FastPath=false にすると、タイマの最頻経路を展開せず常に
+    // tickTimerCounted を呼ぶ (この最適化を入れる前と同じ形)。実機で
+    // 焼き直さずに効果を測るための口 (perf_switch.h)。テンプレートに
+    // してあるのは、有効側の生成コードをスイッチ導入前と同一に保つため。
+    template <bool FastPath = true>
+    void tick(u32 cycles)
     {
         const u32 mfpCycles = cycles >> kCpuToMfpShift;
         if (mfpCycles == 0)
@@ -168,7 +169,7 @@ public:
             // 絶対ロングの展開で -3.1% を実測している。分ける位置が要点。
             const u32 remainder = counter - t.prescale;
             u8& value = timerValue_[t.index];
-            const bool decrementsOnce = inlineFastPath && remainder < t.prescale && value > 1;
+            const bool decrementsOnce = FastPath && remainder < t.prescale && value > 1;
             if (decrementsOnce)
             {
                 counter = remainder;
