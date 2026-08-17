@@ -74,6 +74,17 @@ public:
     // デバイスなので、これを使わないと未定義割り込みのハンドラへ飛んでしまう。
     void requestInterrupt(u32 level, u32 vectorNumber = 0);
 
+    // 受理待ちの割り込みレベル (0 = なし)。
+    //
+    // イベント駆動の STOP 一括飛び越しがこれを見る。STOP 中に割り込みを
+    // 要求されても st_.stopped が下りるのは次の step() なので、これを
+    // 見ないと「もう起きることが決まっている」CPU を期限まで眠らせて
+    // しまい、割り込みの受理が期限ぶん遅れる (実際に踏んだ)。
+    [[nodiscard]] u32 pendingInterruptLevel() const
+    {
+        return pendingIrq_;
+    }
+
     // RESET 命令が実行されたときに呼ばれる。
     //
     // 68000 の RESET は RESET 信号を外部へ出すだけで CPU 自身は何もしないが、

@@ -420,6 +420,11 @@ void printUsage()
         "  --stats         実行した命令の内訳を最後に出す\n"
         "  --no-fast-tick  毎命令通る経路の最適化を切って走らせる\n"
         "                  付けた側と付けない側で最終状態が一致するはず\n"
+        "  --event-driven  次にデバイスの状態が変わる時点まで飛ばす\n"
+        "                  (docs/knowledge/event-driven-implementation.md)\n"
+        "                  付けた側と付けない側で最終状態が一致するはず\n"
+        "  --shadow-verify 期限を計算するが飛ばさず、予測と実際を突き合わせる\n"
+        "                  段 1 の検証。最後に不一致の件数を出す\n"
         "\n"
         "ROM はライセンス上リポジトリに含まれない。NOTICE.md を参照。\n");
 }
@@ -601,6 +606,8 @@ int main(int argc, char** argv)
     std::size_t traceLast = 0;
     bool showStats = false;
     bool noFastTick = false;
+    bool eventDriven = false;
+    bool shadowVerify = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -702,6 +709,19 @@ int main(int argc, char** argv)
         else if (arg == "--no-fast-tick")
         {
             noFastTick = true;
+        }
+        // イベント駆動 (docs/knowledge/event-driven-implementation.md)。
+        // 実機では速度を測るために切り替えるが、ホストでは
+        // 「飛ばした側と毎命令 tick 側で最終状態が一致するか」を
+        // 実物の IPL-ROM と Human68k で確かめるのに使う。
+        else if (arg == "--event-driven")
+        {
+            eventDriven = true;
+        }
+        // 段 1 の shadow 検証。飛ばさずに期限の予測だけを突き合わせる。
+        else if (arg == "--shadow-verify")
+        {
+            shadowVerify = true;
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -868,6 +888,18 @@ int main(int argc, char** argv)
         std::printf("[perf] 毎命令通る経路の最適化を切って走らせる\n");
     }
 
+    if (eventDriven)
+    {
+        machine.setEventDriven(true);
+        std::printf("[perf] イベント駆動で走らせる (次に状態が変わる時点まで飛ばす)\n");
+    }
+
+    if (shadowVerify)
+    {
+        machine.setShadowVerify(true);
+        std::printf("[perf] shadow 検証: 期限を計算するが飛ばさない\n");
+    }
+
     machine.reset();
 
     std::printf("[reset] SSP=%08X PC=%08X\n", machine.cpu().state().a[7],
@@ -905,16 +937,30 @@ int main(int argc, char** argv)
     //  tickDevices が 8 倍重く見えていた。quantum は観測可能なずれを作ると
     //  分かって撤廃したので、今は両経路の tick 粒度は同じ。それでも
     //  「実機と同じ関数を回す」という原則は変わらない。)
+    // キー入力があっても run() 経路を使う。
+    //
+    // Why これを許すか: run() と step() は別の関数で、イベント駆動
+    // (--event-driven) が乗っているのは run() だけ。キーを打つ検証を
+    // step() 経路へ落とすと、**「A> まで起動して dir が動く」を
+    // イベント駆動で一度も確かめないまま通ってしまう**。
+    // キーは「次に打つサイクル」までで run() を刻めば送れる。
     const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
-                               keys.empty() && mouseScript.empty() && watchAddr == 0;
+                               mouseScript.empty() && watchAddr == 0;
     if (canUseFastRun)
     {
         while (spent < cycleLimit)
         {
             // 1 回の run() で回す量。大きすぎると停止の検出が遅れる。
             constexpr x68k::u32 kFastRunChunk = 100000;
-            const x68k::u32 chunk =
-                static_cast<x68k::u32>(std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent));
+            x68k::u64 limit = std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent);
+            // 次にキーを打つ時刻を跨がない。跨ぐと、打つべき時刻から
+            // 最大 1 スライスぶん遅れて送ることになる。
+            const bool hasMoreKeys = keyIndex < keys.size();
+            if (hasMoreKeys && nextKeyCycle > spent)
+            {
+                limit = std::min<x68k::u64>(limit, nextKeyCycle - spent);
+            }
+            const x68k::u32 chunk = static_cast<x68k::u32>(limit > 0 ? limit : 1);
             const x68k::u32 used = machine.run(chunk);
             if (used == 0)
             {
@@ -924,6 +970,28 @@ int main(int argc, char** argv)
             // run() は命令数を返さない。サイクル数から概算する
             // (統計を出さない経路なので、正確な命令数は要らない)。
             instructions += used / 4;
+
+            // 台本の時刻に達したキーを送る。押下と離鍵で 1 回ずつ。
+            if (hasMoreKeys && spent >= nextKeyCycle)
+            {
+                const x68k::u8 code = x68k::asciiToScanCode(keys[keyIndex]);
+                if (code == 0)
+                {
+                    ++keyIndex;  // 対応していない文字は飛ばす
+                }
+                else if (keyReleased)
+                {
+                    machine.pressKey(code);
+                    keyReleased = false;
+                }
+                else
+                {
+                    machine.pressKey(static_cast<x68k::u8>(code | 0x80u));
+                    keyReleased = true;
+                    ++keyIndex;
+                }
+                nextKeyCycle = spent + kKeyIntervalCycles;
+            }
         }
     }
 
@@ -1038,6 +1106,18 @@ int main(int argc, char** argv)
     std::printf("[done] %llu 命令 / %llu サイクル実行\n",
                 static_cast<unsigned long long>(instructions),
                 static_cast<unsigned long long>(spent));
+
+    if (shadowVerify)
+    {
+        // 不一致 = 「予測した期限より前に状態が変わった」。飛ばす実装は
+        // その変化を飛び越していたことになる。1 件でもあれば設計が誤り。
+        //
+        // 突き合わせ件数が 0 なら検証そのものが素通りしている。
+        // 「ぴたり」は予測が区間の中に収まった件数で、0 だと予測が常に
+        // 保守的すぎて 1 サイクルも飛ばせないことになる。
+        std::printf("[shadow] 不一致 %u 件 / 突き合わせ %u 件 (うちぴたり %u 件)\n",
+                    machine.shadowMismatches(), machine.shadowChecks(), machine.shadowExact());
+    }
 
     if (machine.isHalted())
     {

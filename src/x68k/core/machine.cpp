@@ -3,6 +3,7 @@
 
 #include "machine.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace x68k
@@ -164,6 +165,16 @@ void Machine::reset()
     bus_.setRomMappedAtZero(true);
     bus_.clearTextDirty();
 
+    // 期限の生成元 (MFP / CRTC / RTC) を 3 つとも 0 に戻したので、
+    // 溜まっていた時間と期限の両方を捨てる。
+    //
+    // Why not 溜まった時間を流してから捨てないか: 流す先のデバイスが
+    // 既にリセットされている。リセット前の時間をリセット後のデバイスへ
+    // 渡すと、reset 直後だけ位相がずれる。
+    sched_.reset();
+    shadowArmed_ = false;
+    stopSkippedCycles_ = 0;
+
     cpu_.reset();
 }
 
@@ -212,6 +223,44 @@ u32 Machine::run(u32 cycles)
     //
     // 組み合わせは 8 通りだが、実体化されるのは実際に使うものだけで、
     // 有効側 (true,true,true) が本番の姿になる。
+    //
+    // イベント駆動もここで 1 回だけ見る。同じ理由で実行時の bool を
+    // ループへ持ち込まない。有効側の runEventDriven は、スイッチが
+    // 無かったときと同じ生成コードになる。
+    // shadow 検証はホスト専用の別ループへ分ける。
+    //
+    // Why not runWith の中で見ないか: それだと本番のホットループに毎命令の
+    // ロードと分岐が乗る。実際に置いた版を objdump で見たら、有効側
+    // (true,true,true) の生成コードが変わっていた。測る道具が測る対象を
+    // 変えてはいけない (perf_switch.h)。
+    if (shadowVerify_)
+    {
+        if (perf_.allEnabled())
+        {
+            return runShadowVerify<true, true, true>(cycles);
+        }
+        return runShadowVerify<false, false, false>(cycles);
+    }
+    if (eventDriven_)
+    {
+        if (perf_.inlineMfpTimer)
+        {
+            if (perf_.inlineRtcTick)
+            {
+                return perf_.inlineCrtcTick ? runEventDriven<true, true, true>(cycles)
+                                            : runEventDriven<true, true, false>(cycles);
+            }
+            return perf_.inlineCrtcTick ? runEventDriven<true, false, true>(cycles)
+                                        : runEventDriven<true, false, false>(cycles);
+        }
+        if (perf_.inlineRtcTick)
+        {
+            return perf_.inlineCrtcTick ? runEventDriven<false, true, true>(cycles)
+                                        : runEventDriven<false, true, false>(cycles);
+        }
+        return perf_.inlineCrtcTick ? runEventDriven<false, false, true>(cycles)
+                                    : runEventDriven<false, false, false>(cycles);
+    }
     if (perf_.inlineMfpTimer)
     {
         if (perf_.inlineRtcTick)
@@ -250,6 +299,408 @@ u32 Machine::runWith(u32 cycles)
     }
 
     return spent;
+}
+
+// 段 1 の shadow 検証。飛ばさずに、期限の予測だけを裏で突き合わせる。
+//
+// Why not イベント駆動側で検証しないか: 飛ばす側で検証すると、
+// 「予測した期限に飛んだ先で状態が変わっていた」しか見えない。予測より
+// **早く** 状態が変わっていた場合は飛び越した後なので検出できない。
+// 毎命令 tick のまま裏で予測を回せば、1 サイクル単位で
+// 「最初に変わった瞬間」が分かる。
+//
+// Why not runWith の中に if (shadowVerify_) を置かないか: それだと
+// **本番のホットループに毎命令のロードと分岐が乗る**。実際に置いた版を
+// objdump で見たところ、有効側 (true,true,true) の生成コードが変わって
+// いた。計測器が測る対象を変えてはいけないという規律 (perf_switch.h) は
+// 検証器にも同じくかかる。ホスト専用の別ループへ出す。
+//
+// このループは実機では一度も呼ばれない。ホストの --shadow-verify だけ。
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
+u32 Machine::runShadowVerify(u32 cycles)
+{
+    u32 spent = 0;
+    while (spent < cycles)
+    {
+        serviceInterrupts();
+
+        const u32 used = cpu_.step();
+        if (used == 0)
+        {
+            break;  // 停止した
+        }
+        spent += used;
+
+        tickDevices<FastMfp, FastRtc, FastCrtc>(used);
+
+        shadowElapsed_ += used;
+        shadowObserve(used);
+    }
+
+    return spent;
+}
+
+// イベント駆動の run()。**毎命令の判定は debt_ とゼロの比較 1 本だけ**。
+//
+// 変数同士の比較 (spent < cycles) を毎命令に入れると、過去 2 回と同じ轍を
+// 踏む (-18%, -6.5% の実測)。スライスの終端は sched_ が絶対サイクルで
+// 別に持っていて、遅い側でしか見ない。
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
+u32 Machine::runEventDriven(u32 cycles)
+{
+    sched_.beginSlice(cycles);
+    rearmDeadline();
+
+    // 入口で既に STOP なら、その場で飛ばす。
+    //
+    // Why これが要るか: 期限はスライス終端で切り詰められる。STOP のまま
+    // スライスへ入ると、遅い側へ落ちるのはスライスが終わるときだけなので、
+    // 飛び越しの出番が 1 度も来ない。20,000 サイクルのスライスなら
+    // call8 M68k::step() を 5,000 回回してからスライスが終わる。
+    // 実測でも、ここが無いと 400,000 サイクル中 31,494 しか飛ばせなかった。
+    //
+    // ホットパスには 1 命令も足していない。ループの外の 1 回だけ。
+    if (cpu_.state().stopped && cpu_.pendingInterruptLevel() == 0)
+    {
+        skipStopped<FastMfp, FastRtc, FastCrtc>();
+        if (sched_.reachedSliceEnd())
+        {
+            return sched_.sliceSpent();
+        }
+    }
+
+    for (;;)
+    {
+        const u32 used = cpu_.step();
+        if (used == 0)
+        {
+            // halted。溜まった時間を捨てずに実体化してから抜ける。
+            //
+            // Why not そのまま break するか: 未実体化のサイクルが消えると、
+            // halt した瞬間だけデバイスの時刻が巻き戻る。毎命令 tick 版と
+            // 状態が食い違い、同値テストが落ちる。
+            settle<FastMfp, FastRtc, FastCrtc>();
+            break;
+        }
+        if (sched_.advance(used))
+        {
+            if (reachSlow<FastMfp, FastRtc, FastCrtc>())
+            {
+                break;
+            }
+        }
+    }
+
+    return sched_.sliceSpent();
+}
+
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
+void Machine::settle()
+{
+    // 毎命令の advance() は debt_ しか触らないので、ここで unsettled_ を
+    // 引き直す。遅い側へ入るのはここだけなので、この 1 行で不変条件
+    // (debt_ == unsettled_ - deadlineAt_) が閉じる。
+    sched_.syncUnsettled();
+
+    u32 remaining = sched_.pending();
+    while (remaining != 0)
+    {
+        // CRTC へ 1 フレーム以上を一度に渡すと、その間の垂直帰線の開始と
+        // 終了を丸ごと落とす (video.h の tickFast のコメント)。
+        //
+        // **現状ここは実際には 1 周しかしない。** 垂直帰線のエッジ 2 点が
+        // 常に期限に入っているので (nextEventCycle)、飛ぶ量は必ず
+        // 162,342 サイクル以下になる。STOP の一括飛ばしで割り込み源が
+        // 1 つも無い場合ですら、CRTC のエッジが先に来て刻んでいることを
+        // 実測で確認した (jump は 18,000 と 162,340 の繰り返しになる)。
+        //
+        // Why not それなら消さないか: 冗長なのは「CRTC が期限に入って
+        // いる」という **今の設計** に依存した結論で、変更 4 (CRTC を
+        // イベント化しない) を見直したら即座に反転する。そのとき壊れ方は
+        // 「垂直帰線が丸ごと消える」で、症状から原因へ辿るのが難しい。
+        // ループ 1 つぶんの保険としては安い。
+        const u32 chunk = std::min(remaining, Scheduler::kMaxSettleChunk);
+        tickDevices<FastMfp, FastRtc, FastCrtc>(chunk);
+        sched_.consume(chunk);
+        remaining -= chunk;
+    }
+}
+
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
+bool Machine::reachSlow()
+{
+    settle<FastMfp, FastRtc, FastCrtc>();
+
+    // 割り込みを配送する。配送できない保留が残ったら、期限を張らずに
+    // 毎命令リトライへ縮退する。
+    //
+    // 配送失敗は状態を変えない (serviceMfpInterrupt はマスク中に
+    // acknowledge せず false を返す) し、IoSc はレベル保持で
+    // acknowledgeInterrupt が const なので受理しても status_ が下がらない。
+    // つまり **新しいエッジは二度と来ない**。ここで縮退させることが、
+    // 割り込みの正しさを wake の網羅性から切り離している。
+    serviceInterrupts();
+    const bool blocked =
+        mfp_.hasPendingInterrupt() || scc_.hasPendingInterrupt() || iosc_.hasPendingInterrupt();
+
+    if (sched_.reachedSliceEnd())
+    {
+        return true;
+    }
+
+    if (blocked)
+    {
+        sched_.holdForPendingInterrupt();
+        return false;
+    }
+
+    // STOP 中は命令が 4 サイクルずつしか進まない。ここで飛ばさないと、
+    // 利得が最大のはずの区間で call8 M68k::step() を期限のサイクル数 / 4 回
+    // 回すことになり、純粋な劣化になる。
+    //
+    // Why not ホットパスへ st_.stopped の判定を足さないか: 毎命令の判定は
+    // ゼロ比較 1 本という規律を崩す。ここは期限ごとにしか通らないので、
+    // ロードと分岐を足しても効かない。
+    //
+    // 受理待ちの割り込みが既にあるときは飛ばさない。st_.stopped が下りるのは
+    // 次の step() なので、ここで飛ばすと「もう起きることが決まっている」CPU を
+    // 期限まで眠らせることになり、受理が期限ぶん (最大 80,000 サイクル)
+    // 遅れる。毎命令 tick 版と PC が食い違うので同値テストで落ちる。
+    const bool sleepsUntilDeadline = cpu_.state().stopped && cpu_.pendingInterruptLevel() == 0;
+    if (sleepsUntilDeadline)
+    {
+        skipStopped<FastMfp, FastRtc, FastCrtc>();
+        return sched_.reachedSliceEnd();
+    }
+
+    rearmDeadline();
+    return false;
+}
+
+// STOP 中の一括飛び越し。割り込みが来るかスライスが終わるまで、期限を
+// 追いながら丸ごと進める。
+//
+// STOP から抜けるのは割り込みだけで、割り込みを起こせるのはデバイスの
+// 期限だけ。だから期限まで飛ばしても 1 サイクルも観測点を跨がない。
+//
+// **ループにするのが要点。** 1 期限ぶんだけ飛ばして返すと、呼び出し元の
+// ホットループが「期限を張り直す → 4 サイクルずつ期限まで空回りする →
+// また飛ぶ」を繰り返し、**飛ばした意味が無くなる**。実測で 400,000
+// サイクル中 31,494 しか飛ばせていなかった。ここで割り込みが立つまで
+// 追い続ければ、STOP 区間の全部が 1 回の呼び出しで消化される。
+//
+// 抜ける条件は 3 つ。どれも「次の命令が意味を持つ」瞬間になっている:
+//   - 割り込みが受理待ちになった (次の step() が例外を積む)
+//   - スライスが終わった (呼び出し元が抜ける)
+//   - 期限が今そのもので 1 サイクルも進めない (毎命令へ縮退する)
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
+void Machine::skipStopped()
+{
+    for (;;)
+    {
+        const std::uint64_t target = std::min(nextEventCycle(), sched_.sliceEnd());
+        if (target <= sched_.now())
+        {
+            // 期限が今そのものなら 1 サイクルも飛ばせない。毎命令へ戻す。
+            sched_.holdForPendingInterrupt();
+            return;
+        }
+
+        // 飛ばす量を STOP の刻み (4 サイクル) の倍数へ切り上げる。
+        //
+        // Why これが要るか: 毎命令 tick 版は STOP 中も M68k::step() を
+        // 呼び、そのたびに 4 サイクルずつ進む (m68k.cpp が stopped で 4 を
+        // 返す)。つまりデバイスが見る時刻は必ず 4 の倍数の格子に乗る。
+        // 飛ばす側が期限ちょうど (4 の倍数とは限らない) に着地すると、
+        // 同じ総サイクル数を回しても CRTC のフレーム内位置が 1 ラスタ
+        // ずれる。実際に rasterNumber が 151 と 152 で食い違って落ちた。
+        //
+        // 切り上げるのは、毎命令 tick 版が「期限を跨いだ最初の 4 の倍数」
+        // まで進んでから割り込みを配送するため。切り下げると配送が
+        // 1 刻み早くなる。
+        constexpr u32 kStopStep = 4;
+        u32 jump = static_cast<u32>(target - sched_.now());
+        const u32 remainder = jump % kStopStep;
+        if (remainder != 0)
+        {
+            jump += kStopStep - remainder;
+        }
+        stopSkippedCycles_ += jump;
+        sched_.injectPending(jump);
+        settle<FastMfp, FastRtc, FastCrtc>();
+
+        // 飛んだ先で割り込みを配送する。受理待ちになったら CPU が起きるので、
+        // 期限を張り直して呼び出し元へ返す。
+        serviceInterrupts();
+        const bool wakes = cpu_.pendingInterruptLevel() != 0;
+        if (wakes || sched_.reachedSliceEnd())
+        {
+            rearmDeadline();
+            return;
+        }
+
+        // 配送できない保留が残っているなら、毎命令リトライへ縮退する。
+        // 飛ばし続けると、マスクが下りる瞬間を跨いでしまう。
+        const bool blocked =
+            mfp_.hasPendingInterrupt() || scc_.hasPendingInterrupt() || iosc_.hasPendingInterrupt();
+        if (blocked)
+        {
+            sched_.holdForPendingInterrupt();
+            return;
+        }
+    }
+}
+
+Settled Machine::materialize()
+{
+    // 未実体化ぶんが 0 なら何もしない。イベント駆動を切っているときは
+    // 常にここで返る (毎命令 tick なので溜まらない)。
+    //
+    // 判定の前に unsettled_ を引き直すこと。毎命令の advance() は debt_
+    // しか触らないので、引き直す前の pending() は前回の遅い側からの
+    // 経過を含んでいない。
+    sched_.syncUnsettled();
+    if (sched_.pending() == 0)
+    {
+        return Scheduler::certify();
+    }
+
+    // Why not テンプレートで分けないか: ここは I/O アクセスの経路で、
+    // 毎命令のホットループではない。ゲストが $E88000 台を読むのは
+    // 割り込みハンドラの中や初期化のときだけなので、分岐が乗っても
+    // 測れない。有効側の生成コードを変えてはいけないという規律は
+    // ホットループにかかるもので、ここには及ばない。
+    //
+    // 3 つを個別に見るのは run() と同じ理由。まとめて allEnabled() で
+    // 判定すると、RTC だけ切ったつもりが MFP と CRTC まで切れて、
+    // イベント駆動の同値テストが「スイッチの取り違え」を見逃す。
+    if (perf_.inlineMfpTimer)
+    {
+        if (perf_.inlineRtcTick)
+        {
+            perf_.inlineCrtcTick ? settle<true, true, true>() : settle<true, true, false>();
+        }
+        else
+        {
+            perf_.inlineCrtcTick ? settle<true, false, true>() : settle<true, false, false>();
+        }
+    }
+    else if (perf_.inlineRtcTick)
+    {
+        perf_.inlineCrtcTick ? settle<false, true, true>() : settle<false, true, false>();
+    }
+    else
+    {
+        perf_.inlineCrtcTick ? settle<false, false, true>() : settle<false, false, false>();
+    }
+    return Scheduler::certify();
+}
+
+std::uint64_t Machine::nextEventCycle() const
+{
+    // 3 つの期限生成元の最小値。値は「今から何サイクル後か」で持ち、
+    // 最後に now_ を足して絶対サイクルへ直す。
+    //
+    // MFP: IER で許可されているタイマのタイムアウト。IER が落ちている
+    //      タイマ (X68000 の既定ではタイマ B) は IPR を立てないので入らない。
+    //      これが段 4 の核心で、8 サイクル期限を外せる理由。
+    // CRTC: 垂直帰線の開始と終了の 2 点。GPIP4 が変わり、AER 次第で
+    //      割り込みも上がる。
+    // RTC: 秒の繰り上がり。
+    u32 best = mfp_.cyclesUntilNextRaise();
+    best = std::min(best, crtc_.cyclesUntilVBlankEdge());
+    best = std::min(best, rtc_.cyclesUntilCarry());
+
+    return sched_.now() + best;
+}
+
+void Machine::rearmDeadline()
+{
+    sched_.armDeadline(nextEventCycle());
+}
+
+Machine::DeviceFingerprint Machine::fingerprint()
+{
+    DeviceFingerprint f;
+    // peek を使うのは、read が UDR で副作用を持つため。タイマの現在値だけは
+    // peek がリロード値を返すので、read 側の値を別に取る必要がある —
+    // ここでは Mfp の内部を覗かず、read が返す値をそのまま指紋にする。
+    f.ipra = mfp_.peek(Mfp::kIpra);
+    f.iprb = mfp_.peek(Mfp::kIprb);
+    f.gpip = mfp_.peek(Mfp::kGpip);
+    f.timerValue[0] = mfp_.read(Mfp::kTadr);
+    f.timerValue[1] = mfp_.read(Mfp::kTbdr);
+    f.timerValue[2] = mfp_.read(Mfp::kTcdr);
+    f.timerValue[3] = mfp_.read(Mfp::kTddr);
+    f.second = (rtc_.read(Rtc::kSecond10) * 10u) + rtc_.read(Rtc::kSecond1);
+    f.inVBlank = crtc_.inVerticalBlank();
+    return f;
+}
+
+// 段 1 の shadow 検証: 期限を予測して、これから測り始める。
+void Machine::shadowBeginPrediction()
+{
+    // 予測する期限は「割り込みが上がる時点」ではなく「外から見える
+    // 状態が 1 つでも変わる時点」。指紋にはタイマの現在値も入れてある。
+    //
+    // Why not nextEventCycle() をそのまま使うか: あれは IER で許可された
+    // タイマしか見ない。タイマ B は IPR を立てないので期限には入らないが、
+    // timerValue_ は 8 サイクルごとに変わる。予測を nextEventCycle と
+    // 同じにすると、この検証は「自分が正しいと思っていること」を
+    // 確かめるだけになり、実体化リストの穴を一つも捕まえられない。
+    u32 best = mfp_.cyclesUntilAnyTimerChange();
+    best = std::min(best, crtc_.cyclesUntilVBlankEdge());
+    best = std::min(best, rtc_.cyclesUntilCarry());
+
+    shadowPredicted_ = best;
+    shadowElapsed_ = 0;
+    shadowBaseline_ = fingerprint();
+    shadowArmed_ = true;
+}
+
+// 実際に最初に状態が変わったサイクルを、予測と突き合わせる。
+void Machine::shadowObserve(u32 used)
+{
+    if (!shadowArmed_)
+    {
+        shadowBeginPrediction();
+        return;
+    }
+
+    const DeviceFingerprint nowPrint = fingerprint();
+    if (!(nowPrint != shadowBaseline_))
+    {
+        // まだ何も変わっていない。予測を過ぎているなら、期限が **遅すぎた**
+        // ことにはならない (予測より遅く変わる分には飛び越さない) ので
+        // 見逃してよい。ここで数えるのは「予測より早く変わった」だけ。
+        return;
+    }
+
+    ++shadowChecks_;
+
+    // 変化が起きたのは (前の命令の終わり, 今] の区間。実際の変化時刻を
+    // T とすると intervalBegin < T <= shadowElapsed_。
+    //
+    // 予測 P がこの区間より **後ろ** にあれば (P > shadowElapsed_)、
+    // 飛ばす実装は P まで飛んで変化を **飛び越して** いた。これが致命傷。
+    //
+    // P がこの区間より手前なのは許す。予測が保守的すぎるだけで、飛ぶ量が
+    // 短くなり、その先で改めて期限を引き直す。正しさは失われない。
+    const u32 intervalBegin = shadowElapsed_ - used;
+    const bool jumpedOver = shadowPredicted_ > shadowElapsed_;
+    if (jumpedOver)
+    {
+        ++shadowMismatches_;
+    }
+    // 予測が区間の中にぴたりと入った回数も見たい。ここが 0 のままなら、
+    // 予測が常に保守的すぎて何も飛ばせていないことになる。
+    const bool exact = shadowPredicted_ > intervalBegin && shadowPredicted_ <= shadowElapsed_;
+    if (exact)
+    {
+        ++shadowExact_;
+    }
+
+    shadowArmed_ = false;
 }
 
 u32 Machine::runNullExec(u32 cycles)
@@ -392,6 +843,21 @@ template u32 Machine::runWith<false, true, false>(u32);
 template u32 Machine::runWith<false, false, true>(u32);
 template u32 Machine::runWith<false, false, false>(u32);
 
+// イベント駆動側も同じ 8 通り。有効側 (true,true,true) が本番の姿になる。
+template u32 Machine::runEventDriven<true, true, true>(u32);
+template u32 Machine::runEventDriven<true, true, false>(u32);
+template u32 Machine::runEventDriven<true, false, true>(u32);
+template u32 Machine::runEventDriven<true, false, false>(u32);
+template u32 Machine::runEventDriven<false, true, true>(u32);
+template u32 Machine::runEventDriven<false, true, false>(u32);
+template u32 Machine::runEventDriven<false, false, true>(u32);
+template u32 Machine::runEventDriven<false, false, false>(u32);
+
+// shadow 検証はホスト専用で、速さを測る道具ではない。組み合わせは
+// 「全部有効」と「全部無効」の 2 つだけ実体化する。
+template u32 Machine::runShadowVerify<true, true, true>(u32);
+template u32 Machine::runShadowVerify<false, false, false>(u32);
+
 void Machine::serviceInterruptsSlow()
 {
     // MFP (レベル 6) を先に見る。SCC (レベル 5) より優先度が高いので、
@@ -507,11 +973,25 @@ bool Machine::serviceSccInterrupt()
 void Machine::pressKey(u8 scanCode)
 {
     mfp_.receiveKeyboardByte(scanCode);
+    // **run() の外から呼ばれる。** IPRA の受信フル (kIntRecvFull) が
+    // 時間と無関係に立つので、期限を切って次命令で遅い側へ落とす。
+    //
+    // 漏らしても割り込みは失われない (保留中フォールバックが救う) が、
+    // 次のデバイスイベントまでキー入力が遅れる。
+    sched_.wake();
+    shadowInvalidate();
 }
 
 bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 {
-    return scc_.moveMouse(dx, dy, leftButton, rightButton);
+    const bool accepted = scc_.moveMouse(dx, dy, leftButton, rightButton);
+    if (accepted)
+    {
+        // 積めたときだけ期限を切る。false なら SCC の状態は変わっていない
+        // ので、切っても遅い側を 1 回無駄に通るだけになる。
+        sched_.wake();
+    }
+    return accepted;
 }
 
 // --- 音声 --------------------------------------------------------------------
@@ -636,7 +1116,14 @@ u8 Machine::ioRead8(u32 addr)
             {
                 return 0u;
             }
-            return mfp_.read((addr - kMfpBase) / 2);
+            // タイマデータレジスタ (TADR/TBDR/TCDR/TDDR) と IPRA/IPRB は
+            // 時間で変わる。溜まっている時間を流してから読む。
+            //
+            // 特に TBDR。X68000 は IERA bit0 = 0 でタイマ B を走らせるので
+            // 割り込みは上がらず期限にも入らないが、ゲストは 8 サイクルに
+            // 1 減るカウンタとして読める。ここを落とすと quantum を入れた
+            // ときとまったく同じ観測可能なずれが読み出し側から再発する。
+            return mfpRead(materialize(), (addr - kMfpBase) / 2);
         }
 
         case kSasiBase:
@@ -653,7 +1140,11 @@ u8 Machine::ioRead8(u32 addr)
         case kRtcBase:
             // RTC (RP5C15)。レジスタは 4bit 幅で 2 バイトおきに並ぶ。
             // Human68k は起動時に日付を読むので、妥当な値を返す必要がある。
-            return rtc_.read((addr - kRtcBase) / 2);
+            //
+            // 秒は 10,000,000 サイクルに 1 度しか繰り上がらないが、
+            // ゲストは秒レジスタを命令単位でポーリングできる。実体化を
+            // 落とすと秒の境界が期限ぶん遅れて見える。
+            return rtcRead(materialize(), (addr - kRtcBase) / 2);
 
         case kSysPortBase:
             // システムポート。コントラストや CPU 種別。
@@ -779,13 +1270,27 @@ void Machine::ioWrite8(u32 addr, u8 value)
             const bool isOddAddress = (addr & 1) != 0;
             if (isOddAddress)
             {
-                mfp_.write((addr - kMfpBase) / 2, value);
+                // 「settle → 適用 → 再計算」の 3 段。
+                //
+                // 1 段目を落とすと、TCDCR で分周を 200 から 4 へ変えた
+                // ときに、旧分周で溜まっていた時間が新分周で消化されて
+                // 偽の割り込みが連発する。3 段目を落とすと旧設定の期限の
+                // まま走り続ける。どちらも型で強制する。
+                mfpWrite(materialize(), sched_.rearm(), (addr - kMfpBase) / 2, value);
             }
             return;
         }
 
         case kRtcBase:
-            rtc_.write((addr - kRtcBase) / 2, value);
+            // RTC は書き込みで期限が変わらない (Rtc::write も setDateTime も
+            // cycleAccumulator_ に触らない)。それでも rearm を通すのは、
+            // 「期限を変えない」が実装依存の結論だから。将来 write が
+            // 位相を触るようになったとき、ここを直し忘れても壊れない。
+            //
+            // Why not 期限を捨てないか: 捨てると秒の位相がリセットされ、
+            // ゲストが時計を書くたびに秒の境界がずれて実機と違う。
+            // rearm は「引き直す」であって「捨てる」ではない。
+            rtcWrite(materialize(), sched_.rearm(), (addr - kRtcBase) / 2, value);
             return;
 
         case kSasiBase:

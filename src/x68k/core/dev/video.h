@@ -104,6 +104,29 @@ public:
         return inVBlank_;
     }
 
+    // 次に垂直帰線の状態が変わるまでの CPU サイクル数。
+    //
+    // 変わる点はフレーム内に 2 つしかない: 表示期間の終わり
+    // (kCyclesPerFrame - kVBlankCycles) と、フレームの終わり
+    // (= 次フレームの 0)。今どちら側に居るかで次の点が決まる。
+    //
+    // 周期はコンパイル時定数なので、CRTC レジスタが書かれても変わらない。
+    // 将来 R04-R09 から実周期を計算する実装へ変えたら、ここも
+    // レジスタ依存になり、Crtc::write が期限を無効化する必要が出る。
+    [[nodiscard]] u32 cyclesUntilVBlankEdge() const
+    {
+        static constexpr u32 kVBlankBegin = kCyclesPerFrame - kVBlankCycles;
+        if (inVBlank_)
+        {
+            return kCyclesPerFrame - frameCycles_;
+        }
+        // 表示期間中。ただし frameCycles_ が既に境界を越えているのに
+        // inVBlank_ が false という状態は tickFast の直後には起こらない
+        // (越えた瞬間に true になる)。念のため 0 を返さないよう畳む。
+        return frameCycles_ < kVBlankBegin ? kVBlankBegin - frameCycles_
+                                           : kCyclesPerFrame - frameCycles_;
+    }
+
     // 現在のラスタ番号。ラスタ割り込みや $E80028 の読み出しに使う。
     [[nodiscard]] u32 rasterNumber() const;
 

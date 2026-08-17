@@ -263,7 +263,7 @@ TEST_SUITE("device-timing")
         constexpr x68k::u32 kCodeBegin = 0x400;
         constexpr x68k::u32 kCodeEnd = 0x8000;
 
-        const auto runWith = [&](bool fastPath)
+        const auto runWith = [&](bool fastPath, bool eventDriven)
         {
             std::fill(ram.begin(), ram.end(), 0);
             poke16(0, 0x0000);
@@ -291,6 +291,7 @@ TEST_SUITE("device-timing")
             sw.inlineCrtcTick = fastPath;
             sw.inlineMfpTimer = fastPath;
             m.setPerfSwitch(sw);
+            m.setEventDriven(eventDriven);
             m.reset();
 
             // タイマ C と D を動かす (X68000 が実際に使う 2 本)。
@@ -329,9 +330,27 @@ TEST_SUITE("device-timing")
             };
         };
 
-        const std::vector<x68k::u32> fast = runWith(true);
-        const std::vector<x68k::u32> slow = runWith(false);
+        const std::vector<x68k::u32> fast = runWith(true, false);
+        const std::vector<x68k::u32> slow = runWith(false, false);
         CHECK(fast == slow);
+
+        // イベント駆動を第 4 の軸として足す。
+        //
+        // イベント駆動は「次にデバイスの状態が変わる時点まで飛ばす」ので、
+        // 毎命令 tick と **1 サイクルもずれない** ことが唯一の条件になる。
+        // ずれるなら quantum と同じ取引をしていることになり、この
+        // ファイルが 3 度撤回させたのと同じ誤りを 4 度目に犯している。
+        //
+        // 比較対象に rasterNumber() が入っているのが要点。CRTC をイベント源
+        // として飛ばしにかかると、317 サイクル粒度のずれがここで即座に出る。
+        // 「CRTC はイベント化しない」という設計判断の安全網になっている。
+        const std::vector<x68k::u32> evented = runWith(true, true);
+        CHECK(evented == fast);
+
+        // 最適化スイッチとイベント駆動の組み合わせも見る。片方だけの
+        // 一致だと、イベント駆動側が FastPath を渡し間違えていても通る。
+        const std::vector<x68k::u32> eventedSlow = runWith(false, true);
+        CHECK(eventedSlow == slow);
 
         // 素通りのテストになっていないこと。全部 0 同士の一致では何も
         // 守れないので、3 つのデバイスが**それぞれ**動いた証拠を確かめる。

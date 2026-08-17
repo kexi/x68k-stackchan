@@ -121,6 +121,21 @@ std::atomic<bool> g_audioEnabled{X68K_ENABLE_AUDIO != 0};
 // 効いても計測には影響しない。
 std::atomic<bool> g_fastTickEnabled{true};
 
+// イベント駆動 (docs/knowledge/event-driven-implementation.md)。
+//
+// 命令ごとに全デバイスへサイクルを配るのをやめ、「次にどれかの状態が
+// 変わる時点」まで時間を溜めて一度に流す。状態が変わる瞬間は 1 サイクルも
+// ずれない (quantum と違う点がここ)。
+//
+// **既定は無効**。有効側の生成コードを変えないまま、同じ起動の中で
+// '$' で切り替えて前後を測るために入れてある。効果を確かめて確定するまでは
+// 本番の姿を動かさない。
+//
+// 立てるのはシリアルを受けるタスク、読むのはエミュレーションコア。
+// 切り替えはスライスの切れ目でしか効かないので、run の途中で経路が
+// 変わることは無い。
+std::atomic<bool> g_eventDrivenEnabled{false};
+
 // JIT の上限を測るモード (src/x68k/core/cpu/jit_probe.h)。
 //
 // 命令の実行を空回しにして走らせ、ループ運営・割り込み判定・デバイスの
@@ -166,6 +181,9 @@ void applyNullExecStage(int stage)
 // 上の値をエミュレーションコアが Machine へ写したかどうか。
 // 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
 bool g_fastTickApplied = true;
+
+// 同じくイベント駆動を Machine へ写したかどうか。既定は無効。
+bool g_eventDrivenApplied = false;
 
 // 音声タスクが動いているか。スピーカーを開けなかったときは false のまま。
 bool g_speakerReady = false;
@@ -688,6 +706,15 @@ void emulatorTask(void* /*arg*/)
             g_fastTickApplied = wantFastTick;
         }
 
+        // イベント駆動の切り替えも同じ形で写す。run() の入口で 1 回だけ
+        // 読まれるので、ホットループの中には何も足さない。
+        const bool wantEventDriven = g_eventDrivenEnabled.load(std::memory_order_relaxed);
+        if (wantEventDriven != g_eventDrivenApplied)
+        {
+            g_machine.setEventDriven(wantEventDriven);
+            g_eventDrivenApplied = wantEventDriven;
+        }
+
         const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
         if (sliceCycles > 0)
         {
@@ -1025,6 +1052,23 @@ private:
             return;
         }
 
+        // '$' でイベント駆動を切り替える。
+        //
+        // '&' と同じく、焼き直さずに同じ起動の中で前後を比べるため。
+        // **Human68k を A> まで起動させてから**測ること。ディスク無しだと
+        // 同じ変更が +3.17% と +6.40% で倍違った実測がある。
+        //
+        // 切り替えても状態遷移は変わらない (ホストの同値テストが第 4 の軸
+        // として固定している) ので、走らせたまま何度でも往復してよい。
+        const bool isEventDrivenToggle = c == '$';
+        if (isEventDrivenToggle)
+        {
+            const bool enabled = !g_eventDrivenEnabled.load();
+            g_eventDrivenEnabled = enabled;
+            ESP_LOGI(kTag, "イベント駆動: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
         // '%' で JIT の上限計測モードを切り替える (jit_probe.h)。
         //
         // 命令の実行を空回しにするので、**ゲストは止まって見える**。
@@ -1092,6 +1136,13 @@ private:
                      g_machine.sram().hasValidMagic() ? 1 : 0);
             ESP_LOGI(kTag, "CPU PC=%08X SR=%04X halted=%d", g_machine.cpu().state().pc,
                      g_machine.cpu().state().sr, g_machine.isHalted() ? 1 : 0);
+
+            // 画面モードと表示許可。描画が 1 回 23ms かかる原因が
+            // グラフィック合成かテキストのみかを切り分けるために出す。
+            // $E82600 の bit5 がテキスト、bit4-0 がグラフィックの表示許可。
+            const auto& v = g_machine.video();
+            ESP_LOGI(kTag, "VIDEO 画面モード=%04X 表示制御=%04X プライオリティ=%04X",
+                     v.screenMode(), v.displayControl(), v.priority());
             return;
         }
 
@@ -1651,7 +1702,8 @@ extern "C" void app_main(void)
     {
         ESP_LOGI(kTag,
                  "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ、"
-                 "'|' で音源の ON/OFF、'&' で毎命令経路の最適化の ON/OFF");
+                 "'|' で音源の ON/OFF、'&' で毎命令経路の最適化の ON/OFF、"
+                 "'$' でイベント駆動の ON/OFF");
     }
     else
     {

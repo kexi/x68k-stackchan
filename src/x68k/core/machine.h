@@ -27,6 +27,7 @@
 #include "dev/sram.h"
 #include "dev/video.h"
 #include "perf_switch.h"
+#include "scheduler.h"
 
 namespace x68k
 {
@@ -147,6 +148,67 @@ public:
     [[nodiscard]] const PerfSwitch& perfSwitch() const
     {
         return perf_;
+    }
+
+    // イベント駆動 (docs/knowledge/event-driven-implementation.md) を使うか。
+    //
+    // 切り替えは **スライスの切れ目でだけ**行う。run() の入口で 1 回読み、
+    // その中では読み直さないので、走っている最中に書いても次のスライスから
+    // 効く。既存の run() 経路は残してあり、状態遷移は両側で完全に一致する
+    // (test_device_timing.cpp の同値テストが第 4 の軸として固定している)。
+    void setEventDriven(bool enabled)
+    {
+        eventDriven_ = enabled;
+    }
+
+    [[nodiscard]] bool eventDriven() const
+    {
+        return eventDriven_;
+    }
+
+    // 段 1 の shadow 検証。期限を計算するが **飛ばさない**。
+    //
+    // 毎命令 tick は現行のまま回し、その裏で「次に状態が変わるのは
+    // いつか」を予測して、実際に最初に変わったサイクルと突き合わせる。
+    // 不一致が出るなら、期限の計算そのものが間違っているので、飛ばす
+    // 実装を実機へ持っていく意味が無い。
+    //
+    // ホスト専用。実機の速度に影響しないよう、有効側 (通常の run) の
+    // 生成コードは 1 命令も変わらない (テンプレートで分けてある)。
+    void setShadowVerify(bool enabled)
+    {
+        shadowVerify_ = enabled;
+    }
+
+    // shadow 検証で見つかった不一致の件数。0 でなければ期限計算が誤っている。
+    [[nodiscard]] u32 shadowMismatches() const
+    {
+        return shadowMismatches_;
+    }
+
+    // shadow 検証で突き合わせた期限の件数。0 のままなら素通りしている。
+    [[nodiscard]] u32 shadowChecks() const
+    {
+        return shadowChecks_;
+    }
+
+    // 予測がぴたりと当たった件数。0 のままなら、予測が常に保守的すぎて
+    // 1 サイクルも飛ばせないことになる (検証は通るが利得が無い)。
+    [[nodiscard]] u32 shadowExact() const
+    {
+        return shadowExact_;
+    }
+
+    // STOP 中に一括で飛び越したサイクル数の合計。
+    //
+    // 飛び越しは速度の話で、状態は飛ばしても飛ばさなくても同じになる。
+    // だから同値テストでは「飛び越しを消す」変異が捕まらない。ここを
+    // 数えて、飛ばしていることそのものをテストで固定する。
+    //
+    // 数えるのは遅い側だけなので、毎命令のホットパスは 1 命令も増えない。
+    [[nodiscard]] std::uint64_t stopSkippedCycles() const
+    {
+        return stopSkippedCycles_;
     }
 
     [[nodiscard]] M68k& cpu()
@@ -368,9 +430,156 @@ private:
     template <bool FastMfp, bool FastRtc, bool FastCrtc>
     u32 runWith(u32 cycles);
 
+    // イベント駆動版の run()。毎命令は debt_ への加算とゼロ比較だけになる。
+    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    u32 runEventDriven(u32 cycles);
+
+    // 段 1 の shadow 検証を回す run()。**ホスト専用**。
+    //
+    // runWith と同じ毎命令 tick に、期限の予測の突き合わせを足したもの。
+    // 別の関数にしてあるのは、本番の runWith の生成コードを 1 命令も
+    // 変えないため (runWith の中に if (shadowVerify_) を置いた版は、
+    // objdump で有効側の生成コードが変わっていた)。
+    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    u32 runShadowVerify(u32 cycles);
+
+    // 期限に達したときだけ通る遅い側。true を返したらスライス終端。
+    //
+    // ここでやること:
+    //   1. 溜まった時間をデバイスへ流す (settle)
+    //   2. 割り込みを配送する。配送できない保留があれば縮退させる
+    //   3. STOP 中なら次の期限まで丸ごと飛ばす
+    //   4. 期限を張り直す
+    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    bool reachSlow();
+
+    // 溜まった時間をデバイスへ流し、「機械全体が今の時刻に追いついた」
+    // 証明を返す。イベント駆動でないときは何もせず証明だけ返す。
+    //
+    // 実行時の bool を見るが、ここは I/O アクセスの経路であって毎命令の
+    // ホットループではない。ゲストが $E88000 台を読むのは割り込みハンドラの
+    // 中や初期化のときだけで、頻度が 3 桁違う。
+    [[nodiscard]] Settled materialize();
+
+    // 時間で動くデバイスのレジスタを読む。実体化してからでないと呼べない。
+    //
+    // トークンをここへ置くのは、ioRead8 / ioRead16 (ioRead8 x2 に落ちる) /
+    // DMA (bus_.read8 を直接呼ぶ) の 3 経路を 1 箇所で覆うため。
+    // デバイスの read() 自身に置くと、Machine を通らない単体テストまで
+    // Scheduler を連れてくることになる。
+    [[nodiscard]] u8 mfpRead(Settled, u32 regIndex)
+    {
+        return mfp_.read(regIndex);
+    }
+    [[nodiscard]] u8 rtcRead(Settled, u32 regIndex) const
+    {
+        return rtc_.read(regIndex);
+    }
+
+    // 時間で動くデバイスのレジスタを書く。
+    //
+    // 順序は必ず「settle (旧設定で消化) → 適用 → 再計算」の 3 段。
+    // Settled が 1 段目を、Rearm のデストラクタが 3 段目を強制する。
+    // 2 段目を飛ばす道は無いので、3 段の順序が型で決まる。
+    void mfpWrite(Settled, const Rearm&, u32 regIndex, u8 value)
+    {
+        mfp_.write(regIndex, value);
+        shadowInvalidate();
+    }
+    void rtcWrite(Settled, const Rearm&, u32 regIndex, u8 value)
+    {
+        rtc_.write(regIndex, value);
+        shadowInvalidate();
+    }
+
+    // shadow 検証の予測を捨てる。デバイスの設定が変わったときに呼ぶ。
+    //
+    // Why これが要るか: 予測は「今の設定のまま何も触らなければ、次に
+    // 状態が変わるのはいつか」を答える。ゲストが TCDCR や IER を書くと
+    // その前提が崩れるので、古い予測を実際の変化と突き合わせても
+    // 「飛び越した」ではなく「前提が変わった」を数えることになる。
+    //
+    // 本番のイベント駆動では Rearm のデストラクタが同じ役目を果たす。
+    // ここで捨てるのは、検証を本番と同じ条件へ揃えるため。
+    //
+    // 実測: これを入れる前は Human68k の起動 (9 億サイクル) で 12 件の
+    // 「不一致」が出た。全て「予測したあとにゲストが MFP を書いた」ケース。
+    void shadowInvalidate()
+    {
+        if (shadowVerify_)
+        {
+            shadowArmed_ = false;
+        }
+    }
+
+    // STOP 中の一括飛び越し。次の期限まで丸ごと進める。
+    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    void skipStopped();
+
+    // 溜まった時間をデバイスへ流す。実体化。
+    //
+    // CRTC が 1 フレーム以上をまとめて受け取ると、その間の垂直帰線の
+    // 開始と終了を報告しなくなる (video.h の tickFast のコメント)。
+    // kMaxSettleChunk で刻んでから渡す。
+    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    void settle();
+
+    // 次にどれかのデバイスの状態が変わる絶対サイクル。
+    [[nodiscard]] std::uint64_t nextEventCycle() const;
+
+    // 期限を張り直す。settle 済みであることが前提。
+    void rearmDeadline();
+
+    // 段 1 の shadow 検証。予測した期限と、実際に最初に状態が変わった
+    // サイクルを突き合わせる。used は直前の命令が消費したサイクル数で、
+    // 「変化が起きた区間」の始まりを決めるのに要る。
+    void shadowBeginPrediction();
+    void shadowObserve(u32 used);
+
+    // デバイスから見える「変化の指紋」。shadow 検証が比較に使う。
+    struct DeviceFingerprint
+    {
+        u8 ipra = 0;
+        u8 iprb = 0;
+        u8 gpip = 0;
+        u8 timerValue[4] = {};
+        u32 second = 0;
+        bool inVBlank = false;
+
+        bool operator!=(const DeviceFingerprint& o) const
+        {
+            return ipra != o.ipra || iprb != o.iprb || gpip != o.gpip || second != o.second ||
+                   inVBlank != o.inVBlank || timerValue[0] != o.timerValue[0] ||
+                   timerValue[1] != o.timerValue[1] || timerValue[2] != o.timerValue[2] ||
+                   timerValue[3] != o.timerValue[3];
+        }
+    };
+    [[nodiscard]] DeviceFingerprint fingerprint();
+
     // 毎命令通る経路の最適化スイッチ。既定は全て有効で、無効側は
     // 実機の計測でだけ使う (perf_switch.h)。
     PerfSwitch perf_{};
+
+    // イベント駆動の時間管理。**perf_ の直後に置く**。
+    //
+    // Machine は多相基底 3 つ (上の class 宣言) を持つので offset 0 は
+    // vtable になり、debt_ をそこへ置けない。それでも前の方に寄せるのは、
+    // Xtensa の l32i.n (narrow なロード) が offset ≤ 60 でしか使えないため。
+    // 毎命令通る唯一のメンバなので、1 命令の幅が効く。
+    Scheduler sched_{};
+
+    bool eventDriven_ = false;
+    bool shadowVerify_ = false;
+    u32 shadowMismatches_ = 0;
+    u32 shadowChecks_ = 0;
+    u32 shadowExact_ = 0;
+    std::uint64_t stopSkippedCycles_ = 0;
+    // shadow 検証: 予測した「次に変わるまでのサイクル数」と、その時点の指紋。
+    u32 shadowPredicted_ = 0;
+    u32 shadowElapsed_ = 0;
+    DeviceFingerprint shadowBaseline_{};
+    bool shadowArmed_ = false;
+
     int nullExecStage_ = 0;
 
     Sram sram_;
