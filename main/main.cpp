@@ -1262,6 +1262,15 @@ private:
         if (isJitProbe)
         {
             probeJitFeasibility();
+            // どれだけ取れるかも見る。コードキャッシュの設計はここで決まる。
+            {
+                const std::size_t largest =
+                    heap_caps_get_largest_free_block(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+                const std::size_t total =
+                    heap_caps_get_free_size(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+                ESP_LOGI(kTag, "[jit] 実行可能メモリ 空き=%u 最大連続=%u",
+                         static_cast<unsigned>(total), static_cast<unsigned>(largest));
+            }
             return;
         }
 
