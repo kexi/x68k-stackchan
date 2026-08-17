@@ -1129,381 +1129,52 @@ TEST_CASE("STOP 中もタイマが進み、割り込みで抜ける")
 - `/Users/kei/ghq/github.com/kexi/x68k-stackchan/test/test_device_timing.cpp`
 - 新規: `src/x68k/core/scheduler.h` (`Scheduler` / `Settled` / `Rearm`)
 
-**設計の 1 行要約**: 負数 `debt_` で毎命令をゼロ比較 1 本に保ちつつ、**割り込みの正しさは wake の網羅性でなく「保留中は毎命令リトライへ縮退する」フォールバックで守り**、CRTC は `rasterNumber` の 317 サイクル粒度ゆえイベント化しない。",
-    "fatalCount": 0,
-    "attacks": 3
-  },
-  "workflowProgress": [
-    {
-      "type": "workflow_phase",
-      "index": 1,
-      "title": "Survey"
-    },
-    {
-      "type": "workflow_phase",
-      "index": 2,
-      "title": "Design"
-    },
-    {
-      "type": "workflow_phase",
-      "index": 3,
-      "title": "Adversarial"
-    },
-    {
-      "type": "workflow_phase",
-      "index": 4,
-      "title": "Synthesize"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 1,
-      "label": "survey:observability",
-      "phaseIndex": 1,
-      "phaseTitle": "Survey",
-      "agentId": "ad66af0a1061b3a0c",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786962521821,
-      "queuedAt": 1786962521811,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786962715203,
-      "tokens": 114198,
-      "toolCalls": 38,
-      "durationMs": 193382,
-      "resultPreview": "{"findings":[{"area":"MFP タイマデータレジスタ TADR/TBDR/TCDR/TDDR ($E8801F/$E88021/$E88023/$E88025)","detail":"Mfp::read (src/x68k/core/dev/mfp.cpp:66-73) はこの 4 本だけ reg_ ではなく timerValue_[i] を返す。timerValue_ を減らすのは Mfp::tickFast (src/x68k/core/dev/mfp.h:150-182) と Mfp::tickTimerCounted (mfp.cpp:284-326) だけ。変化の粒度は `プリスケール値 x 2 CPU サイクル` (kCpuToMfpShift=1, mfp.h:120)。実測設定では タイマ B が分周 4 => **8 CPU サイクルごとに 1 減る*…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 2,
-      "label": "survey:invalidation",
-      "phaseIndex": 1,
-      "phaseTitle": "Survey",
-      "agentId": "a36ace4e2e44ffde3",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786962521821,
-      "queuedAt": 1786962521812,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786962755142,
-      "tokens": 102654,
-      "toolCalls": 25,
-      "durationMs": 233321,
-      "resultPreview": "{"findings":[{"area":"構造的前提: 書き込みは「過去の時点」で起きる (machine.cpp:235-253)","detail":"runWith は `serviceInterrupts(); used = cpu_.step(); tickDevices(used);` の順で回る (machine.cpp:240-249)。つまり **命令が実行された時点ではデバイスの時間はまだ進んでいない**。イベント駆動で期限まで飛ばすと、この「未適用の時間」が最大で期限ぶん (タイマ C なら 80,000 サイクル) 溜まる。この状態で ioWrite8 → mfp_.write が走ると、書き込みは「溜まった時間を旧設定で消化する前」に適用されることになる。したがって全ての無効化経路は **settle(遅延中の時間を旧設定へ適用) → 書き込みを適用 → 期限を…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 3,
-      "label": "survey:interrupts",
-      "phaseIndex": 1,
-      "phaseTitle": "Survey",
-      "agentId": "aebac904ca8f0f00f",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786962521822,
-      "queuedAt": 1786962521812,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786962778202,
-      "tokens": 113731,
-      "toolCalls": 44,
-      "durationMs": 256380,
-      "resultPreview": "{"findings":[{"area":"結論: serviceInterrupts はイベント駆動化できるが、wake の契機は「デバイスが進んだとき」だけでは全く足りない","detail":"毎命令の判定は machine.h:311-321 の 3 項 OR (mfp_/scc_/iosc_.hasPendingInterrupt) と machine.h:340-343 の updateFdcInterruptLine の 2 つ。ゲート自体は 2 段構えになっている。第 1 ゲート = 各デバイスの「保留があるか」、第 2 ゲート = machine.cpp:371/406/440 の cpu_.state().interruptMask() 比較。さらに第 3 のラッチが CPU 内にある: M68k::requestInterrupt (m68k.cpp:590-597)…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 4,
-      "label": "design:countdown",
-      "phaseIndex": 2,
-      "phaseTitle": "Design",
-      "agentId": "a96bbfad7ef853c17",
-      "model": "claude-opus-5[1m]",
-      "state": "error",
-      "startedAt": 1786962778218,
-      "queuedAt": 1786962778207,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963619364,
-      "error": "agent({schema}): StructuredOutput retry cap (5) exceeded — 5 failed calls with no valid output",
-      "tokens": 91491,
-      "toolCalls": 19,
-      "durationMs": 841145
-    },
-    {
-      "type": "workflow_agent",
-      "index": 5,
-      "label": "design:deadline-cache",
-      "phaseIndex": 2,
-      "phaseTitle": "Design",
-      "agentId": "a6f1a525c133c890c",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786962778219,
-      "queuedAt": 1786962778208,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "lastToolSummary": "## 全体像 デバイス (MFP タイマ x4 / CRTC / RTC) ごとに「次…",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963432441,
-      "tokens": 98239,
-      "toolCalls": 29,
-      "durationMs": 654222,
-      "resultPreview": "{"approach":"## 全体像\
-\
-デバイス (MFP タイマ x4 / CRTC / RTC) ごとに「次に状態が変わるまでの絶対サイクル」を個別に持つ。ただし**毎命令のホットパスはその表を一切読まない**。最小値を 1 個の `std::int32_t debt_` に負数として畳み、毎命令は `debt_ += used; if (debt_ >= 0) slow();` だけ。\
-\
-個別に持つ利得は速度でなく**無効化の局所性**。TCDCR が書かれたとき CRTC/RTC の期限は再計算不要で、MFP の 4 本だけ引き直して最小値を取り直せばよい。単一期限だと「何が最小だったか」を失うので、全部引き直すか、保守的に 0 へ落として次命令で全デバイスを settle することになる。\
-\
-## Xtensa GCC 14.2.0 (-O2 -mlongcalls…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 6,
-      "label": "design:fused",
-      "phaseIndex": 2,
-      "phaseTitle": "Design",
-      "agentId": "af6ab198af78cf779",
-      "model": "claude-opus-5[1m]",
-      "state": "error",
-      "startedAt": 1786962778219,
-      "queuedAt": 1786962778208,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963481054,
-      "error": "agent({schema}): StructuredOutput retry cap (5) exceeded — 5 failed calls with no valid output",
-      "tokens": 93991,
-      "toolCalls": 23,
-      "durationMs": 702834
-    },
-    {
-      "type": "workflow_agent",
-      "index": 7,
-      "label": "attack:deadline-cache:timing",
-      "phaseIndex": 3,
-      "phaseTitle": "Adversarial",
-      "agentId": "af18782c4cd7a2bb4",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786963619383,
-      "queuedAt": 1786963619368,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "lastToolSummary": "fixable",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963801743,
-      "tokens": 72501,
-      "toolCalls": 23,
-      "durationMs": 182360,
-      "resultPreview": "{"verdict":"fixable","breaks":[{"scenario":"IMRB=0 (垂直帰線割り込みマスク) の状態で `btst #4,$E88001` / `bne.s` の GPIP4 ポーリングループを回す。設計の期限表は crtcEdge を持つが、invalidation セクションが「トークンは Mfp::read / Rtc::read の側に置く」と定めているため、Mfp::read(Settled, kGpip) の Settled は「MFP が実体化済み」の証明でしかなく、CRTC を進める義務が型に現れない。タイマ C の期限 80,000 サイクルまで飛ぶと、その間に来るはずの V-DISP 立ち下がりが遅れて観測され、ループの反復回数が変わる。","why":"mfp.cpp:271-282 の raise() は `if ((reg_[i…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 8,
-      "label": "attack:deadline-cache:interrupt-loss",
-      "phaseIndex": 3,
-      "phaseTitle": "Adversarial",
-      "agentId": "afe59ba6565db184b",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786963619386,
-      "queuedAt": 1786963619368,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "lastToolSummary": "fixable",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963828985,
-      "tokens": 87382,
-      "toolCalls": 28,
-      "durationMs": 209599,
-      "resultPreview": "{"verdict":"fixable","breaks":[{"scenario":"MFP タイマ C (IERB=26, 分周 200/データ 200 = 80,000 サイクル周期) が、CPU が既にレベル 6 ハンドラ内 (m68k.cpp:647 の setSr で IPL=6) にいる瞬間に raise される。mfp.cpp:271 の raise() が IPR を立て、期限機構が debt_ = 0 を書く。次命令で reachSlow() → serviceMfpInterrupt() (machine.cpp:390) に入るが、machine.cpp:412-415 の `const u32 mask = cpu_.state().interruptMask(); if (kMfpInterruptLevel <= mask) return false;` で …"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 9,
-      "label": "attack:deadline-cache:perf",
-      "phaseIndex": 3,
-      "phaseTitle": "Adversarial",
-      "agentId": "aeb82b4252f690a09",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786963619386,
-      "queuedAt": 1786963619368,
-      "attempt": 1,
-      "lastToolName": "StructuredOutput",
-      "lastToolSummary": "fixable",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786963824389,
-      "tokens": 64955,
-      "toolCalls": 23,
-      "durationMs": 205003,
-      "resultPreview": "{"verdict":"fixable","breaks":[{"scenario":"Human68k のアイドル (STOP 中)。m68k.cpp:651-654 は `if (st_.stopped) { return 4; }` で、**0 ではなく 4 を返す**。提案のホットループは `used == 0` でしか抜けないので、STOP 中も `call8 M68k::step()` → 4 を返す、を延々繰り返す。タイマ C の期限 80,000 サイクルまで飛ぶには call8 を 20,000 回実行する。各回 step() 冒頭で st_.halted / pendingIrq_ / st_.stopped の 3 ロード + 3 分岐を通る (m68k.cpp:610-651)。","why":"設計は risks で「STOP 中はゲストが何もポーリングできない唯…"
-    },
-    {
-      "type": "workflow_agent",
-      "index": 10,
-      "label": "synthesize",
-      "phaseIndex": 4,
-      "phaseTitle": "Synthesize",
-      "agentId": "acb648c4cd2801aed",
-      "model": "claude-opus-5[1m]",
-      "state": "done",
-      "startedAt": 1786963828986,
-      "queuedAt": 1786963828985,
-      "attempt": 1,
-      "lastToolName": "Write",
-      "lastToolSummary": "/private/tmp/claude-501/-Users-kei-ghq-github-com-kexi-x68k…",
-      "promptPreview": "リポジトリ: /Users/kei/ghq/github.com/kexi/x68k-stackchan
-自作 X68000 エミュレータ (M5Stack CoreS3 / ESP32-S3 240MHz)。実効 5137 kHz (実機比 51%)。
-
-## 目的
-命令ごとに Machine::tickDevices を呼ぶのをやめ、「次にデバイスの状態が変わる時点」まで
-飛ばす (イベント駆動)。quantum と違い、状態が変わる瞬間は 1 サイクルもずらさない。
-
-## 実測 (CoreS3 実機、Human68k 稼働中)
-命令の実行を空回しにして段階的に外した内訳:
-- tickDevices        118.76 ns/cycle (59%)
-- serviceInterrupts   56.25 ns/cycle (28%)
-- ループ運営          18.…",
-      "lastProgressAt": 1786964147513,
-      "tokens": 123268,
-      "toolCalls": 14,
-      "durationMs": 318527,
-      "resultPreview": "I verified every load-bearing claim in the attack reports against the source. Here is the consolidated design.
+**設計の 1 行要約**: 負数 `debt_` で毎命令をゼロ比較 1 本に保ちつつ、**割り込みの正しさは wake の網羅性でなく「保留中は毎命令リトライへ縮退する」フォールバックで守り**、CRTC は `rasterNumber` の 317 サイクル粒度ゆえイベント化しない。
 
 ---
 
-# イベント駆動デバイス — 実装確定版
+## 結論: 10000 kHz (実機比 100%) はこの設計では届かない
 
-## 実装結果 (2026-08-17、CoreS3 実機、Human68k 稼働中)
+**到達点は 8128 kHz (実機比 81%)。** 目標に必要な 1.23 倍を埋める手段が実測で尽きた。
 
-**実装して実機で測った。同じ起動の中で `'$'` を切り替え、ON → OFF → ON で再現。**
+### run の外の内訳 (2026-08-18、CoreS3 実機、イベント駆動 ON)
 
-| | 実効クロック | 実機比 |
-|---|---|---|
-| OFF | 4991 / 4989 kHz | 49.9% |
-| **ON** | **7579 kHz** | **75.8%** |
+5 秒あたりの実時間を分離して測った:
 
-**+51.9%。** 試算は 12655 kHz だったので、届いたのは 6 割ほど。残差の
-原因は `serviceInterrupts` を毎命令のまま残していること (28% ぶん) と、
-縮退 (`degraded_`) に落ちる区間があること。次段で詰める。
+| 区分 | 実時間 | 割合 |
+|---|---:|---:|
+| `run` の中 (命令実行 + デバイス) | 4542ms | 90.8% |
+| 描画 (`renderTo`) | 214ms | 4.3% |
+| その他 (`vTaskDelay` / 入力 / 音声) | 244ms | 4.9% |
 
-検証: ホストテスト 559 件 / 226,521 assertions、状態が完全に不変
-(400M サイクルで 99998982 命令 / `$ED0000=82773638`)、Human68k が
-`A>` まで起動して `dir` が動く。
+**「描画を Core0 へ移す」の上限は +4.5% だった。** 直前まで 9% を根拠に +7% と見積もっていたが、
+それは描画・入力・音声・yield を一括りにした数字で、描画だけを分離すると 4.3%。
+残る 4.9% の主体は `vTaskDelay` で、ウォッチドッグ対策なので移せない。
 
-## 0. 事前検証で確定した事実 (推測でなく実コードから)
+`renderTo` はエミュレーションコアが持つテキスト VRAM を読むため、Core0 へ移すと
+所有権の境界をまたぐ。**+4.5% のためにデータ競合の対処を入れる価値はない**と判断した。
 
-攻撃レポートの主張のうち、設計を変える 5 件を実コードで確認した。
+### 手段が尽きたことの根拠
 
-| 主張 | 確認 | 実体 |
-|---|---|---|
-| STOP は 0 でなく 4 を返す | **正しい** | `m68k.cpp:651-655` `if (st_.stopped) { return 4; }`。0 を返すのは `m68k.cpp:612` の halted のみ |
-| `rasterNumber()` が同値テストの比較対象 | **正しい*…"
-    }
-  ],
-  
+必要なのは 1.229 倍。すべて実測済み:
+
+| 手段 | 実測 |
+|---|---|
+| 描画を Core0 へ移す | **+4.5%** (唯一残っていた正の未実装手段) |
+| フラグ計算の除去 | 上限 +8.5% だが**実装すると -3.6%** |
+| デコード済みブロックキャッシュ | **-9.2%** |
+| ネイティブ発行 | 呼び出しだけで 14.1 サイクルの床 (17%) |
+| メモリ階層 (PSRAM / 配置) | 効果なし (キャッシュミス率で確認済み) |
+| CPU クロック | 240MHz で **ESP32-S3 の上限** |
+
+唯一の正の手段を足しても 8505 kHz。残るのは真の動的リコンパイルだけで、
+上の「床」を覆す必要があり、別プロジェクト規模になる。
+
+### 計測でつまずいた点 (再発防止)
+
+**`g_eventDrivenEnabled` の既定は `false`。** シリアルの `$` で切り替わる。
+これを送らずに測ると 5446 kHz (毎命令版) が出る。**8128 と 5446 を取り違えると、
+無関係な変更を「大幅な後退」と誤診する。** 実際にこのセッションで一度誤診した。
+
+トグルのキーは `$` であって `` ` `` ではない (`main.cpp` の `isEventDrivenToggle`)。
+切り替え時に `イベント駆動: ON` がログへ出るので、**計測スクリプトはこの行を必ず確認する**。
