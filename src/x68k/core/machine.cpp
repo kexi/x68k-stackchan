@@ -263,20 +263,46 @@ u32 Machine::runNullExec(u32 cycles)
     // 毎命令のロードと分岐になり、測ろうとしている対象にコストを乗せる。
     // 本番の '&' スイッチで同じ誤りを一度犯している (perf_switch.h)。
     // 計測モードでも同じ規律を守らないと、出てくる内訳が信用できない。
+    // 段 0-3 は導入時の意味をそのまま残す。過去の実測 (tickDevices 59% /
+    // serviceInterrupts 28% / 床 18.75 ns) と比べられなくなるため。
+    // 段 4-7 を足して、tickDevices の中身を 1 つずつ落とす。
+    //
+    //   0: 全部含む                    ← 基準
+    //   1: tickDevices を外す
+    //   2: 割り込み判定を外す
+    //   3: 両方外す                    ← 床 (ループ運営だけ)
+    //   4: MFP だけ外す                ← 段 0 との差が MFP の寄与
+    //   5: RTC だけ外す                ← 同上 RTC
+    //   6: CRTC だけ外す               ← 同上 CRTC。変更 4 の判断はこれで決まる
+    //   7: CRTC だけ残す               ← 4-6 の差分の和が合うかの裏取り
+    //
+    // Why not 4-6 の差だけで済ませないか: 3 つの tick は同じループの中で
+    // キャッシュとレジスタを共有している。1 つ外した差が単独の寄与と
+    // 一致する保証は無い。7 で「CRTC だけ」を直接測り、段 3 (床) との差が
+    // 段 0 と段 6 の差と揃うかを見れば、内訳が加法的かどうかが分かる。
+    // 揃わないなら差分ではなく段 7 の側を信じる。
     switch (nullExecStage_)
     {
         case 1:
-            return runNullExecWith<false, true>(cycles);
+            return runNullExecWith<false, false, false, true>(cycles);
         case 2:
-            return runNullExecWith<true, false>(cycles);
+            return runNullExecWith<true, true, true, false>(cycles);
         case 3:
-            return runNullExecWith<false, false>(cycles);
+            return runNullExecWith<false, false, false, false>(cycles);
+        case 4:
+            return runNullExecWith<false, true, true, true>(cycles);
+        case 5:
+            return runNullExecWith<true, false, true, true>(cycles);
+        case 6:
+            return runNullExecWith<true, true, false, true>(cycles);
+        case 7:
+            return runNullExecWith<false, false, true, true>(cycles);
         default:
-            return runNullExecWith<true, true>(cycles);
+            return runNullExecWith<true, true, true, true>(cycles);
     }
 }
 
-template <bool WithDevices, bool WithInterrupts>
+template <bool WithMfp, bool WithRtc, bool WithCrtc, bool WithInterrupts>
 u32 Machine::runNullExecWith(u32 cycles)
 {
     // 1 命令 4 サイクルとするのは、実測した平均が約 4 サイクルだったため
@@ -293,18 +319,41 @@ u32 Machine::runNullExecWith(u32 cycles)
             serviceInterrupts();
         }
         spent += kCyclesPerInstruction;
-        if (WithDevices)
+
+        // Why not tickDevices を呼ばずにここへ展開したか: tickDevices は
+        // 本番の run() が通る関数で、テンプレート引数を 3 から 6 へ
+        // 増やすと有効側の実体化が 8 通りから 64 通りへ増える。
+        // 計測のためだけに本番経路の生成コードを触らない (perf_switch.h)。
+        // 中身は tickDevices と同じ順序・同じ FastPath で並べてある。
+        if (WithMfp)
         {
-            tickDevices<true, true, true>(kCyclesPerInstruction);
+            mfp_.tickFast<true>(kCyclesPerInstruction);
+        }
+        if (WithRtc)
+        {
+            rtc_.tickFast<true>(kCyclesPerInstruction);
+        }
+        if (WithCrtc)
+        {
+            if (crtc_.tickFast<true>(kCyclesPerInstruction))
+            {
+                mfp_.setVerticalBlank(crtc_.inVerticalBlank());
+            }
         }
     }
     return spent;
 }
 
-template u32 Machine::runNullExecWith<true, true>(u32);
-template u32 Machine::runNullExecWith<true, false>(u32);
-template u32 Machine::runNullExecWith<false, true>(u32);
-template u32 Machine::runNullExecWith<false, false>(u32);
+// runNullExec の switch が使う組み合わせだけを実体化する。
+// 16 通り全ては要らない (使わない実体はコードサイズを食うだけ)。
+template u32 Machine::runNullExecWith<true, true, true, true>(u32);      // 段 0
+template u32 Machine::runNullExecWith<false, false, false, true>(u32);   // 段 1
+template u32 Machine::runNullExecWith<true, true, true, false>(u32);     // 段 2
+template u32 Machine::runNullExecWith<false, false, false, false>(u32);  // 段 3
+template u32 Machine::runNullExecWith<false, true, true, true>(u32);     // 段 4
+template u32 Machine::runNullExecWith<true, false, true, true>(u32);     // 段 5
+template u32 Machine::runNullExecWith<true, true, false, true>(u32);     // 段 6
+template u32 Machine::runNullExecWith<false, false, true, true>(u32);    // 段 7
 
 template <bool FastMfp, bool FastRtc, bool FastCrtc>
 void Machine::tickDevices(u32 cycles)

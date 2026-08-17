@@ -12,6 +12,7 @@
 // なければならない。
 
 #include <algorithm>
+#include <iterator>
 #include <utility>
 #include <vector>
 
@@ -348,5 +349,107 @@ TEST_SUITE("device-timing")
         // RTC: 1 秒ぶん進んでいる。reset 直後は 0 秒。
         const x68k::u32 seconds = fast[6] * 10 + fast[5];
         CHECK(seconds >= 1);
+    }
+
+    // 上限計測モード (runNullExec) の段が、名前どおりのデバイスだけを
+    // 進めること。
+    //
+    // ここが守るのは速さではなく **計測値の意味** で、落ちたときの被害は
+    // 「テストが赤くなる」ではなく「実機で測った内訳を信じて設計判断を
+    // 誤る」形で出る。段 6 (CRTC だけ外す) が実は CRTC を進めていたら、
+    // CRTC の寄与は 0 と出る。その数字を見て「CRTC はイベント化しなくて
+    // よい」と結論すると、根拠の無い判断が根拠のある判断の顔をする。
+    //
+    // 段の意味は machine.cpp の runNullExec の switch にある。
+    TEST_CASE("上限計測の段は名前どおりのデバイスだけを進める")
+    {
+        // 各デバイスが「進んだかどうか」を外から見た結果。
+        struct Advanced
+        {
+            bool mfp = false;
+            bool rtc = false;
+            bool crtc = false;
+
+            bool operator==(const Advanced& o) const
+            {
+                return mfp == o.mfp && rtc == o.rtc && crtc == o.crtc;
+            }
+        };
+
+        const auto runStage = [](int stage)
+        {
+            x68k::Machine m;
+            x68k::MemoryMap map{};
+
+            // runNullExec は命令を実行しないので RAM は要らないが、
+            // reset がベクタを読むので空の RAM を与えておく。
+            static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+            std::fill(ram.begin(), ram.end(), 0);
+            map.mainRam = ram.data();
+            m.setMemory(map);
+            m.reset();
+
+            // タイマ C を動かす。MFP が進んだことは TCDR の読み値で見る。
+            //
+            // 順序が重要: データレジスタの書き込みがメインカウンタへ即座に
+            // 入るのは **タイマが停止しているときだけ** (mfp.cpp の
+            // loadTimerIfStopped)。先に TCDCR で走らせてしまうと
+            // timerValue_ は reset 直後の 0 のままで、tick を外した段でも
+            // 「200 ではない」が成立して素通りする。
+            m.mfp().write(x68k::Mfp::kTcdr, 200);
+            m.mfp().write(x68k::Mfp::kTcdcr, 0x70);  // C=分周 200
+
+            m.setNullExecStage(stage);
+
+            // RTC の 1 秒境界 (10,000,000) を跨ぐまで回す。
+            // ここに届かないと RTC が進んだかどうかを外から見られない
+            // (cycleAccumulator_ は private で、秒が繰り上がって初めて
+            // read から見える)。
+            x68k::u64 spent = 0;
+            while (spent < 10500000)
+            {
+                spent += m.runNullExec(9973);
+            }
+
+            Advanced a;
+            a.mfp = m.mfp().read(x68k::Mfp::kTcdr) != 200;
+            a.rtc =
+                (m.rtc().read(x68k::Rtc::kSecond10) * 10 + m.rtc().read(x68k::Rtc::kSecond1)) > 0;
+            a.crtc = m.crtc().rasterNumber() != 0;
+            return a;
+        };
+
+        // 段ごとに「進むはず」の 3 つ組。machine.cpp の switch と対にする。
+        //
+        // Why not 段 0 と各段の差だけを見ないか: 差が 0 でないことは
+        // 「何かが変わった」しか言わない。どのデバイスが動いたかを直接
+        // 押さえないと、MFP を外したつもりで RTC を外していても通る。
+        const struct
+        {
+            int stage;
+            Advanced expected;
+        } kTable[] = {
+            {0, {true, true, true}},     // 全部含む
+            {1, {false, false, false}},  // tickDevices を外す
+            {2, {true, true, true}},     // 割り込み判定を外す (デバイスは進む)
+            {3, {false, false, false}},  // 両方外す (床)
+            {4, {false, true, true}},    // MFP だけ外す
+            {5, {true, false, true}},    // RTC だけ外す
+            {6, {true, true, false}},    // CRTC だけ外す
+            {7, {false, false, true}},   // CRTC だけ残す
+        };
+
+        // 表が段を 1 つも取りこぼしていないこと。段を足して表を足さないと、
+        // 新しい段が誰にも確かめられないまま実機の数字になる。
+        REQUIRE(static_cast<int>(std::size(kTable)) == x68k::Machine::kNullExecStageCount);
+
+        for (const auto& row : kTable)
+        {
+            CAPTURE(row.stage);
+            const Advanced actual = runStage(row.stage);
+            CHECK(actual.mfp == row.expected.mfp);
+            CHECK(actual.rtc == row.expected.rtc);
+            CHECK(actual.crtc == row.expected.crtc);
+        }
     }
 }

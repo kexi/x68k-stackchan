@@ -112,17 +112,26 @@ public:
     // JIT に着手するかどうかを決めるための実測用。
     u32 runNullExec(u32 cycles);
 
-    // runNullExec の実体。WithDevices / WithInterrupts をテンプレート引数に
-    // して、計測器自身が毎命令の分岐にならないようにする。
-    template <bool WithDevices, bool WithInterrupts>
+    // runNullExec の実体。含めるものを全てテンプレート引数にして、
+    // 計測器自身が毎命令の分岐にならないようにする。
+    //
+    // WithMfp / WithRtc / WithCrtc は tickDevices の中身を 1 つずつ
+    // 落とすためにある。tickDevices が 59% を占めることは測れているが、
+    // その内訳が分からないと「CRTC をイベント化しない」判断の可否が
+    // 決まらない (docs/knowledge/event-driven-implementation.md の段 0)。
+    template <bool WithMfp, bool WithRtc, bool WithCrtc, bool WithInterrupts>
     u32 runNullExecWith(u32 cycles);
 
-    // runNullExec でデバイスの tick と割り込み判定まで外すか。
-    // ループ運営だけが残る状態の天井を見るために使う。
+    // runNullExec が何を含めるかを選ぶ。0 から順に巡回させて内訳を測る。
+    // 段の意味は machine.cpp の runNullExec の switch にある。
     void setNullExecStage(int stage)
     {
         nullExecStage_ = stage;
     }
+
+    // 巡回させる段の数。main のシリアル側が % で割るのに使う。
+    // ここを増やしたら machine.cpp の switch も増やす。
+    static constexpr int kNullExecStageCount = 8;
 
     // 毎命令通る経路の最適化を個別に切る。実機で焼き直さずに効果を
     // 測るための口 (perf_switch.h に理由がある)。既定は全て有効。

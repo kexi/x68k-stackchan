@@ -132,6 +132,37 @@ std::atomic<bool> g_fastTickEnabled{true};
 std::atomic<bool> g_nullExecProbe{false};
 std::atomic<int> g_nullExecStage{0};
 
+// 上限計測の段に名前を付ける。段の定義は machine.cpp の switch にある。
+//
+// 段 4-7 は tickDevices (全体の 59%) の中身を MFP / RTC / CRTC へ
+// 分解するためにある。CRTC をイベント化するかどうかの判断が、CRTC 単独の
+// 寄与を知らないと決まらない (docs/knowledge/event-driven-implementation.md)。
+const char* nullExecStageName(int stage)
+{
+    static const char* const kNames[x68k::Machine::kNullExecStageCount] = {
+        "全部含む (基準)", "tickDevices を外す", "割り込み判定を外す", "両方外す (床)",
+        "MFP だけ外す",    "RTC だけ外す",       "CRTC だけ外す",      "CRTC だけ残す",
+    };
+    const bool isKnown = stage >= 0 && stage < x68k::Machine::kNullExecStageCount;
+    if (!isKnown)
+    {
+        return "不明";
+    }
+    return kNames[stage];
+}
+
+// 段を選び直す。'_' の巡回と '#' の直接指定が両方ここを通る。
+//
+// Machine へ写すのはシリアルのタスクだが、setNullExecStage が書くのは
+// int 1 つで、エミュレーションコアが読むのはスライスの入口だけ。
+// 途中で切り替わっても、次のスライスから新しい段になるだけで壊れない。
+void applyNullExecStage(int stage)
+{
+    g_nullExecStage = stage;
+    g_machine.setNullExecStage(stage);
+    ESP_LOGI(kTag, "上限計測 stage %d: %s", stage, nullExecStageName(stage));
+}
+
 // 上の値をエミュレーションコアが Machine へ写したかどうか。
 // 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
 bool g_fastTickApplied = true;
@@ -1008,19 +1039,29 @@ private:
             return;
         }
 
-        // '_' で、上限計測モードからさらにデバイスの tick と割り込み判定を
-        // 外す。ループ運営だけが残るので、機械としての天井が見える。
+        // '_' で、上限計測モードの段を 1 つ進める。段 0-3 が全体の内訳
+        // (tickDevices / 割り込み判定 / 床)、段 4-7 が tickDevices の内訳。
         //
         // 上限計測モード ('%') が ON のときだけ意味がある。
         const bool isSkipDevicesToggle = c == '_';
         if (isSkipDevicesToggle)
         {
-            const int stage = (g_nullExecStage.load() + 1) % 4;
-            g_nullExecStage = stage;
-            g_machine.setNullExecStage(stage);
-            static const char* const kNames[4] = {"全部含む", "tickDevices を外す",
-                                                  "割り込み判定を外す", "両方外す"};
-            ESP_LOGI(kTag, "上限計測 stage %d: %s", stage, kNames[stage]);
+            const int stage = (g_nullExecStage.load() + 1) % x68k::Machine::kNullExecStageCount;
+            applyNullExecStage(stage);
+            return;
+        }
+
+        // '#' で段 4 (MFP だけ外す) へ直接飛ぶ。
+        //
+        // Why not '_' の巡回だけで済ませないか: 段 4-7 は 5 秒ごとの報告を
+        // 数回ぶん見てから次へ進めたい。巡回だけだと段 6 (CRTC) へ行くのに
+        // '_' を 7 回押すことになり、その間に温度と SD の状態が変わる。
+        // 内訳は同一起動の中で連続して測らないと差が揺れに埋もれる
+        // (焼き直しの揺れ 3711 vs 3630 kHz を一度踏んでいる)。
+        const bool isBreakdownJump = c == '#';
+        if (isBreakdownJump)
+        {
+            applyNullExecStage(4);
             return;
         }
 
