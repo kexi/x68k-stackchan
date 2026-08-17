@@ -182,11 +182,11 @@ u32 Machine::step()
     // step() 経路でも同じ状態になることを確かめられるように)。
     if (perf_.allEnabled())
     {
-        tickDevices<true>(cycles);
+        tickDevices<true, true, true>(cycles);
     }
     else
     {
-        tickDevices<false>(cycles);
+        tickDevices<false, false, false>(cycles);
     }
 
     return cycles;
@@ -203,16 +203,35 @@ u32 Machine::run(u32 cycles)
     //
     // テンプレート引数にすれば、有効側は **スイッチを入れる前と同じ
     // 生成コード** になる。定数畳み込みで分岐ごと消えるので、本番の姿に
-    // 計測用の細工が残らない。切り替えの代償はスライスごとの分岐 1 回で、
+    // 計測用の細工が残らない。切り替えの代償はスライスごとの分岐で、
     // 20000 サイクルに 1 度なので無視できる。
-    if (perf_.allEnabled())
+    //
+    // 3 つを個別に見るのは、perf_switch.h が「個別に切れる」と約束して
+    // いるため。まとめて allEnabled() で判定すると、RTC だけ切ったつもりが
+    // MFP と CRTC まで切れて、どれが効いたのか分からなくなる。
+    //
+    // 組み合わせは 8 通りだが、実体化されるのは実際に使うものだけで、
+    // 有効側 (true,true,true) が本番の姿になる。
+    if (perf_.inlineMfpTimer)
     {
-        return runWith<true>(cycles);
+        if (perf_.inlineRtcTick)
+        {
+            return perf_.inlineCrtcTick ? runWith<true, true, true>(cycles)
+                                        : runWith<true, true, false>(cycles);
+        }
+        return perf_.inlineCrtcTick ? runWith<true, false, true>(cycles)
+                                    : runWith<true, false, false>(cycles);
     }
-    return runWith<false>(cycles);
+    if (perf_.inlineRtcTick)
+    {
+        return perf_.inlineCrtcTick ? runWith<false, true, true>(cycles)
+                                    : runWith<false, true, false>(cycles);
+    }
+    return perf_.inlineCrtcTick ? runWith<false, false, true>(cycles)
+                                : runWith<false, false, false>(cycles);
 }
 
-template <bool FastTick>
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
 u32 Machine::runWith(u32 cycles)
 {
     u32 spent = 0;
@@ -227,16 +246,16 @@ u32 Machine::runWith(u32 cycles)
         }
         spent += used;
 
-        tickDevices<FastTick>(used);
+        tickDevices<FastMfp, FastRtc, FastCrtc>(used);
     }
 
     return spent;
 }
 
-template <bool FastTick>
+template <bool FastMfp, bool FastRtc, bool FastCrtc>
 void Machine::tickDevices(u32 cycles)
 {
-    mfp_.tick<FastTick>(cycles);
+    mfp_.tickFast<FastMfp>(cycles);
 
     // RTC も CRTC もまとめない。
     //
@@ -250,19 +269,25 @@ void Machine::tickDevices(u32 cycles)
     // いずれもゲストが命令単位でポーリングできる値なので、「分解能より
     // 細かいから見えない」は成り立たない。ポーリングループの反復回数
     // として観測できる。速度のために正しさを崩す取引だったので戻した。
-    rtc_.tick<FastTick>(cycles);
+    rtc_.tickFast<FastRtc>(cycles);
 
-    if (crtc_.tick<FastTick>(cycles))
+    if (crtc_.tickFast<FastCrtc>(cycles))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
     }
 }
 
-// この 2 つは machine.cpp の中でしか呼ばれないので、明示的な実体化で足りる。
+// machine.cpp の中でしか呼ばれないので、明示的な実体化で足りる。
 // ヘッダへ定義を出すと、machine.h を読む全ての TU が SASI の状態機械まで
 // 抱えることになる。
-template u32 Machine::runWith<true>(u32);
-template u32 Machine::runWith<false>(u32);
+template u32 Machine::runWith<true, true, true>(u32);
+template u32 Machine::runWith<true, true, false>(u32);
+template u32 Machine::runWith<true, false, true>(u32);
+template u32 Machine::runWith<true, false, false>(u32);
+template u32 Machine::runWith<false, true, true>(u32);
+template u32 Machine::runWith<false, true, false>(u32);
+template u32 Machine::runWith<false, false, true>(u32);
+template u32 Machine::runWith<false, false, false>(u32);
 
 void Machine::serviceInterruptsSlow()
 {

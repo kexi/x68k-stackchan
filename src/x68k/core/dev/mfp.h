@@ -123,8 +123,10 @@ public:
     // tickTimerCounted を呼ぶ (この最適化を入れる前と同じ形)。実機で
     // 焼き直さずに効果を測るための口 (perf_switch.h)。テンプレートに
     // してあるのは、有効側の生成コードをスイッチ導入前と同一に保つため。
-    template <bool FastPath = true>
-    void tick(u32 cycles)
+    // 渡し忘れをコンパイルエラーにするため、既定引数は付けない
+    // (rtc.h の tickFast に理由がある)。
+    template <bool FastPath>
+    void tickFast(u32 cycles)
     {
         const u32 mfpCycles = cycles >> kCpuToMfpShift;
         if (mfpCycles == 0)

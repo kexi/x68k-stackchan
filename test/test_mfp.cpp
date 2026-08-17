@@ -245,7 +245,7 @@ TEST_CASE("Software EOI ではサービス中より下位の割り込みを受�
     // サービス中に下位の割り込みが上がっても受理できない。
     mfp.write(x68k::Mfp::kTbdr, 1);
     mfp.write(x68k::Mfp::kTbcr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerB) != 0);
     CHECK_FALSE(mfp.hasPendingInterrupt());
     CHECK(mfp.acknowledgeInterrupt() == 0);
@@ -269,7 +269,7 @@ TEST_CASE("Software EOI でもサービス中より上位の割り込みは受�
     // 先に下位 (タイマ B) をサービス中にする。
     mfp.write(x68k::Mfp::kTbdr, 1);
     mfp.write(x68k::Mfp::kTbcr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerB) != 0);
 
@@ -293,7 +293,7 @@ TEST_CASE("グループ A のサービス中はグループ B を全て抑止す
 
     mfp.write(x68k::Mfp::kTbdr, 1);
     mfp.write(x68k::Mfp::kTbcr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
 
     // グループ B は A の最下位より下位なので受理されない。
@@ -345,11 +345,11 @@ TEST_CASE("Software EOI の優先度基準は最上位のサービス中ビッ�
     // 立てられないので、実際の受理経路を通す。
     mfp.write(x68k::Mfp::kTbdr, 1);
     mfp.write(x68k::Mfp::kTbcr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
     mfp.write(x68k::Mfp::kTadr, 1);
     mfp.write(x68k::Mfp::kTacr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK(mfp.acknowledgeInterrupt() != 0);
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerA) != 0);
     CHECK((mfp.peek(x68k::Mfp::kIsra) & x68k::Mfp::kIntTimerB) != 0);
@@ -431,7 +431,7 @@ TEST_CASE("割り込みの禁止は他のチャネルの保留を巻き込まな
     mfp.receiveKeyboardByte(0x41);
     mfp.write(x68k::Mfp::kTadr, 1);
     mfp.write(x68k::Mfp::kTacr, 0x01);
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
 
     // 受信だけ禁止する。タイマ A の保留は残るはず。
@@ -567,7 +567,7 @@ TEST_CASE("制御レジスタが 0 のタイマは止まったまま")
     mfp.write(x68k::Mfp::kTacr, 0x00);
     mfp.write(x68k::Mfp::kTadr, 1);
 
-    mfp.tick(100000);
+    mfp.tickFast<true>(100000);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) == 0);
 }
 
@@ -582,7 +582,7 @@ TEST_CASE("タイマ A がタイムアウトすると割り込みが上がる")
     mfp.write(x68k::Mfp::kTadr, 1);
     mfp.write(x68k::Mfp::kTacr, 0x01);
 
-    mfp.tick(64);
+    mfp.tickFast<true>(64);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
 }
 
@@ -598,7 +598,7 @@ TEST_CASE("タイマ C と D は TCDCR の別々のニブルで制御される")
 
     // 上位ニブルだけ設定 = タイマ C のみ動く。
     mfp.write(x68k::Mfp::kTcdcr, 0x10);
-    mfp.tick(64);
+    mfp.tickFast<true>(64);
 
     CHECK((mfp.peek(x68k::Mfp::kIprb) & x68k::Mfp::kIntTimerC) != 0);
     CHECK((mfp.peek(x68k::Mfp::kIprb) & x68k::Mfp::kIntTimerD) == 0);
@@ -666,7 +666,7 @@ TEST_CASE("動作中にデータレジスタへ書いても現在の周期は変
     mfp.write(x68k::Mfp::kTacr, 0x01);
 
     // 1 カウントぶん進める。CPU サイクルは MFP サイクルの 2 倍で数える。
-    mfp.tick(4 * 2);
+    mfp.tickFast<true>(4 * 2);
     // read はライブカウンタを返す。peek は生のレジスタ (次のリロード値) を
     // 返すテスト用の窓口なので、ここでは read を使う。
     const x68k::u8 afterOneCount = mfp.read(x68k::Mfp::kTadr);
@@ -677,7 +677,7 @@ TEST_CASE("動作中にデータレジスタへ書いても現在の周期は変
     CHECK(mfp.read(x68k::Mfp::kTadr) == 3);
 
     // 残り 3 カウントで最初のタイムアウト。書いた 200 ではない。
-    mfp.tick(4 * 2 * 3);
+    mfp.tickFast<true>(4 * 2 * 3);
     CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) != 0);
 
     // リロードされた値は書いた 200。
@@ -717,7 +717,7 @@ TEST_CASE("TAI/TBI を要するモードのタイマは経過サイクルで進�
         mfp.write(x68k::Mfp::kTacr, control);
 
         // 最大の分周比 (200) で 4 カウントぶん回しても足りるだけ進める。
-        mfp.tick(200 * 2 * 8);
+        mfp.tickFast<true>(200 * 2 * 8);
 
         CHECK(mfp.read(x68k::Mfp::kTadr) == 4);
         CHECK((mfp.peek(x68k::Mfp::kIpra) & x68k::Mfp::kIntTimerA) == 0);
@@ -738,18 +738,18 @@ TEST_CASE("停止するとプリスケーラの端数は捨てられる")
     mfp.write(x68k::Mfp::kTacr, 0x01);  // 4 分周
 
     // 1 カウントに満たない端数だけ進める。
-    mfp.tick(3 * 2);
+    mfp.tickFast<true>(3 * 2);
     CHECK(mfp.read(x68k::Mfp::kTadr) == 10);
 
     // 停止して再開する。端数が残っていれば 1 MFP サイクルで減ってしまう。
     mfp.write(x68k::Mfp::kTacr, 0x00);
     mfp.write(x68k::Mfp::kTacr, 0x01);
 
-    mfp.tick(3 * 2);
+    mfp.tickFast<true>(3 * 2);
     CHECK(mfp.read(x68k::Mfp::kTadr) == 10);
 
     // 4 サイクル目でようやく減る。
-    mfp.tick(1 * 2);
+    mfp.tickFast<true>(1 * 2);
     CHECK(mfp.read(x68k::Mfp::kTadr) == 9);
 }
 
@@ -789,14 +789,14 @@ TEST_CASE("TCDCR はタイマ C と D のプリスケーラを別々に捨てる
         mfp.write(x68k::Mfp::kTcdcr, 0x11);
 
         // 両方を 1 カウントに満たない端数だけ進める。
-        mfp.tick(3 * 2);
+        mfp.tickFast<true>(3 * 2);
 
         // 片方だけ止めて再開する。もう片方は動かしたまま。
         mfp.write(x68k::Mfp::kTcdcr, c.stopped);
         mfp.write(x68k::Mfp::kTcdcr, 0x11);
 
         // 1 サイクル進めると、端数が残っている側は減り、捨てられた側は残る。
-        mfp.tick(1 * 2);
+        mfp.tickFast<true>(1 * 2);
         CHECK(mfp.read(c.clearedReg) == 10);
         CHECK(mfp.read(c.keptReg) == 9);
     }

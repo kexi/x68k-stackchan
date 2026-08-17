@@ -73,8 +73,10 @@ public:
     // へ戻る。実機で焼き直さずに効果を測るための口 (perf_switch.h)。
     // テンプレートにしてあるのは、有効側の生成コードをスイッチ導入前と
     // 同一に保つため。bool の引数だと毎命令フラグを読んで分岐する。
-    template <bool FastPath = true>
-    bool tick(u32 cycles)
+    // 渡し忘れをコンパイルエラーにするため、既定引数は付けない
+    // (rtc.h の tickFast に理由がある)。
+    template <bool FastPath>
+    bool tickFast(u32 cycles)
     {
         const bool needsSlowPath = !FastPath || cycles >= kCyclesPerFrame;
         if (needsSlowPath)

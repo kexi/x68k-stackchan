@@ -66,10 +66,10 @@ TEST_CASE("時間が進むと秒が繰り上がる")
     rtc.setDateTime(26, 1, 1, 0, 0, 0);
 
     // X68000 の CPU は 10MHz。1 秒ぶん進める。
-    rtc.tick(10000000);
+    rtc.tickFast<true>(10000000);
     CHECK(rtc.read(x68k::Rtc::kSecond1) == 1);
 
-    rtc.tick(10000000 * 59);
+    rtc.tickFast<true>(10000000 * 59);
     CHECK(rtc.read(x68k::Rtc::kSecond1) == 0);
     CHECK(rtc.read(x68k::Rtc::kSecond10) == 0);
     CHECK(rtc.read(x68k::Rtc::kMinute1) == 1);
@@ -81,7 +81,7 @@ TEST_CASE("月末で日が繰り上がる")
     rtc.reset();
     // 1 月 31 日 23:59:59 の 1 秒後は 2 月 1 日。
     rtc.setDateTime(26, 1, 31, 23, 59, 59);
-    rtc.tick(10000000);
+    rtc.tickFast<true>(10000000);
 
     CHECK(rtc.read(x68k::Rtc::kMonth1) == 2);
     CHECK(rtc.read(x68k::Rtc::kDay10) == 0);
@@ -94,7 +94,7 @@ TEST_CASE("うるう年の 2 月は 29 日まである")
     rtc.reset();
     // 2024 年 (下 2 桁 24) はうるう年。2 月 28 日の翌日は 29 日。
     rtc.setDateTime(24, 2, 28, 23, 59, 59);
-    rtc.tick(10000000);
+    rtc.tickFast<true>(10000000);
     CHECK(rtc.read(x68k::Rtc::kMonth1) == 2);
     CHECK(rtc.read(x68k::Rtc::kDay10) == 2);
     CHECK(rtc.read(x68k::Rtc::kDay1) == 9);
@@ -103,7 +103,7 @@ TEST_CASE("うるう年の 2 月は 29 日まである")
     x68k::Rtc rtc2;
     rtc2.reset();
     rtc2.setDateTime(26, 2, 28, 23, 59, 59);
-    rtc2.tick(10000000);
+    rtc2.tickFast<true>(10000000);
     CHECK(rtc2.read(x68k::Rtc::kMonth1) == 3);
     CHECK(rtc2.read(x68k::Rtc::kDay1) == 1);
 }
@@ -113,7 +113,7 @@ TEST_CASE("年末で年が繰り上がる")
     x68k::Rtc rtc;
     rtc.reset();
     rtc.setDateTime(26, 12, 31, 23, 59, 59);
-    rtc.tick(10000000);
+    rtc.tickFast<true>(10000000);
 
     CHECK(rtc.read(x68k::Rtc::kYear10) == 2);
     CHECK(rtc.read(x68k::Rtc::kYear1) == 7);

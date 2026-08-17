@@ -40,8 +40,8 @@ std::pair<x68k::u32, x68k::u32> compareGranularity(Setup setup, Changed changed,
     // 一致しても意味が無い (実際、位相 0 では差が出ずに見逃した)。
     if (warmup != 0)
     {
-        fine.tick(warmup);
-        coarse.tick(warmup);
+        fine.template tickFast<true>(warmup);
+        coarse.template tickFast<true>(warmup);
     }
 
     x68k::u32 fineAt = 0;
@@ -49,7 +49,7 @@ std::pair<x68k::u32, x68k::u32> compareGranularity(Setup setup, Changed changed,
     x68k::u32 pending = 0;
     for (x68k::u32 cyc = fineStep; cyc <= limit; cyc += fineStep)
     {
-        fine.tick(fineStep);
+        fine.template tickFast<true>(fineStep);
         if (fineAt == 0 && changed(fine))
         {
             fineAt = cyc;
@@ -58,7 +58,7 @@ std::pair<x68k::u32, x68k::u32> compareGranularity(Setup setup, Changed changed,
         pending += fineStep;
         if (pending >= coarseStep)
         {
-            coarse.tick(pending);
+            coarse.template tickFast<true>(pending);
             pending = 0;
         }
         if (coarseAt == 0 && changed(coarse))
@@ -215,7 +215,7 @@ TEST_SUITE("device-timing")
 
         // 分周器を半分 (2 MFP サイクル = 4 CPU サイクル) 進めておく。
         // ここが要点で、位相 0 だと quantum があっても差が出ない。
-        m.mfp().tick(4);
+        m.mfp().tickFast<true>(4);
 
         const x68k::u32 sspBefore = m.cpu().state().a[7];
 
@@ -248,12 +248,19 @@ TEST_SUITE("device-timing")
         // Machine::tickDevices() がスイッチを取り違えていても、あるいは
         // 片方のデバイスへ渡し忘れていても通ってしまう。実機が通るのは
         // run() 経路なので、配線ごと確かめる。
-        static std::vector<x68k::u8> ram(0x10000, 0);
+        // MemoryMap::mainRam は常に kMainRamSize (2MB) として読まれる。
+        // 短いバッファを渡すと、PC が伸びた先で確保範囲外を読む。
+        // 1050 万サイクル回すので、ここは実寸で用意する。
+        static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
         const auto poke16 = [](x68k::u32 addr, x68k::u16 v)
         {
             ram[addr] = static_cast<x68k::u8>(v >> 8);
             ram[addr + 1] = static_cast<x68k::u8>(v & 0xFF);
         };
+
+        // NOP を並べる範囲。末尾から先頭へ戻して PC を循環させる。
+        constexpr x68k::u32 kCodeBegin = 0x400;
+        constexpr x68k::u32 kCodeEnd = 0x8000;
 
         const auto runWith = [&](bool fastPath)
         {
@@ -261,13 +268,17 @@ TEST_SUITE("device-timing")
             poke16(0, 0x0000);
             poke16(2, 0x8000);  // SSP
             poke16(4, 0x0000);
-            poke16(6, 0x0400);  // PC = $400
-            // RAM 全体を NOP で埋める。1000 万サイクル回すので $8000 まで
-            // では足りず、PC が伸び続けても命令が尽きないようにする。
-            for (x68k::u32 a = 0x400; a < 0x10000; a += 2)
+            poke16(6, kCodeBegin);  // PC
+            for (x68k::u32 a = kCodeBegin; a < kCodeEnd; a += 2)
             {
                 poke16(a, 0x4E71);  // NOP (4 サイクル)
             }
+            // 末尾は BRA で先頭へ戻す。$6000 が BRA.w で、次のワードが
+            // 「BRA の置き場所 + 2」からの変位。PC が範囲外へ出ないので、
+            // どれだけ長く回しても NOP の海の中に居続ける。
+            const x68k::u32 braAt = kCodeEnd - 4;
+            poke16(braAt, 0x6000);
+            poke16(braAt + 2, static_cast<x68k::u16>(kCodeBegin - (braAt + 2)));
 
             x68k::Machine m;
             x68k::MemoryMap map{};
@@ -321,11 +332,20 @@ TEST_SUITE("device-timing")
         const std::vector<x68k::u32> slow = runWith(false);
         CHECK(fast == slow);
 
-        // 素通りのテストになっていないこと。全部 0 同士の一致では
-        // 何も守れないので、実際に動いた証拠を個別に確かめる。
+        // 素通りのテストになっていないこと。全部 0 同士の一致では何も
+        // 守れないので、3 つのデバイスが**それぞれ**動いた証拠を確かめる。
+        //
+        // ここを 1 つでも省くと、そのデバイスへ FastPath を渡し忘れる
+        // 配線ミスを見逃す (両側とも既定の経路を通って一致してしまう)。
         REQUIRE(fast.size() == 8);
-        CHECK(fast[2] != 0);  // タイマの割り込みが保留になっている
-        // RTC が 1 秒ぶん進んでいる (reset 直後は 0 秒)。
+
+        // MFP: タイマの割り込みが保留になっている。
+        CHECK(fast[2] != 0);
+
+        // CRTC: ラスタ番号が動いている。reset 直後は 0。
+        CHECK(fast[4] != 0);
+
+        // RTC: 1 秒ぶん進んでいる。reset 直後は 0 秒。
         const x68k::u32 seconds = fast[6] * 10 + fast[5];
         CHECK(seconds >= 1);
     }

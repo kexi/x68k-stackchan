@@ -458,12 +458,12 @@ TEST_CASE("ラスタ番号がフレームの範囲を出ない")
     crtc.reset();
 
     // 1 フレームを大きく超える値を一度に渡す。
-    (void)crtc.tick(x68k::Crtc::kCyclesPerFrame * 3 + 12345);
+    (void)crtc.tickFast<true>(x68k::Crtc::kCyclesPerFrame * 3 + 12345);
     CHECK(crtc.rasterNumber() < kRasterCount);
 
     // フレーム境界のちょうど手前も確かめる。端数が最終ラスタへ
     // 集中していると、ここで 568 が返る。
     crtc.reset();
-    (void)crtc.tick(x68k::Crtc::kCyclesPerFrame - 1);
+    (void)crtc.tickFast<true>(x68k::Crtc::kCyclesPerFrame - 1);
     CHECK(crtc.rasterNumber() < kRasterCount);
 }
