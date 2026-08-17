@@ -417,6 +417,43 @@ std::atomic<bool> g_redrawRequested{false};
     ESP_LOGI(kTag, "[native] 呼び出し 1 回 %.1f ns (%.1f CPU サイクル) sink=%d", nsPerCall,
              nsPerCall * 0.24, sink);
     ESP_LOGI(kTag, "[native] 参考: インタプリタは 1 ゲスト命令 約 85 CPU サイクル");
+
+    // ここまでは windowed ABI (entry / retw.n / callx8) の値。
+    //
+    // **床が呼び出しそのもののコストなのか、レジスタウィンドウの
+    // 回転コストなのかを切り分ける。** JIT が出すコードは call0 ABI を
+    // 選べるので、ウィンドウ回転が主因なら床は下がる。
+    //
+    //   ret.n  = 0xF00D
+    // entry も retw も使わない。call0 は戻り番地を a0 に置くだけなので、
+    // 何もしない関数は ret.n 1 命令で足りる。
+    word[0] = 0x0000F00Du;
+    asm volatile("isync" ::: "memory");
+
+    const std::int64_t t2 = esp_timer_get_time();
+    // callx0 は a0 を壊す。clobber に入れて退避を任せる。
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("callx0 %0" ::"r"(code) : "a0", "memory");
+    }
+    const std::int64_t t3 = esp_timer_get_time();
+    const double ns0 = (double)(t3 - t2) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] call0 呼び出し 1 回 %.1f ns (%.1f CPU サイクル)", ns0, ns0 * 0.24);
+
+    // **空ループそのもののコストを引く。** 上の 2 つは「ループ 1 周 +
+    // 呼び出し 1 回」を測っている。呼び出しの実費を知るには、同じ形の
+    // ループで呼び出しだけ抜いた値が要る。
+    const std::int64_t t4 = esp_timer_get_time();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+    }
+    const std::int64_t t5 = esp_timer_get_time();
+    const double nsLoop = (double)(t5 - t4) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] 空ループ 1 周 %.1f ns (%.1f CPU サイクル)", nsLoop, nsLoop * 0.24);
+    ESP_LOGI(kTag, "[native] → 呼び出しの実費: windowed %.1f / call0 %.1f CPU サイクル",
+             (nsPerCall - nsLoop) * 0.24, (ns0 - nsLoop) * 0.24);
+
     heap_caps_free(code);
 }
 
