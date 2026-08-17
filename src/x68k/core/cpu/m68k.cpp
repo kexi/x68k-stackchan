@@ -5,6 +5,10 @@
 
 #include "m68k.h"
 
+#if X68K_COUNT_JIT_COVERAGE
+#include "m68k_length.h"
+#endif
+
 #if X68K_COUNT_FETCH_ORIGIN
 // 段 0 の計測用。恒久的な機能ではない。
 constexpr unsigned kBlockHistSize = 65536;
@@ -14,6 +18,23 @@ unsigned long g_refillFromRam = 0;
 // (完全な集計ではなく集中度の目安。衝突は集中度を過大評価する側に働くので、
 // 「集中していない」と出たらその結論は信用できる)。
 unsigned long g_blockHits[kBlockHistSize];
+#endif
+
+#if X68K_COUNT_JIT_COVERAGE
+// JIT の被覆率 h の計測用。恒久的な機能ではない。
+//
+// h = 「翻訳できた命令 / 実行した命令」。JIT が 10000 kHz に届くかは
+// Chit だけでなく h で決まる (Cavg = h*Chit + (1-h)*(85+Cmiss))。
+unsigned long g_jitTotal = 0;
+unsigned long g_jitDecodable = 0;
+// 命令語の上位 4bit ごとの内訳。届かない場合に「次に何を足すべきか」が判る。
+unsigned long g_jitByGroup[16] = {};
+unsigned long g_jitDecodableByGroup[16] = {};
+// 連続して翻訳できた長さの分布。呼び出しコスト 6.7 サイクルを
+// 何命令で償却できるかが決まる。
+constexpr unsigned kRunHistSize = 33;
+unsigned long g_jitRunLen[kRunHistSize] = {};
+unsigned long g_jitCurrentRun = 0;
 #endif
 
 namespace x68k
@@ -643,6 +664,35 @@ u32 M68k::unimplemented(u16 op)
     return 0;
 }
 
+#if X68K_COUNT_JIT_COVERAGE
+// 実行された命令が instructionLength で翻訳できるかを数える。
+//
+// **実行の直前に呼ぶ。** 静的な出現頻度ではなく動的な実行頻度が要る
+// (ループの中の 1 命令は 1 回しか現れないが何万回も実行される)。
+void M68k::countJitCoverage(u16 op)
+{
+    const unsigned group = static_cast<unsigned>(op >> 12);
+    ++g_jitTotal;
+    ++g_jitByGroup[group];
+    const bool decodable = instructionLength(op) != kUnknownLength;
+    if (decodable)
+    {
+        ++g_jitDecodable;
+        ++g_jitDecodableByGroup[group];
+        ++g_jitCurrentRun;
+        return;
+    }
+    // 翻訳できない命令に当たった時点で連続は途切れる。
+    if (g_jitCurrentRun != 0)
+    {
+        const unsigned long capped =
+            g_jitCurrentRun < kRunHistSize ? g_jitCurrentRun : kRunHistSize - 1;
+        ++g_jitRunLen[capped];
+        g_jitCurrentRun = 0;
+    }
+}
+#endif
+
 u32 M68k::step()
 {
     if (st_.halted)
@@ -702,6 +752,14 @@ u32 M68k::step()
     }
 
     const u16 op = fetch();
+#if X68K_COUNT_JIT_COVERAGE
+    // JIT の被覆率 h を実ワークロードで測る。**恒久的な機能ではない。**
+    //
+    // 「上位 50 ブロックが 96.6%」はブロック入口の頻度であって、
+    // 翻訳できる命令の率ではない。JIT が成立するかは後者で決まるので、
+    // 実際に実行された命令を instructionLength に通して数える。
+    countJitCoverage(op);
+#endif
     // Why not 実行サイクルを累計しないか: st_.cycles は書くだけで、
     // src/ test/ host/ main/ のどこからも読まれていなかった (git grep で確認)。
     // 32bit の Xtensa では u64 の加算がキャリー合成を伴うので、**毎命令**

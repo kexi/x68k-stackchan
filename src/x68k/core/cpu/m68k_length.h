@@ -48,10 +48,26 @@ namespace x68k
 {
 
 // 命令長が分からないことを表す。
+//
+// 命令長として 0 は起こりえない (最短の命令が 2 バイト) ので、
+// 命令長の番兵としては 0 で構わない。
 inline constexpr u32 kUnknownLength = 0;
 
+// 拡張ワード数が分からないことを表す。
+//
+// **命令長の番兵と分けてある。** 拡張ワード数は 0 が正当な値
+// (Dn や (An) は拡張ワードを持たない) なので、kUnknownLength と
+// 同じ 0 を使うと「拡張ワード無し」と「不明」を区別できない。
+//
+// 区別できなかったとき何が起きたか: レジスタ間 MOVE (MOVE.w D0,D1 など)
+// が軒並み「翻訳できない」と判定され、実ワークロードでの MOVE の
+// 翻訳率が 10.3% しかなかった。ブロックが 1〜2 命令で途切れる原因が
+// これで、デコーダ自体は正しいのに「ブロックは効かない」と誤って
+// 結論していた。
+inline constexpr u32 kUnknownExtensionWords = 0xFFFFFFFFu;
+
 // 実効アドレスが消費する拡張ワード数。size は 1/2/4 バイト。
-// 使えないモードの組み合わせには kUnknownLength を返す。
+// 使えないモードの組み合わせには kUnknownExtensionWords を返す。
 inline u32 eaExtensionWords(u32 mode, u32 reg, u32 size)
 {
     switch (mode)
@@ -78,10 +94,10 @@ inline u32 eaExtensionWords(u32 mode, u32 reg, u32 size)
                 case 4:  // #immediate
                     return size == 4 ? 2u : 1u;
                 default:
-                    return kUnknownLength;
+                    return kUnknownExtensionWords;
             }
         default:
-            return kUnknownLength;
+            return kUnknownExtensionWords;
     }
 }
 
@@ -114,15 +130,15 @@ inline u32 instructionLength(u16 op)
                 return kUnknownLength;
             }
             const u32 dstWords = eaExtensionWords(dstMode, dstReg, size);
-            if (srcWords == kUnknownLength && !(mode == 7 && reg > 4))
+            const bool srcUnknown = srcWords == kUnknownExtensionWords;
+            const bool dstUnknown = dstWords == kUnknownExtensionWords;
+            if (srcUnknown || dstUnknown)
             {
                 return kUnknownLength;
             }
-            if (dstWords == kUnknownLength && !(dstMode == 7 && dstReg > 4))
-            {
-                return kUnknownLength;
-            }
-            if ((mode == 7 && reg > 4) || (dstMode == 7 && dstReg > 4))
+            // 転送先に PC 相対 (mode 7 reg 2/3) は来ない。来たら不正命令。
+            const bool dstIsPcRelative = dstMode == 7 && (dstReg == 2 || dstReg == 3);
+            if (dstIsPcRelative)
             {
                 return kUnknownLength;
             }

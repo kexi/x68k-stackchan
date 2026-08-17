@@ -1513,4 +1513,85 @@ TEST_SUITE("イベント駆動")
         // 素通りしていないこと。対象の命令が実際に検査されている。
         CHECK(checked > 3000);
     }
+
+    // 対象グループの命令を「分からない」と取りこぼしていない。
+    //
+    // **上のテストだけでは不十分だった。** 上は「翻訳できると判定した
+    // 命令が正しいか」しか見ておらず、`kUnknownLength` を返した命令は
+    // `continue` で飛ばしている。そのため**取りこぼし (偽陰性) が
+    // 素通りする**。
+    //
+    // 実際に素通りした: 拡張ワード数の番兵が命令長の番兵と同じ 0 だった
+    // ため、拡張ワードを持たない実効アドレス (Dn, (An) など) が「不明」と
+    // 誤判定され、レジスタ間 MOVE が軒並み落ちていた。上のテストは
+    // 3268/3268 一致で通り続けていたが、実ワークロードでの MOVE の
+    // 翻訳率は 10.3% しかなかった。
+    //
+    // 取りこぼしはブロックを短くするだけで正しさは壊さないので、
+    // **速度としてしか現れない**。だから明示的に数える。
+    TEST_CASE("命令長デコーダが対象グループを取りこぼさない")
+    {
+        // 転送先が即値・PC 相対の MOVE は不正命令なので、落として当然。
+        const auto isInvalidMoveDestination = [](x68k::u16 op)
+        {
+            const x68k::u32 dstMode = static_cast<x68k::u32>((op >> 6) & 7u);
+            const x68k::u32 dstReg = static_cast<x68k::u32>((op >> 9) & 7u);
+            return dstMode == 7 && dstReg >= 2;
+        };
+        // 転送元 mode 7 の reg 5-7 は 68000 に無い。
+        const auto isInvalidSource = [](x68k::u16 op)
+        {
+            const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
+            const x68k::u32 reg = static_cast<x68k::u32>(op & 7u);
+            return mode == 7 && reg > 4;
+        };
+
+        std::size_t moveTotal = 0;
+        std::size_t moveDecodable = 0;
+        for (x68k::u32 opv = 0x1000; opv < 0x4000; ++opv)
+        {
+            const auto op = static_cast<x68k::u16>(opv);
+            if (isInvalidMoveDestination(op) || isInvalidSource(op))
+            {
+                continue;
+            }
+            // MOVE.b で転送元が An (mode 1) は不正。
+            const bool isByteMoveFromAddressRegister = (op >> 12) == 0x1 && ((op >> 3) & 7u) == 1;
+            if (isByteMoveFromAddressRegister)
+            {
+                continue;
+            }
+            ++moveTotal;
+            if (x68k::instructionLength(op) != x68k::kUnknownLength)
+            {
+                ++moveDecodable;
+            }
+        }
+        CAPTURE(moveTotal);
+        CAPTURE(moveDecodable);
+        // 正当な MOVE はすべて翻訳できること。
+        CHECK(moveDecodable == moveTotal);
+
+        // MOVEQ (bit8 が 0) はすべて翻訳できること。
+        std::size_t moveqDecodable = 0;
+        for (x68k::u32 opv = 0x7000; opv < 0x8000; ++opv)
+        {
+            const auto op = static_cast<x68k::u16>(opv);
+            if ((op & 0x0100u) != 0)
+            {
+                continue;
+            }
+            if (x68k::instructionLength(op) != x68k::kUnknownLength)
+            {
+                ++moveqDecodable;
+            }
+        }
+        CHECK(moveqDecodable == 2048);
+
+        // 拡張ワード数の番兵と命令長の番兵が別物であること。
+        // ここが同じだと上の偽陰性が再発する。
+        CHECK(x68k::kUnknownExtensionWords != x68k::kUnknownLength);
+        CHECK(x68k::eaExtensionWords(0, 0, 2) == 0);  // Dn は拡張ワード無し
+        CHECK(x68k::eaExtensionWords(7, 5, 2) == x68k::kUnknownExtensionWords);
+    }
 }

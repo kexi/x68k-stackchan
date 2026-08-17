@@ -22,6 +22,13 @@
 #include "gui_demo.h"
 #include "machine.h"
 
+#if X68K_COUNT_JIT_COVERAGE
+extern unsigned long g_jitTotal;
+extern unsigned long g_jitDecodable;
+extern unsigned long g_jitByGroup[16];
+extern unsigned long g_jitDecodableByGroup[16];
+extern unsigned long g_jitRunLen[33];
+#endif
 #if X68K_COUNT_FETCH_ORIGIN
 extern unsigned long g_refillFromRom;
 extern unsigned long g_refillFromRam;
@@ -1191,6 +1198,43 @@ int main(int argc, char** argv)
             machine.mfp().peek(x68k::Mfp::kTcdcr), machine.mfp().peek(x68k::Mfp::kTadr),
             machine.mfp().peek(x68k::Mfp::kTbdr), machine.mfp().peek(x68k::Mfp::kTcdr),
             machine.mfp().peek(x68k::Mfp::kTddr));
+#if X68K_COUNT_JIT_COVERAGE
+        // JIT の被覆率 h。10000 kHz に届くかは Chit だけでなく h で決まる。
+        {
+            const double h = g_jitTotal != 0 ? (double)g_jitDecodable / (double)g_jitTotal : 0.0;
+            std::printf("[jit] 実行 %lu 命令 / 翻訳可 %lu = h %.1f%%\n", g_jitTotal, g_jitDecodable,
+                        h * 100.0);
+            std::printf("[jit] グループ別 (実行数 / うち翻訳可):\n");
+            for (int g = 0; g < 16; ++g)
+            {
+                if (g_jitByGroup[g] == 0)
+                {
+                    continue;
+                }
+                std::printf("      $%X: %10lu / %10lu (%5.1f%%) 全体の %.1f%%\n", g,
+                            g_jitByGroup[g], g_jitDecodableByGroup[g],
+                            100.0 * (double)g_jitDecodableByGroup[g] / (double)g_jitByGroup[g],
+                            100.0 * (double)g_jitByGroup[g] / (double)g_jitTotal);
+            }
+            // 連続長: 呼び出しコスト 6.7 サイクルを何命令で償却できるか。
+            unsigned long runs = 0;
+            unsigned long instrs = 0;
+            for (unsigned i = 1; i < 33; ++i)
+            {
+                runs += g_jitRunLen[i];
+                instrs += g_jitRunLen[i] * i;
+            }
+            std::printf("[jit] 連続 %lu 本 / 計 %lu 命令 = 平均 %.2f 命令\n", runs, instrs,
+                        runs != 0 ? (double)instrs / (double)runs : 0.0);
+            for (unsigned i = 1; i < 33; ++i)
+            {
+                if (g_jitRunLen[i] != 0)
+                {
+                    std::printf("      長さ %2u: %lu 本\n", i, g_jitRunLen[i]);
+                }
+            }
+        }
+#endif
 #if X68K_COUNT_FETCH_ORIGIN
         // 段 0: ブロックキャッシュを ROM 窓に限れるかを決めるための計測。
         // 「IPL-ROM 79%」は起動中の値で、Human68k 稼働中は未計測だった。

@@ -67,6 +67,11 @@ public:
     // halted または stopped の場合は何もせず 0 を返す。
     X68K_HOT_PATH u32 step();
 
+#if X68K_COUNT_JIT_COVERAGE
+    // JIT の被覆率を数える (計測用。恒久的な機能ではない)。
+    static void countJitCoverage(u16 op);
+#endif
+
     // 割り込みを要求する。level は 1-7 (7 はマスク不可)。
     // 実際に受け付けられるかは SR の割り込みマスクによる。
     //
