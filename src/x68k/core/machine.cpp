@@ -429,6 +429,7 @@ void Machine::settle()
 template <bool FastMfp, bool FastRtc, bool FastCrtc>
 bool Machine::reachSlow()
 {
+    sched_.countReach();
     settle<FastMfp, FastRtc, FastCrtc>();
 
     // 割り込みを配送する。配送できない保留が残ったら、期限を張らずに

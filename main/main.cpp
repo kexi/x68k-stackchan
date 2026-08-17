@@ -147,10 +147,14 @@ std::atomic<bool> g_eventDrivenEnabled{false};
 std::atomic<bool> g_nullExecProbe{false};
 std::atomic<int> g_nullExecStage{0};
 
-#if X68K_MEASURE_DISK
 // スライスの実時間の内訳を測る。恒久的な機能ではない。
+//
+// 実効クロックからの逆算は「1 スライスあたり何回それが起きるか」の仮定に
+// 依存する。その仮定が外れて誤診したことがあるので (SD が原因と読み違えた)、
+// 直接測れる形を常設にしておく。
 std::int64_t g_runUs = 0;
 std::uint32_t g_runCount = 0;
+#if X68K_MEASURE_DISK
 std::int64_t g_renderUs = 0;
 std::uint32_t g_renderCount = 0;
 #endif
@@ -728,9 +732,7 @@ void emulatorTask(void* /*arg*/)
         {
             // JIT の上限計測モードでは命令を実行せず、ループ運営と
             // デバイスの時間だけを回す (jit_probe.h)。
-#if X68K_MEASURE_DISK
             const std::int64_t runT0 = esp_timer_get_time();
-#endif
             if (g_nullExecProbe.load(std::memory_order_relaxed))
             {
                 g_machine.runNullExec(sliceCycles);
@@ -739,10 +741,8 @@ void emulatorTask(void* /*arg*/)
             {
                 g_machine.run(sliceCycles);
             }
-#if X68K_MEASURE_DISK
             g_runUs += esp_timer_get_time() - runT0;
             ++g_runCount;
-#endif
             totalCycles += sliceCycles;
         }
 
@@ -888,6 +888,23 @@ void emulatorTask(void* /*arg*/)
                          seekUs, reqs);
             }
 #endif
+            // イベント駆動が実際にどれだけ飛べているか。
+            // 実効クロックだけでは縮退している区間が見えない。
+            {
+                const std::int64_t runUs = g_runUs;
+                const std::uint32_t runs = g_runCount;
+                g_runUs = 0;
+                g_runCount = 0;
+                ESP_LOGI(kTag, "[slice] run=%lldus n=%u (5 秒 = 5000000us)", runUs, runs);
+            }
+            {
+                const auto& st = g_machine.schedulerStats();
+                const unsigned long long far = st.armedFar;
+                const unsigned long long avg = far != 0 ? st.spanSum / far : 0;
+                ESP_LOGI(kTag, "[sched] 遅い側=%llu 期限=%llu(平均%llucyc) 近すぎ=%llu 保留=%llu",
+                         st.reaches, far, avg, st.armedNear, st.heldPending);
+                g_machine.resetSchedulerStats();
+            }
             ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
                      static_cast<unsigned long long>(totalCycles), khz);
             lastReportMs = now;

@@ -145,6 +145,16 @@ public:
         perf_ = value;
     }
 
+    // スケジューラの統計 (scheduler.h の Stats)。恒久的な機能ではない。
+    [[nodiscard]] const Scheduler::Stats& schedulerStats() const
+    {
+        return sched_.stats();
+    }
+    void resetSchedulerStats()
+    {
+        sched_.resetStats();
+    }
+
     [[nodiscard]] const PerfSwitch& perfSwitch() const
     {
         return perf_;

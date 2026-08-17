@@ -148,6 +148,38 @@ public:
         return degraded_;
     }
 
+    // 遅い側へ落ちた回数と、その理由の内訳。**恒久的な機能ではない。**
+    //
+    // イベント駆動が期待どおり飛ばせているかは、実効クロックだけでは
+    // 分からない。「1 回の期限で平均何サイクル飛べたか」が見えないと、
+    // 縮退している区間を潰す作業が推測になる。
+    //
+    // 数えるのは遅い側だけ。ホットパスには 1 命令も足さない。
+    struct Stats
+    {
+        std::uint64_t reaches = 0;      // 遅い側へ落ちた回数
+        std::uint64_t armedNear = 0;    // 期限が近すぎて縮退した回数
+        std::uint64_t armedFar = 0;     // 期限を張れた回数
+        std::uint64_t heldPending = 0;  // 保留中フォールバックで縮退した回数
+        std::uint64_t spanSum = 0;      // 張れた期限の合計 (平均を出す)
+    };
+
+    [[nodiscard]] const Stats& stats() const
+    {
+        return stats_;
+    }
+
+    void resetStats()
+    {
+        stats_ = Stats{};
+    }
+
+    // 遅い側へ落ちたことを数える。reachSlow の先頭から呼ぶ。
+    void countReach()
+    {
+        ++stats_.reaches;
+    }
+
     // スライスの開始。sliceEnd_ を絶対サイクルで固定する。
     void beginSlice(u32 cycles)
     {
@@ -241,10 +273,13 @@ public:
             degraded_ = true;
             deadlineAt_ = now_;
             debt_ = 0;
+            ++stats_.armedNear;
             return;
         }
         degraded_ = false;
         deadlineAt_ = limit;
+        ++stats_.armedFar;
+        stats_.spanSum += delta;
         debt_ = -static_cast<std::int32_t>(delta);
     }
 
@@ -257,6 +292,7 @@ public:
     // wake の網羅性から切り離す唯一の仕組みになっている。
     void holdForPendingInterrupt()
     {
+        ++stats_.heldPending;
         degraded_ = true;
         deadlineAt_ = now_;
         debt_ = 0;
@@ -333,6 +369,7 @@ private:
     std::uint64_t sliceBegin_ = 0;
     // 縮退中 (期限が近すぎるか、保留中の割り込みがある)。
     bool degraded_ = true;
+    Stats stats_{};
 };
 
 inline Rearm::~Rearm()
