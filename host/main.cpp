@@ -1094,6 +1094,18 @@ int main(int argc, char** argv)
             }
             std::printf("[tvram] plane%u: %zu バイト 最初の行 %zu\n", plane, count, firstLine);
         }
+        // タイマの設定も出す。イベント駆動の設計は「次に状態が変わるまで
+        // 何サイクルあるか」で決まるので、ゲストがどの分周でタイマを
+        // 回しているかがそのまま効果を左右する
+        // (docs/knowledge/event-driven-devices.md)。
+        std::printf(
+            "[mfp] TACR=%02X TBCR=%02X TCDCR=%02X TADR=%02X TBDR=%02X TCDR=%02X TDDR=%02X\n",
+            machine.mfp().peek(x68k::Mfp::kTacr), machine.mfp().peek(x68k::Mfp::kTbcr),
+            machine.mfp().peek(x68k::Mfp::kTcdcr), machine.mfp().peek(x68k::Mfp::kTadr),
+            machine.mfp().peek(x68k::Mfp::kTbdr), machine.mfp().peek(x68k::Mfp::kTcdr),
+            machine.mfp().peek(x68k::Mfp::kTddr));
+        std::printf("[mfp] IERB=%02X IMRB=%02X IPRB=%02X\n", machine.mfp().peek(x68k::Mfp::kIerb),
+                    machine.mfp().peek(x68k::Mfp::kImrb), machine.mfp().peek(x68k::Mfp::kIprb));
         std::printf("[mfp] IERA=%02X IPRA=%02X IMRA=%02X RSR=%02X UDR=%02X SR=%04X\n",
                     machine.mfp().peek(0x03), machine.mfp().peek(0x05), machine.mfp().peek(0x09),
                     machine.mfp().peek(0x15), machine.mfp().peek(0x17), machine.cpu().state().sr);
