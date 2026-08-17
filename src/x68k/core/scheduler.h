@@ -162,6 +162,8 @@ public:
         std::uint64_t armedFar = 0;     // 期限を張れた回数
         std::uint64_t heldPending = 0;  // 保留中フォールバックで縮退した回数
         std::uint64_t spanSum = 0;      // 張れた期限の合計 (平均を出す)
+        std::uint64_t rearms = 0;       // レジスタ書き込み等で期限を引き直した回数
+        std::uint64_t wakes = 0;        // 外から期限を切られた回数 (pressKey 等)
     };
 
     [[nodiscard]] const Stats& stats() const
@@ -319,7 +321,11 @@ public:
     //
     void requestRearm()
     {
+        ++stats_.rearms;
         wake();
+        // wake() が数えた wakes を戻す。rearm と外部注入 (pressKey 等) は
+        // 起こる理由が違うので、混ぜると「どちらを削れば効くか」が見えない。
+        --stats_.wakes;
     }
 
     // 期限を今すぐ切る (wake)。次命令が必ず遅い側へ落ちる。
@@ -329,6 +335,7 @@ public:
     // 置けば、debt_ = 0 でも pending() の値は変わらない。
     void wake()
     {
+        ++stats_.wakes;
         // 先に unsettled_ を引き直す。
         //
         // Why これが要るか: unsettled_ を更新するのは syncUnsettled() だけで、

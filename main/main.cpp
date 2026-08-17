@@ -915,8 +915,12 @@ void emulatorTask(void* /*arg*/)
                 const auto& st = g_machine.schedulerStats();
                 const unsigned long long far = st.armedFar;
                 const unsigned long long avg = far != 0 ? st.spanSum / far : 0;
-                ESP_LOGI(kTag, "[sched] 遅い側=%llu 期限=%llu(平均%llucyc) 近すぎ=%llu 保留=%llu",
-                         st.reaches, far, avg, st.armedNear, st.heldPending);
+                ESP_LOGI(kTag,
+                         "[sched] 遅い側=%llu 期限=%llu(平均%llucyc) 近すぎ=%llu 保留=%llu "
+                         "rearm=%llu wake=%llu",
+                         st.reaches, far, avg, st.armedNear, st.heldPending,
+                         static_cast<unsigned long long>(st.rearms),
+                         static_cast<unsigned long long>(st.wakes));
                 g_machine.resetSchedulerStats();
             }
             ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
