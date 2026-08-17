@@ -1039,6 +1039,18 @@ private:
                      m.peek(x68k::Mfp::kTbdr), m.peek(x68k::Mfp::kTcdr), m.peek(x68k::Mfp::kTddr));
             ESP_LOGI(kTag, "MFP IERA=%02X IERB=%02X IMRA=%02X IMRB=%02X", m.peek(x68k::Mfp::kIera),
                      m.peek(x68k::Mfp::kIerb), m.peek(x68k::Mfp::kImra), m.peek(x68k::Mfp::kImrb));
+
+            // SRAM の起動デバイスと、CPU が今どこを走っているか。
+            //
+            // ホストで起動するイメージが実機で起動しないとき、SRAM の
+            // 設定 (SD に永続化される) と PC の居場所で切り分けられる。
+            const auto& sr = g_machine.sram();
+            ESP_LOGI(kTag, "SRAM 起動デバイス=%04X 画面モード=%02X マジック有効=%d",
+                     static_cast<unsigned>(sr.read16(x68k::Sram::kOffsetBootDevice)),
+                     sr.read8(x68k::Sram::kOffsetScreenMode),
+                     g_machine.sram().hasValidMagic() ? 1 : 0);
+            ESP_LOGI(kTag, "CPU PC=%08X SR=%04X halted=%d", g_machine.cpu().state().pc,
+                     g_machine.cpu().state().sr, g_machine.isHalted() ? 1 : 0);
             return;
         }
 
