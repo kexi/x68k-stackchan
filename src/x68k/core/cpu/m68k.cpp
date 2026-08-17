@@ -35,6 +35,9 @@ unsigned long g_jitDecodableByGroup[16] = {};
 constexpr unsigned kRunHistSize = 33;
 unsigned long g_jitRunLen[kRunHistSize] = {};
 unsigned long g_jitCurrentRun = 0;
+// $4 の内訳。h を伸ばすとき何から手を付けるかを実行頻度で決める。
+unsigned long g_group4[64] = {};
+unsigned long g_g4Named[12] = {};
 #endif
 
 namespace x68k
@@ -674,6 +677,62 @@ void M68k::countJitCoverage(u16 op)
     const unsigned group = static_cast<unsigned>(op >> 12);
     ++g_jitTotal;
     ++g_jitByGroup[group];
+    // 未対応グループの内訳。何を足せば h が伸びるかを実行頻度で決める。
+    if (group == 0x4)
+    {
+        // $4 は形が多い。上位ビットで代表的な命令に振り分ける。
+        //   4E75 RTS / 4E71 NOP / 4E4x TRAP / 4E5x LINK,UNLK / 4EBx JSR / 4ED0.. JMP
+        //   4Axx TST,TAS / 48xx MOVEM,PEA,SWAP,EXT / 41xx LEA / 40..44xx NEG,NOT,CLR
+        ++g_group4[(op >> 6) & 0x3Fu];
+        if ((op & 0xFFC0u) == 0x4E80u)
+        {
+            ++g_g4Named[0];
+        }  // JSR
+        else if ((op & 0xFFC0u) == 0x4EC0u)
+        {
+            ++g_g4Named[1];
+        }  // JMP
+        else if (op == 0x4E75u)
+        {
+            ++g_g4Named[2];
+        }  // RTS
+        else if (op == 0x4E71u)
+        {
+            ++g_g4Named[3];
+        }  // NOP
+        else if ((op & 0xF1C0u) == 0x41C0u)
+        {
+            ++g_g4Named[4];
+        }  // LEA
+        else if ((op & 0xFF00u) == 0x4A00u)
+        {
+            ++g_g4Named[5];
+        }  // TST/TAS
+        else if ((op & 0xFB80u) == 0x4880u)
+        {
+            ++g_g4Named[6];
+        }  // MOVEM
+        else if ((op & 0xFFC0u) == 0x4840u)
+        {
+            ++g_g4Named[7];
+        }  // PEA
+        else if ((op & 0xFF00u) == 0x4200u)
+        {
+            ++g_g4Named[8];
+        }  // CLR
+        else if ((op & 0xFFF8u) == 0x4E50u)
+        {
+            ++g_g4Named[9];
+        }  // LINK
+        else if ((op & 0xFFF8u) == 0x4E58u)
+        {
+            ++g_g4Named[10];
+        }  // UNLK
+        else
+        {
+            ++g_g4Named[11];
+        }  // その他
+    }
     const bool decodable = instructionLength(op) != kUnknownLength;
     if (decodable)
     {

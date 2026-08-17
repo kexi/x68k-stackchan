@@ -165,14 +165,139 @@ inline u32 instructionLength(u16 op)
             return 2;
         }
 
+        case 0x4:
+        {
+            // $4 は実行の 32.3% を占める最大のグループ。実行頻度で測った
+            // 内訳 (Human68k 稼働中、全体に対する割合):
+            //   RTS 8.4% / TST,TAS 6.5% / MOVEM 6.1% / CLR 3.9%
+            //   LEA 3.1% / JSR 2.4% / その他 1.9% / JMP,NOP,PEA,LINK ほぼ 0
+            //
+            // Why 形ごとに分けるか: $4 は「グループ」ではなく雑多な命令の
+            // 寄せ集めで、実効アドレスを持つものと持たないものが混在する。
+            // 上位ビットのパターンで振り分けるしかない。
+            // 判定の順序と マスクは m68k_ops_group4.cpp の実装に合わせてある
+            // (ずれると長さと実行が食い違う)。
+
+            // 拡張ワードを持たない固定長の命令。
+            const bool isRts = op == 0x4E75u;
+            const bool isNop = op == 0x4E71u;
+            const bool isRte = op == 0x4E73u;
+            const bool isRtr = op == 0x4E77u;
+            const bool isSwap = (op & 0xFFF8u) == 0x4840u;
+            const bool isUnlk = (op & 0xFFF8u) == 0x4E58u;
+            const bool isExt = (op & 0xFFB8u) == 0x4880u;
+            if (isRts || isNop || isRte || isRtr || isSwap || isUnlk || isExt)
+            {
+                return 2;
+            }
+
+            // LINK は 16bit の変位が続く。
+            const bool isLink = (op & 0xFFF8u) == 0x4E50u;
+            if (isLink)
+            {
+                return 4;
+            }
+
+            // MOVEM はレジスタマスクを 1 ワード読んでから実効アドレス。
+            //
+            // Why EXT より後に見るか: EXT.W ($4880-$4887) は MOVEM の
+            // マスク ($FB80) にも当たる。実装側も mode != 0 で切り分けて
+            // いるので、同じ順序にする (逆にすると EXT を MOVEM と誤り、
+            // 長さが 2 バイト過大になる)。
+            const bool isMovem = (op & 0xFB80u) == 0x4880u && mode != 0;
+            if (isMovem)
+            {
+                const u32 words = eaExtensionWords(mode, reg, 2);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                return 4 + words * 2;
+            }
+
+            // LEA <ea>,An : 0100 rrr 111 mmm rrr
+            const bool isLea = (op & 0xF1C0u) == 0x41C0u;
+            // JSR / JMP : 0100 1110 10/11 mmm rrr
+            const bool isJsr = (op & 0xFFC0u) == 0x4E80u;
+            const bool isJmp = (op & 0xFFC0u) == 0x4EC0u;
+            const bool isPea = (op & 0xFFC0u) == 0x4840u;
+            if (isLea || isJsr || isJmp || isPea)
+            {
+                // どれも実効アドレスを 1 つ取り、サイズはロング相当。
+                // ただし即値 (mode 7 reg 4) は取れない。
+                const bool isImmediate = mode == 7 && reg == 4;
+                if (isImmediate)
+                {
+                    return kUnknownLength;
+                }
+                const u32 words = eaExtensionWords(mode, reg, 4);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                return 2 + words * 2;
+            }
+
+            // 単項演算 NEGX/CLR/NEG/NOT/TST : 0100 oooo ss mmm rrr
+            //
+            // **判別ビットは (op >> 8) & 0xF。** 実装 (m68k_ops_group4.cpp の
+            // unary_ops) が switch している値と同じものを使う。
+            // ここを (op >> 9) & 7 で書くと TST ($4A) が範囲から外れ、
+            // 実行の 6.5% を占める命令を丸ごと取りこぼす。
+            //
+            // ss = 11 はサイズを持たない別命令 (TAS や $4Exx) なので除く。
+            const u32 opcodeBits = static_cast<u32>((op >> 8) & 0xFu);
+            const u32 sizeBits = static_cast<u32>((op >> 6) & 3u);
+            const bool isUnaryOpcode = opcodeBits == 0x0 || opcodeBits == 0x2 ||
+                                       opcodeBits == 0x4 || opcodeBits == 0x6 || opcodeBits == 0xA;
+            const bool isUnary = isUnaryOpcode && sizeBits != 3;
+            if (isUnary)
+            {
+                const u32 size = sizeBits == 0 ? 1u : (sizeBits == 1 ? 2u : 4u);
+                // TST は読むだけなので PC 相対と即値も取れる。
+                // 書き込む方 (NEGX/CLR/NEG/NOT) は取れない。
+                const bool isReadOnly = opcodeBits == 0xA;
+                const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+                if (!isReadOnly && isImmediateOrPcRelative)
+                {
+                    return kUnknownLength;
+                }
+                const u32 words = eaExtensionWords(mode, reg, size);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                return 2 + words * 2;
+            }
+
+            // TAS <ea> : 0100 1010 11 mmm rrr (byte のみ)
+            const bool isTas = (op & 0xFFC0u) == 0x4AC0u;
+            if (isTas)
+            {
+                const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+                if (isImmediateOrPcRelative)
+                {
+                    return kUnknownLength;
+                }
+                const u32 words = eaExtensionWords(mode, reg, 1);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                return 2 + words * 2;
+            }
+
+            // 残り (TRAP, MOVE to/from SR, CHK, ILLEGAL, RESET, STOP…) は
+            // 扱わない。実行頻度の合計が 1.9% で、形が individually 違う。
+            return kUnknownLength;
+        }
+
         default:
             // ここに挙げていないグループは扱わない。
             //
             // Why 全部やらないか: 命令長を間違えるとブロックがずれる。
-            // 実測で分布の上位を占めるのは misc (32.7%) と分岐 (24.4%) と
-            // MOVE (22.5%) だが、**misc は命令ごとに形が違いすぎる**
-            // (MOVEM のレジスタマスク、LEA、JSR、単項演算…)。
-            // まず確実に分かるものだけで組み、効果が出てから広げる。
+            // 残るのは $0 (即値/ビット操作 4.6%)、$D (ADD 4.7%)、
+            // $B (CMP/EOR 3.8%) など。効果を測ってから広げる。
             return kUnknownLength;
     }
 }

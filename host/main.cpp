@@ -28,6 +28,8 @@ extern unsigned long g_jitDecodable;
 extern unsigned long g_jitByGroup[16];
 extern unsigned long g_jitDecodableByGroup[16];
 extern unsigned long g_jitRunLen[33];
+extern unsigned long g_group4[64];
+extern unsigned long g_g4Named[12];
 #endif
 #if X68K_COUNT_FETCH_ORIGIN
 extern unsigned long g_refillFromRom;
@@ -1215,6 +1217,22 @@ int main(int argc, char** argv)
                             g_jitByGroup[g], g_jitDecodableByGroup[g],
                             100.0 * (double)g_jitDecodableByGroup[g] / (double)g_jitByGroup[g],
                             100.0 * (double)g_jitByGroup[g] / (double)g_jitTotal);
+            }
+            // $4 の内訳。全体の 32.3% を占めるので、ここを足すのが最大の伸びしろ。
+            {
+                const char* names[12] = {"JSR",   "JMP", "RTS", "NOP",  "LEA",  "TST/TAS",
+                                         "MOVEM", "PEA", "CLR", "LINK", "UNLK", "その他"};
+                std::printf("[jit] $4 の内訳 (全体の %.1f%%):\n",
+                            100.0 * (double)g_jitByGroup[4] / (double)g_jitTotal);
+                for (int i = 0; i < 12; ++i)
+                {
+                    if (g_g4Named[i] == 0)
+                    {
+                        continue;
+                    }
+                    std::printf("      %-8s %10lu (全体の %.1f%%)\n", names[i], g_g4Named[i],
+                                100.0 * (double)g_g4Named[i] / (double)g_jitTotal);
+                }
             }
             // 連続長: 呼び出しコスト 6.7 サイクルを何命令で償却できるか。
             unsigned long runs = 0;

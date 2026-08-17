@@ -1588,6 +1588,46 @@ TEST_SUITE("イベント駆動")
         }
         CHECK(moveqDecodable == 2048);
 
+        // $4 の主要な命令が翻訳できること。
+        //
+        // ここは実行頻度で選んである (Human68k 稼働中、全体に対する割合):
+        // RTS 8.4% / TST 6.5% / MOVEM 6.1% / CLR 3.9% / LEA 3.1% / JSR 2.4%。
+        // 1 つでも落ちると h が数 % 単位で下がるので、名指しで固定する。
+        struct Group4Case
+        {
+            x68k::u16 op;
+            x68k::u32 expected;
+            const char* name;
+        };
+        const Group4Case group4[] = {
+            {0x4E75, 2, "RTS"},
+            {0x4E71, 2, "NOP"},
+            {0x4E73, 2, "RTE"},
+            {0x4E77, 2, "RTR"},
+            {0x4840, 2, "SWAP D0"},
+            {0x4E58, 2, "UNLK A0"},
+            {0x4880, 2, "EXT.W D0"},
+            {0x4E50, 4, "LINK A0,#d"},
+            {0x4E90, 2, "JSR (A0)"},
+            {0x4ED0, 2, "JMP (A0)"},
+            {0x41D0, 2, "LEA (A0),A0"},
+            {0x4250, 2, "CLR.w (A0)"},
+            {0x4A50, 2, "TST.w (A0)"},
+            {0x4AD0, 2, "TAS (A0)"},
+            {0x48D0, 4, "MOVEM.l regs,(A0)"},
+            // 実効アドレスが拡張ワードを取る形。
+            {0x4EB9, 6, "JSR (xxx).L"},
+            {0x41F9, 6, "LEA (xxx).L,A0"},
+            {0x4A79, 6, "TST.w (xxx).L"},
+            {0x48E8, 6, "MOVEM.l regs,(d16,A0)"},
+        };
+        for (const auto& c : group4)
+        {
+            CAPTURE(c.name);
+            CAPTURE(c.op);
+            CHECK(x68k::instructionLength(c.op) == c.expected);
+        }
+
         // 拡張ワード数の番兵と命令長の番兵が別物であること。
         // ここが同じだと上の偽陰性が再発する。
         CHECK(x68k::kUnknownExtensionWords != x68k::kUnknownLength);
