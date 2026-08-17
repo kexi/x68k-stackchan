@@ -293,6 +293,24 @@ public:
     // 置けば、debt_ = 0 でも pending() の値は変わらない。
     void wake()
     {
+        // 先に unsettled_ を引き直す。
+        //
+        // Why これが要るか: unsettled_ を更新するのは syncUnsettled() だけで、
+        // それを呼ぶのは settle() と materialize() に限られる (毎命令の
+        // advance() は debt_ しか触らない。ホットパスを 4 命令に保つため)。
+        // つまり「遅い側へ入っていない状態で wake() を呼ぶ」と、前回の
+        // 遅い側からの経過サイクルが deadlineAt_ の代入で丸ごと消える。
+        //
+        // 現在の呼び出し元は materialize() と組で使われるため偶然助かって
+        // いるが、それは **C++ の full-expression 内のデストラクタ順序** に
+        // 依存している。Settled / Rearm でわざわざ型に固定した規律の外側の
+        // 規則に正しさが乗るのは危うい。materialize() を伴わない wake() を
+        // 1 箇所足した瞬間に、そこから溜まった時間が黙って消える
+        // (症状はタイマが遅れる・秒がずれるで、原因へ辿るのが難しい)。
+        //
+        // wake() は遅い側 (I/O アクセスと外部注入) でしか呼ばれないので、
+        // 1 行足してもホットパスには影響しない。
+        syncUnsettled();
         deadlineAt_ = unsettled_;
         debt_ = 0;
         degraded_ = true;

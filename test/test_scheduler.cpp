@@ -1231,4 +1231,76 @@ TEST_SUITE("イベント駆動")
             REQUIRE((used % 2) == 0);
         }
     }
+    // run() の外から立った割り込みが、次の命令境界で配送される。
+    //
+    // pressKey / moveMouse は run() の外から呼ばれるので、IPR が時間と
+    // 無関係に立つ。期限を張ったまま飛ばし続けると、次のデバイスイベント
+    // (最大 80,000 サイクル先) までキー入力が届かない。
+    //
+    // pressKey 側の sched_.wake() がこれを防いでいる。ここが抜けると
+    // 配送が遅れ、ゲストからはポーリングループの反復回数として見える。
+    TEST_CASE("run() の外から立った割り込みが期限を待たずに配送される")
+    {
+        Fixture fx;
+        fx.build({
+            0x5482,  // ADDQ.L #2,D2
+            0x60FC,  // BRA.S -4
+        });
+        fx.poke16(0x0100, 0x0000);
+        fx.poke16(0x0102, 0x0900);
+        fx.poke16(0x0900, 0xD682);  // ADD.L D2,D3  配送時の D2 を記録
+        fx.poke16(0x0902, 0x4E73);  // RTE
+
+        const auto deliveryDelay = [&](bool eventDriven, x68k::u32 preRun)
+        {
+            x68k::Machine m;
+            fx.attach(m, eventDriven);
+            m.mfp().write(x68k::Mfp::kVr, 0x40);
+            m.mfp().write(x68k::Mfp::kIera, x68k::Mfp::kIntRecvFull);
+            m.mfp().write(x68k::Mfp::kImra, x68k::Mfp::kIntRecvFull);
+            m.cpu().setSr(0x2000);
+            m.run(preRun);
+            const x68k::u32 before = m.cpu().state().d[2];
+            m.pressKey(0x1E);
+            m.run(20000);
+            const x68k::u32 atDelivery = m.cpu().state().d[3];
+            return atDelivery >= before ? atDelivery - before : 0u;
+        };
+
+        // 位相を変えても毎命令 tick 版と一致すること。
+        for (const x68k::u32 preRun : {1000u, 1001u, 1234u, 40000u})
+        {
+            CAPTURE(preRun);
+            CHECK(deliveryDelay(true, preRun) == deliveryDelay(false, preRun));
+        }
+    }
+
+    // 遅い側へ入っていない状態で wake() を呼んでも、溜まった時間が消えない。
+    //
+    // unsettled_ を更新するのは syncUnsettled() だけで、それを呼ぶのは
+    // settle() と materialize() に限られる (毎命令の advance() は debt_ しか
+    // 触らない。ホットパスを 4 命令に保つため)。wake() が unsettled_ を
+    // 引き直さずに deadlineAt_ へ代入すると、前回の遅い側からの経過が消える。
+    //
+    // 現在の呼び出し元は materialize() と組で使われるので偶然助かるが、
+    // それは C++ の full-expression 内のデストラクタ順序に依存している。
+    // Settled / Rearm で型に固定した規律の外側の規則なので、ここで直接守る。
+    TEST_CASE("遅い側を通らずに wake しても溜まった時間が消えない")
+    {
+        x68k::Scheduler s;
+        s.reset();
+        s.beginSlice(100000);
+        s.armDeadline(50000);
+
+        // 毎命令ぶん進める。いずれも期限に届かないので遅い側へは入らない。
+        for (int i = 0; i < 100; ++i)
+        {
+            CHECK_FALSE(s.advance(4));
+        }
+
+        // wake() が先頭で syncUnsettled() を呼ぶので、ここで pending() が
+        // 積んだぶんと一致する。呼ばないと 0 になって 400 サイクルが消える。
+        s.wake();
+        CHECK(s.pending() == 400);
+    }
 }
