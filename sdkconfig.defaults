@@ -37,6 +37,11 @@ CONFIG_PM_ENABLE=n
 #   アクセスがランダムにクラッシュする」と experimental 扱いで警告している。
 #   エミュレータは長時間連続稼働するので温度変化を踏みやすく、割に合わない。
 #
+#   加えて **そもそも効かない**。実機で EXTMEM のカウンタを読んだところ、
+#   Human68k 稼働中の PSRAM ミス率は 0.31%、命令キャッシュは 0.003% だった
+#   (docs/knowledge/event-driven-implementation.md)。メモリ階層は律速では
+#   ないので、速くしても伸びしろが無い。
+#
 # ESP-IDF 5.x ではターゲット別の CONFIG_ESP32S3_SPIRAM_SUPPORT がマスターで、
 # ここから CONFIG_SPIRAM が select される (CONFIG_SPIRAM は非プロンプトなので
 # sdkconfig.defaults から直接立てても無視される)。

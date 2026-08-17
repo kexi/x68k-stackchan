@@ -17,6 +17,9 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+
+// キャッシュのアクセス/ミスカウンタ (計測用。恒久機能ではない)。
+#include "soc/extmem_reg.h"
 #include <driver/usb_serial_jtag.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -1243,6 +1246,38 @@ private:
             g_eventNullExec = on;
             g_machine.setNullExecInEvent(on);
             ESP_LOGI(kTag, "イベント駆動のまま命令を空回し: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'c' でキャッシュのアクセス数とミス数を出す。恒久機能ではない。
+        //
+        // 88 CPU サイクル/命令が「1 つの重い処理」なのか「合算」なのかは、
+        // ミス率を見れば分かる。I-cache のミスが多ければコード配置、
+        // PSRAM のミスが多ければメインメモリのアクセスが律速。
+        //
+        // Why not 顔モードの 'e' 等と衝突しないか: あちらは isFaceMode で
+        // 守られている。ここは X68K モードでも使いたいので、記号ではなく
+        // 英字だが、Human68k のコマンドラインで 'c' 単独を打つ機会は
+        // 実質無い (打ちたければ切ってから測る)。
+        const bool isCacheStats = c == 'c';
+        if (isCacheStats)
+        {
+            const uint32_t ibusAcs = REG_READ(EXTMEM_IBUS_ACS_CNT_REG);
+            const uint32_t ibusMiss = REG_READ(EXTMEM_IBUS_ACS_MISS_CNT_REG);
+            const uint32_t dbusAcs = REG_READ(EXTMEM_DBUS_ACS_CNT_REG);
+            const uint32_t dbusFlashMiss = REG_READ(EXTMEM_DBUS_ACS_FLASH_MISS_CNT_REG);
+            const uint32_t dbusRamMiss = REG_READ(EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT_REG);
+            ESP_LOGI(kTag, "[cache] ibus acs=%lu miss=%lu (%.2f%%)", (unsigned long)ibusAcs,
+                     (unsigned long)ibusMiss,
+                     ibusAcs != 0 ? 100.0 * (double)ibusMiss / (double)ibusAcs : 0.0);
+            ESP_LOGI(kTag, "[cache] dbus acs=%lu flashMiss=%lu spiramMiss=%lu (%.2f%%)",
+                     (unsigned long)dbusAcs, (unsigned long)dbusFlashMiss,
+                     (unsigned long)dbusRamMiss,
+                     dbusAcs != 0 ? 100.0 * (double)(dbusFlashMiss + dbusRamMiss) / (double)dbusAcs
+                                  : 0.0);
+            // 次の測定のために 0 へ戻す。
+            REG_WRITE(EXTMEM_CACHE_ACS_CNT_CLR_REG, 0x3);
+            REG_WRITE(EXTMEM_CACHE_ACS_CNT_CLR_REG, 0x0);
             return;
         }
 
