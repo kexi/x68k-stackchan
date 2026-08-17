@@ -1303,4 +1303,55 @@ TEST_SUITE("イベント駆動")
         s.wake();
         CHECK(s.pending() == 400);
     }
+    // fetch の窓判定が境界で誤らない。
+    //
+    // 命令フェッチは「RAM の窓に収まるか」「ROM の窓に収まるか」を見てから
+    // 直接読む。窓の境界をまたぐワードは配列の外を触るので、必ず遅い経路
+    // (バス) へ落とさなければならない。
+    //
+    // Why これを先に書くか: fetch をポインタキャッシュへ置き換える予定で、
+    // その実装は `ptr < end` の 1 比較に縮める。**u32 の加算がラップすると
+    // 判定が偽陽性になる**境界があり、そこを踏むと窓の外を読む。
+    // 実装より先に、守るべき性質をテストで固定しておく。
+    TEST_CASE("命令フェッチは窓の境界をまたぐと遅い経路へ落ちる")
+    {
+        // メイン RAM の末尾ちょうどに PC を置き、そこから 1 ワード読む。
+        // 末尾の 1 バイトだけが窓に入る位置なので、直接経路は使えない。
+        static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+        std::fill(ram.begin(), ram.end(), 0);
+
+        // リセットベクタ。SSP と PC を置く。
+        const auto poke16 = [](x68k::u32 a, x68k::u16 v)
+        {
+            ram[a] = static_cast<x68k::u8>(v >> 8);
+            ram[a + 1] = static_cast<x68k::u8>(v & 0xFF);
+        };
+        poke16(0, 0x0000);
+        poke16(2, 0x8000);
+        poke16(4, 0x0000);
+        poke16(6, 0x0400);
+        for (x68k::u32 a = 0x400; a < 0x8000; a += 2)
+        {
+            poke16(a, 0x4E71);  // NOP
+        }
+
+        x68k::Machine m;
+        x68k::MemoryMap map{};
+        map.mainRam = ram.data();
+        m.setMemory(map);
+        m.reset();
+
+        // RAM の最終ワードに NOP を置き、そこから実行させる。
+        // ここを直接経路が読めること自体は正しい (窓に収まる)。
+        const x68k::u32 lastWord = x68k::kMainRamSize - 2;
+        poke16(lastWord, 0x4E71);
+        x68k::M68kState st = m.cpu().state();
+        st.pc = lastWord;
+        m.cpu().loadStateForTest(st);
+        const x68k::u32 spent = m.run(8);
+
+        // 窓の内側なので実行できる。落ちたり halt したりしないこと。
+        CHECK(spent > 0);
+        CHECK_FALSE(m.isHalted());
+    }
 }
