@@ -173,6 +173,9 @@ public:
         // 実体が差し替わったら、控えている世代は全部当てにならない。
         // 個別に消して回るより 1 つ進める方が漏れようがない。
         codeGen_.touchAll();
+        // 見え方そのものが変わる。ページの世代では表現できないので、
+        // 写像の世代も進める (CodeGenMap::mappingEpoch のコメント参照)。
+        codeGen_.bumpMappingEpoch();
         fastRam_ = base;
         fastRamLimit_ = base != nullptr ? length : 0;
     }
@@ -183,6 +186,14 @@ public:
     // SystemBus::setRomMappedAtZero と必ず対で呼ぶ。
     void setFastRamReadable(bool readable)
     {
+        // **ゲスト RAM は 1 バイトも変わらないのに、見える中身が変わる。**
+        // ページの世代は書き込みしか数えないのでここを取りこぼす。
+        // 取りこぼすと、$000000 の ROM 写像が外れた前後で古い前提の
+        // まま実行することになる。
+        if (fastRamReadable_ != readable)
+        {
+            codeGen_.bumpMappingEpoch();
+        }
         fastRamReadable_ = readable;
     }
 
@@ -201,6 +212,8 @@ public:
     // Bus を挟んでいる理由。窓の位置は必ず SystemBus から教わる。
     void setFastRom(const u8* base, u32 busBase, u32 length)
     {
+        // ROM の窓が動くのも写像の変化。setFastRam と同じ扱いにする。
+        codeGen_.bumpMappingEpoch();
         fastRom_ = base;
         fastRomBase_ = busBase;
         fastRomLength_ = base != nullptr ? length : 0;

@@ -85,6 +85,10 @@ constexpr u32 signBit(u32 size)
 void M68k::reset()
 {
     st_ = M68kState{};
+    // リセットは $000000 の ROM 写像を戻す。中身は書き換わらないので
+    // ページの世代では表現できない (CodeGenMap::mappingEpoch 参照)。
+    codeGen_.touchAll();
+    codeGen_.bumpMappingEpoch();
     // リセット時は特権モードで割り込みマスク 7。
     st_.sr = sr_bit::kSupervisor | sr_bit::kIntMask;
 
@@ -138,6 +142,7 @@ void M68k::loadStateForTest(const M68kState& s)
     pendingIrq_ = 0;
     // 外から状態を差し替えたので、控えている世代は当てにならない。
     codeGen_.touchAll();
+    codeGen_.bumpMappingEpoch();
 }
 
 // --- プリフェッチ ----------------------------------------------------------

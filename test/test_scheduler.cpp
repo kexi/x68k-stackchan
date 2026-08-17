@@ -1404,6 +1404,65 @@ TEST_SUITE("イベント駆動")
             CHECK(m.cpu().codeGenMap().generation(target) != before);
         }
 
+        SUBCASE("世代は一周しない")
+        {
+            // **65,536 回書くと世代が元へ戻る**バグがあった。戻った瞬間、
+            // 書き換えられたページが「変わっていない」ことになり、古い
+            // コードを静かに実行し続ける。1KB ページに 65,536 回の書き込みは
+            // スタックやワーク領域なら数秒で届く。
+            //
+            // 飽和させて「常に古い」を返し続けるのが正しい振る舞い。
+            // 遅くなる (毎回バイト照合へ落ちる) が、正しさは保たれる。
+            auto& map = m.cpu().codeGenMap();
+            const std::uint16_t start = map.generation(target);
+            for (int i = 0; i < 70000; ++i)
+            {
+                map.touch(target);
+            }
+            const std::uint16_t after = map.generation(target);
+            CHECK(after == x68k::CodeGenMap::kAlwaysStale);
+            CHECK(after != start);
+            // 飽和後にさらに書いても戻らない。
+            map.touch(target);
+            CHECK(map.generation(target) == x68k::CodeGenMap::kAlwaysStale);
+        }
+
+        SUBCASE("範囲外は常に古いものとして扱う")
+        {
+            // 0 を返すと「まだ一度も書かれていないページ」と区別できず、
+            // 範囲外に置いたブロックが有効と見なされる。
+            auto& map = m.cpu().codeGenMap();
+            CHECK(map.generation(0xC00000) == x68k::CodeGenMap::kAlwaysStale);
+        }
+
+        SUBCASE("写像の変化はページの世代では表現できない")
+        {
+            // **ゲスト RAM は 1 バイトも変わらないのに見える中身が変わる**
+            // 経路がある。ページの世代は書き込みしか数えないので、
+            // これを取りこぼす。取りこぼすと $000000 の ROM 写像が外れた
+            // 前後で古い前提のまま実行することになる。
+            auto& map = m.cpu().codeGenMap();
+
+            // 値が変わるときだけ動く。まず既知の状態へ揃える。
+            m.cpu().setFastRamReadable(false);
+
+            const x68k::u32 e0 = map.mappingEpoch();
+            m.cpu().setFastRamReadable(true);
+            CHECK(map.mappingEpoch() != e0);
+
+            // 同じ値なら動かさない (無駄に全ブロックを捨てない)。
+            const x68k::u32 e1 = map.mappingEpoch();
+            m.cpu().setFastRamReadable(true);
+            CHECK(map.mappingEpoch() == e1);
+
+            m.cpu().setFastRamReadable(false);
+            CHECK(map.mappingEpoch() != e1);
+
+            const x68k::u32 e2 = map.mappingEpoch();
+            m.cpu().setFastRom(nullptr, 0, 0);
+            CHECK(map.mappingEpoch() != e2);
+        }
+
         SUBCASE("実体の差し替えは全ページを無効にする")
         {
             const std::uint16_t before = m.cpu().codeGenMap().generation(target);
