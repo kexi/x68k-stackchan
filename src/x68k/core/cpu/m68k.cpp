@@ -615,37 +615,48 @@ u32 M68k::step()
     }
 
     // 割り込みは命令境界でのみ受け付ける。レベル 7 はマスク不可。
-    const bool irqPending = pendingIrq_ != 0;
-    const bool irqAllowed = pendingIrq_ == 7 || pendingIrq_ > st_.interruptMask();
-    if (irqPending && irqAllowed)
+    //
+    // 判定を 2 段にしてあるのは、**毎命令通るのに保留があるのは稀**だから。
+    // 外側は pendingIrq_ のロードとゼロ比較だけで、SR からマスクを切り出す
+    // interruptMask() は保留があるときにしか計算しない。
+    //
+    // Why not 1 つの if にまとめないか: && の左右はどちらも副作用が無いので
+    // 意味は同じだが、コンパイラは interruptMask() (SR のロード + シフト +
+    // マスク) を短絡の前へ持ち上げることがある。段を分ければ、保留が無い
+    // 経路に SR のロードが乗らないことがコードの形から読める。
+    if (pendingIrq_ != 0)
     {
-        const u32 level = pendingIrq_;
-        const u32 vectorNumber =
-            pendingVector_ != 0 ? pendingVector_ : (vector::kAutoVectorBase + level);
-        pendingIrq_ = 0;
-        pendingVector_ = 0;
-
-        // STOP で止まっていた場合は、例外を積む前にプリフェッチを STOP の次の
-        // 命令へ進める。
-        //
-        // Why これが要るか: STOP はプリフェッチを命令語の位置に巻き戻して
-        // 停止する (実機がそうなので、テストベクタもそれを期待する)。その状態の
-        // まま takeException に入ると framePc = pc - 4 が STOP の命令語自身を
-        // 指し、ハンドラから RTE で戻ると STOP を再実行して永久に止まる。
-        // st_.pc は「命令語 + 4」= 即値の次のワード、つまり STOP の次の命令を
-        // 指しているので、そこから読み直せば戻り先が正しくなる。
-        const bool wasStopped = st_.stopped;
-        st_.stopped = false;
-        if (wasStopped)
+        const bool irqAllowed = pendingIrq_ == 7 || pendingIrq_ > st_.interruptMask();
+        if (irqAllowed)
         {
-            refillPrefetch(st_.pc);
-        }
+            const u32 level = pendingIrq_;
+            const u32 vectorNumber =
+                pendingVector_ != 0 ? pendingVector_ : (vector::kAutoVectorBase + level);
+            pendingIrq_ = 0;
+            pendingVector_ = 0;
 
-        // ベクタ番号を自分で返すデバイス (X68000 の MFP など) は
-        // requestInterrupt でその番号を渡してくる。渡されなければ自動ベクタ。
-        takeException(vectorNumber);
-        setSr(static_cast<u16>((st_.sr & clearMask(sr_bit::kIntMask)) | (level << 8)));
-        return 44;
+            // STOP で止まっていた場合は、例外を積む前にプリフェッチを STOP の次の
+            // 命令へ進める。
+            //
+            // Why これが要るか: STOP はプリフェッチを命令語の位置に巻き戻して
+            // 停止する (実機がそうなので、テストベクタもそれを期待する)。その状態の
+            // まま takeException に入ると framePc = pc - 4 が STOP の命令語自身を
+            // 指し、ハンドラから RTE で戻ると STOP を再実行して永久に止まる。
+            // st_.pc は「命令語 + 4」= 即値の次のワード、つまり STOP の次の命令を
+            // 指しているので、そこから読み直せば戻り先が正しくなる。
+            const bool wasStopped = st_.stopped;
+            st_.stopped = false;
+            if (wasStopped)
+            {
+                refillPrefetch(st_.pc);
+            }
+
+            // ベクタ番号を自分で返すデバイス (X68000 の MFP など) は
+            // requestInterrupt でその番号を渡してくる。渡されなければ自動ベクタ。
+            takeException(vectorNumber);
+            setSr(static_cast<u16>((st_.sr & clearMask(sr_bit::kIntMask)) | (level << 8)));
+            return 44;
+        }
     }
 
     if (st_.stopped)
@@ -655,8 +666,14 @@ u32 M68k::step()
     }
 
     const u16 op = fetch();
+    // Why not 実行サイクルを累計しないか: st_.cycles は書くだけで、
+    // src/ test/ host/ main/ のどこからも読まれていなかった (git grep で確認)。
+    // 32bit の Xtensa では u64 の加算がキャリー合成を伴うので、**毎命令**
+    // 誰も読まない値のために数命令を払っていたことになる。
+    //
+    // 実行したサイクル数は戻り値で呼び出し側へ渡る。時間の管理は
+    // Machine::run と Scheduler が持っており、CPU 側に控えは要らない。
     const u32 cycles = execute(op);
-    st_.cycles += cycles;
     return cycles;
 }
 
