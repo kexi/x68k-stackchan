@@ -86,6 +86,16 @@ public:
         tickCarry();
     }
 
+    // 次に秒が繰り上がるまでの CPU サイクル数。
+    //
+    // 期限が時計の値に依存しないのがこのデバイスの性質で、Rtc::write も
+    // setDateTime も cycleAccumulator_ に触らない。だから書き込みで期限を
+    // 捨ててはいけない (捨てると秒の位相がリセットされて実機と違う)。
+    [[nodiscard]] u32 cyclesUntilCarry() const
+    {
+        return kCyclesPerSecond - cycleAccumulator_;
+    }
+
     // 起点となる日時を設定する。エミュレータの起動時にホストの時刻を渡す。
     // year は西暦の下 2 桁 (RP5C15 は 2 桁しか持たない)。
     void setDateTime(u32 year, u32 month, u32 day, u32 hour, u32 minute, u32 second);

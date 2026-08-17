@@ -117,6 +117,8 @@ add_executable(x68k_tests
   # バス経由と結果が変わらないことを実際の命令実行で押さえる。
   test_m68k_fastram.cpp
   test_device_timing.cpp
+  # イベント駆動が毎命令 tick と 1 サイクルもずれないこと。
+  test_scheduler.cpp
   test_sram.cpp
   test_sram_persist.cpp
   test_bus.cpp
@@ -186,6 +188,26 @@ target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/src/x68k/platform)
 # 確かめられないと壊れたままになる判断を持つので、ここだけを引き上げる。
 target_include_directories(x68k_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/freertos_shim)
 add_test(NAME x68k_tests COMMAND x68k_tests)
+
+# --- コンパイルが失敗しなければならないテスト -------------------------------
+#
+# x68k::Settled が偽造できないことを、**実際にコンパイルさせて**確かめる。
+#
+# Why not doctest の static_assert で済ませないか: private な defaulted
+# default ctor は std::is_default_constructible_v を false にしたまま
+# `f({})` を通してしまう (実測で確認)。型特性は「守れていない状態」を
+# false で報告するので、そこだけ見ると守れているように見える。
+# 実際にコンパイルさせて落ちることを見るしかない。
+#
+# EXCLUDE_FROM_ALL を付けるのは、通常のビルドでこれを作らせないため。
+# ctest がこのターゲットだけを名指しでビルドし、失敗することを期待する。
+add_executable(x68k_compile_fail_settled EXCLUDE_FROM_ALL compile_fail_settled.cpp)
+target_link_libraries(x68k_compile_fail_settled PRIVATE x68k_core)
+add_test(
+  NAME settled_is_unforgeable
+  COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target x68k_compile_fail_settled --config $<CONFIG>
+)
+set_tests_properties(settled_is_unforgeable PROPERTIES WILL_FAIL TRUE)
 
 # --- ホストのエミュレータランナー -------------------------------------------
 # 実機に焼かずに IPL-ROM と Human68k の起動をデバッグするための入口。
