@@ -132,6 +132,14 @@ std::atomic<bool> g_fastTickEnabled{true};
 std::atomic<bool> g_nullExecProbe{false};
 std::atomic<int> g_nullExecStage{0};
 
+#if X68K_MEASURE_DISK
+// スライスの実時間の内訳を測る。恒久的な機能ではない。
+std::int64_t g_runUs = 0;
+std::uint32_t g_runCount = 0;
+std::int64_t g_renderUs = 0;
+std::uint32_t g_renderCount = 0;
+#endif
+
 // 上の値をエミュレーションコアが Machine へ写したかどうか。
 // 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
 bool g_fastTickApplied = true;
@@ -662,6 +670,9 @@ void emulatorTask(void* /*arg*/)
         {
             // JIT の上限計測モードでは命令を実行せず、ループ運営と
             // デバイスの時間だけを回す (jit_probe.h)。
+#if X68K_MEASURE_DISK
+            const std::int64_t runT0 = esp_timer_get_time();
+#endif
             if (g_nullExecProbe.load(std::memory_order_relaxed))
             {
                 g_machine.runNullExec(sliceCycles);
@@ -670,6 +681,10 @@ void emulatorTask(void* /*arg*/)
             {
                 g_machine.run(sliceCycles);
             }
+#if X68K_MEASURE_DISK
+            g_runUs += esp_timer_get_time() - runT0;
+            ++g_runCount;
+#endif
             totalCycles += sliceCycles;
         }
 
@@ -755,7 +770,17 @@ void emulatorTask(void* /*arg*/)
         // Machine を読むのはこのコアだけ。表示コアへは完成した RGB565 を
         // 渡すので、テキスト VRAM やダーティフラグを両コアで奪い合わない。
         followCursor();
+#if X68K_MEASURE_DISK
+        const std::int64_t renderT0 = esp_timer_get_time();
+#endif
         const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
+#if X68K_MEASURE_DISK
+        g_renderUs += esp_timer_get_time() - renderT0;
+        if (rendered)
+        {
+            ++g_renderCount;
+        }
+#endif
         if (rendered && !g_frames.publish())
         {
             // 表示コアがまだ前のフレームを転送中で渡せなかった。
@@ -776,6 +801,35 @@ void emulatorTask(void* /*arg*/)
             const std::uint32_t elapsed = now - lastReportMs;
             const unsigned khz =
                 elapsed > 0 ? static_cast<unsigned>((totalCycles - lastReportCycles) / elapsed) : 0;
+#if X68K_MEASURE_DISK
+            // スライスの実時間の内訳。ディスクだけでは説明が付かないので、
+            // Machine::run そのものに何 ms かかっているかも並べて出す。
+            {
+                const std::int64_t runUs = g_runUs;
+                const std::uint32_t runs = g_runCount;
+                g_runUs = 0;
+                g_runCount = 0;
+                const std::int64_t renderUs = g_renderUs;
+                const std::uint32_t renders = g_renderCount;
+                g_renderUs = 0;
+                g_renderCount = 0;
+                ESP_LOGI(kTag, "[slice] run=%lldus n=%u render=%lldus 描画=%u (5 秒)", runUs, runs,
+                         renderUs, renders);
+            }
+            // ディスクに費やした実時間を実効クロックと並べて出す。
+            // ディスクに触るスライスは全体の 1% 未満なので、平均の落ち込みが
+            // 本当にディスク由来かは、逆算ではなくこの数字でしか分からない。
+            {
+                const std::int64_t readUs = x68k_platform::g_diskReadUs;
+                const std::int64_t seekUs = x68k_platform::g_diskSeekUs;
+                const std::uint32_t reqs = x68k_platform::g_diskReadCount;
+                x68k_platform::g_diskReadUs = 0;
+                x68k_platform::g_diskSeekUs = 0;
+                x68k_platform::g_diskReadCount = 0;
+                ESP_LOGI(kTag, "[disk] read=%lldus seek=%lldus req=%u (この 5 秒間)", readUs,
+                         seekUs, reqs);
+            }
+#endif
             ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
                      static_cast<unsigned long long>(totalCycles), khz);
             lastReportMs = now;

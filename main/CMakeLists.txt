@@ -68,3 +68,12 @@ idf_component_register(
         esp_driver_ledc
         esp_driver_gpio
 )
+
+# ディスク読み出しの実時間を測る計測 (storage_sd.cpp)。
+# 既定は 0。just measure-disk が -DX68K_MEASURE_DISK=1 で有効にする。
+# 判断が済んだら消す。
+if(DEFINED X68K_MEASURE_DISK)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_MEASURE_DISK=${X68K_MEASURE_DISK})
+else()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_MEASURE_DISK=0)
+endif()

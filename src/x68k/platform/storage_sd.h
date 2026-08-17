@@ -26,6 +26,14 @@
 namespace x68k_platform
 {
 
+#if X68K_MEASURE_DISK
+// ディスク読み出しの実時間 (storage_sd.cpp)。恒久的な機能ではない。
+// 「実効クロックの落ち込みがディスク由来か」を推定でなく実測で確かめる。
+extern std::int64_t g_diskReadUs;
+extern std::uint32_t g_diskReadCount;
+extern std::int64_t g_diskSeekUs;
+#endif
+
 // SD 上のパス。
 inline constexpr const char* kSdMountPoint = "/sd";
 inline constexpr const char* kIplromPath = "/sd/x68k/iplrom.dat";
