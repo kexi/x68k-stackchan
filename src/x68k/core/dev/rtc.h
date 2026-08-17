@@ -52,13 +52,40 @@ public:
     void write(u32 regIndex, u8 value);
 
     // CPU サイクルぶん時間を進める。秒が繰り上がる。
-    void tick(u32 cycles);
+    //
+    // ここは **毎命令通る**のに、実際に秒が繰り上がるのは 1 秒 =
+    // 10,000,000 サイクルに 1 度だけ。つまり実行のほぼ全ては
+    // 「累算して閾値に届かない」で終わる。その判定だけをヘッダに置き、
+    // 繰り上がる回だけ .cpp 側の tickCarry() を呼ぶ。
+    //
+    // Why not quantum でまとめないか: 一度「RTC は 1 秒単位でしか変わらない
+    // から 10000 サイクルまとめてよい」として実装したが、ゲストは秒レジスタを
+    // 命令単位でポーリングでき、秒の境界が最大 1998 サイクル遅れるずれが
+    // 観測できた (docs/knowledge/cores3-emulator-runtime.md)。ここは
+    // まとめず、渡す量はそのままで**呼び出しの間接性だけを消す**。
+    // 状態遷移はサイクル単位で完全に元のままになる。
+    void tick(u32 cycles)
+    {
+        cycleAccumulator_ += cycles;
+        if (cycleAccumulator_ < kCyclesPerSecond)
+        {
+            return;  // ここが最頻。1 秒に 1 度しか下へ落ちない。
+        }
+        tickCarry();
+    }
 
     // 起点となる日時を設定する。エミュレータの起動時にホストの時刻を渡す。
     // year は西暦の下 2 桁 (RP5C15 は 2 桁しか持たない)。
     void setDateTime(u32 year, u32 month, u32 day, u32 hour, u32 minute, u32 second);
 
 private:
+    // X68000 の CPU は 10MHz。1 秒ぶんのサイクル数。
+    // tick() の速い側がヘッダで比較するので、ここに置く。
+    static constexpr u32 kCyclesPerSecond = 10000000;
+
+    // tick() の遅い側。累算が閾値に届いたときだけ呼ばれる。
+    void tickCarry();
+
     void advanceOneSecond();
 
     // 時計の値。BCD ではなく 10 進の各桁として持つ (レジスタが 4bit 幅のため)。

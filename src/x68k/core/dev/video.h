@@ -56,7 +56,39 @@ public:
     // 報告しない (最終状態が呼ぶ前と同じなら false になる)。
     // まとめて進める呼び方をするなら、境界ごとに刻むか、通過したエッジを
     // 返せる形へ作り直す必要がある。
-    bool tick(u32 cycles);
+    //
+    // ここは **毎命令通る**。1 命令ぶんのサイクルは常に 1 フレームより
+    // 遥かに短く、垂直帰線の境界を跨ぐのは 1 フレーム = 180,342 サイクルに
+    // 2 度だけ。つまりほぼ全ての呼び出しは「足して、境界を跨がず、false」で
+    // 終わる。その経路だけをヘッダに置き、剰余が要る場合と状態が変わる場合を
+    // .cpp 側の tickSlow() に残す。
+    //
+    // Why not quantum でまとめないか: 一度 64 サイクル単位でまとめたが、
+    // ゲストは GPIP4 ($E88001) を命令単位でポーリングでき、垂直帰線の開始が
+    // 24 サイクル遅れるずれが観測できた
+    // (docs/knowledge/cores3-emulator-runtime.md)。渡す量は変えず、
+    // **呼び出しの間接性だけ**を消す。
+    bool tick(u32 cycles)
+    {
+        if (cycles >= kCyclesPerFrame)
+        {
+            return tickSlow(cycles);  // 剰余が要る。ホストのまとめ呼びだけ
+        }
+        frameCycles_ += cycles;
+        if (frameCycles_ >= kCyclesPerFrame)
+        {
+            frameCycles_ -= kCyclesPerFrame;
+        }
+
+        // 表示期間の後ろに垂直帰線が来る。
+        const bool nowVBlank = frameCycles_ >= (kCyclesPerFrame - kVBlankCycles);
+        if (nowVBlank == inVBlank_)
+        {
+            return false;  // ここが最頻。フレーム中 2 回しか下へ落ちない。
+        }
+        inVBlank_ = nowVBlank;
+        return true;
+    }
 
     [[nodiscard]] bool inVerticalBlank() const
     {
@@ -67,6 +99,9 @@ public:
     [[nodiscard]] u32 rasterNumber() const;
 
 private:
+    // tick() の遅い側。1 フレーム以上をまとめて渡されたときだけ呼ばれる。
+    bool tickSlow(u32 cycles);
+
     std::array<u16, kRegCount> reg_{};
     u32 frameCycles_ = 0;
     bool inVBlank_ = false;
