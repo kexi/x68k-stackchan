@@ -349,9 +349,13 @@ std::atomic<bool> g_redrawRequested{false};
 //
 // Why not 大きい定数を入れないか: MOVI.N の即値は 4bit しか無い。
 // ここで確かめたいのは「走るか」だけなので、幅は要らない。
-// 既定では呼ばない。CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
-// MALLOC_CAP_EXEC が必ず失敗する (実測)。JIT を再検討するときに
-// sdkconfig で保護を切ってから呼ぶ。
+// シリアルの 'j' で呼ぶ。
+//
+// かつて「CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は MALLOC_CAP_EXEC が
+// 必ず失敗する」と書いていたが、**現在その設定は無効** (sdkconfig の
+// # CONFIG_ESP_SYSTEM_MEMPROT_FEATURE is not set) で、実機で確かめたら
+// EXEC|32BIT で確保でき、生成したコードが正しく走った (2026-08-18)。
+// 前提が変わったら測り直すこと。
 [[maybe_unused]] void probeJitFeasibility()
 {
     constexpr std::size_t kProbeBytes = 64;
@@ -1246,6 +1250,18 @@ private:
             g_eventNullExec = on;
             g_machine.setNullExecInEvent(on);
             ESP_LOGI(kTag, "イベント駆動のまま命令を空回し: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'j' で JIT の実現性を確かめる。恒久機能ではない。
+        //
+        // 記録には「CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
+        // MALLOC_CAP_EXEC が必ず失敗する」とあるが、現在の sdkconfig では
+        // **その設定は無効になっている**。前提が変わっているので測り直す。
+        const bool isJitProbe = c == 'j';
+        if (isJitProbe)
+        {
+            probeJitFeasibility();
             return;
         }
 
