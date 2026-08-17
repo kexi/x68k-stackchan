@@ -371,7 +371,16 @@ u32 Machine::runEventDriven(u32 cycles)
 
     for (;;)
     {
-        const u32 used = cpu_.step();
+        // 命令の実行だけを空回しにして、イベント駆動の状態のまま
+        // 「命令実行が何 ns/cycle か」を測る。
+        //
+        // Why これが要るか: 過去の「命令実行 0.90 ns/cycle」は quantum を
+        // 撤回する前、tickDevices が毎命令だった頃の測定で、デバイス処理が
+        // 支配的すぎて命令実行が埋もれていた。イベント駆動で tickDevices が
+        // 25,000 サイクルに 1 回まで減った今、その数字は使えない。
+        //
+        // **恒久的な機能ではない。** 状態は進まないのでゲストは動かない。
+        const u32 used = nullExecInEvent_ ? 4u : cpu_.step();
         if (used == 0)
         {
             // halted。溜まった時間を捨てずに実体化してから抜ける。

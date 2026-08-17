@@ -125,6 +125,13 @@ public:
 
     // runNullExec が何を含めるかを選ぶ。0 から順に巡回させて内訳を測る。
     // 段の意味は machine.cpp の runNullExec の switch にある。
+    // イベント駆動のまま命令実行だけを空回しにする (計測用)。
+    // 恒久的な機能ではない。
+    void setNullExecInEvent(bool on)
+    {
+        nullExecInEvent_ = on;
+    }
+
     void setNullExecStage(int stage)
     {
         nullExecStage_ = stage;
@@ -591,6 +598,7 @@ private:
     bool shadowArmed_ = false;
 
     int nullExecStage_ = 0;
+    bool nullExecInEvent_ = false;
 
     Sram sram_;
     SystemBus bus_;

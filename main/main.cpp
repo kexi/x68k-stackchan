@@ -146,6 +146,7 @@ std::atomic<bool> g_eventDrivenEnabled{false};
 // JIT に着手するかどうかを決めるための実測用。既定は無効。
 std::atomic<bool> g_nullExecProbe{false};
 std::atomic<int> g_nullExecStage{0};
+std::atomic<bool> g_eventNullExec{false};
 
 // スライスの実時間の内訳を測る。恒久的な機能ではない。
 //
@@ -877,16 +878,14 @@ void emulatorTask(void* /*arg*/)
             // スライスの実時間の内訳。ディスクだけでは説明が付かないので、
             // Machine::run そのものに何 ms かかっているかも並べて出す。
             {
-                const std::int64_t runUs = g_runUs;
-                const std::uint32_t runs = g_runCount;
-                g_runUs = 0;
-                g_runCount = 0;
+                // run の実時間は下の無条件ブロックが出す。ここでは描画だけ。
+                // 両方で g_runUs を読むと、先に読んだ側がリセットして
+                // もう一方が 0 を見る (実際に踏んだ)。
                 const std::int64_t renderUs = g_renderUs;
                 const std::uint32_t renders = g_renderCount;
                 g_renderUs = 0;
                 g_renderCount = 0;
-                ESP_LOGI(kTag, "[slice] run=%lldus n=%u render=%lldus 描画=%u (5 秒)", runUs, runs,
-                         renderUs, renders);
+                ESP_LOGI(kTag, "[render] %lldus 描画=%u 回 (5 秒)", renderUs, renders);
             }
             // ディスクに費やした実時間を実効クロックと並べて出す。
             // ディスクに触るスライスは全体の 1% 未満なので、平均の落ち込みが
@@ -1232,6 +1231,18 @@ private:
             const auto& v = g_machine.video();
             ESP_LOGI(kTag, "VIDEO 画面モード=%04X 表示制御=%04X プライオリティ=%04X",
                      v.screenMode(), v.displayControl(), v.priority());
+            return;
+        }
+
+        // '=' でイベント駆動のまま命令実行だけを空回しにする (計測用)。
+        // ゲストは止まって見える。恒久的な機能ではない。
+        const bool isEventNullExec = c == '=';
+        if (isEventNullExec)
+        {
+            const bool on = !g_eventNullExec.load();
+            g_eventNullExec = on;
+            g_machine.setNullExecInEvent(on);
+            ESP_LOGI(kTag, "イベント駆動のまま命令を空回し: %s", on ? "ON" : "OFF");
             return;
         }
 
