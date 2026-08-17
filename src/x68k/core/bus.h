@@ -19,6 +19,7 @@
 
 #include <cstdint>
 
+#include "cpu/code_gen_map.h"
 #include "cpu/m68k_types.h"
 #include "dev/sram.h"
 #include "dev/video.h"
@@ -191,6 +192,17 @@ public:
     // Why not 登録を必須にしないか: テストベクタは SystemBus を使わず
     // 独自の Bus 実装を渡す。登録が無ければ CPU は今までどおり
     // 全アクセスを仮想関数で通すので、既存の使い方は何も変わらない。
+    // デコード済みブロックの世代を進める先を教わる (code_gen_map.h)。
+    //
+    // Why バスにも要るか: CPU の直行路だけでは足りない。ROM 写像中の
+    // 書き込み、窓を跨ぐアクセス、そして **DMA** はここを通る。
+    // Human68k はプログラムを DMA でロードしてから実行するので、
+    // ここが漏れると「書いてから実行する」経路が丸ごと抜ける。
+    void setCodeGenMap(CodeGenMap* map)
+    {
+        codeGen_ = map;
+    }
+
     void attachFastPathCpu(M68k* cpu)
     {
         fastPathCpu_ = cpu;
@@ -243,6 +255,7 @@ private:
     void* watchUser_ = nullptr;
     // 直接経路を使う CPU。所有しない。未登録なら全アクセスが仮想関数を通る。
     M68k* fastPathCpu_ = nullptr;
+    CodeGenMap* codeGen_ = nullptr;
 
     // ウォッチ対象なら通知する。write8 / write16 の両方から呼ぶ。
     void notifyWatch(u32 addr, u32 value, u32 size)

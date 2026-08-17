@@ -1354,4 +1354,62 @@ TEST_SUITE("イベント駆動")
         CHECK(spent > 0);
         CHECK_FALSE(m.isHalted());
     }
+    // ゲスト RAM の書き換えが世代に記録される。
+    //
+    // デコード済みブロックは「この番地の命令列はこう」という前提を持つ。
+    // ゲストが書き換えたら前提が崩れるので、世代でそれを知る
+    // (src/x68k/core/cpu/code_gen_map.h)。
+    //
+    // **書き込みの経路は 3 つある。** どれか 1 つでも世代を上げ損なうと、
+    // 古い前提のまま走り続ける。3 つとも個別に確かめる。
+    //
+    // Why これを先に書くか: 命令フェッチの窓をポインタでキャッシュしたとき、
+    // 無効化の経路を 1 つ漏らす変異を既存テストが検出できなかった。
+    // 同じ失敗を繰り返さないため、機構より先に検出できることを固定する。
+    TEST_CASE("ゲスト RAM の書き換えが 3 つの経路すべてで世代に載る")
+    {
+        static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+        static std::vector<std::uint16_t> gens(x68k::kMainRamSize / x68k::CodeGenMap::kPageSize, 0);
+        std::fill(ram.begin(), ram.end(), 0);
+        std::fill(gens.begin(), gens.end(), 0);
+
+        x68k::Machine m;
+        x68k::MemoryMap map{};
+        map.mainRam = ram.data();
+        m.setMemory(map);
+        m.reset();
+        m.cpu().codeGenMap().setStorage(gens.data(), static_cast<x68k::u32>(gens.size()));
+
+        const x68k::u32 target = 0x1000;
+
+        SUBCASE("CPU の直行路 (fastRam)")
+        {
+            const std::uint16_t before = m.cpu().codeGenMap().generation(target);
+            m.cpu().writeForTest(target, 0x1234);
+            CHECK(m.cpu().codeGenMap().generation(target) != before);
+        }
+
+        SUBCASE("バス経由 (CPU の遅い経路と DMA が通る)")
+        {
+            const std::uint16_t before = m.cpu().codeGenMap().generation(target);
+            m.bus().write16(target, 0x5678);
+            CHECK(m.cpu().codeGenMap().generation(target) != before);
+        }
+
+        SUBCASE("バス経由のバイト書き込み")
+        {
+            const std::uint16_t before = m.cpu().codeGenMap().generation(target);
+            m.bus().write8(target, 0x9A);
+            CHECK(m.cpu().codeGenMap().generation(target) != before);
+        }
+
+        SUBCASE("実体の差し替えは全ページを無効にする")
+        {
+            const std::uint16_t before = m.cpu().codeGenMap().generation(target);
+            const std::uint16_t beforeFar = m.cpu().codeGenMap().generation(x68k::kMainRamSize - 1);
+            m.cpu().codeGenMap().touchAll();
+            CHECK(m.cpu().codeGenMap().generation(target) != before);
+            CHECK(m.cpu().codeGenMap().generation(x68k::kMainRamSize - 1) != beforeFar);
+        }
+    }
 }

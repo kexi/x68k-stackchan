@@ -112,6 +112,8 @@ void M68k::loadStateForTest(const M68kState& s)
 {
     st_ = s;
     pendingIrq_ = 0;
+    // 外から状態を差し替えたので、控えている世代は当てにならない。
+    codeGen_.touchAll();
 }
 
 // --- プリフェッチ ----------------------------------------------------------
@@ -283,6 +285,7 @@ void M68k::write8(u32 addr, u8 value)
     const u32 a = addr & M68k::kAddrMask;
     if (fastRamHasByte(a))
     {
+        codeGen_.touch(a);
         fastRam_[a] = value;
         return;
     }
@@ -299,6 +302,7 @@ void M68k::write16(u32 addr, u16 value)
     }
     if (fastRamHasWord(a))
     {
+        codeGen_.touch(a);
         fastRam_[a] = static_cast<u8>(value >> 8);
         fastRam_[a + 1] = static_cast<u8>(value & 0xFFu);
         return;
@@ -316,6 +320,9 @@ void M68k::write32(u32 addr, u32 value)
     }
     if (fastRamHasLong(a))
     {
+        // ロングは 4 バイト。1KB ページを跨ぐことがあるので両端を数える。
+        codeGen_.touch(a);
+        codeGen_.touch(a + 3);
         fastRam_[a] = static_cast<u8>(value >> 24);
         fastRam_[a + 1] = static_cast<u8>(value >> 16);
         fastRam_[a + 2] = static_cast<u8>(value >> 8);

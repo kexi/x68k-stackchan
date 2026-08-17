@@ -103,6 +103,10 @@ Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
     // 以後、実体・ROM 写像・ウォッチが変わるたびにバスが CPU へ教え直す。
     bus_.attachFastPathCpu(&cpu_);
 
+    // 書き込みの世代を数える先を教える。CPU の直行路は CPU 自身が触るが、
+    // ROM 写像中の書き込み・窓を跨ぐアクセス・DMA はバスを通る。
+    bus_.setCodeGenMap(&cpu_.codeGenMap());
+
     // X68000 では RESET 命令で $000000 の ROM 写像が解除される。
     // 68000 自身は RESET 信号を出すだけなので、機種固有のこの反応は
     // Machine が受け取って処理する。

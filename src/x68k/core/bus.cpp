@@ -311,6 +311,12 @@ void SystemBus::write8(u32 addr, u8 value)
         // ROM が写像されている間の書き込みは RAM 側へ行く (ROM は書けない)。
         if (mem_.mainRam != nullptr)
         {
+            // ここは CPU の遅い経路と **DMA** の両方が通る。デコード済み
+            // ブロックの前提が崩れたことを世代で伝える (code_gen_map.h)。
+            if (codeGen_ != nullptr)
+            {
+                codeGen_->touch(a);
+            }
             mem_.mainRam[a] = value;
         }
         return;
@@ -370,6 +376,10 @@ void SystemBus::write16(u32 addr, u16 value)
     const bool fitsInMainRam = a + 1 < kMainRamSize;
     if (fitsInMainRam && mem_.mainRam != nullptr)
     {
+        if (codeGen_ != nullptr)
+        {
+            codeGen_->touch(a);
+        }
         mem_.mainRam[a] = static_cast<u8>(value >> 8);
         mem_.mainRam[a + 1] = static_cast<u8>(value & 0xFFu);
         return;

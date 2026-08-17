@@ -21,6 +21,7 @@
 #ifndef X68K_CORE_CPU_M68K_H
 #define X68K_CORE_CPU_M68K_H
 
+#include "code_gen_map.h"
 #include "m68k_types.h"
 
 // ホットパスを内部 SRAM (IRAM) へ置くための印。
@@ -139,8 +140,28 @@ public:
     //
     // romAtZero は「$000000 に IPL-ROM が写像されている」間 true。写像中は
     // 窓の読み出しが RAM ではなく ROM 側に当たるので、fast path を止める。
+    // デコード済みブロックの世代表 (code_gen_map.h)。
+    // 書き込みのたびに触るので、CPU が直接持つ。
+    // テストから CPU の書き込み経路を直接叩く。
+    //
+    // Why 要るか: 「CPU の直行路 (fastRam) が世代を上げるか」は、
+    // バス経由と区別して確かめないと意味が無い。命令を組んで走らせると
+    // どちらを通ったか分からない。
+    void writeForTest(u32 addr, u16 value)
+    {
+        write16(addr, value);
+    }
+
+    [[nodiscard]] CodeGenMap& codeGenMap()
+    {
+        return codeGen_;
+    }
+
     void setFastRam(u8* base, u32 length)
     {
+        // 実体が差し替わったら、控えている世代は全部当てにならない。
+        // 個別に消して回るより 1 つ進める方が漏れようがない。
+        codeGen_.touchAll();
         fastRam_ = base;
         fastRamLimit_ = base != nullptr ? length : 0;
     }
@@ -533,6 +554,8 @@ private:
     // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
     bool fastRamReadable_ = false;
     M68kState st_;
+    // ゲスト RAM の書き換えを世代で追う (code_gen_map.h)。
+    CodeGenMap codeGen_;
     // 保留中の割り込みレベル (0 = なし)。
     u32 pendingIrq_ = 0;
     // 保留中の割り込みが使うベクタ番号 (0 = 自動ベクタ)。
