@@ -26,6 +26,7 @@
 #include "dev/sprite.h"
 #include "dev/sram.h"
 #include "dev/video.h"
+#include "perf_switch.h"
 
 namespace x68k
 {
@@ -100,6 +101,22 @@ public:
 
     // 1 命令だけ実行する。トレース用。
     u32 step();
+
+    // 毎命令通る経路の最適化を個別に切る。実機で焼き直さずに効果を
+    // 測るための口 (perf_switch.h に理由がある)。既定は全て有効。
+    //
+    // 呼ぶのはエミュレーションを走らせていないタイミング、あるいは
+    // スライスの切れ目。切り替えても状態遷移は変わらないので、途中で
+    // 切り替えてもゲストからは見えない。
+    void setPerfSwitch(const PerfSwitch& value)
+    {
+        perf_ = value;
+    }
+
+    [[nodiscard]] const PerfSwitch& perfSwitch() const
+    {
+        return perf_;
+    }
 
     [[nodiscard]] M68k& cpu()
     {
@@ -309,6 +326,10 @@ private:
 
     // 時間で動くデバイスへ経過サイクルを渡す。step() と run() の共通路。
     void tickDevices(u32 cycles);
+
+    // 毎命令通る経路の最適化スイッチ。既定は全て有効で、無効側は
+    // 実機の計測でだけ使う (perf_switch.h)。
+    PerfSwitch perf_{};
 
     Sram sram_;
     SystemBus bus_;

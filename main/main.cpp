@@ -106,6 +106,25 @@ x68k_platform::M5SpeakerSink g_speaker;
 #endif
 std::atomic<bool> g_audioEnabled{X68K_ENABLE_AUDIO != 0};
 
+// 毎命令通る経路の最適化を入れるか (src/x68k/core/perf_switch.h)。
+//
+// Why not コンパイル時に決めないか: 最適化が効いたかどうかは実機でしか
+// 判定できないのに、実効クロックは起動ごとに揺れる (SD の中身、PSRAM の
+// 割り付け、温度)。焼き直して前後を比べるとその揺れが混ざるので、
+// **同じ起動の中で切り替えて**比べる。音源の '|' が同じ形で先にある。
+//
+// これを 1 回焼けば、5 秒ごとの実効クロックの報告を挟みながら
+// 全ての組み合わせを順に測れる。既定は有効 (本番の姿)。
+//
+// 立てるのはシリアルを受けるタスク、読むのはエミュレーションコア。
+// 切り替えても状態遷移は変わらないので、遷移が 1 スライス遅れて
+// 効いても計測には影響しない。
+std::atomic<bool> g_fastTickEnabled{true};
+
+// 上の値をエミュレーションコアが Machine へ写したかどうか。
+// 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
+bool g_fastTickApplied = true;
+
 // 音声タスクが動いているか。スピーカーを開けなかったときは false のまま。
 bool g_speakerReady = false;
 
@@ -611,6 +630,22 @@ void emulatorTask(void* /*arg*/)
         // SRAM の書き戻しと停止の検出を持つ。眠りを伸ばすとそちらの
         // 反応まで鈍る。停止中は下の vTaskDelay(1) を毎周回すので、
         // 止めている間の CPU は run を飛ばすだけで十分に空く。
+        // 最適化スイッチが切り替わったら Machine へ写す。
+        //
+        // スライスの切れ目で writes ので、run の途中で経路が変わることは
+        // 無い。毎スライス atomic を 1 回読むだけなので、計測している
+        // ホットループの中には何も足さない。
+        const bool wantFastTick = g_fastTickEnabled.load(std::memory_order_relaxed);
+        if (wantFastTick != g_fastTickApplied)
+        {
+            x68k::PerfSwitch sw;
+            sw.inlineRtcTick = wantFastTick;
+            sw.inlineCrtcTick = wantFastTick;
+            sw.inlineMfpTimer = wantFastTick;
+            g_machine.setPerfSwitch(sw);
+            g_fastTickApplied = wantFastTick;
+        }
+
         const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
         if (sliceCycles > 0)
         {
@@ -916,6 +951,26 @@ private:
             const bool enabled = !g_audioEnabled.load();
             g_audioEnabled = enabled;
             ESP_LOGI(kTag, "音源: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '&' で毎命令通る経路の最適化を切り替える。
+        //
+        // 音源の '|' と同じ理由で、焼き直さずに同じ起動の中で比べるため
+        // にある。切り替えたら 5 秒ごとの「実効 NNNN kHz」を 20 回ほど
+        // 読んで、収束後の平均を前後で比べる (起動直後は低めに出るので
+        // 最初の数回は捨てる)。
+        //
+        // Why not 'p' のような文字か: 無条件に横取りする口 ('~' '|' '!'
+        // '<' '>') は全て記号にしてある。英字を無条件で取ると Human68k へ
+        // 打てなくなる (顔モード限定の 'e' 'S' 'h' は isFaceMode で
+        // 守られているが、これは X68K モードでも使いたい)。
+        const bool isPerfToggle = c == '&';
+        if (isPerfToggle)
+        {
+            const bool enabled = !g_fastTickEnabled.load();
+            g_fastTickEnabled = enabled;
+            ESP_LOGI(kTag, "毎命令経路の最適化: %s", enabled ? "ON" : "OFF");
             return;
         }
 
@@ -1475,7 +1530,7 @@ extern "C" void app_main(void)
     {
         ESP_LOGI(kTag,
                  "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ、"
-                 "'|' で音源の ON/OFF");
+                 "'|' で音源の ON/OFF、'&' で毎命令経路の最適化の ON/OFF");
     }
     else
     {

@@ -204,7 +204,7 @@ u32 Machine::run(u32 cycles)
 
 void Machine::tickDevices(u32 cycles)
 {
-    mfp_.tick(cycles);
+    mfp_.tick(cycles, perf_.inlineMfpTimer);
 
     // RTC も CRTC もまとめない。
     //
@@ -218,9 +218,9 @@ void Machine::tickDevices(u32 cycles)
     // いずれもゲストが命令単位でポーリングできる値なので、「分解能より
     // 細かいから見えない」は成り立たない。ポーリングループの反復回数
     // として観測できる。速度のために正しさを崩す取引だったので戻した。
-    rtc_.tick(cycles);
+    rtc_.tick(cycles, perf_.inlineRtcTick);
 
-    if (crtc_.tick(cycles))
+    if (crtc_.tick(cycles, perf_.inlineCrtcTick))
     {
         mfp_.setVerticalBlank(crtc_.inVerticalBlank());
     }

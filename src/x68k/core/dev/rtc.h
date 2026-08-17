@@ -64,10 +64,14 @@ public:
     // 観測できた (docs/knowledge/cores3-emulator-runtime.md)。ここは
     // まとめず、渡す量はそのままで**呼び出しの間接性だけを消す**。
     // 状態遷移はサイクル単位で完全に元のままになる。
-    void tick(u32 cycles)
+    // inlineFastPath を false にすると、この最適化を入れる前と同じ
+    // 「常に実呼び出し」へ戻る。実機で焼き直さずに効果を測るための口で、
+    // 状態遷移はどちらでも完全に同一 (perf_switch.h を見よ)。
+    void tick(u32 cycles, bool inlineFastPath = true)
     {
         cycleAccumulator_ += cycles;
-        if (cycleAccumulator_ < kCyclesPerSecond)
+        const bool canReturnEarly = inlineFastPath && cycleAccumulator_ < kCyclesPerSecond;
+        if (canReturnEarly)
         {
             return;  // ここが最頻。1 秒に 1 度しか下へ落ちない。
         }

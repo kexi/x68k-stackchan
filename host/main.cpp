@@ -418,6 +418,8 @@ void printUsage()
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
         "  --stats         実行した命令の内訳を最後に出す\n"
+        "  --no-fast-tick  毎命令通る経路の最適化を切って走らせる\n"
+        "                  付けた側と付けない側で最終状態が一致するはず\n"
         "\n"
         "ROM はライセンス上リポジトリに含まれない。NOTICE.md を参照。\n");
 }
@@ -598,6 +600,7 @@ int main(int argc, char** argv)
     bool hasTraceFrom = false;
     std::size_t traceLast = 0;
     bool showStats = false;
+    bool noFastTick = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -691,6 +694,14 @@ int main(int argc, char** argv)
         else if (arg == "--stats")
         {
             showStats = true;
+        }
+        // 毎命令通る経路の最適化を切って走らせる。実機では 1 文字で
+        // 切り替えるが (main/main.cpp の 'p')、ホストでは
+        // 「切った側と入れた側で最終状態が一致するか」を機械的に
+        // 確かめるのに使う。一致しなければ最適化が状態を変えている。
+        else if (arg == "--no-fast-tick")
+        {
+            noFastTick = true;
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -845,6 +856,16 @@ int main(int argc, char** argv)
             continue;
         }
         machine.setFloppyDisk(d, &floppy[d]);
+    }
+
+    if (noFastTick)
+    {
+        x68k::PerfSwitch off;
+        off.inlineRtcTick = false;
+        off.inlineCrtcTick = false;
+        off.inlineMfpTimer = false;
+        machine.setPerfSwitch(off);
+        std::printf("[perf] 毎命令通る経路の最適化を切って走らせる\n");
     }
 
     machine.reset();

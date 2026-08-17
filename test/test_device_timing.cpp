@@ -233,4 +233,68 @@ TEST_SUITE("device-timing")
         CHECK(sspAfter < sspBefore);
         CHECK(m.cpu().state().interruptMask() == 6);
     }
+
+    // 毎命令通る経路の最適化 (perf_switch.h) は、速さだけを変えて
+    // 状態を変えないという約束で入れてある。実機で焼き直さずに効果を
+    // 測るためのスイッチなので、両側で同じ答えが出ないと比較の意味が無い。
+    //
+    // ここが落ちるときは、速い側が遅い側と違う計算をしている。
+    // 速度の差ではなく **正しさの差** なので、実機の数字を見る前に直す。
+    TEST_CASE("最適化スイッチの両側で状態が一致する")
+    {
+        // 同じ入力を両側へ与え、時間で動くデバイスの見えるところを比べる。
+        const auto runWith = [](bool fastPath)
+        {
+            x68k::Machine m;
+            x68k::PerfSwitch sw;
+            sw.inlineRtcTick = fastPath;
+            sw.inlineCrtcTick = fastPath;
+            sw.inlineMfpTimer = fastPath;
+            m.setPerfSwitch(sw);
+            m.reset();
+
+            // タイマ C と D を動かす (X68000 が実際に使う 2 本)。
+            // 分周は別々にして、片方だけの一致で通らないようにする。
+            // タイマ C/D の割り込みを許可する。IPRB が立たないと、下の
+            // 「素通りではない」確認が効かなくなる (IER を 0 のままにすると
+            // MC68901 は IPR も立てない)。
+            const x68k::u8 timerCD =
+                static_cast<x68k::u8>(x68k::Mfp::kIntTimerC | x68k::Mfp::kIntTimerD);
+            m.mfp().write(x68k::Mfp::kIerb, timerCD);
+            m.mfp().write(x68k::Mfp::kImrb, timerCD);
+            m.mfp().write(x68k::Mfp::kTcdcr, 0x51);  // C=分周 50, D=分周 4
+            m.mfp().write(x68k::Mfp::kTcdr, 200);
+            m.mfp().write(x68k::Mfp::kTddr, 3);
+
+            // 素数サイクルで刻む。分周値の倍数だと、閾値をちょうど跨ぐ
+            // 場合と跨がない場合の差が出ない。
+            for (int i = 0; i < 20000; ++i)
+            {
+                m.mfp().tick(7, fastPath);
+                m.rtc().tick(7, fastPath);
+                m.crtc().tick(7, fastPath);
+            }
+
+            // タイマの現在値、垂直帰線、秒、保留割り込みを一度に見る。
+            return std::vector<x68k::u32>{
+                m.mfp().read(x68k::Mfp::kTcdr),
+                m.mfp().read(x68k::Mfp::kTddr),
+                m.mfp().peek(x68k::Mfp::kIprb),
+                static_cast<x68k::u32>(m.crtc().inVerticalBlank() ? 1 : 0),
+                m.crtc().rasterNumber(),
+                m.rtc().read(0),
+                m.rtc().read(1),
+            };
+        };
+
+        const std::vector<x68k::u32> fast = runWith(true);
+        const std::vector<x68k::u32> slow = runWith(false);
+        CHECK(fast == slow);
+
+        // 素通りのテストになっていないこと。刻んだ結果、タイマが実際に
+        // 減っていて保留も立っているのを確かめる (全部 0 同士の一致では
+        // 何も守れない)。
+        REQUIRE(fast.size() == 7);
+        CHECK(fast[2] != 0);
+    }
 }
