@@ -11,6 +11,7 @@
 //   x68k-run --iplrom rom/iplrom.dat [--hdd rom/hdd0.hdf] [--fd0 disk.xdf]
 //            [--ppm out.ppm] [--trace] [--cycles N]
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,12 @@
 #include "io/ascii_keymap.h"
 #include "gui_demo.h"
 #include "machine.h"
+
+#if X68K_COUNT_FETCH_ORIGIN
+extern unsigned long g_refillFromRom;
+extern unsigned long g_refillFromRam;
+extern unsigned long g_blockHits[65536];
+#endif
 #include "video/cgrom_fallback.h"
 #include "video/graphic_raster.h"
 #include "video/text_raster.h"
@@ -1184,6 +1191,47 @@ int main(int argc, char** argv)
             machine.mfp().peek(x68k::Mfp::kTcdcr), machine.mfp().peek(x68k::Mfp::kTadr),
             machine.mfp().peek(x68k::Mfp::kTbdr), machine.mfp().peek(x68k::Mfp::kTcdr),
             machine.mfp().peek(x68k::Mfp::kTddr));
+#if X68K_COUNT_FETCH_ORIGIN
+        // 段 0: ブロックキャッシュを ROM 窓に限れるかを決めるための計測。
+        // 「IPL-ROM 79%」は起動中の値で、Human68k 稼働中は未計測だった。
+        {
+            const unsigned long tot = g_refillFromRom + g_refillFromRam;
+            std::printf("[fetch] refill ROM=%lu RAM=%lu (ROM %.1f%%)\n", g_refillFromRom,
+                        g_refillFromRam,
+                        tot != 0 ? 100.0 * (double)g_refillFromRom / (double)tot : 0.0);
+            // 集中度: 実行回数の多い順に並べ、上位 N でどれだけ覆えるか。
+            {
+                std::vector<unsigned long> v(g_blockHits, g_blockHits + 65536);
+                std::sort(v.begin(), v.end(), std::greater<unsigned long>());
+                unsigned long all = 0;
+                for (unsigned long x : v)
+                {
+                    all += x;
+                }
+                unsigned long acc = 0;
+                const int marks[] = {50, 100, 200, 500, 1000, 2000};
+                for (int m : marks)
+                {
+                    acc = 0;
+                    for (int i = 0; i < m && i < 65536; ++i)
+                    {
+                        acc += v[(std::size_t)i];
+                    }
+                    std::printf("[block] 上位 %5d 個で動的実行の %.1f%%\n", m,
+                                all != 0 ? 100.0 * (double)acc / (double)all : 0.0);
+                }
+                std::size_t nonzero = 0;
+                for (unsigned long x : v)
+                {
+                    if (x != 0)
+                    {
+                        ++nonzero;
+                    }
+                }
+                std::printf("[block] 到達したブロック先頭 %zu 個\n", nonzero);
+            }
+        }
+#endif
         std::printf("[mfp] IERB=%02X IMRB=%02X IPRB=%02X\n", machine.mfp().peek(x68k::Mfp::kIerb),
                     machine.mfp().peek(x68k::Mfp::kImrb), machine.mfp().peek(x68k::Mfp::kIprb));
         std::printf("[mfp] IERA=%02X IPRA=%02X IMRA=%02X RSR=%02X UDR=%02X SR=%04X\n",

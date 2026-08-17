@@ -5,6 +5,17 @@
 
 #include "m68k.h"
 
+#if X68K_COUNT_FETCH_ORIGIN
+// 段 0 の計測用。恒久的な機能ではない。
+constexpr unsigned kBlockHistSize = 65536;
+unsigned long g_refillFromRom = 0;
+unsigned long g_refillFromRam = 0;
+// ブロック先頭 PC のヒストグラム。PC を 2 で割って下位ビットで畳む
+// (完全な集計ではなく集中度の目安。衝突は集中度を過大評価する側に働くので、
+// 「集中していない」と出たらその結論は信用できる)。
+unsigned long g_blockHits[kBlockHistSize];
+#endif
+
 namespace x68k
 {
 namespace
@@ -134,6 +145,24 @@ void M68k::refillPrefetch(u32 newPc)
     const u32 a = newPc & M68k::kAddrMask;
     // 分岐のたびに 2 ワード読む。ここも直接経路を通す。
     // 4 バイトとも窓に収まるときだけ (またぐ場合は下の一般路が境界を見る)。
+#if X68K_COUNT_FETCH_ORIGIN
+    // 段 0 タスク 2: ブロック先頭 PC の実行回数。集中度が高ければ、
+    // 小さいコードキャッシュでも動的実行の大半を覆える。
+    g_blockHits[(newPc >> 1) & (kBlockHistSize - 1)]++;
+    // 段 0: ブロックキャッシュを ROM 窓に限れるかを決めるための計測。
+    // 「IPL-ROM 79%」は起動中の値で、Human68k 稼働中は未計測だった。
+    {
+        u32 dummy = 0;
+        if (fastRomHas(a, 4, dummy))
+        {
+            ++g_refillFromRom;
+        }
+        else
+        {
+            ++g_refillFromRam;
+        }
+    }
+#endif
     if (fastRamReadable_ && fastRamHasLong(a))
     {
         st_.ir = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
