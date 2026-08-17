@@ -142,6 +142,12 @@ public:
     // 窓の読み出しが RAM ではなく ROM 側に当たるので、fast path を止める。
     // デコード済みブロックの世代表 (code_gen_map.h)。
     // 書き込みのたびに触るので、CPU が直接持つ。
+    // テストからプリフェッチを張り直す。命令長デコーダの検証に使う。
+    void refillPrefetchForTest(u32 pc)
+    {
+        refillPrefetch(pc);
+    }
+
     // テストから CPU の書き込み経路を直接叩く。
     //
     // Why 要るか: 「CPU の直行路 (fastRam) が世代を上げるか」は、

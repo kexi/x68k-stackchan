@@ -19,6 +19,7 @@
 #include "dev/mfp.h"
 #include "dev/rtc.h"
 #include "dev/video.h"
+#include "cpu/m68k_length.h"
 #include "machine.h"
 #include "scheduler.h"
 #include "doctest.h"
@@ -1411,5 +1412,105 @@ TEST_SUITE("イベント駆動")
             CHECK(m.cpu().codeGenMap().generation(target) != before);
             CHECK(m.cpu().codeGenMap().generation(x68k::kMainRamSize - 1) != beforeFar);
         }
+    }
+    // 命令長デコーダが「実行して PC が進む量」と一致する。
+    //
+    // デコード済みブロックを組むには「次の命令はどこか」が要る。68000 の
+    // 命令は 2〜10 バイトで、長さは実効アドレスのモードと拡張ワードで決まる
+    // (src/x68k/core/cpu/m68k_length.h)。
+    //
+    // **一度ここで失敗している。** 2 バイト固定で並べたら 2 命令目以降の
+    // 位置がずれ、ブロックが 1 命令で抜けて 100 倍以上遅くなった。
+    // 長さが正しいことは、実行と突き合わせてしか確かめられない。
+    TEST_CASE("命令長デコーダが実行と一致する")
+    {
+        static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+        const auto poke16 = [](x68k::u32 a, x68k::u16 v)
+        {
+            ram[a] = static_cast<x68k::u8>(v >> 8);
+            ram[a + 1] = static_cast<x68k::u8>(v & 0xFF);
+        };
+
+        std::size_t checked = 0;
+        std::size_t mismatched = 0;
+        x68k::u16 firstBad = 0;
+
+        for (x68k::u32 opv = 0; opv < 0x10000; ++opv)
+        {
+            const auto op = static_cast<x68k::u16>(opv);
+            const x68k::u32 length = x68k::instructionLength(op);
+            if (length == x68k::kUnknownLength)
+            {
+                continue;
+            }
+            // 分岐は成立すると PC が飛ぶので長さの検証にならない。
+            // 実行時は「PC が想定と違えば抜ける」で守られる。
+            if ((op >> 12) == 0x6)
+            {
+                continue;
+            }
+
+            std::fill(ram.begin(), ram.end(), 0);
+            poke16(0, 0x0000);
+            poke16(2, 0x8000);
+            poke16(4, 0x0000);
+            poke16(6, 0x1000);
+            for (x68k::u32 a = 0x1000; a < 0x1100; a += 2)
+            {
+                poke16(a, 0x4E71);  // NOP
+            }
+            poke16(0x1000, op);
+            // 拡張ワードには RAM 内を指す安全な値を置く。
+            for (x68k::u32 w = 1; w < 5; ++w)
+            {
+                poke16(0x1000 + w * 2, 0x0020);
+            }
+
+            x68k::Machine m;
+            x68k::MemoryMap map{};
+            map.mainRam = ram.data();
+            m.setMemory(map);
+            m.reset();
+
+            x68k::M68kState st = m.cpu().state();
+            st.pc = 0x1000;
+            st.sr = 0x2000;
+            for (int i = 0; i < 8; ++i)
+            {
+                st.d[i] = 0x20;
+                st.a[i] = 0x40;
+            }
+            st.a[7] = 0x8000;
+            m.cpu().loadStateForTest(st);
+            m.cpu().refillPrefetchForTest(0x1000);
+
+            m.step();
+            if (m.isHalted())
+            {
+                continue;
+            }
+            // 実行後の PC は「次の命令語 + 4」。
+            const x68k::u32 after = m.cpu().state().pc - 4;
+            const bool wentForward = after >= 0x1000 && after - 0x1000 <= 10;
+            if (!wentForward)
+            {
+                continue;  // 制御が飛んだ
+            }
+
+            ++checked;
+            if (after - 0x1000 != length)
+            {
+                ++mismatched;
+                if (firstBad == 0)
+                {
+                    firstBad = op;
+                }
+            }
+        }
+
+        CAPTURE(firstBad);
+        CHECK(mismatched == 0);
+        // 素通りしていないこと。対象の命令が実際に検査されている。
+        CHECK(checked > 3000);
     }
 }
