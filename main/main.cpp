@@ -121,6 +121,17 @@ std::atomic<bool> g_audioEnabled{X68K_ENABLE_AUDIO != 0};
 // 効いても計測には影響しない。
 std::atomic<bool> g_fastTickEnabled{true};
 
+// JIT の上限を測るモード (src/x68k/core/cpu/jit_probe.h)。
+//
+// 命令の実行を空回しにして走らせ、ループ運営・割り込み判定・デバイスの
+// tick だけが残った状態の実効クロックを見る。ここで出る数字が
+// 「JIT が命令を無限に速く実行できたとして届く上限」になる。
+//
+// **状態が進まないのでゲストは止まって見える。** 恒久的な機能ではなく、
+// JIT に着手するかどうかを決めるための実測用。既定は無効。
+std::atomic<bool> g_nullExecProbe{false};
+std::atomic<int> g_nullExecStage{0};
+
 // 上の値をエミュレーションコアが Machine へ写したかどうか。
 // 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
 bool g_fastTickApplied = true;
@@ -649,7 +660,16 @@ void emulatorTask(void* /*arg*/)
         const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
         if (sliceCycles > 0)
         {
-            g_machine.run(sliceCycles);
+            // JIT の上限計測モードでは命令を実行せず、ループ運営と
+            // デバイスの時間だけを回す (jit_probe.h)。
+            if (g_nullExecProbe.load(std::memory_order_relaxed))
+            {
+                g_machine.runNullExec(sliceCycles);
+            }
+            else
+            {
+                g_machine.run(sliceCycles);
+            }
             totalCycles += sliceCycles;
         }
 
@@ -971,6 +991,36 @@ private:
             const bool enabled = !g_fastTickEnabled.load();
             g_fastTickEnabled = enabled;
             ESP_LOGI(kTag, "毎命令経路の最適化: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '%' で JIT の上限計測モードを切り替える (jit_probe.h)。
+        //
+        // 命令の実行を空回しにするので、**ゲストは止まって見える**。
+        // 実効クロックの報告だけが意味を持つ。JIT に着手するかどうかを
+        // 決めるための実測用で、恒久的な機能ではない。
+        const bool isNullExecToggle = c == '%';
+        if (isNullExecToggle)
+        {
+            const bool enabled = !g_nullExecProbe.load();
+            g_nullExecProbe = enabled;
+            ESP_LOGI(kTag, "JIT 上限計測モード: %s (ゲストは進みません)", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '_' で、上限計測モードからさらにデバイスの tick と割り込み判定を
+        // 外す。ループ運営だけが残るので、機械としての天井が見える。
+        //
+        // 上限計測モード ('%') が ON のときだけ意味がある。
+        const bool isSkipDevicesToggle = c == '_';
+        if (isSkipDevicesToggle)
+        {
+            const int stage = (g_nullExecStage.load() + 1) % 4;
+            g_nullExecStage = stage;
+            g_machine.setNullExecStage(stage);
+            static const char* const kNames[4] = {"全部含む", "tickDevices を外す",
+                                                  "割り込み判定を外す", "両方外す"};
+            ESP_LOGI(kTag, "上限計測 stage %d: %s", stage, kNames[stage]);
             return;
         }
 

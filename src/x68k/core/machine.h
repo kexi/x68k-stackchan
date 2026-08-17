@@ -102,6 +102,28 @@ public:
     // 1 命令だけ実行する。トレース用。
     u32 step();
 
+    // JIT の上限を測るための計測モード (cpu/jit_probe.h)。
+    //
+    // 命令の実行を空回しにして、ループ運営・割り込み判定・デバイスの
+    // tick だけを残した状態で走る。ここで出る実効クロックが
+    // 「JIT が命令を無限に速く実行できたとして届く上限」になる。
+    //
+    // **状態は進まないのでゲストは動かない。** 恒久的な機能ではなく、
+    // JIT に着手するかどうかを決めるための実測用。
+    u32 runNullExec(u32 cycles);
+
+    // runNullExec の実体。WithDevices / WithInterrupts をテンプレート引数に
+    // して、計測器自身が毎命令の分岐にならないようにする。
+    template <bool WithDevices, bool WithInterrupts>
+    u32 runNullExecWith(u32 cycles);
+
+    // runNullExec でデバイスの tick と割り込み判定まで外すか。
+    // ループ運営だけが残る状態の天井を見るために使う。
+    void setNullExecStage(int stage)
+    {
+        nullExecStage_ = stage;
+    }
+
     // 毎命令通る経路の最適化を個別に切る。実機で焼き直さずに効果を
     // 測るための口 (perf_switch.h に理由がある)。既定は全て有効。
     //
@@ -340,6 +362,7 @@ private:
     // 毎命令通る経路の最適化スイッチ。既定は全て有効で、無効側は
     // 実機の計測でだけ使う (perf_switch.h)。
     PerfSwitch perf_{};
+    int nullExecStage_ = 0;
 
     Sram sram_;
     SystemBus bus_;

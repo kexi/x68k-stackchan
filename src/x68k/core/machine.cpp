@@ -252,6 +252,60 @@ u32 Machine::runWith(u32 cycles)
     return spent;
 }
 
+u32 Machine::runNullExec(u32 cycles)
+{
+    // JIT の上限と、デバイス処理の内訳を測るモード。命令の実行そのものを
+    // 空回しにして、ループ運営・割り込み判定・tickDevices だけを残す。
+    //
+    // Stage をテンプレート引数にして入口で 1 回だけ分岐する。
+    //
+    // Why not 実行時の int を毎命令見ないか: それだと計測器自身が
+    // 毎命令のロードと分岐になり、測ろうとしている対象にコストを乗せる。
+    // 本番の '&' スイッチで同じ誤りを一度犯している (perf_switch.h)。
+    // 計測モードでも同じ規律を守らないと、出てくる内訳が信用できない。
+    switch (nullExecStage_)
+    {
+        case 1:
+            return runNullExecWith<false, true>(cycles);
+        case 2:
+            return runNullExecWith<true, false>(cycles);
+        case 3:
+            return runNullExecWith<false, false>(cycles);
+        default:
+            return runNullExecWith<true, true>(cycles);
+    }
+}
+
+template <bool WithDevices, bool WithInterrupts>
+u32 Machine::runNullExecWith(u32 cycles)
+{
+    // 1 命令 4 サイクルとするのは、実測した平均が約 4 サイクルだったため
+    // (400M サイクルで 99,998,982 命令 = 4.00)。
+    //
+    // **状態は進まない。** 速度の上限を見るためだけのモードで、
+    // ゲストは動かない (jit_probe.h を見よ)。
+    constexpr u32 kCyclesPerInstruction = 4;
+    u32 spent = 0;
+    while (spent < cycles)
+    {
+        if (WithInterrupts)
+        {
+            serviceInterrupts();
+        }
+        spent += kCyclesPerInstruction;
+        if (WithDevices)
+        {
+            tickDevices<true, true, true>(kCyclesPerInstruction);
+        }
+    }
+    return spent;
+}
+
+template u32 Machine::runNullExecWith<true, true>(u32);
+template u32 Machine::runNullExecWith<true, false>(u32);
+template u32 Machine::runNullExecWith<false, true>(u32);
+template u32 Machine::runNullExecWith<false, false>(u32);
+
 template <bool FastMfp, bool FastRtc, bool FastCrtc>
 void Machine::tickDevices(u32 cycles)
 {
