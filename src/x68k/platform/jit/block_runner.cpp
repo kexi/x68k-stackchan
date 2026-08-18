@@ -37,18 +37,15 @@ u32 mappingEpochOf(void* ctx)
 
 }  // namespace
 
-void BlockRunner::rememberFailure(BlockSlot& slot, std::uint32_t entryPc, std::uint16_t gen,
-                                  std::uint32_t epoch)
+void BlockRunner::rememberFailure(std::uint32_t entryPc, std::uint16_t gen)
 {
     // **飽和したページは覚えない。** kAlwaysStale は「常に古い」なので、
-    // 覚えても次回必ず外れる。覚えた分だけスロットを無駄にする。
+    // 覚えても次回必ず外れる。覚えた分だけ表を無駄にする。
     if (gen == CodeGenMap::kAlwaysStale)
     {
         return;
     }
-    slot.failedPc = entryPc;
-    slot.failedGen = gen;
-    slot.failedEpoch = epoch;
+    neg_.insert(entryPc, gen);
 }
 
 void BlockRunner::reset()
@@ -61,6 +58,7 @@ void BlockRunner::reset()
     {
         code_->reset();
     }
+    neg_.clear();
     codeFull_ = false;
 }
 
@@ -73,15 +71,13 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
 
     // **一度失敗した番地なら、もう試さない。**
     //
-    // 世代と写像が当時のままなら、同じ命令列が同じ結果になる。
-    // どちらかが動いていれば覚え直す (ゲストが書き換えた可能性がある)。
+    // 世代が当時のままなら同じ命令列が同じ結果になる。動いていれば
+    // 覚え直す (ゲストが書き換えた可能性がある)。写像の変化は run() が
+    // 一括で捨てている。
     CodeGenMap& map = cpu.codeGenMap();
     BlockSlot& here = slots_[slotIndex(entryPc)];
     const std::uint16_t nowGen = map.generation(entryPc);
-    const bool rememberedFailure = here.failedPc == entryPc && nowGen != CodeGenMap::kAlwaysStale &&
-                                   here.failedGen == nowGen &&
-                                   here.failedEpoch == map.mappingEpoch();
-    if (rememberedFailure)
+    if (neg_.contains(entryPc, nowGen))
     {
         ++stats_.negativeHit;
         return nullptr;
@@ -95,7 +91,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (!BlockPlanner::plan(src, gen, entryPc, plan))
     {
         ++stats_.translateFail;
-        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
+        rememberFailure(entryPc, nowGen);
         return nullptr;
     }
 
@@ -107,7 +103,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         !cpu.peekCodeWord(plan.fallThroughPc + 2, fallIrc))
     {
         ++stats_.translateFail;
-        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
+        rememberFailure(entryPc, nowGen);
         return nullptr;
     }
 
@@ -115,7 +111,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (need == 0)
     {
         ++stats_.translateFail;
-        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
+        rememberFailure(entryPc, nowGen);
         return nullptr;
     }
 
@@ -124,7 +120,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         // 発行用の控えに収まらない。段 1 の kMaxOps = 4 では起きないが、
         // 上限を上げたときに黙って壊れないよう明示的に諦める。
         ++stats_.translateFail;
-        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
+        rememberFailure(entryPc, nowGen);
         return nullptr;
     }
 
@@ -147,7 +143,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (!emitBlock(plan, fallIr, fallIrc, staging_, need, emitted))
     {
         ++stats_.translateFail;
-        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
+        rememberFailure(entryPc, nowGen);
         return nullptr;
     }
 
@@ -166,8 +162,6 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     code_->commit();
 
     BlockSlot& slot = here;
-    // 翻訳できたので、この番地の「できない」記憶は捨てる。
-    slot.failedPc = 0;
     // **鍵だけを写す。** ops[] は翻訳の途中でしか要らない。
     slot.entryPc = plan.entryPc;
     slot.mappingEpoch = plan.mappingEpoch;
@@ -187,6 +181,18 @@ NativeResult BlockRunner::run(M68k& cpu)
     {
         ++stats_.deferInterrupt;
         return NativeResult{0, NativeExit::kDeferToStep};
+    }
+
+    // **写像が変わったら負の記憶を全部捨てる。**
+    //
+    // 世代はページ単位だが写像は全体に効く。個別に持つより一括で捨てる方が
+    // 安く、かつ漏れようがない。写像が動くのは setFastRam / setFastRom /
+    // reset / loadStateForTest だけなので稀。
+    const u32 nowEpoch = cpu.codeGenMap().mappingEpoch();
+    if (nowEpoch != seenEpoch_)
+    {
+        neg_.clear();
+        seenEpoch_ = nowEpoch;
     }
 
     // 現在の命令語アドレス。プリフェッチの契約により pc は「命令語 + 4」。

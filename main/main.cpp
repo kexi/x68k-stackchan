@@ -906,6 +906,11 @@ std::uint16_t* g_codeGen = nullptr;
 // 1 スロット 40 バイトなので 512 で 20,480 バイト。実測の最大ブロックが
 // 31,744 なので連続で取れる。1024 は 40,960 で取れない。
 constexpr x68k::u32 kJitSlots = 512;
+
+// 「翻訳できない」を覚える表。**成功ブロックとは別に持つ。**
+// 1024 件 x 8 バイト = 8,192 バイト。2 の冪でなければならない。
+constexpr x68k::u32 kJitNegEntries = 2048;
+x68k::jit::NegEntry* g_jitNeg = nullptr;
 x68k::jit::BlockSlot* g_jitSlots = nullptr;
 x68k::jit::ExecMemory g_jitCode;
 x68k::jit::BlockRunner g_jitRunner;
@@ -953,6 +958,12 @@ bool reserveMemory()
     if (g_jitSlots == nullptr)
     {
         ESP_LOGW(kTag, "JIT のスロットを内部 SRAM に置けません (JIT は無効)");
+    }
+    g_jitNeg = static_cast<x68k::jit::NegEntry*>(heap_caps_calloc(
+        kJitNegEntries, sizeof(x68k::jit::NegEntry), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitNeg == nullptr)
+    {
+        ESP_LOGW(kTag, "JIT の負のキャッシュを置けません (再翻訳が減りません)");
     }
     if (!g_jitCode.acquire(kJitCodeBytes))
     {
@@ -1782,6 +1793,7 @@ private:
                     return;
                 }
                 g_jitRunner.setStorage(g_jitSlots, kJitSlots, &g_jitCode);
+                g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
                 g_jitRunner.reset();
                 g_machine.cpu().setNativeExec(g_jitRunner.exec());
                 // **JIT はイベント駆動の経路にしか無い。**
