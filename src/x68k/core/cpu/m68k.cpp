@@ -54,6 +54,14 @@ unsigned long g_hNativeCandidates = 0;
 #define X68K_JIT_STORE_KEEPS_BLOCK 0
 #endif
 constexpr bool kStoreKeepsBlock = X68K_JIT_STORE_KEEPS_BLOCK != 0;
+// 分岐先へ直結する (direct chaining) 設計を仮定するか。
+//
+// ブロック間を直結すれば、分岐が成立しても検索とゲートウェイを
+// 払わずに次のブロックへ入れる。区間長の見積もりが変わる。
+#ifndef X68K_JIT_DIRECT_CHAIN
+#define X68K_JIT_DIRECT_CHAIN 0
+#endif
+constexpr bool kDirectChain = X68K_JIT_DIRECT_CHAIN != 0;
 #endif
 
 namespace x68k
@@ -777,15 +785,19 @@ bool M68k::countJitCoverage(u16 op)
             const u32 cond = static_cast<u32>((op >> 8) & 0xFu);
             const bool isBraOrBsr = cond == 0 || cond == 1;
             // BSR は必ず飛ぶ。Bcc は条件次第なので、実際に評価する。
-            continuesBlock = !isBraOrBsr && !testCondition(cond);
-            if (isBraOrBsr)
+            const bool taken = isBraOrBsr || testCondition(cond);
+            if (taken)
             {
                 ++g_cutBranch;
             }
-            else if (!continuesBlock)
-            {
-                ++g_cutBranch;
-            }
+            // direct chaining なら、分岐先のブロックへ検索を経ずに飛べる。
+            // 区間としては続いているものとして数える (BSR は戻り番地を
+            // 積むので除く)。
+            // 成立しなければそのまま続く。成立した場合、direct chaining が
+            // あれば分岐先のブロックへ検索を経ずに飛べるので区間は途切れない。
+            // BSR は戻り番地をスタックへ積むので直結できない。
+            const bool chainable = kDirectChain && !isBraOrBsr;
+            continuesBlock = !taken || chainable;
         }
         else if (group == 0x4)
         {
