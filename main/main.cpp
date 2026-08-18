@@ -901,7 +901,11 @@ std::uint16_t* g_codeGen = nullptr;
 // スロット数は 2 の冪 (slotIndex がマスクで畳む)。256 スロット x 112 バイト
 // = 28,672 バイト。実測の内部 SRAM 空き 48KB に対して、世代配列 4KB と
 // 合わせて 32KB。**PSRAM には置かない** (散らばったアクセスで実機が止まる)。
-constexpr x68k::u32 kJitSlots = 256;
+// **2 の冪でなければならない** (slotIndex がマスクで畳む)。
+//
+// 1 スロット 40 バイトなので 512 で 20,480 バイト。実測の最大ブロックが
+// 31,744 なので連続で取れる。1024 は 40,960 で取れない。
+constexpr x68k::u32 kJitSlots = 512;
 x68k::jit::BlockSlot* g_jitSlots = nullptr;
 x68k::jit::ExecMemory g_jitCode;
 x68k::jit::BlockRunner g_jitRunner;

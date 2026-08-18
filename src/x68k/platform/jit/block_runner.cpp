@@ -168,7 +168,12 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     BlockSlot& slot = here;
     // 翻訳できたので、この番地の「できない」記憶は捨てる。
     slot.failedPc = 0;
-    slot.plan = plan;
+    // **鍵だけを写す。** ops[] は翻訳の途中でしか要らない。
+    slot.entryPc = plan.entryPc;
+    slot.mappingEpoch = plan.mappingEpoch;
+    slot.page = plan.page;
+    slot.pageGen = plan.pageGen;
+    slot.count = plan.count;
     slot.code = buf + emitted.entryOffset;
     slot.endsWithBranch = emitted.endsWithBranch;
     slot.branchTarget = emitted.branchTarget;
@@ -192,14 +197,14 @@ NativeResult BlockRunner::run(M68k& cpu)
 
     // 設計 §5.5 の順で照合する。**順序が意味を持つ。**
     CodeGenMap& map = cpu.codeGenMap();
-    const std::uint16_t nowGen = map.generation(slot->plan.page << CodeGenMap::kPageShift);
-    const bool hit = slot->code != nullptr &&                          // 翻訳済み
-                     slot->plan.entryPc != 0 &&                        // 空きの番兵
-                     slot->plan.entryPc == entryPc &&                  // タグ
-                     slot->plan.count <= kMaxOps &&                    // ゴミ検査
-                     slot->plan.mappingEpoch == map.mappingEpoch() &&  // 写像
-                     nowGen != CodeGenMap::kAlwaysStale &&             // **先に見る**
-                     nowGen == slot->plan.pageGen;                     // 世代の一致
+    const std::uint16_t nowGen = map.generation(slot->page << CodeGenMap::kPageShift);
+    const bool hit = slot->code != nullptr &&                     // 翻訳済み
+                     slot->entryPc != 0 &&                        // 空きの番兵
+                     slot->entryPc == entryPc &&                  // タグ
+                     slot->count <= kMaxOps &&                    // ゴミ検査
+                     slot->mappingEpoch == map.mappingEpoch() &&  // 写像
+                     nowGen != CodeGenMap::kAlwaysStale &&        // **先に見る**
+                     nowGen == slot->pageGen;                     // 世代の一致
 
     if (!hit)
     {
@@ -210,11 +215,11 @@ NativeResult BlockRunner::run(M68k& cpu)
             {
                 ++stats_.keyMissStale;
             }
-            else if (slot->plan.mappingEpoch != map.mappingEpoch())
+            else if (slot->mappingEpoch != map.mappingEpoch())
             {
                 ++stats_.keyMissEpoch;
             }
-            else if (slot->plan.entryPc != entryPc)
+            else if (slot->entryPc != entryPc)
             {
                 ++stats_.keyMissTag;
             }
@@ -235,7 +240,7 @@ NativeResult BlockRunner::run(M68k& cpu)
     const std::uint32_t ret = runBlock(&cpu.state(), slot->code);
 
     ++stats_.blocksRun;
-    stats_.insnsRun += slot->plan.count;
+    stats_.insnsRun += slot->count;
 
     const bool branchTaken = (ret & kBranchTakenFlag) != 0;
     const u32 cycles = ret & ~kBranchTakenFlag;
