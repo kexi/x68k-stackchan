@@ -30,6 +30,8 @@ extern unsigned long g_jitDecodableByGroup[16];
 extern unsigned long g_jitRunLen[33];
 extern unsigned long g_group4[64];
 extern unsigned long g_g4Named[12];
+extern unsigned long long g_jitCyclesDecodable;
+extern unsigned long long g_jitCyclesOther;
 #endif
 #if X68K_COUNT_FETCH_ORIGIN
 extern unsigned long g_refillFromRom;
@@ -1217,6 +1219,21 @@ int main(int argc, char** argv)
                             g_jitByGroup[g], g_jitDecodableByGroup[g],
                             100.0 * (double)g_jitDecodableByGroup[g] / (double)g_jitByGroup[g],
                             100.0 * (double)g_jitByGroup[g] / (double)g_jitTotal);
+            }
+            // 翻訳可否ごとの 1 命令あたりゲストサイクル数。
+            // Cavg モデルの「85」を全命令平均で使ってよいかを確かめる。
+            {
+                const double decAvg = g_jitDecodable != 0
+                                          ? (double)g_jitCyclesDecodable / (double)g_jitDecodable
+                                          : 0.0;
+                const unsigned long other = g_jitTotal - g_jitDecodable;
+                const double othAvg = other != 0 ? (double)g_jitCyclesOther / (double)other : 0.0;
+                const double allAvg =
+                    g_jitTotal != 0
+                        ? (double)(g_jitCyclesDecodable + g_jitCyclesOther) / (double)g_jitTotal
+                        : 0.0;
+                std::printf("[jit] ゲストサイクル/命令: 翻訳可 %.2f / 翻訳不可 %.2f / 全体 %.2f\n",
+                            decAvg, othAvg, allAvg);
             }
             // $4 の内訳。全体の 32.3% を占めるので、ここを足すのが最大の伸びしろ。
             {

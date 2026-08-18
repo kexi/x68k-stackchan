@@ -38,6 +38,9 @@ unsigned long g_jitCurrentRun = 0;
 // $4 の内訳。h を伸ばすとき何から手を付けるかを実行頻度で決める。
 unsigned long g_group4[64] = {};
 unsigned long g_g4Named[12] = {};
+// 翻訳可否ごとのゲストサイクル数。Cavg モデルの重みを検証する。
+unsigned long long g_jitCyclesDecodable = 0;
+unsigned long long g_jitCyclesOther = 0;
 #endif
 
 namespace x68k
@@ -677,7 +680,7 @@ u32 M68k::unimplemented(u16 op)
 //
 // **実行の直前に呼ぶ。** 静的な出現頻度ではなく動的な実行頻度が要る
 // (ループの中の 1 命令は 1 回しか現れないが何万回も実行される)。
-void M68k::countJitCoverage(u16 op)
+bool M68k::countJitCoverage(u16 op)
 {
     const unsigned group = static_cast<unsigned>(op >> 12);
     ++g_jitTotal;
@@ -739,12 +742,19 @@ void M68k::countJitCoverage(u16 op)
         }  // その他
     }
     const bool decodable = instructionLength(op) != kUnknownLength;
+    // 翻訳可能な命令とそうでない命令で、実際のサイクル数 (68000 の
+    // 公称値) がどう違うかを分ける。Cavg モデルの (1-h)*(85+Cmiss) の
+    // 項が妥当かを確かめるため。
+    //
+    // Why 68000 のサイクル数を使うか: ホストでは実 CPU 時間を測っても
+    // 意味が無い (x86/ARM の速度で、Xtensa とは違う)。ゲストの公称
+    // サイクル数なら「どの命令が重いか」の相対関係は保たれる。
     if (decodable)
     {
         ++g_jitDecodable;
         ++g_jitDecodableByGroup[group];
         ++g_jitCurrentRun;
-        return;
+        return true;
     }
     // 翻訳できない命令に当たった時点で連続は途切れる。
     if (g_jitCurrentRun != 0)
@@ -754,6 +764,7 @@ void M68k::countJitCoverage(u16 op)
         ++g_jitRunLen[capped];
         g_jitCurrentRun = 0;
     }
+    return false;
 }
 #endif
 
@@ -822,7 +833,7 @@ u32 M68k::step()
     // 「上位 50 ブロックが 96.6%」はブロック入口の頻度であって、
     // 翻訳できる命令の率ではない。JIT が成立するかは後者で決まるので、
     // 実際に実行された命令を instructionLength に通して数える。
-    countJitCoverage(op);
+    const bool jitDecodable = countJitCoverage(op);
 #endif
     // Why not 実行サイクルを累計しないか: st_.cycles は書くだけで、
     // src/ test/ host/ main/ のどこからも読まれていなかった (git grep で確認)。
@@ -832,6 +843,21 @@ u32 M68k::step()
     // 実行したサイクル数は戻り値で呼び出し側へ渡る。時間の管理は
     // Machine::run と Scheduler が持っており、CPU 側に控えは要らない。
     const u32 cycles = execute(op);
+#if X68K_COUNT_JIT_COVERAGE
+    // 翻訳できる命令とできない命令で、ゲストのサイクル数がどう違うか。
+    //
+    // Cavg = h*Chit + (1-h)*(85+Cmiss) の「85」は全命令の平均だが、
+    // **翻訳できない命令が平均より重いなら、モデルは楽観的すぎる。**
+    // 逆に軽いなら悲観的。どちらかを実測で確かめる。
+    if (jitDecodable)
+    {
+        g_jitCyclesDecodable += cycles;
+    }
+    else
+    {
+        g_jitCyclesOther += cycles;
+    }
+#endif
     return cycles;
 }
 
