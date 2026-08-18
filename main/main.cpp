@@ -549,6 +549,161 @@ std::atomic<bool> g_redrawRequested{false};
     heap_caps_free(outs);
 }
 
+// 段 0-C3: ネイティブ命令本体の実費を測る。**恒久的な機能ではない。**
+//
+// 0-C2 でブロックの固定費が出た。残る未知は「ネイティブの命令本体が
+// インタプリタ比で何倍になるか」。**4 倍なら Go、2 倍なら No-Go。**
+//
+// エミッタは書かない。C++ で「JIT が吐くであろう形」を手書きし、
+// -O2 の生成コードを実測する。Xtensa のエンコーディングを自分で
+// 組み立てるのは 2 度失敗しているので、コンパイラに吐かせる。
+//
+// **これは上限寄りの値。** 実際のエミッタはレジスタ割り当てが
+// これより下手になる。下回ったら No-Go の材料になる。
+[[maybe_unused]] void probeNativeBody()
+{
+    // ゲストのレジスタファイル。JIT も同じ形で持つ。
+    static std::uint32_t d[8];
+    static std::uint32_t a[8];
+    static std::uint16_t sr;
+    static std::uint8_t ram[65536];
+    for (int i = 0; i < 8; ++i)
+    {
+        d[i] = 0x12345678u + static_cast<std::uint32_t>(i);
+        a[i] = 0x1000u + static_cast<std::uint32_t>(i) * 4u;
+    }
+
+    constexpr int kIters = 2000000;
+    std::uint32_t sink = 0;
+
+    // --- 空ループ ---
+    std::uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+        sink += static_cast<std::uint32_t>(i);
+    }
+    std::uint32_t t1 = esp_cpu_get_cycle_count();
+    const double loop = (double)(t1 - t0) / (double)kIters;
+
+    // --- 1. MOVE.w D0,D1 + N/Z フラグ ---
+    // 最も単純な形。JIT が最も得意とする命令。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **転送元を毎回変える。** 固定だと結果が不変になり、
+        // ループ外へ持ち上げられる (実測で負の値が出た)。
+        d[0] = d[0] + static_cast<std::uint32_t>(i);
+        const std::uint32_t v = d[0] & 0xFFFFu;
+        d[1] = (d[1] & 0xFFFF0000u) | v;
+        std::uint16_t s = static_cast<std::uint16_t>(sr & 0xFFF0u);
+        if (v == 0)
+        {
+            s |= 0x0004u;
+        }
+        if ((v & 0x8000u) != 0)
+        {
+            s |= 0x0008u;
+        }
+        sr = s;
+        sink += v;
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveReg = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 2. MOVE.w (A0),D1 : fast RAM 読み + 境界検査 + ビッグエンディアン組立 ---
+    // 実効アドレスが窓に収まるかを実行時に見る (Codex の言う runtime guard)。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **アドレスを毎回変える。** 定数だと境界検査もアドレス計算も
+        // ループ外へ持ち上げられ、実測が無意味になる。
+        const std::uint32_t ea = (a[0] + static_cast<std::uint32_t>(i) * 2u) & 0xFFFEu;
+        if ((ea & 1u) == 0 && ea + 1u < sizeof(ram))
+        {
+            const std::uint32_t v = static_cast<std::uint32_t>((ram[ea] << 8) | ram[ea + 1]);
+            d[1] = (d[1] & 0xFFFF0000u) | v;
+            std::uint16_t s = static_cast<std::uint16_t>(sr & 0xFFF0u);
+            if (v == 0)
+            {
+                s |= 0x0004u;
+            }
+            if ((v & 0x8000u) != 0)
+            {
+                s |= 0x0008u;
+            }
+            sr = s;
+            sink += v;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveLoad = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 3. MOVE.w D1,(A0) : fast RAM 書き + 世代の更新 ---
+    static std::uint16_t gens[64];
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t ea = (a[0] + static_cast<std::uint32_t>(i) * 2u) & 0xFFFEu;
+        if ((ea & 1u) == 0 && ea + 1u < sizeof(ram))
+        {
+            const std::uint32_t v = d[1] & 0xFFFFu;
+            ram[ea] = static_cast<std::uint8_t>(v >> 8);
+            ram[ea + 1] = static_cast<std::uint8_t>(v);
+            // CodeGenMap::touch 相当 (飽和つき)
+            const unsigned page = (ea >> 10) & 63u;
+            const std::uint16_t cur = gens[page];
+            gens[page] = cur == 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(cur + 1);
+            sink += v;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveStore = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 4. Bcc の条件評価 + 期限判定 ---
+    // ブロック内の各命令の後に debt を進めて期限を見る。
+    static std::int32_t debt = -1000000;
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **sr を毎回変える。** 固定だと条件が定数畳み込みされ、
+        // 分岐そのものが消える (実測で負の値が出た)。
+        sr = static_cast<std::uint16_t>(sink & 0x001Fu);
+        const bool taken = (sr & 0x0004u) != 0;
+        debt += 8;
+        if (debt >= 0)
+        {
+            debt = -1000000;
+        }
+        sink += taken ? 1u : 3u;
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double bccDebt = (double)(t1 - t0) / (double)kIters - loop;
+
+    constexpr double kInterp = 85.0;
+    ESP_LOGI(kTag, "[c3] 空ループ %.2f (以下は差し引き済み)", loop);
+    ESP_LOGI(kTag, "[c3] MOVE.w D0,D1 + NZ            %.2f (インタプリタ比 %.1f 倍)", moveReg,
+             kInterp / (moveReg > 0.01 ? moveReg : 0.01));
+    ESP_LOGI(kTag, "[c3] MOVE.w (A0),D1 + guard + NZ  %.2f (%.1f 倍)", moveLoad,
+             kInterp / (moveLoad > 0.01 ? moveLoad : 0.01));
+    ESP_LOGI(kTag, "[c3] MOVE.w D1,(A0) + guard + gen %.2f (%.1f 倍)", moveStore,
+             kInterp / (moveStore > 0.01 ? moveStore : 0.01));
+    ESP_LOGI(kTag, "[c3] Bcc + debt 更新              %.2f (%.1f 倍)", bccDebt,
+             kInterp / (bccDebt > 0.01 ? bccDebt : 0.01));
+    // 実行分布で重み付けした平均 (レジスタ間 30% / 読み 30% / 書き 20% / 分岐 20%)
+    const double weighted = moveReg * 0.3 + moveLoad * 0.3 + moveStore * 0.2 + bccDebt * 0.2;
+    ESP_LOGI(kTag, "[c3] 分布で重み付けした本体 %.2f サイクル (インタプリタ比 %.2f 倍)", weighted,
+             kInterp / (weighted > 0.01 ? weighted : 0.01));
+    // **負の値は測定が壊れている合図。** 差分を取る計測では、
+    // 最適化で消えた側が空ループぶんのマイナスとして現れる。
+    const bool anyNegative = moveReg < 0.0 || moveLoad < 0.0 || moveStore < 0.0 || bccDebt < 0.0;
+    if (anyNegative)
+    {
+        ESP_LOGW(kTag, "[c3] **負の値がある = 最適化で消えている。この結果は無効**");
+    }
+    ESP_LOGI(kTag, "[c3] sink=%u", static_cast<unsigned>(sink));
+}
+
 [[maybe_unused]] void probeNativeCeiling()
 {
     constexpr std::size_t kBytes = 256;
@@ -1547,6 +1702,14 @@ private:
         // 大量に回して測る。インタプリタの 85 CPU サイクル/命令と
         // 比べれば、ネイティブ化で何倍になりうるかが出る。
         // 'C' で段 0-C2 (キャッシュ経路の費用) を測る。恒久機能ではない。
+        // 'B' で段 0-C3 (ネイティブ命令本体の実費) を測る。恒久機能ではない。
+        const bool isNativeBodyProbe = c == 'B';
+        if (isNativeBodyProbe)
+        {
+            probeNativeBody();
+            return;
+        }
+
         const bool isCachePathProbe = c == 'C';
         if (isCachePathProbe)
         {
