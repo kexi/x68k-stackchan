@@ -77,6 +77,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_alu.cpp
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_misc.cpp
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_group4.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/block_planner.cpp
   ${X68K_ROOT}/src/x68k/core/bus.cpp
   ${X68K_ROOT}/src/x68k/core/machine.cpp
   ${X68K_ROOT}/src/x68k/core/dev/sram.cpp
@@ -119,6 +120,8 @@ add_executable(x68k_tests
   test_device_timing.cpp
   # イベント駆動が毎命令 tick と 1 サイクルもずれないこと。
   test_scheduler.cpp
+  # ブロック翻訳器。許可リストの内側と外側を 65,536 通り全部で問う。
+  test_block_plan.cpp
   test_sram.cpp
   test_sram_persist.cpp
   test_bus.cpp

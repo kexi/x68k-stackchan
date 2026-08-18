@@ -15,6 +15,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_alu.cpp"
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_misc.cpp"
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_group4.cpp"
+        "${X68K_ROOT}/src/x68k/core/cpu/block_planner.cpp"
         "${X68K_ROOT}/src/x68k/core/bus.cpp"
         "${X68K_ROOT}/src/x68k/core/machine.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/sram.cpp"
