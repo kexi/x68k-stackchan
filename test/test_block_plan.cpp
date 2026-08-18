@@ -116,9 +116,57 @@ bool specSafeMove(x68k::u16 op)
         return false;
     }
     const x68k::u32 srcMode = static_cast<x68k::u32>((op >> 3) & 7u);
+    const x68k::u32 srcReg = static_cast<x68k::u32>(op & 7u);
     const x68k::u32 dstMode = static_cast<x68k::u32>((op >> 6) & 7u);
-    // 両側が Dn。dstMode == 1 は MOVEA で A レジスタを書くので除く。
-    return srcMode == 0 && dstMode == 0;
+    const x68k::u32 size = group == 1 ? 1u : (group == 2 ? 4u : 2u);
+
+    // 転送先は Dn か An。メモリへ書く形はアドレスエラーとページ世代の
+    // 更新を背負うので安全ではない。
+    if (dstMode > 1)
+    {
+        return false;
+    }
+    // 転送元は Dn / An / 即値。mode 7 の 0-3 は絶対番地と PC 相対で、
+    // 読み出しがメモリに触る。
+    const bool srcIsImmediate = srcMode == 7 && srcReg == 4;
+    if (srcMode > 1 && !srcIsImmediate)
+    {
+        return false;
+    }
+    // byte で An に触る形は 68000 に無い (不当命令として例外に入る)。
+    const bool touchesAddressRegisterAsByte = size == 1 && (srcMode == 1 || dstMode == 1);
+    return !touchesAddressRegisterAsByte;
+}
+
+// $4 のうち、メモリに触れず例外も起きない形。
+//
+// LEA は実効アドレスを**求めるだけで読まない**ので、メモリに触らない。
+// TST / CLR は mode 0 (Dn) に限れば同じ。
+bool specSafeMisc(x68k::u16 op)
+{
+    if ((op >> 12) != 0x4u)
+    {
+        return false;
+    }
+    const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
+    const x68k::u32 reg = static_cast<x68k::u32>(op & 7u);
+
+    const bool isLea = (op & 0xF1C0u) == 0x41C0u;
+    if (isLea)
+    {
+        // mode 3/4 は An を進める副作用を持つ。mode 6 と 7.2/7.3 は
+        // 安全だが拡張ワードの解釈が要るので範囲外。
+        return mode == 2 || mode == 5 || (mode == 7 && reg <= 1);
+    }
+
+    // 単項演算は (op >> 8) & 0xF で判別する (実装の unary_ops と同じ)。
+    const x68k::u32 opcodeBits = static_cast<x68k::u32>((op >> 8) & 0xFu);
+    const x68k::u32 sizeField = static_cast<x68k::u32>((op >> 6) & 3u);
+    if (sizeField == 3 || mode != 0)
+    {
+        return false;
+    }
+    return opcodeBits == 0xAu || opcodeBits == 0x2u;  // TST / CLR
 }
 
 // MOVEQ #imm8,Dn。bit8 が立つ符号は 68000 に無い。
@@ -169,7 +217,8 @@ bool specSafeBranch(x68k::u16 op)
 
 bool specSafe(x68k::u16 op)
 {
-    return specSafeMove(op) || specSafeMoveq(op) || specSafeAlu(op) || specSafeBranch(op);
+    return specSafeMove(op) || specSafeMoveq(op) || specSafeAlu(op) || specSafeBranch(op) ||
+           specSafeMisc(op);
 }
 
 // --- 実行して突き合わせるための Machine -------------------------------------
@@ -840,16 +889,26 @@ TEST_SUITE("BlockPlanner")
             CHECK_FALSE(x68k::BlockPlanner::planOne(toAn, kEntry, planned));
         }
 
-        // MOVEA.w / MOVEA.l も入れない (A レジスタを書き、フラグを変えない)。
-        const x68k::u16 moveaOps[] = {
-            0x3040,  // MOVEA.w D0,A0
-            0x2040,  // MOVEA.l D0,A0
-        };
-        for (const x68k::u16 op : moveaOps)
+        // MOVEA.w / MOVEA.l は Tier A で**受け入れる**ようになった。
+        // A レジスタを書くがメモリには触らず、例外も起きない。
+        // **フラグを 1 つも変えない**ので、MOVE と別の種別にする。
+        struct MoveaCase
         {
-            CAPTURE(op);
+            x68k::u16 op;
+            x68k::PlanKind kind;
+        };
+        const MoveaCase moveaOps[] = {
+            {0x3040, x68k::PlanKind::kMoveaDregToAreg},  // MOVEA.w D0,A0
+            {0x2040, x68k::PlanKind::kMoveaDregToAreg},  // MOVEA.l D0,A0
+            {0x3048, x68k::PlanKind::kMoveaAregToAreg},  // MOVEA.w A0,A0
+            {0x307C, x68k::PlanKind::kMoveaImmToAreg},   // MOVEA.w #imm,A0
+        };
+        for (const MoveaCase& c : moveaOps)
+        {
+            CAPTURE(c.op);
             x68k::PlannedOp planned{};
-            CHECK_FALSE(x68k::BlockPlanner::planOne(op, kEntry, planned));
+            REQUIRE(x68k::BlockPlanner::planOne(c.op, kEntry, planned));
+            CHECK(planned.kind == c.kind);
         }
     }
 

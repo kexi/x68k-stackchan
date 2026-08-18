@@ -36,6 +36,21 @@ enum class PlanKind : u8
     kMoveq,             // MOVEQ #imm8,Dn (bit8 == 0)
     kAluRegToReg,       // ADD/SUB/AND/OR/EOR/CMP <Dn>,Dm (両側 mode 0)
     kBranch,            // Bcc / BRA。**必ずブロック末尾**。BSR は含まない
+
+    // --- Tier A: メモリに触れず例外も起きない形 ---
+    //
+    // **§5.3 の前提を 1mm も動かさない。** どれも実効アドレスを持たないか
+    // (LEA は持つが「アドレスを求めるだけで読まない」)、副作用がレジスタに
+    // 閉じている。実行時ガードが要らないのが Tier A の定義。
+    kMoveAregToDreg,   // MOVE.w/l An,Dn。srcReg = An 番号
+    kMoveImmToDreg,    // MOVE.b/w/l #imm,Dn。imm = size でマスク済み
+    kMoveaDregToAreg,  // MOVEA.w/l Dn,An。**フラグ不変**
+    kMoveaAregToAreg,  // MOVEA.w/l An,An。**フラグ不変**
+    kMoveaImmToAreg,   // MOVEA.w/l #imm,An。imm = 符号拡張済み
+    kTstDreg,          // TST.b/w/l Dn。srcReg = 対象 (読むだけ)
+    kClrDreg,          // CLR.b/w/l Dn。dstReg = 対象
+    kLeaDisp,          // LEA (An),An / (d16,An),An。imm = 符号拡張済み変位
+    kLeaAbs,           // LEA (xxx).W/L,An。imm = アドレス
 };
 
 enum class PlanAluOp : u8

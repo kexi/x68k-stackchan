@@ -80,24 +80,119 @@ bool planMove(u16 op, PlannedOp& out)
     const u32 dstMode = static_cast<u32>((op >> 6) & 7u);
     const u32 dstReg = static_cast<u32>((op >> 9) & 7u);
 
-    // Why not mode 1 (An) を許すか: MOVE.b が An に触ると 68000 は不当命令
-    // 例外を出す (m68k_ops_move.cpp が readEa より前に弾いている)。
-    // mode 0 だけに絞れば、サイズによらずその形が存在しなくなる。
-    // MOVEA (dstMode == 1) はフラグを変えず A レジスタへ符号拡張して入る
-    // 別の命令なので、混ぜずにここで落とす。
-    const bool bothAreDataRegisters = srcMode == 0 && dstMode == 0;
-    if (!bothAreDataRegisters)
+    const u32 size = moveSizeFromGroup(group);
+
+    // 転送先は Dn か An だけ。メモリへ書く形は codeGen_ の世代更新と
+    // アドレスエラーを背負うので Tier A には入れない。
+    if (dstMode > 1)
     {
         return false;
     }
 
-    out.kind = PlanKind::kMoveRegToReg;
+    // 転送元は Dn / An / 即値だけ。mode 7 の 0-3 (絶対・PC 相対) は
+    // 読み出しがメモリに触る。
+    const bool srcIsImmediate = srcMode == 7 && srcReg == 4;
+    if (srcMode > 1 && !srcIsImmediate)
+    {
+        return false;
+    }
+
+    // **byte で An に触る形は不当命令。** 68000 は例外を出す
+    // (m68k_ops_move.cpp が readEa より前に弾いている)。§5.3 の
+    // 「例外が起きうる地点を入れない」に直結するので、ここで落とす。
+    const bool touchesAddressRegisterAsByte = size == kByte && (srcMode == 1 || dstMode == 1);
+    if (touchesAddressRegisterAsByte)
+    {
+        return false;
+    }
+
+    // 転送先が An なら MOVEA。**フラグを 1 つも変えない別の命令**なので、
+    // 転送元ごとに種別を分けてエミッタが取り違えないようにする。
+    if (dstMode == 1)
+    {
+        out.kind = srcIsImmediate ? PlanKind::kMoveaImmToAreg
+                   : srcMode == 1 ? PlanKind::kMoveaAregToAreg
+                                  : PlanKind::kMoveaDregToAreg;
+    }
+    else
+    {
+        out.kind = srcIsImmediate ? PlanKind::kMoveImmToDreg
+                   : srcMode == 1 ? PlanKind::kMoveAregToDreg
+                                  : PlanKind::kMoveRegToReg;
+    }
     out.srcReg = static_cast<u8>(srcReg);
     out.dstReg = static_cast<u8>(dstReg);
-    out.size = static_cast<u8>(moveSizeFromGroup(group));
-    // groupMove の writeEa 経路は 4 を返す (m68k_ops_move.cpp)。
+    out.size = static_cast<u8>(size);
+    // groupMove は MOVEA 経路も writeEa 経路も 4 を返す (m68k_ops_move.cpp)。
     out.cycles = 4;
     return true;
+}
+
+// $4 から、メモリに触れず例外も起きない 3 系統だけを拾う。
+//
+// Why not NEGX/NEG/NOT Dn も入れないか: X と累積 Z が絡む。planAlu が
+// ADDX/SUBX を除いているのと同じ理由で、まず確実な形だけにする。
+bool planMisc(u16 op, PlannedOp& out)
+{
+    const u32 mode = static_cast<u32>((op >> 3) & 7u);
+    const u32 reg = static_cast<u32>(op & 7u);
+
+    // LEA <ea>,An : 0100 rrr 111 mmm rrr
+    //
+    // **アドレスを求めるだけで読まない**ので、メモリに触らない。
+    const bool isLea = (op & 0xF1C0u) == 0x41C0u;
+    if (isLea)
+    {
+        // mode 3/4 は An を進める副作用、mode 6 と 7.2/7.3 は安全だが
+        // 拡張ワードの解釈が要るので今回は入れない。
+        const bool isDisp = mode == 2 || mode == 5;
+        const bool isAbs = mode == 7 && reg <= 1;
+        if (!isDisp && !isAbs)
+        {
+            return false;
+        }
+        out.kind = isDisp ? PlanKind::kLeaDisp : PlanKind::kLeaAbs;
+        out.srcReg = static_cast<u8>(reg);
+        out.dstReg = static_cast<u8>((op >> 9) & 7u);
+        out.size = static_cast<u8>(kLong);
+        // m68k_ops_group4.cpp の LEA は EA の形によらず 4 を返す。
+        out.cycles = 4;
+        return true;
+    }
+
+    // 単項 TST / CLR : 0100 oooo ss mmm rrr。
+    // **判別ビットは (op >> 8) & 0xF。** 実装の unary_ops が switch している
+    // 値と揃える (ここを (op >> 9) & 7 で書いて TST を丸ごと取りこぼした
+    // 前例がある)。
+    const u32 opcodeBits = static_cast<u32>((op >> 8) & 0xFu);
+    const u32 sizeField = static_cast<u32>((op >> 6) & 3u);
+    if (sizeField == 3 || mode != 0)
+    {
+        return false;
+    }
+    const u32 size = sizeField == 0 ? kByte : (sizeField == 1 ? kWord : kLong);
+
+    if (opcodeBits == 0xAu)  // TST Dn
+    {
+        out.kind = PlanKind::kTstDreg;
+        out.srcReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(size);
+        out.cycles = 4;
+        return true;
+    }
+    if (opcodeBits == 0x2u)  // CLR Dn
+    {
+        out.kind = PlanKind::kClrDreg;
+        out.dstReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(size);
+        // **サイズによらず 6。** 実機の 68000 は .b/.w の Dn 形が 4 だが、
+        // このエミュレータは一律 6 を返す (m68k_ops_group4.cpp)。
+        // JIT の契約は「インタプリタとビット単位で同一」なので、
+        // 実機の値へ「直す」と JIT ON/OFF でサイクルが割れる。
+        out.cycles = 6;
+        return true;
+    }
+    return false;
 }
 
 // MOVEQ #imm8,Dn。
@@ -251,6 +346,8 @@ bool BlockPlanner::planOne(u16 op, u32 pc, PlannedOp& out)
         case 0x2u:
         case 0x3u:
             return planMove(op, out);
+        case 0x4u:
+            return planMisc(op, out);
         case 0x6u:
             return planBranch(op, pc, out);
         case 0x7u:
