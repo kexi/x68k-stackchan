@@ -31,6 +31,7 @@
 #include <cstdio>
 
 #include "jit/block_runner.h"
+#include "jit/xtensa_encoder.h"
 #include "jit/exec_memory.h"
 
 #include "app_mode.h"
@@ -1823,6 +1824,79 @@ private:
                      g_machine.cpu().hasNativeExec() ? "ON" : "OFF");
             ESP_LOGI(kTag, "[jit] 実行可能メモリ %u / %u バイト", (unsigned)g_jitCode.used(),
                      (unsigned)g_jitCode.capacity());
+            return;
+        }
+
+        // 'L' で「JIT の経路だけ」を最小コードで試す。恒久機能ではない。
+        //
+        // 生成コードを疑うか、経路 (実行可能メモリ / ゲートウェイ / isync) を
+        // 疑うかを切り分ける。**ret.n 1 命令だけ**を置いて呼ぶ。
+        // これが落ちるなら経路が悪い。通るなら生成コードが悪い。
+        const bool isMinimalBlockProbe = c == 'L';
+        if (isMinimalBlockProbe)
+        {
+            if (!g_jitCode.isReady())
+            {
+                ESP_LOGW(kTag, "[probe] 実行可能メモリが無い");
+                return;
+            }
+            // **段 0 のプローブと同じ形でその場で確保する。**
+            // 起動時に確保した ExecMemory と、その場で確保したものを
+            // 比べれば「いつ確保したか」が効くかが分かる。
+            auto* fresh = static_cast<std::uint8_t*>(
+                heap_caps_malloc(64, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT));
+            ESP_LOGI(kTag, "[probe] 起動時=%p その場=%p", (void*)g_jitCode.base(), (void*)fresh);
+            if (fresh == nullptr)
+            {
+                ESP_LOGW(kTag, "[probe] その場で確保できない");
+                return;
+            }
+            std::uint8_t* p = fresh;
+            auto* dst = reinterpret_cast<volatile std::uint32_t*>(p);
+
+            // --- A: windowed で書いて普通の関数ポインタで呼ぶ (段 0 と同じ) ---
+            // entry a1,32 / movi.n a2,10 / retw.n
+            dst[0] = 0x0C004136u;
+            dst[1] = 0x00F01DA2u;
+            __asm__ __volatile__("isync" ::: "memory");
+            using FnW = int (*)();
+            const int rw = reinterpret_cast<FnW>(p)();
+            ESP_LOGI(kTag, "[probe] A windowed = %d (10 なら成功)", rw);
+
+            // --- B: call0 で書いて runBlock で呼ぶ ---
+            alignas(4) std::uint8_t stage[8] = {};
+            std::size_t n = x68k::jit::movi(stage, 2, 4);
+            n += x68k::jit::retN(stage + n);
+            const auto* srcw = reinterpret_cast<const std::uint32_t*>(stage);
+            dst[0] = srcw[0];
+            dst[1] = srcw[1];
+            __asm__ __volatile__("isync" ::: "memory");
+            ESP_LOGI(kTag, "[probe] B call0 %u バイト。まず素の callx0 で呼ぶ", (unsigned)n);
+
+            // --- B1: 退避なしの素の callx0 ---
+            // ゲートウェイの退避が悪いのか、callx0 そのものが悪いのかを分ける。
+            {
+                register std::uint32_t arg __asm__("a2") = 0;
+                register const void* tgt __asm__("a3") = p;
+                __asm__ __volatile__("callx0 %1" : "+r"(arg) : "r"(tgt) : "a0", "memory");
+                ESP_LOGI(kTag, "[probe] B1 素の callx0 = %u (4 なら成功)", (unsigned)arg);
+            }
+
+            // --- B2: runBlock 経由 ---
+            // **static にする。** 84 バイトの M68kState をこのハンドラの
+            // スタックへ置くと、シリアルタスクのスタックが足りない疑いがある。
+            // B2 の直前に、B1 と同じ形をもう一度だけ実行する。
+            // 「1 回目は通るが 2 回目で落ちる」なら isync / キャッシュの話。
+            {
+                register std::uint32_t arg __asm__("a2") = 0;
+                register const void* tgt __asm__("a3") = p;
+                __asm__ __volatile__("callx0 %1" : "+r"(arg) : "r"(tgt) : "a0", "memory");
+                ESP_LOGI(kTag, "[probe] B1b 2 回目 = %u", (unsigned)arg);
+            }
+
+            static x68k::M68kState dummy{};
+            const std::uint32_t r = x68k::jit::runBlock(&dummy, p);
+            ESP_LOGI(kTag, "[probe] B2 runBlock = %u (4 なら成功)", (unsigned)r);
             return;
         }
 

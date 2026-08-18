@@ -114,7 +114,7 @@ void ExecMemory::syncInstructionCache()
 #endif
 }
 
-std::uint32_t runBlock(void* state, const void* code)
+X68K_JIT_IRAM std::uint32_t runBlock(void* state, const void* code)
 {
 #if defined(ESP_PLATFORM) && defined(__XTENSA__)
     // この関数は windowed ABI でコンパイルされるので、entry / retw と a0 の
@@ -137,35 +137,37 @@ std::uint32_t runBlock(void* state, const void* code)
     // Why 引数の順が (state, code) なのか: a2 = 第 1 引数、a3 = 第 2 引数
     // なので、この順なら mov が 1 つも要らない。生成コードは
     // entry / callx0 a3 / retw.n の 3 命令だけになる (実測で確認)。
-    // **a4-a11 を明示的に退避する。**
+    // **a0 を自分で退避する。** これが無いと必ず落ちる。
     //
-    // Why 要るか: コンパイラがこの関数へ置く entry は `entry a1, 32` で、
-    // **窓は a0-a3 の 4 本しかない**。生成コードは a2-a11 を使うので、
-    // a4 以降は窓の外 = 祖先フレームの生きた値を壊す。
+    // `callx0` は戻り番地を **a0** に書く。ところが a0 は windowed ABI の
+    // 戻り番地でもあり、この関数の出口の `retw.n` はそれを使って戻る。
+    // callx0 が上書きした a0 のまま retw.n を実行すると、**自分自身の
+    // retw.n の番地へ戻ろうとして** IllegalInstruction で落ちる。
     //
-    // 壊れ方は「retw.n が IllegalInstruction で落ちる」だった (実機で踏んだ)。
-    // 窓の状態そのものが壊れるので、戻る瞬間まで症状が出ない。
+    // 実機で踏んだときの証拠: PC == A0 == retw.n の番地。
     //
-    // Why not clobber リストに書くだけで済ませないか: 試したが GCC は
-    // `entry a1, 32` のまま窓を広げない (実測)。窓の大きさは呼び出し規約で
-    // 決まり、clobber は動かせない。**自分でスタックへ逃がすしかない。**
+    // Why not clobber に "a0" と書くだけで済まないか: 書いてあるが GCC は
+    // 退避コードを出さない。a0 は「entry / retw が面倒を見る」前提の
+    // 特別なレジスタなので、通常の caller-saved と同じには扱われない。
+    // **自分で mov して戻すしかない。**
     //
-    // Why not 生成コードを a0-a3 に閉じ込めないか: それが本筋だが、
-    // 68000 の 1 命令に src / dst / 結果 / CCR / SR / 定数の置き場が要り、
-    // 4 本では収まらない。段 3 でレジスタ割り当てを見直すときの課題として
-    // 残す。ここでは 16 命令払って正しさを取る。
-    std::uint32_t saved[8];
+    // a4-a11 は clobber に書けば足りる (呼び先が潰してよいレジスタなので
+    // コンパイラが前後で生きた値を置かない)。特別扱いが要るのは a0 だけ。
     register std::uint32_t arg __asm__("a2") = reinterpret_cast<std::uint32_t>(state);
     register const void* target __asm__("a3") = code;
+    // **退避先はスタック。** レジスタに逃がすとどれを選んでも問題が出る:
+    // 制約なしだと GCC は a12 を選び (実測)、それは entry a1, 32 の窓の外。
+    // a3 に固定すると入力オペランドと衝突してコンパイルが通らない。
+    // メモリなら窓と無関係に安全で、コストは 2 命令 (s32i/l32i)。
+    std::uint32_t savedA0 = 0;
     __asm__ __volatile__(
-        "s32i a4, %2, 0\n s32i a5, %2, 4\n s32i a6, %2, 8\n s32i a7, %2, 12\n"
-        "s32i a8, %2, 16\n s32i a9, %2, 20\n s32i a10, %2, 24\n s32i a11, %2, 28\n"
-        "callx0 %1\n"
-        "l32i a4, %2, 0\n l32i a5, %2, 4\n l32i a6, %2, 8\n l32i a7, %2, 12\n"
-        "l32i a8, %2, 16\n l32i a9, %2, 20\n l32i a10, %2, 24\n l32i a11, %2, 28\n"
-        : "+r"(arg)
-        : "r"(target), "r"(saved)
-        : "a0", "memory");
+        "s32i a0, %0, 0\n"
+        "callx0 %2\n"
+        "l32i a0, %0, 0\n"
+        :
+        : "r"(&savedA0), "r"(arg), "r"(target)
+        : "memory");
+    __asm__ __volatile__("" : "+r"(arg));
     return arg;
 #else
     // ホストでは呼べない。**黙って 0 を返さない** — 0 は「実行できなかった」の

@@ -34,6 +34,17 @@
 #include <cstddef>
 #include <cstdint>
 
+#if defined(ESP_PLATFORM)
+#include <esp_attr.h>
+#endif
+
+// 実機では IRAM へ置く。ホストでは無意味なので空にする。
+#if defined(ESP_PLATFORM)
+#define X68K_JIT_IRAM IRAM_ATTR
+#else
+#define X68K_JIT_IRAM
+#endif
+
 namespace x68k::jit
 {
 
@@ -128,7 +139,10 @@ private:
 // (EmittedBlock::entryOffset を足した位置)。state は M68kState の先頭。
 // **引数の順は (state, code)。** a2 = 第 1 引数 / a3 = 第 2 引数なので、
 // この順なら飛び先を a3 へ置くのに mov が 1 つも要らない。
-std::uint32_t runBlock(void* state, const void* code);
+// **IRAM に置く。** flash に置くと、生成コード (IRAM) へ callx0 したときに
+// IllegalInstruction で落ちた (実機で確認)。インラインアセンブラで同じ
+// callx0 を書くと通るのに、関数にすると落ちるのが手がかりだった。
+std::uint32_t runBlock(void* state, const void* code) X68K_JIT_IRAM;
 
 }  // namespace x68k::jit
 
