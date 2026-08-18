@@ -32,6 +32,11 @@ extern unsigned long g_group4[64];
 extern unsigned long g_g4Named[12];
 extern unsigned long long g_jitCyclesDecodable;
 extern unsigned long long g_jitCyclesOther;
+extern unsigned long g_cutBranch;
+extern unsigned long g_cutCall;
+extern unsigned long g_cutStore;
+extern unsigned long g_cutIrq;
+extern unsigned long g_nativeRunLen[33];
 #endif
 #if X68K_COUNT_FETCH_ORIGIN
 extern unsigned long g_refillFromRom;
@@ -1219,6 +1224,29 @@ int main(int argc, char** argv)
                             g_jitByGroup[g], g_jitDecodableByGroup[g],
                             100.0 * (double)g_jitDecodableByGroup[g] / (double)g_jitByGroup[g],
                             100.0 * (double)g_jitByGroup[g] / (double)g_jitTotal);
+            }
+            // h_native: 「長さが分かる」ではなく「ネイティブの直線コードで
+            // 続けられる」割合。ブロックを切る理由も出す。
+            {
+                unsigned long runs = 0;
+                unsigned long instrs = 0;
+                for (unsigned i = 1; i < 33; ++i)
+                {
+                    runs += g_nativeRunLen[i];
+                    instrs += g_nativeRunLen[i] * i;
+                }
+                std::printf("[jit] --- h_native (実ブロック) ---\n");
+                std::printf("[jit] ネイティブ区間 %lu 本 / 計 %lu 命令 = 平均 %.2f 命令\n", runs,
+                            instrs, runs != 0 ? (double)instrs / (double)runs : 0.0);
+                std::printf("[jit] 切れた理由: 分岐 %lu / 呼出・復帰 %lu / 書込 %lu / 割込 %lu\n",
+                            g_cutBranch, g_cutCall, g_cutStore, g_cutIrq);
+                for (unsigned i = 1; i < 33; ++i)
+                {
+                    if (g_nativeRunLen[i] != 0)
+                    {
+                        std::printf("      長さ %2u: %lu 本\n", i, g_nativeRunLen[i]);
+                    }
+                }
             }
             // 翻訳可否ごとの 1 命令あたりゲストサイクル数。
             // Cavg モデルの「85」を全命令平均で使ってよいかを確かめる。

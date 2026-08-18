@@ -69,7 +69,7 @@ public:
 
 #if X68K_COUNT_JIT_COVERAGE
     // JIT の被覆率を数える (計測用。恒久的な機能ではない)。
-    static bool countJitCoverage(u16 op);
+    bool countJitCoverage(u16 op);
 #endif
 
     // 割り込みを要求する。level は 1-7 (7 はマスク不可)。

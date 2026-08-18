@@ -52,3 +52,16 @@
 20	1289	1787011181147694139	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/machine.cpp.o	40f5080b8510fda4
 1289	1355	1787011182416691624	libx68k_core.a	47ba3e7ba183f3f9
 1355	1475	1787011182482493764	x68k-run	d63b00bbe003de1
+6	236	1787011295004772092	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k_ops_move.cpp.o	cb63a06fe1d16ff9
+18	295	1787011295017124671	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/bus.cpp.o	9fccedf014adf133
+15	376	1787011295013659692	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k_ops_group4.cpp.o	fa12a0c211748d5
+11	392	1787011295010509097	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k_ops_misc.cpp.o	d46138a0f636ef98
+9	449	1787011295007781766	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k_ops_alu.cpp.o	4cc0e424658bb5ff
+2	462	1787011295001404783	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k.cpp.o	1821e4aff0b0ea9a
+33	650	1787011295031579188	CMakeFiles/x68k-run.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/host/gui_demo.cpp.o	7a2b3b65027fec0
+26	931	1787011295025249665	CMakeFiles/x68k-run.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/host/main.cpp.o	a7ae45d046ebc1ba
+22	1189	1787011295021416300	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/machine.cpp.o	40f5080b8510fda4
+1189	1249	1787011296188021296	libx68k_core.a	47ba3e7ba183f3f9
+1249	1346	1787011296248318396	x68k-run	d63b00bbe003de1
+2	854	1787011312539853736	CMakeFiles/x68k-run.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/host/main.cpp.o	a7ae45d046ebc1ba
+854	950	1787011313391631704	x68k-run	d63b00bbe003de1

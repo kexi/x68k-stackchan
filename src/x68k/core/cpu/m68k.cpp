@@ -41,6 +41,19 @@ unsigned long g_g4Named[12] = {};
 // 翻訳可否ごとのゲストサイクル数。Cavg モデルの重みを検証する。
 unsigned long long g_jitCyclesDecodable = 0;
 unsigned long long g_jitCyclesOther = 0;
+// h_native の計測。ブロックを切る理由ごとに数える。
+unsigned long g_cutBranch = 0;
+unsigned long g_cutCall = 0;
+unsigned long g_cutStore = 0;
+unsigned long g_cutIrq = 0;
+unsigned long g_nativeRun = 0;
+unsigned long g_nativeRunLen[33] = {};
+unsigned long g_hNativeCandidates = 0;
+// 書き込みでブロックを切るか。設計の選択肢を実測で比べるためのスイッチ。
+#ifndef X68K_JIT_STORE_KEEPS_BLOCK
+#define X68K_JIT_STORE_KEEPS_BLOCK 0
+#endif
+constexpr bool kStoreKeepsBlock = X68K_JIT_STORE_KEEPS_BLOCK != 0;
 #endif
 
 namespace x68k
@@ -742,6 +755,110 @@ bool M68k::countJitCoverage(u16 op)
         }  // その他
     }
     const bool decodable = instructionLength(op) != kUnknownLength;
+
+    // **ここから先が h_native。** 上の decodable は「命令長が分かる」
+    // だけで、ネイティブの直線コードとして続けられるかは別問題。
+    //
+    // ブロックを切らざるを得ない理由を、実行時の状態で分類する:
+    //   - 制御が飛ぶ (taken branch / JSR / RTS / JMP)
+    //   - ゲスト RAM への書き込み (後続コードを書き換えた可能性がある)
+    //   - 窓の外へのアクセス (I/O。副作用があるのでインタプリタへ)
+    //   - 割り込みが保留している
+    //
+    // 「長さが分かる」割合と「ネイティブで続けられる」割合を取り違えると、
+    // 呼び出しコストの償却を過大に見積もる。
+    bool continuesBlock = decodable;
+    if (decodable)
+    {
+        const u32 group = static_cast<u32>(op >> 12);
+        // 分岐は成立するとブロックが切れる。成立しなければ続く。
+        if (group == 0x6)
+        {
+            const u32 cond = static_cast<u32>((op >> 8) & 0xFu);
+            const bool isBraOrBsr = cond == 0 || cond == 1;
+            // BSR は必ず飛ぶ。Bcc は条件次第なので、実際に評価する。
+            continuesBlock = !isBraOrBsr && !testCondition(cond);
+            if (isBraOrBsr)
+            {
+                ++g_cutBranch;
+            }
+            else if (!continuesBlock)
+            {
+                ++g_cutBranch;
+            }
+        }
+        else if (group == 0x4)
+        {
+            // JSR / JMP / RTS / RTE / RTR は制御が飛ぶ。
+            const bool isJsr = (op & 0xFFC0u) == 0x4E80u;
+            const bool isJmp = (op & 0xFFC0u) == 0x4EC0u;
+            const bool isReturn = op == 0x4E75u || op == 0x4E73u || op == 0x4E77u;
+            if (isJsr || isJmp || isReturn)
+            {
+                continuesBlock = false;
+                ++g_cutCall;
+            }
+        }
+    }
+    // 書き込み先がゲスト RAM なら、後続の命令語を書き換えた可能性がある。
+    // 世代を上げるだけでは足りず、その場でブロックを終端する必要がある。
+    if (continuesBlock)
+    {
+        const u32 group = static_cast<u32>(op >> 12);
+        const u32 dstMode = static_cast<u32>((op >> 6) & 7u);
+        const bool isMoveToMemory = group >= 0x1 && group <= 0x3 && dstMode >= 2;
+        // CLR / NEGX / NEG / NOT も書く。
+        const u32 unaryOpcode = static_cast<u32>((op >> 8) & 0xFu);
+        const bool isUnaryWrite = group == 0x4 &&
+                                  (unaryOpcode == 0x0 || unaryOpcode == 0x2 || unaryOpcode == 0x4 ||
+                                   unaryOpcode == 0x6) &&
+                                  ((op >> 3) & 7u) >= 2;
+        // MOVEM のレジスタ→メモリ方向も書く。
+        const bool isMovemStore = (op & 0xFB80u) == 0x4880u && (op & 0x0400u) == 0;
+        if (isMoveToMemory || isUnaryWrite || isMovemStore)
+        {
+            ++g_cutStore;
+            // **書き込みでブロックを切るかどうかは設計の選択。**
+            //
+            // 切る側の理屈: 書いた先が自分の後続命令だったら、翻訳済みの
+            // コードが古くなる。その場で終端すれば必ず正しい。
+            //
+            // 切らない側の理屈: ブロックの途中に飛び込む経路は無いので、
+            // 「次にこのブロックへ入るとき」に世代を検査すれば足りる。
+            // 自分自身を書き換えた場合だけが問題だが、それは 1 ページ
+            // 1KB の世代が上がるので入口で捕まる。
+            //
+            // 切ると区間が 26.5% 短くなる (実測) ので、切らない設計の
+            // 見込みも測る。
+            if (!kStoreKeepsBlock)
+            {
+                continuesBlock = false;
+            }
+        }
+    }
+    if (continuesBlock && pendingIrq_ != 0)
+    {
+        continuesBlock = false;
+        ++g_cutIrq;
+    }
+    if (continuesBlock)
+    {
+        ++g_nativeRun;
+    }
+    else
+    {
+        if (g_nativeRun != 0)
+        {
+            const unsigned long capped =
+                g_nativeRun < kRunHistSize ? g_nativeRun : kRunHistSize - 1;
+            ++g_nativeRunLen[capped];
+            g_nativeRun = 0;
+        }
+    }
+    if (decodable)
+    {
+        ++g_hNativeCandidates;
+    }
     // 翻訳可能な命令とそうでない命令で、実際のサイクル数 (68000 の
     // 公称値) がどう違うかを分ける。Cavg モデルの (1-h)*(85+Cmiss) の
     // 項が妥当かを確かめるため。
