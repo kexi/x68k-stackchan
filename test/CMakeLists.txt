@@ -167,6 +167,7 @@ add_executable(x68k_tests
   test_avatar.cpp
   test_audio.cpp
   ${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp
+  ${X68K_ROOT}/src/x68k/platform/jit/block_runner.cpp
   # 実行可能メモリの切り出し。ESP32 では MALLOC_CAP_EXEC、ホストでは
   # 整列付きの new から取る。**整列と容量の判断はホストでも同じコードを回す**
   # (実機でしか試せない形にすると、壊れたままになる)。

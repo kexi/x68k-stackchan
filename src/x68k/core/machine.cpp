@@ -247,23 +247,11 @@ u32 Machine::run(u32 cycles)
     }
     if (eventDriven_)
     {
-        if (perf_.inlineMfpTimer)
-        {
-            if (perf_.inlineRtcTick)
-            {
-                return perf_.inlineCrtcTick ? runEventDriven<true, true, true>(cycles)
-                                            : runEventDriven<true, true, false>(cycles);
-            }
-            return perf_.inlineCrtcTick ? runEventDriven<true, false, true>(cycles)
-                                        : runEventDriven<true, false, false>(cycles);
-        }
-        if (perf_.inlineRtcTick)
-        {
-            return perf_.inlineCrtcTick ? runEventDriven<false, true, true>(cycles)
-                                        : runEventDriven<false, true, false>(cycles);
-        }
-        return perf_.inlineCrtcTick ? runEventDriven<false, false, true>(cycles)
-                                    : runEventDriven<false, false, false>(cycles);
+        // ネイティブ実行器を教わっているときだけ UseNative=true を選ぶ。
+        // 教わっていなければ if constexpr の非選択枝が実体化されないので、
+        // **生成コードに tryNative の呼び出しが 1 命令も残らない**。
+        return cpu_.hasNativeExec() ? dispatchEventDriven<true>(cycles)
+                                    : dispatchEventDriven<false>(cycles);
     }
     if (perf_.inlineMfpTimer)
     {
@@ -344,12 +332,34 @@ u32 Machine::runShadowVerify(u32 cycles)
     return spent;
 }
 
+template <bool UseNative>
+u32 Machine::dispatchEventDriven(u32 cycles)
+{
+    if (perf_.inlineMfpTimer)
+    {
+        if (perf_.inlineRtcTick)
+        {
+            return perf_.inlineCrtcTick ? runEventDriven<true, true, true, UseNative>(cycles)
+                                        : runEventDriven<true, true, false, UseNative>(cycles);
+        }
+        return perf_.inlineCrtcTick ? runEventDriven<true, false, true, UseNative>(cycles)
+                                    : runEventDriven<true, false, false, UseNative>(cycles);
+    }
+    if (perf_.inlineRtcTick)
+    {
+        return perf_.inlineCrtcTick ? runEventDriven<false, true, true, UseNative>(cycles)
+                                    : runEventDriven<false, true, false, UseNative>(cycles);
+    }
+    return perf_.inlineCrtcTick ? runEventDriven<false, false, true, UseNative>(cycles)
+                                : runEventDriven<false, false, false, UseNative>(cycles);
+}
+
 // イベント駆動の run()。**毎命令の判定は debt_ とゼロの比較 1 本だけ**。
 //
 // 変数同士の比較 (spent < cycles) を毎命令に入れると、過去 2 回と同じ轍を
 // 踏む (-18%, -6.5% の実測)。スライスの終端は sched_ が絶対サイクルで
 // 別に持っていて、遅い側でしか見ない。
-template <bool FastMfp, bool FastRtc, bool FastCrtc>
+template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative>
 u32 Machine::runEventDriven(u32 cycles)
 {
     sched_.beginSlice(cycles);
@@ -384,7 +394,21 @@ u32 Machine::runEventDriven(u32 cycles)
         // 25,000 サイクルに 1 回まで減った今、その数字は使えない。
         //
         // **恒久的な機能ではない。** 状態は進まないのでゲストは動かない。
-        const u32 used = nullExecInEvent_ ? 4u : cpu_.step();
+        u32 used;
+        if constexpr (UseNative)
+        {
+            // ブロックを 1 本走らせる。走らなければ step() へ落ちる。
+            //
+            // Why ここに if を書いてよいか: UseNative は template 引数なので
+            // 非選択枝は実体化されない。UseNative=false の生成コードに
+            // このブロックは 1 命令も残らない。
+            const NativeResult r = cpu_.tryNative();
+            used = r.exit == NativeExit::kRan ? r.cycles : cpu_.step();
+        }
+        else
+        {
+            used = nullExecInEvent_ ? 4u : cpu_.step();
+        }
         if (used == 0)
         {
             // halted。溜まった時間を捨てずに実体化してから抜ける。

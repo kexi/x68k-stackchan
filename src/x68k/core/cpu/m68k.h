@@ -22,6 +22,7 @@
 #define X68K_CORE_CPU_M68K_H
 
 #include "code_gen_map.h"
+#include "native_exec.h"
 #include "m68k_types.h"
 
 // ホットパスを内部 SRAM (IRAM) へ置くための印。
@@ -89,6 +90,100 @@ public:
     [[nodiscard]] u32 pendingInterruptLevel() const
     {
         return pendingIrq_;
+    }
+
+    // ネイティブ実行器を教わる。setFastRam と同じ「外から教わる」流儀。
+    //
+    // 教わっていない間は run が nullptr なので、Machine の分岐塔が
+    // UseNative=false の実体化しか選ばない。**既定で挙動が 1 ビットも
+    // 変わらない**のはこれが根拠。
+    void setNativeExec(const NativeExec& e)
+    {
+        nativeExec_ = e;
+    }
+
+    [[nodiscard]] bool hasNativeExec() const
+    {
+        return nativeExec_.isReady();
+    }
+
+    [[nodiscard]] const NativeStats* nativeStats() const
+    {
+        return nativeExec_.stats != nullptr ? nativeExec_.stats(nativeExec_.context) : nullptr;
+    }
+
+    // ブロックを 1 本走らせる。走らなければ kDeferToStep。
+    //
+    // **呼び出し側は kDeferToStep なら step() を 1 回回す。**
+    // 未対応命令 / halted / stopped / 割り込み保留の 3 つを区別しないのは、
+    // step() が 3 つとも正しく処理するから (native_exec.h の NativeExit 参照)。
+    NativeResult tryNative()
+    {
+        return nativeExec_.run(nativeExec_.context, *this);
+    }
+
+    // ブロックへ入る前に「インタプリタへ落とすべきか」を問う。
+    //
+    // **ネイティブ実行器は必ず入口でこれを見る。** これが無いと、
+    // reachSlow で pendingIrq_ が立った後、ネイティブが成功し続ける限り
+    // step() が呼ばれず、**次に reachSlow へ落ちるまでの最大 80,000
+    // サイクル割り込みが受理されない**。
+    //
+    // halted / stopped も同じ扱いにする。step() が既に 3 つとも正しく
+    // 処理するので、実行器側は理由を区別しなくてよい。
+    [[nodiscard]] bool mustDeferToStep() const
+    {
+        return st_.halted || st_.stopped || pendingIrq_ != 0;
+    }
+
+    // 命令語を「窓の中からだけ」読む。**副作用を持たない。**
+    //
+    // 翻訳器がバスを叩くと、**翻訳しただけで MFP の割り込み要因レジスタが
+    // 動く**。窓に当たらなければ false を返し、呼び出し側はそこで翻訳を
+    // 打ち切る。
+    //
+    // Why not 窓のポインタを外へ出さないか: 生ポインタを渡すと
+    // setFastRam / setFastRamReadable / setFastRom で窓が変わったことを
+    // 受け取り側が知る手段が無い。命令フェッチの窓をポインタでキャッシュ
+    // して捨て損ねた失敗を一度している (code_gen_map.h の冒頭)。
+    [[nodiscard]] bool peekCodeWord(u32 addr, u16& out) const
+    {
+        const u32 a = addr & M68k::kAddrMask;
+        if ((a & 1) != 0)
+        {
+            return false;
+        }
+        if (fastRamReadable_ && fastRamHasWord(a))
+        {
+            out = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+            return true;
+        }
+        if (u32 off = 0; fastRomHas(a, 2, off))
+        {
+            out = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+            return true;
+        }
+        return false;
+    }
+
+    // 分岐成立時にプリフェッチを詰め直す。
+    //
+    // **成立側でしか呼ばない。** 非分岐終端で呼ぶと、インタプリタが
+    // 読まないワード (fallThroughPc + 2) を余分に読む。それが I/O なら
+    // 副作用が起き、窓の外なら faulted_ が立って**インタプリタでは一度も
+    // 起きなかったバスエラー例外**が発生する。
+    //
+    // 戻り値: 奇数番地なら false (アドレスエラーに入っている)。
+    // 翻訳時に I7 が弾いているので通常は起きないが、段 2 以降で I7 を
+    // 緩めたときに呼び出し側が必ず書き換わるように返す。
+    bool branchTo(u32 target)
+    {
+        if ((target & 1) != 0)
+        {
+            return false;
+        }
+        refillPrefetch(target);
+        return true;
     }
 
     // RESET 命令が実行されたときに呼ばれる。
@@ -577,6 +672,8 @@ private:
     u32 fastRomLength_ = 0;
     // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
     bool fastRamReadable_ = false;
+    // ネイティブ実行器。既定は run == nullptr で、教わるまで使われない。
+    NativeExec nativeExec_{};
     M68kState st_;
     // ゲスト RAM の書き換えを世代で追う (code_gen_map.h)。
     CodeGenMap codeGen_;

@@ -1935,3 +1935,69 @@ usp/ssp に対して既にやっているのと同じバイト列走査で、pc/
 `NativeExec` を満たす実行器が無く、`setNativeExec` も `tryNative` も未実装。
 **速度はまだ 1 回も測っていない。**残りは §5.4 (`mustDeferToStep` の入口
 検査) と §5.5 (鍵の照合) とブロックキャッシュ。
+
+---
+
+## 実機検証: IRAM へバイト書き込みはできない (2026-08-19)
+
+段 2 を実機へ配線して初めて分かったこと。**ホストのテストでは原理的に
+見えない**種類の失敗。
+
+### 症状
+
+JIT を ON にすると実効クロックが 8155 → 5415 kHz へ落ち、統計がすべて 0。
+5415 は「イベント駆動 OFF」の値 (5446) にほぼ一致する。
+
+**真因は再起動だった。** シリアルログを掘ると:
+
+```
+Guru Meditation Error: Core 1 panic'ed (LoadStoreError)
+PC : 0x42016d77   EXCVADDR: 0x403daa3c
+```
+
+`addr2line` で `xtensa_encoder.h:77` の `emit16` — つまり**生成コードを
+書いている最中**。落ちて再起動し、起動時の既定 (毎命令 tick) に戻るので、
+「遅くなった」ように見えていた。
+
+### 原因
+
+**ESP32-S3 の IRAM は 32bit 単位でしか読み書きできない。**
+エンコーダは `out[0] = ...; out[1] = ...` とバイト単位で書くので、
+`MALLOC_CAP_EXEC` で取った領域へ直接発行すると必ず落ちる。
+
+`MALLOC_CAP_32BIT` を付けても「32bit でアクセスすれば使える」だけで、
+**バイト書き込みが許されるようにはならない**。`exec_memory.cpp` の
+コメントは制約を正しく書いていたが、**エンコーダ側がそれを守る形に
+なっていなかった**。
+
+### 直し方
+
+通常の RAM に控えを持ち、そこへ発行してから **32bit 単位で写す**。
+
+```cpp
+alignas(4) std::uint8_t staging_[512];
+...
+emitBlock(plan, fallIr, fallIrc, staging_, need, emitted);
+const std::size_t words = (need + 3) / 4;
+auto* dst = reinterpret_cast<volatile std::uint32_t*>(buf);
+const auto* words32 = reinterpret_cast<const std::uint32_t*>(staging_);
+for (std::size_t i = 0; i < words; ++i) { dst[i] = words32[i]; }
+```
+
+### 次の失敗へ進んだ
+
+修正後、例外が `LoadStoreError` から **`IllegalInstruction`** に変わり、
+位置も `emit16` から **`runBlock` の中** へ移った。
+
+**つまり「コードを書けない」段階は抜け、「書いたコードが実行される」
+段階に来た。** 生成コードが不正な命令を含んでいる。
+
+### 教訓
+
+**ホストのテストは「バイト列が正しいこと」までしか問えない。**
+446,888 assertion が緑でも、そのバイト列を**実機の IRAM へどう置くか**は
+1 つも検査していなかった。
+
+計測が「遅くなった」と出たとき、**真っ先に疑うべきは計測系ではなく
+再起動**だった。5415 kHz という値が既知の別モードの値と一致していたのが
+最大の手がかりで、そこに気づくまでに数回の測り直しを費やした。

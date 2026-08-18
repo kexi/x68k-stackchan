@@ -30,6 +30,9 @@
 #include <cstring>
 #include <cstdio>
 
+#include "jit/block_runner.h"
+#include "jit/exec_memory.h"
+
 #include "app_mode.h"
 #include "audio.h"
 #include "avatar.h"
@@ -892,6 +895,18 @@ x68k::u8* g_sasiBuffer = nullptr;
 constexpr x68k::u32 kCodeGenPages = x68k::kMainRamSize / x68k::CodeGenMap::kPageSize;
 std::uint16_t* g_codeGen = nullptr;
 
+// JIT のブロックキャッシュ。
+//
+// スロット数は 2 の冪 (slotIndex がマスクで畳む)。256 スロット x 112 バイト
+// = 28,672 バイト。実測の内部 SRAM 空き 48KB に対して、世代配列 4KB と
+// 合わせて 32KB。**PSRAM には置かない** (散らばったアクセスで実機が止まる)。
+constexpr x68k::u32 kJitSlots = 256;
+x68k::jit::BlockSlot* g_jitSlots = nullptr;
+x68k::jit::ExecMemory g_jitCode;
+x68k::jit::BlockRunner g_jitRunner;
+// 実行可能メモリの要求量。実測で 21KB 取れる。
+constexpr std::size_t kJitCodeBytes = 16 * 1024;
+
 // 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
 x68k::u16* g_avatarSprite = nullptr;
 
@@ -923,6 +938,21 @@ bool reserveMemory()
     // ので、PSRAM に置いても実害が小さい。
     g_sasiBuffer = static_cast<x68k::u8*>(
         heap_caps_calloc(1, x68k::Machine::kSasiBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    // JIT のブロックキャッシュと実行可能メモリ。
+    //
+    // **どちらも失敗してよい。** 取れなければ JIT を教わらないので、
+    // 現行インタプリタのまま動く (挙動は 1 ビットも変わらない)。
+    g_jitSlots = static_cast<x68k::jit::BlockSlot*>(heap_caps_calloc(
+        kJitSlots, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitSlots == nullptr)
+    {
+        ESP_LOGW(kTag, "JIT のスロットを内部 SRAM に置けません (JIT は無効)");
+    }
+    if (!g_jitCode.acquire(kJitCodeBytes))
+    {
+        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)");
+    }
 
     // コードページの世代は内部 SRAM に置く。ブロックの入口で毎回引くので、
     // PSRAM への散らばったアクセスは避ける (実機を止めた実績がある)。
@@ -1733,6 +1763,69 @@ private:
         // 比べれば、ネイティブ化で何倍になりうるかが出る。
         // 'C' で段 0-C2 (キャッシュ経路の費用) を測る。恒久機能ではない。
         // 'B' で段 0-C3 (ネイティブ命令本体の実費) を測る。恒久機能ではない。
+        // 'J' で JIT を切り替える。**同じ起動の中で往復して測れる**ので、
+        // ビルド差やキャッシュの温まり方が結果に混じらない。
+        const bool isJitToggle = c == 'J';
+        if (isJitToggle)
+        {
+            const bool on = !g_machine.cpu().hasNativeExec();
+            if (on)
+            {
+                if (g_jitSlots == nullptr || !g_jitCode.isReady())
+                {
+                    ESP_LOGW(kTag, "JIT: 置き場が無いので有効にできません");
+                    return;
+                }
+                g_jitRunner.setStorage(g_jitSlots, kJitSlots, &g_jitCode);
+                g_jitRunner.reset();
+                g_machine.cpu().setNativeExec(g_jitRunner.exec());
+                // **JIT はイベント駆動の経路にしか無い。**
+                // 毎命令 tick のまま JIT を ON にしても何も起きず、
+                // 「ON にしたのに統計が 0」という紛らわしい状態になる。
+                // 沈黙の無効化を作らないよう、ここで一緒に ON にする。
+                if (!g_eventDrivenEnabled.load(std::memory_order_relaxed))
+                {
+                    g_eventDrivenEnabled = true;
+                    ESP_LOGI(kTag, "JIT: イベント駆動も ON にしました");
+                }
+            }
+            else
+            {
+                g_machine.cpu().setNativeExec(x68k::NativeExec{});
+            }
+            ESP_LOGI(kTag, "JIT: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'K' で JIT の統計を出す。
+        const bool isJitStats = c == 'K';
+        if (isJitStats)
+        {
+            const x68k::NativeStats* st = g_machine.cpu().nativeStats();
+            if (st == nullptr)
+            {
+                ESP_LOGI(kTag, "JIT: 教わっていません");
+                return;
+            }
+            ESP_LOGI(kTag, "[jit] ブロック %llu 本 / 命令 %llu", (unsigned long long)st->blocksRun,
+                     (unsigned long long)st->insnsRun);
+            ESP_LOGI(kTag, "[jit] 落とした: 割込 %llu / 未対応 %llu / 翻訳失敗 %llu",
+                     (unsigned long long)st->deferInterrupt,
+                     (unsigned long long)st->deferUnsupported,
+                     (unsigned long long)st->translateFail);
+            ESP_LOGI(kTag, "[jit] 鍵外れ: タグ %llu / 写像 %llu / 世代 %llu / 飽和 %llu",
+                     (unsigned long long)st->keyMissTag, (unsigned long long)st->keyMissEpoch,
+                     (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale);
+            // **統計が 0 のときに自己診断できるようにする。**
+            // 経路が違えば tryNative は呼ばれないので、統計は 0 のまま。
+            ESP_LOGI(kTag, "[jit] 経路: イベント駆動 %s / JIT %s",
+                     g_machine.eventDriven() ? "ON" : "OFF",
+                     g_machine.cpu().hasNativeExec() ? "ON" : "OFF");
+            ESP_LOGI(kTag, "[jit] 実行可能メモリ %u / %u バイト", (unsigned)g_jitCode.used(),
+                     (unsigned)g_jitCode.capacity());
+            return;
+        }
+
         const bool isNativeBodyProbe = c == 'B';
         if (isNativeBodyProbe)
         {

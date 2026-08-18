@@ -448,8 +448,17 @@ private:
     u32 runWith(u32 cycles);
 
     // イベント駆動版の run()。毎命令は debt_ への加算とゼロ比較だけになる。
-    template <bool FastMfp, bool FastRtc, bool FastCrtc>
+    template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative = false>
     u32 runEventDriven(u32 cycles);
+
+    // 上の 3 段ネストを UseNative ごとに 1 回ずつ通すための入口。
+    //
+    // Why not Fast* をまとめて true に固定しないか: 「まとめて判定すると
+    // RTC だけ切ったつもりが MFP と CRTC まで切れて、どれが効いたのか
+    // 分からなくなる」失敗を既に記録している (perf_switch.h)。測定器が
+    // 測定対象を勝手に変える形は採らない。素直に実体化を増やす。
+    template <bool UseNative>
+    u32 dispatchEventDriven(u32 cycles);
 
     // 段 1 の shadow 検証を回す run()。**ホスト専用**。
     //
