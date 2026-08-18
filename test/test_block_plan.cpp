@@ -1164,4 +1164,38 @@ TEST_SUITE("BlockPlanner")
         CHECK(sizeof(x68k::PlannedOp) == 20);
         CHECK(sizeof(x68k::BlockPlan) == 112);
     }
+
+    // 番地 0 からは翻訳しない (空きスロットの番兵と衝突するため)。
+    //
+    // BlockPlan::entryPc の 0 は「このスロットは空」を意味する。番地 0 の
+    // ブロックを作ると空きスロットと区別できない計画ができ、検索側が空きと
+    // 見て上書きするか空きを有効と読むかで静かに壊れる。
+    TEST_CASE("番地 0 からは翻訳しない")
+    {
+        // 番地 0 に、単体なら確実に翻訳できる命令 (MOVEQ) を置く。
+        static x68k::u16 words[] = {0x7001, 0x7002, 0x7003, 0x7004};
+        const auto read16 = [](void* ctx, x68k::u32 addr, x68k::u16& outWord) -> bool
+        {
+            (void)ctx;
+            if (addr >= sizeof(words))
+            {
+                return false;
+            }
+            outWord = words[addr / 2];
+            return true;
+        };
+        const auto generation = [](void*, x68k::u32) -> x68k::u16 { return 0; };
+        const auto mappingEpoch = [](void*) -> x68k::u32 { return 1; };
+
+        x68k::PlanSource src{read16, nullptr};
+        x68k::PlanGenSource gen{generation, mappingEpoch, nullptr};
+
+        x68k::BlockPlan plan{};
+        // 同じ命令が番地 0 以外なら組めることを先に示す (番兵が理由だと分かる)。
+        CHECK(x68k::BlockPlanner::plan(src, gen, 2, plan));
+        CHECK(plan.count > 0);
+
+        x68k::BlockPlan atZero{};
+        CHECK_FALSE(x68k::BlockPlanner::plan(src, gen, 0, atZero));
+    }
 }

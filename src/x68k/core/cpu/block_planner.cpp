@@ -271,6 +271,22 @@ bool BlockPlanner::planOne(u16 op, u32 pc, PlannedOp& out)
 bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 entryPc,
                         BlockPlan& out)
 {
+    // entryPc == 0 は空きスロットの番兵なので、そこからは翻訳しない。
+    //
+    // Why 要るか: BlockPlan::entryPc の 0 は「このスロットは空」を意味する。
+    // 番地 0 のブロックを作ると、**空きスロットと区別できない計画**が
+    // できてしまう。検索側が空きと見て上書きするか、空きを有効な計画と
+    // 読むかは実装次第で、どちらも静かに壊れる。
+    //
+    // 実害があるかは別問題で、X68000 では $000000-$0003FF が例外ベクタ
+    // テーブルなので通常そこにコードは無い (リセットは番地 4 から PC を
+    // 読む)。**ただし「通常無い」に頼らない。** ゲストは何でもできるし、
+    // 番兵の意味は 68000 の都合とは無関係に守られるべき。
+    if (entryPc == 0)
+    {
+        return false;
+    }
+
     // I9: 世代が飽和 (または CodeGenMap が未配線) なら、そもそも翻訳しない。
     //
     // Why not 翻訳してから鍵の照合で落とすか: kAlwaysStale を控えた計画は
@@ -338,9 +354,15 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         //
         // **+2 が要る。** 出口の CPU 状態は irc == mem16(nextPc + 2) を
         // 含むので、nextPc までしか見ないと「最後の命令の次のワード」は
-        // ページ内でも、その先の irc に入るワードが窓の外へ出る。
-        // そこはブロックが読むべき最後の 2 バイトなので、ここに含めれば
-        // ブロック内のプリフェッチも出口の状態も原理的に窓を外れない。
+        // ページ内でも、その先の irc に入るワードを読み損ねる。
+        //
+        // **これは鍵を 1 ページに閉じるための条件であって、窓の中に
+        // あることの保証ではない。** ページに収まることと窓に収まることは
+        // 別の性質で、現在の窓 (メイン RAM 2MB / IPL-ROM 128KB) の境界が
+        // たまたま 1KB 整列しているために一致して見えているだけ。
+        // 窓の判定は I3 (PlanSource::read16 が false を返したら終端) が
+        // 別に担っている。**I4 があるから窓を考えなくてよい、とは読まないこと。**
+        // 窓の長さが 1KB 非整列になったら、ここではなく I3 が効く。
         if (pageOf(nextPc + 2) != entryPage)
         {
             out.end = BlockEnd::kPageBoundary;
