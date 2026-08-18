@@ -49,6 +49,12 @@ idf_component_register(
         # 実体を共有する)。顔は RGB565 の配列へ画素を置くだけで、LCD へ送るのは
         # DisplayLcd::pushFrame (avatar.h の冒頭を見よ)。
         # servo.cpp だけが ESP-IDF (LEDC) を必要とする。
+        # --- JIT: BlockPlan を Xtensa の機械語へ落とす ---
+        # block_emitter.cpp は ESP-IDF に触らない (吐くのは Xtensa のバイト列で、
+        # 実行するのは exec_memory.cpp の側)。ホストのテストと実体を共有する。
+        # exec_memory.cpp だけが MALLOC_CAP_EXEC と callx0 のゲートウェイを持つ。
+        "${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp"
+        "${X68K_ROOT}/src/x68k/platform/jit/exec_memory.cpp"
         "${X68K_ROOT}/src/x68k/platform/app_mode.cpp"
         "${X68K_ROOT}/src/x68k/platform/avatar.cpp"
         "${X68K_ROOT}/src/x68k/platform/servo.cpp"

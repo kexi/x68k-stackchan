@@ -122,6 +122,23 @@ add_executable(x68k_tests
   test_scheduler.cpp
   # ブロック翻訳器。許可リストの内側と外側を 65,536 通り全部で問う。
   test_block_plan.cpp
+  # Xtensa の命令エンコーダ。platform/jit/ のヘッダオンリーなので、ESP-IDF にも
+  # M5Unified にも触らずホストでビルドできる (吐くのは Xtensa のバイト列であって、
+  # ホストで実行するわけではない)。
+  #
+  # ここをホストテストに入れるのは、**アセンブラとの突き合わせが段 2 の正しさの
+  # 土台**だから。機械語のフィールドが 1 ニブルずれても別の正当な命令として実行
+  # されてしまい、実機では別の命令の途中へ飛んだ先で壊れる。実機に焼く前に、
+  # 手元の ctest で毎回問える場所に置く。
+  test_xtensa_encoder.cpp
+  # BlockPlan → Xtensa の発行器。エンコーダと同じくホストでバイト列を検査する
+  # (吐くのは Xtensa の機械語であって、ホストで実行するわけではない)。
+  #
+  # ここで問うのは 2 つ。**出口で書き戻すレジスタが 1 つも漏れていないこと**
+  # (漏れは次のブロックが読むまで誰にも見えず、原因から遠いところで表面化する)
+  # と、**ADD/SUB のフラグ式が alu::add / alu::sub と一致すること**
+  # (直線コードで出す V と C は、読んで納得しても根拠にならない)。
+  test_block_emitter.cpp
   test_sram.cpp
   test_sram_persist.cpp
   test_bus.cpp
@@ -149,6 +166,12 @@ add_executable(x68k_tests
   test_app_mode.cpp
   test_avatar.cpp
   test_audio.cpp
+  ${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp
+  # 実行可能メモリの切り出し。ESP32 では MALLOC_CAP_EXEC、ホストでは
+  # 整列付きの new から取る。**整列と容量の判断はホストでも同じコードを回す**
+  # (実機でしか試せない形にすると、壊れたままになる)。
+  # 生成コードを実際に呼ぶ runBlock だけは ESP32 専用で、ホストでは落ちる。
+  ${X68K_ROOT}/src/x68k/platform/jit/exec_memory.cpp
   ${X68K_ROOT}/src/x68k/platform/key_queue.cpp
   # 音声の受け渡し。platform/ にあるが ESP-IDF に触らないのでホストで
   # ビルドできる (M5Unified を叩くのは speaker_m5.h の方)。実機では音を
