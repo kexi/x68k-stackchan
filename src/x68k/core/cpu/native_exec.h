@@ -75,10 +75,12 @@ struct NativeStats
     u64 deferCapacity = 0;     // kMaxOps に達した
     // タグが違う (別の PC がこのスロットを使っていた)。
     u64 keyMissTag = 0;
-    u64 keyMissEpoch = 0;   // 写像 epoch 不一致
-    u64 keyMissGen = 0;     // ページ世代不一致
-    u64 keyMissStale = 0;   // kAlwaysStale で捨てた
-    u64 translateFail = 0;  // 入口の命令からして翻訳できなかった
+    u64 keyMissEpoch = 0;  // 写像 epoch 不一致
+    u64 keyMissGen = 0;    // ページ世代不一致
+    u64 keyMissStale = 0;  // kAlwaysStale で捨てた
+    u64 translateFail = 0;
+    // 「翻訳できない」と覚えていたので再翻訳を省いた回数。
+    u64 negativeHit = 0;  // 入口の命令からして翻訳できなかった
 };
 using NativeStatsFn = const NativeStats* (*)(void* context);
 

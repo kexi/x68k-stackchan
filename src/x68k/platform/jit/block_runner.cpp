@@ -37,6 +37,20 @@ u32 mappingEpochOf(void* ctx)
 
 }  // namespace
 
+void BlockRunner::rememberFailure(BlockSlot& slot, std::uint32_t entryPc, std::uint16_t gen,
+                                  std::uint32_t epoch)
+{
+    // **飽和したページは覚えない。** kAlwaysStale は「常に古い」なので、
+    // 覚えても次回必ず外れる。覚えた分だけスロットを無駄にする。
+    if (gen == CodeGenMap::kAlwaysStale)
+    {
+        return;
+    }
+    slot.failedPc = entryPc;
+    slot.failedGen = gen;
+    slot.failedEpoch = epoch;
+}
+
 void BlockRunner::reset()
 {
     for (std::uint32_t i = 0; i < slotCount_; ++i)
@@ -57,6 +71,22 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         return nullptr;
     }
 
+    // **一度失敗した番地なら、もう試さない。**
+    //
+    // 世代と写像が当時のままなら、同じ命令列が同じ結果になる。
+    // どちらかが動いていれば覚え直す (ゲストが書き換えた可能性がある)。
+    CodeGenMap& map = cpu.codeGenMap();
+    BlockSlot& here = slots_[slotIndex(entryPc)];
+    const std::uint16_t nowGen = map.generation(entryPc);
+    const bool rememberedFailure = here.failedPc == entryPc && nowGen != CodeGenMap::kAlwaysStale &&
+                                   here.failedGen == nowGen &&
+                                   here.failedEpoch == map.mappingEpoch();
+    if (rememberedFailure)
+    {
+        ++stats_.negativeHit;
+        return nullptr;
+    }
+
     PlanCtx ctx{&cpu};
     const PlanSource src{&readCodeWord, &ctx};
     const PlanGenSource gen{&pageGeneration, &mappingEpochOf, &ctx};
@@ -65,6 +95,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (!BlockPlanner::plan(src, gen, entryPc, plan))
     {
         ++stats_.translateFail;
+        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
         return nullptr;
     }
 
@@ -76,6 +107,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         !cpu.peekCodeWord(plan.fallThroughPc + 2, fallIrc))
     {
         ++stats_.translateFail;
+        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
         return nullptr;
     }
 
@@ -83,6 +115,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (need == 0)
     {
         ++stats_.translateFail;
+        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
         return nullptr;
     }
 
@@ -91,6 +124,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         // 発行用の控えに収まらない。段 1 の kMaxOps = 4 では起きないが、
         // 上限を上げたときに黙って壊れないよう明示的に諦める。
         ++stats_.translateFail;
+        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
         return nullptr;
     }
 
@@ -113,6 +147,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (!emitBlock(plan, fallIr, fallIrc, staging_, need, emitted))
     {
         ++stats_.translateFail;
+        rememberFailure(here, entryPc, nowGen, map.mappingEpoch());
         return nullptr;
     }
 
@@ -130,7 +165,9 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     // 書く前の中身を拾いうる (1 回目だけ壊れる形で出る)。
     code_->commit();
 
-    BlockSlot& slot = slots_[slotIndex(entryPc)];
+    BlockSlot& slot = here;
+    // 翻訳できたので、この番地の「できない」記憶は捨てる。
+    slot.failedPc = 0;
     slot.plan = plan;
     slot.code = buf + emitted.entryOffset;
     slot.endsWithBranch = emitted.endsWithBranch;

@@ -41,6 +41,24 @@ struct BlockSlot
     BlockPlan plan;
     // 生成コードのエントリポイント。nullptr なら未翻訳。
     const std::uint8_t* code = nullptr;
+    // **翻訳できないことを覚えた番地。** 0 なら覚えていない。
+    //
+    // Why 要るか: 翻訳に失敗しても何も残さないと、同じ番地に来るたび
+    // BlockPlanner::plan() を呼び直す。実機で**翻訳失敗がブロック実行の
+    // 4.4 倍**発生していた (8,819,504 回 / 1,999,173 本)。ブロックに
+    // ならない命令のたびに翻訳の実費を払っており、これが最大の損だった。
+    //
+    // Why 別のフィールドにするか: 成功した計画と同じ場所へ書くと、
+    // 「翻訳できた」と「翻訳できないと分かっている」が区別できない。
+    // 分けておけば、同じスロットに成功ブロックと失敗番地が同居できる
+    // (畳み先が同じでも互いを追い出さない)。
+    std::uint32_t failedPc = 0;
+    // 失敗を覚えた時点の世代と写像。**これが変わったら覚え直す。**
+    //
+    // ゲストが RAM を書き換えれば「翻訳できない」も変わりうる。
+    // 成功したブロックと同じ pull 型の検査を、失敗側にも適用する。
+    std::uint16_t failedGen = 0;
+    std::uint32_t failedEpoch = 0;
     // 分岐で終端したか (戻り値の bit31 を見てよいか)。
     bool endsWithBranch = false;
     // 分岐成立時の飛び先。
@@ -87,6 +105,8 @@ public:
 
 private:
     NativeResult run(M68k& cpu);
+    static void rememberFailure(BlockSlot& slot, std::uint32_t entryPc, std::uint16_t gen,
+                                std::uint32_t epoch);
     // 翻訳して置く。置けたらスロットを返す。
     BlockSlot* translate(M68k& cpu, std::uint32_t entryPc);
     [[nodiscard]] std::uint32_t slotIndex(std::uint32_t pc) const

@@ -1810,6 +1810,8 @@ private:
             }
             ESP_LOGI(kTag, "[jit] ブロック %llu 本 / 命令 %llu", (unsigned long long)st->blocksRun,
                      (unsigned long long)st->insnsRun);
+            ESP_LOGI(kTag, "[jit] 負のキャッシュで省いた再翻訳 %llu 回",
+                     (unsigned long long)st->negativeHit);
             ESP_LOGI(kTag, "[jit] 落とした: 割込 %llu / 未対応 %llu / 翻訳失敗 %llu",
                      (unsigned long long)st->deferInterrupt,
                      (unsigned long long)st->deferUnsupported,
