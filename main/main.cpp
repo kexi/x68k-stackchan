@@ -883,6 +883,15 @@ void reportMemory(const char* phase)
 // フォールバックする (動くが遅くなる)。
 x68k::u8* g_sasiBuffer = nullptr;
 
+// コードページの世代。2MB / 1KB = 2048 ページ = 4KB。
+//
+// Why 静的配列にしないか: 内部 SRAM の .bss を膨らませると、すぐ下で
+// IPL-ROM 128KB を内部 SRAM へ置く処理が失敗する (既存のコメント参照)。
+// 確保に失敗したら未配線のままにする。**未配線でも壊れない**ように
+// 照合側で kAlwaysStale を弾く契約にしてある。
+constexpr x68k::u32 kCodeGenPages = x68k::kMainRamSize / x68k::CodeGenMap::kPageSize;
+std::uint16_t* g_codeGen = nullptr;
+
 // 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
 x68k::u16* g_avatarSprite = nullptr;
 
@@ -914,6 +923,15 @@ bool reserveMemory()
     // ので、PSRAM に置いても実害が小さい。
     g_sasiBuffer = static_cast<x68k::u8*>(
         heap_caps_calloc(1, x68k::Machine::kSasiBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    // コードページの世代は内部 SRAM に置く。ブロックの入口で毎回引くので、
+    // PSRAM への散らばったアクセスは避ける (実機を止めた実績がある)。
+    g_codeGen = static_cast<std::uint16_t*>(heap_caps_calloc(
+        kCodeGenPages, sizeof(std::uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_codeGen == nullptr)
+    {
+        ESP_LOGW(kTag, "コードページの世代を内部 SRAM に置けません (JIT は無効のまま動きます)");
+    }
 
     // IPL-ROM は内部 SRAM を優先。ブート中のホットパスなので効果が大きい。
     g_iplRom = static_cast<x68k::u8*>(
@@ -1060,6 +1078,18 @@ bool loadRoms()
     g_machine.setMemory(memory);
     g_machine.setSasiBuffer(g_sasiBuffer);
     g_machine.setDisk(&g_disk);
+
+    // ゲスト RAM の書き換えを追う世代マップを配線する。
+    //
+    // **配線しないと「常に古い」が「常に有効」に化ける。** 未配線だと
+    // pageCount_ = 0 なので generation() が全アドレスに kAlwaysStale を
+    // 返し、素朴な照合 (控え == 現在) が 0xFFFF == 0xFFFF で通ってしまう。
+    // 照合側でも kAlwaysStale を弾くが、ここで配線しておけば
+    // 通常のページは正しく世代で判定できる。
+    //
+    // 2MB / 1KB = 2048 ページ = 4KB。内部 SRAM に置く (PSRAM への
+    // 散らばったアクセスは実機を止めた実績がある)。
+    g_machine.cpu().codeGenMap().setStorage(g_codeGen, kCodeGenPages);
 
     return true;
 }

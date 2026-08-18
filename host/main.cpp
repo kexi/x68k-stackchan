@@ -888,6 +888,12 @@ int main(int argc, char** argv)
     std::vector<x68k::u8> sasiBuffer(x68k::Machine::kSasiBufferBytes, 0);
     machine.setSasiBuffer(sasiBuffer.data());
 
+    // コードページの世代を配線する。**未配線だと「常に古い」が
+    // 「常に有効」に化ける** (pageCount_ = 0 で generation() が全アドレスに
+    // kAlwaysStale を返し、素朴な照合が通ってしまう)。
+    static std::vector<std::uint16_t> codeGen(x68k::kMainRamSize / x68k::CodeGenMap::kPageSize, 0);
+    machine.cpu().codeGenMap().setStorage(codeGen.data(), static_cast<x68k::u32>(codeGen.size()));
+
     disk.setTrace(traceDisk);
     machine.setDisk(&disk);
 

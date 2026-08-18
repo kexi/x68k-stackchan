@@ -1427,6 +1427,33 @@ TEST_SUITE("イベント駆動")
             CHECK(map.generation(target) == x68k::CodeGenMap::kAlwaysStale);
         }
 
+        SUBCASE("未配線なら全ページが常に古い扱いになる")
+        {
+            // **未配線は「常に有効」に化けやすい。**
+            // setStorage を呼ばないと pageCount_ = 0 なので、
+            // generation() は全アドレスに kAlwaysStale を返す。
+            //
+            // ここで素朴に「控えた世代 == 今の世代」で照合すると
+            //   0xFFFF == 0xFFFF → 一致
+            // となり、**自己書き換えを一切検出しないブロックキャッシュ**が
+            // 成立してしまう。
+            //
+            // 正しい照合は「kAlwaysStale でない かつ 一致」。
+            // 配線を忘れても飽和しても、必ず再翻訳へ落ちる。
+            x68k::CodeGenMap unwired;
+            CHECK_FALSE(unwired.isReady());
+            CHECK(unwired.generation(0) == x68k::CodeGenMap::kAlwaysStale);
+            CHECK(unwired.generation(0x100000) == x68k::CodeGenMap::kAlwaysStale);
+
+            // 「控えと一致するか」だけで判定してはいけないことを固定する。
+            const std::uint16_t remembered = unwired.generation(0x1000);
+            const bool naiveMatch = remembered == unwired.generation(0x1000);
+            CHECK(naiveMatch);  // 素朴な照合は通ってしまう
+            const bool correctMatch = remembered != x68k::CodeGenMap::kAlwaysStale &&
+                                      remembered == unwired.generation(0x1000);
+            CHECK_FALSE(correctMatch);  // 正しい照合は通らない
+        }
+
         SUBCASE("範囲外は常に古いものとして扱う")
         {
             // 0 を返すと「まだ一度も書かれていないページ」と区別できず、
@@ -1571,6 +1598,89 @@ TEST_SUITE("イベント駆動")
         CHECK(mismatched == 0);
         // 素通りしていないこと。対象の命令が実際に検査されている。
         CHECK(checked > 3000);
+    }
+
+    // 分岐の命令長が実行と一致する。
+    //
+    // **上の全数検証は分岐を飛ばしている** (成立すると PC が飛ぶので
+    // 長さの検証にならないため)。しかしブロックは分岐で終端するのが
+    // 中心なので、ここが穴のままだと Bcc.w の長さ 4 が 2 に化けても
+    // テストが全部通る。
+    //
+    // **不成立にすれば PC の進み方がそのまま命令長になる。**
+    // CCR を 0 にしてから BEQ (Z が必要) を置けば必ず不成立。
+    TEST_CASE("分岐の命令長が実行と一致する")
+    {
+        static std::vector<x68k::u8> ram(x68k::kMainRamSize, 0);
+        const auto poke16 = [](x68k::u32 a, x68k::u16 v)
+        {
+            ram[a] = static_cast<x68k::u8>(v >> 8);
+            ram[a + 1] = static_cast<x68k::u8>(v & 0xFF);
+        };
+
+        struct Case
+        {
+            x68k::u16 op;
+            x68k::u32 expected;
+            const char* name;
+        };
+        // cond 7 = BEQ。CCR を 0 にしておけば Z=0 なので必ず不成立。
+        const Case cases[] = {
+            {0x6702, 2, "BEQ.s +2 (8bit 変位)"},
+            {0x67FE, 2, "BEQ.s -2 (8bit 変位、負)"},
+            {0x6700, 4, "BEQ.w (16bit 変位が続く)"},
+            {0x6710, 2, "BEQ.s +16"},
+        };
+
+        for (const auto& c : cases)
+        {
+            CAPTURE(c.name);
+            CAPTURE(c.op);
+            CHECK(x68k::instructionLength(c.op) == c.expected);
+
+            std::fill(ram.begin(), ram.end(), 0);
+            poke16(0, 0x0000);
+            poke16(2, 0x8000);
+            poke16(4, 0x0000);
+            poke16(6, 0x1000);
+            for (x68k::u32 a = 0x1000; a < 0x1100; a += 2)
+            {
+                poke16(a, 0x4E71);  // NOP
+            }
+            poke16(0x1000, c.op);
+            // BEQ.w の変位ワードは 0 のまま (次の命令へ)。
+
+            x68k::Machine m;
+            x68k::MemoryMap map{};
+            map.mainRam = ram.data();
+            m.setMemory(map);
+            m.reset();
+
+            x68k::M68kState st = m.cpu().state();
+            st.pc = 0x1000;
+            // **CCR を 0 にする。** Z が立っていると BEQ が成立して飛ぶ。
+            st.sr = 0x2000;
+            st.a[7] = 0x8000;
+            m.cpu().loadStateForTest(st);
+            m.cpu().refillPrefetchForTest(0x1000);
+
+            m.step();
+            REQUIRE_FALSE(m.isHalted());
+            const x68k::u32 after = m.cpu().state().pc - 4;
+            CHECK(after - 0x1000 == c.expected);
+        }
+
+        // BRA は必ず飛ぶので、飛び先が「命令長ぶん先」になることで問う。
+        // BRA.s +2 ($6002) は 2 バイトの命令の次、つまり +4 へ飛ぶ
+        // (68000 の変位は命令語の次のワードからの相対)。
+        CHECK(x68k::instructionLength(0x6002) == 2);
+        CHECK(x68k::instructionLength(0x6000) == 4);
+        // BSR も同じ形。
+        CHECK(x68k::instructionLength(0x6102) == 2);
+        CHECK(x68k::instructionLength(0x6100) == 4);
+        // $FF は 32bit 変位 (68020 以降) なので扱わない。
+        CHECK(x68k::instructionLength(0x60FF) == x68k::kUnknownLength);
+        CHECK(x68k::instructionLength(0x67FF) == x68k::kUnknownLength);
     }
 
     // 対象グループの命令を「分からない」と取りこぼしていない。
