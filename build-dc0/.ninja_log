@@ -27,3 +27,6 @@
 28	1556	1787022437333284251	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/machine.cpp.o	33f3576602c9002f
 1556	1641	1787022438860770918	libx68k_core.a	47ba3e7ba183f3f9
 1641	1734	1787022438945689819	x68k-run	39656c2a6ecaab8c
+7	390	1787029066542454833	CMakeFiles/x68k_core.dir/Users/kei/ghq/github.com/kexi/x68k-stackchan/src/x68k/core/cpu/m68k.cpp.o	545b5a40106bd475
+390	453	1787029066926223590	libx68k_core.a	47ba3e7ba183f3f9
+453	537	1787029066988689791	x68k-run	39656c2a6ecaab8c

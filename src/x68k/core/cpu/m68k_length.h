@@ -292,6 +292,87 @@ inline u32 instructionLength(u16 op)
             return kUnknownLength;
         }
 
+        case 0x8:  // OR / DIVU / DIVS / SBCD
+        case 0x9:  // SUB / SUBA / SUBX
+        case 0xB:  // CMP / CMPA / CMPM / EOR
+        case 0xC:  // AND / MULU / MULS / ABCD / EXG
+        case 0xD:  // ADD / ADDA / ADDX
+        {
+            // どれも `gggg rrr ooo mmm rrr` の形。opmode で意味が変わる。
+            //
+            // Why これを足すか: この 5 群で実行の 15.6% を占めるのに、
+            // 全部 kUnknownLength を返していた。ブロックがここで必ず
+            // 途切れるので、区間長が伸びない。
+            const u32 opmode = static_cast<u32>((op >> 6) & 7u);
+
+            // opmode 3 / 7 はアドレスレジスタ相手 (ADDA/SUBA/CMPA)
+            // または乗除算 (DIVU/DIVS/MULU/MULS)。どちらも実効アドレスを
+            // 1 つ取る形は同じ。サイズだけ違う。
+            const bool isAddressOrMulDiv = opmode == 3 || opmode == 7;
+            if (isAddressOrMulDiv)
+            {
+                // $8/$C の opmode 3,7 は DIVU/DIVS/MULU/MULS で word 固定。
+                // $9/$B/$D は ADDA/SUBA/CMPA で opmode 3 が word、7 が long。
+                const bool isMulDiv = group == 0x8 || group == 0xC;
+                const u32 size = isMulDiv ? 2u : (opmode == 3 ? 2u : 4u);
+                const u32 words = eaExtensionWords(mode, reg, size);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                // 乗除算はアドレスレジスタ直接を取れない。
+                if (isMulDiv && mode == 1)
+                {
+                    return kUnknownLength;
+                }
+                return 2 + words * 2;
+            }
+
+            const u32 size =
+                opmode == 0 || opmode == 4 ? 1u : (opmode == 1 || opmode == 5 ? 2u : 4u);
+            const bool toMemory = (opmode & 4u) != 0;
+
+            // **特殊形を除く。** メモリ方向で mode が 0 か 1 のとき、
+            // 命令の意味そのものが変わる:
+            //   $9/$D : ADDX/SUBX (Dy,Dx または -(Ay),-(Ax))
+            //   $8/$C : SBCD/ABCD、および $C は EXG も
+            //   $B    : CMPM ((Ay)+,(Ax)+)
+            // いずれも拡張ワードを取らない 2 バイトだが、**判別が
+            // 群ごとに違う**ので、ここでは保守的に諦める。
+            //
+            // Why 諦めてよいか: 実行頻度が低く (ADDX/SUBX は Human68k で
+            // ほぼ出ない)、諦めてもブロックが短くなるだけで正しさは
+            // 損なわれない。取りこぼしは h の計測で見える。
+            const bool isSpecialForm = toMemory && (mode == 0 || mode == 1);
+            if (isSpecialForm)
+            {
+                return kUnknownLength;
+            }
+
+            // EOR ($B のメモリ方向) は転送先に即値と PC 相対を取れない。
+            // それ以外の読み出し方向は取れる。
+            if (toMemory)
+            {
+                const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+                if (isImmediateOrPcRelative)
+                {
+                    return kUnknownLength;
+                }
+            }
+            // byte サイズはアドレスレジスタ直接を取れない。
+            if (size == 1 && mode == 1)
+            {
+                return kUnknownLength;
+            }
+
+            const u32 words = eaExtensionWords(mode, reg, size);
+            if (words == kUnknownExtensionWords)
+            {
+                return kUnknownLength;
+            }
+            return 2 + words * 2;
+        }
+
         default:
             // ここに挙げていないグループは扱わない。
             //
