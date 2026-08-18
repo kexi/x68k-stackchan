@@ -16,6 +16,7 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_cpu.h>
 #include <esp_timer.h>
 
 // キャッシュのアクセス/ミスカウンタ (計測用。恒久機能ではない)。
@@ -364,6 +365,190 @@ std::atomic<bool> g_redrawRequested{false};
 //
 // ここで測るのは **床** であって、実際の JIT が出す値ではない。
 // 床がインタプリタと大差なければ、JIT を書いても意味が無い。
+// 段 0-C2: ブロックキャッシュの経路そのものの費用を測る。
+// **恒久的な機能ではない。**
+//
+// JIT が届くかは「ネイティブ命令本体の速さ」だけでは決まらない。
+// ブロックへ入るたびに検索・タグ比較・世代検査を払い、出るたびに
+// 状態を書き戻す。**これらはエミッタを書かなくても測れる。**
+//
+// ここで出すのは E_budget = ネイティブ命令本体に使える予算:
+//
+//   E_budget = 必要 Chit - (検索 + 世代検査 + ゲートウェイ + 出口)
+//
+// これが小さすぎるなら、エミッタをいくら磨いても届かない。
+//
+// **床でないものを引く。** 空ループのコストを必ず差し引く
+// (かつて 14.1 サイクルと記録した床が、実は 4.7 サイクルのループと
+// windowed ABI の交絡込みだった)。
+[[maybe_unused]] void probeCachePathCost()
+{
+    // 実際のブロックキャッシュに近い形の表を内部 SRAM に置く。
+    // PSRAM は使わない (散らばったアクセスで実機が止まった実績がある)。
+    constexpr unsigned kSlots = 512;
+    struct Slot
+    {
+        std::uint32_t pc;  // タグ
+        std::uint16_t ir;  // プリフェッチ状態も鍵に含む
+        std::uint16_t irc;
+        std::uint32_t epoch;  // 写像の世代
+        std::uint16_t gen0;   // コードページの世代 (2 ページぶん)
+        std::uint16_t gen1;
+        std::uint32_t code;  // 生成コードの位置
+    };
+    auto* slots = static_cast<Slot*>(
+        heap_caps_calloc(kSlots, sizeof(Slot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    auto* gens = static_cast<std::uint16_t*>(
+        heap_caps_calloc(2048, sizeof(std::uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (slots == nullptr || gens == nullptr)
+    {
+        ESP_LOGW(kTag, "[c2] 内部 SRAM を確保できない (空き %u / 最大ブロック %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        heap_caps_free(slots);
+        heap_caps_free(gens);
+        return;
+    }
+
+    // 実ワークロードに近い分布で埋める。ホストの計測では上位 50 ブロックが
+    // 96.6% を占めていたので、少数のスロットを繰り返し引く。
+    constexpr unsigned kHot = 64;
+    for (unsigned i = 0; i < kSlots; ++i)
+    {
+        slots[i].pc = 0xFF0000u + i * 8u;
+        slots[i].ir = static_cast<std::uint16_t>(i);
+        slots[i].irc = static_cast<std::uint16_t>(i * 3u);
+        slots[i].epoch = 1;
+        slots[i].gen0 = 0;
+        slots[i].gen1 = 0;
+        slots[i].code = 0x40000000u + i * 64u;
+    }
+
+    constexpr int kIters = 2000000;
+    std::uint32_t sink = 0;
+
+    // --- 空ループ (これを全部から引く) ---
+    std::uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+        sink += static_cast<std::uint32_t>(i);
+    }
+    std::uint32_t t1 = esp_cpu_get_cycle_count();
+    const double loopCycles = (double)(t1 - t0) / (double)kIters;
+
+    // --- 1. 検索 (ハッシュ + タグ比較) ---
+    // ブロックへ入るたびに必ず払う。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        if (s.pc == pc)
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double lookupCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 2. 検索 + プリフェッチ状態の照合 ---
+    // 鍵は pc だけでは足りない。ir/irc と写像の世代も一致していないと、
+    // 違うプリフェッチ状態のまま実行してしまう。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        const std::uint16_t ir = static_cast<std::uint16_t>(idx);
+        const std::uint16_t irc = static_cast<std::uint16_t>(idx * 3u);
+        if (s.pc == pc && s.ir == ir && s.irc == irc && s.epoch == 1u)
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double keyCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 3. 検索 + 鍵 + 世代検査 2 ページ ---
+    // ブロックが跨ぐ可能性のある 2 ページぶんを見る。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        const std::uint16_t ir = static_cast<std::uint16_t>(idx);
+        const std::uint16_t irc = static_cast<std::uint16_t>(idx * 3u);
+        const unsigned page = (pc >> 10) & 2047u;
+        if (s.pc == pc && s.ir == ir && s.irc == irc && s.epoch == 1u && s.gen0 == gens[page] &&
+            s.gen1 == gens[(page + 1u) & 2047u])
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double fullCheckCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 4. 出口の状態書き戻し ---
+    // ブロックを抜けるとき pc/ir/irc を必ず実体化する。
+    // インタプリタが命令ごとに払っていたものを、ブロック単位に減らせるかが
+    // JIT の利得の中心だったので、その残りを測る。
+    // **ループの外へ持ち上げられないようにする。**
+    //
+    // 静的な 1 つの変数へ書くと、コンパイラは最後の 1 回だけ残して
+    // ループから追い出す (実測で -7.09 サイクル = 空ループぶんの
+    // マイナスが出た。消えている証拠)。
+    // volatile にすると毎回ストアは立つが、レジスタ割り当ても妨げるので
+    // 過大に出る。実際の JIT は M68kState の連続した領域へ書くので、
+    // 書き先を回して「消せないが volatile でもない」形にする。
+    struct StateOut
+    {
+        std::uint32_t pc;
+        std::uint16_t ir;
+        std::uint16_t irc;
+    };
+    auto* outs = static_cast<StateOut*>(
+        heap_caps_calloc(64, sizeof(StateOut), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (outs == nullptr)
+    {
+        ESP_LOGW(kTag, "[c2] 出口計測の領域を確保できない");
+        heap_caps_free(slots);
+        heap_caps_free(gens);
+        return;
+    }
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        StateOut& o = outs[static_cast<unsigned>(i) & 63u];
+        o.pc = 0xFF0000u + static_cast<std::uint32_t>(i);
+        o.ir = static_cast<std::uint16_t>(i);
+        o.irc = static_cast<std::uint16_t>(i * 3u);
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double commitCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+    // 最適化で消えていないことを確かめる (消えていれば 0 に近い値になる)。
+    sink += outs[0].pc + outs[0].ir + outs[0].irc;
+
+    ESP_LOGI(kTag, "[c2] 内部 SRAM 空き %u / 最大ブロック %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    ESP_LOGI(kTag, "[c2] 空ループ %.2f サイクル (以下は差し引き済み)", loopCycles);
+    ESP_LOGI(kTag, "[c2] 検索 (ハッシュ+タグ)            %.2f", lookupCycles);
+    ESP_LOGI(kTag, "[c2] + 鍵の照合 (ir/irc/epoch)       %.2f", keyCycles);
+    ESP_LOGI(kTag, "[c2] + 世代検査 2 ページ             %.2f", fullCheckCycles);
+    ESP_LOGI(kTag, "[c2] 出口の状態書き戻し (pc/ir/irc)  %.2f", commitCycles);
+    ESP_LOGI(kTag, "[c2] ブロック 1 本あたり = %.2f + ゲートウェイ 6.7 = %.2f サイクル",
+             fullCheckCycles + commitCycles, fullCheckCycles + commitCycles + 6.7);
+    ESP_LOGI(kTag, "[c2] sink=%u", static_cast<unsigned>(sink));
+
+    heap_caps_free(slots);
+    heap_caps_free(gens);
+    heap_caps_free(outs);
+}
+
 [[maybe_unused]] void probeNativeCeiling()
 {
     constexpr std::size_t kBytes = 256;
@@ -1361,6 +1546,14 @@ private:
         // ゲスト 1 命令ぶんに相当する仕事 (レジスタ間 MOVE) を
         // 大量に回して測る。インタプリタの 85 CPU サイクル/命令と
         // 比べれば、ネイティブ化で何倍になりうるかが出る。
+        // 'C' で段 0-C2 (キャッシュ経路の費用) を測る。恒久機能ではない。
+        const bool isCachePathProbe = c == 'C';
+        if (isCachePathProbe)
+        {
+            probeCachePathCost();
+            return;
+        }
+
         const bool isNativeProbe = c == 'n';
         if (isNativeProbe)
         {
