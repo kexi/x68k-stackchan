@@ -81,6 +81,8 @@ struct NativeStats
     u64 translateFail = 0;
     // 世代が飽和して翻訳できなくなり、全部捨てて数え直した回数。
     u64 generationReset = 0;
+    // 分岐で終端したブロックの実行回数 (direct chaining の的)。
+    u64 endedWithBranch = 0;
     // 「翻訳できない」と覚えていたので再翻訳を省いた回数。
     u64 negativeHit = 0;  // 入口の命令からして翻訳できなかった
     // 読みガードが不成立でブロックを降りた回数 (Tier B)。

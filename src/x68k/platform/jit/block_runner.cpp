@@ -319,6 +319,13 @@ NativeResult BlockRunner::run(M68k& cpu)
     const std::uint32_t ret = runBlock(&cpu.state(), slot->code);
 
     ++stats_.blocksRun;
+    // **実行ごとの終端理由。** translate() で数えると、キャッシュが温まった
+    // 後は翻訳が起きないので実態が見えない (Tier C で踏んだ)。
+    // 分岐で終わったブロックの割合。direct chaining が効くかを決める。
+    if (slot->endsWithBranch)
+    {
+        ++stats_.endedWithBranch;
+    }
 
     const BlockReturn decoded = decodeBlockReturn(ret);
     const u32 cycles = decoded.cycles;

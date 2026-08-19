@@ -1826,6 +1826,11 @@ private:
             }
             ESP_LOGI(kTag, "[jit] ブロック %llu 本 / 命令 %llu", (unsigned long long)st->blocksRun,
                      (unsigned long long)st->insnsRun);
+            ESP_LOGI(kTag, "[jit] 分岐で終端 %llu (実行の %.0f%%)",
+                     (unsigned long long)st->endedWithBranch,
+                     st->blocksRun != 0
+                         ? 100.0 * (double)st->endedWithBranch / (double)st->blocksRun
+                         : 0.0);
             ESP_LOGI(kTag, "[jit] 世代を捨て直した %llu 回",
                      (unsigned long long)st->generationReset);
             ESP_LOGI(kTag, "[jit] 負のキャッシュで省いた再翻訳 %llu 回",
