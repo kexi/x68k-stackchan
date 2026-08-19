@@ -155,6 +155,29 @@ inline constexpr bool canWideOffset(std::uint32_t off)
     return off <= 1020u && (off % 4u) == 0u;
 }
 
+// l8ui at, as, off  — 符号なし 8bit ロード。off は 0..255。
+// 確認元: `l8ui a4, a2, 0` = 42 02 00 / `l8ui a5, a2, 1` = 52 02 01
+//         `l8ui a15, a14, 255` = f2 0e ff / `l8ui a11, a3, 128` = b2 03 80
+//
+// **オフセットは割らない。** l32i は 4 で、l16ui は 2 で割った商を imm8 へ
+// 入れるが、こちらはバイト単位なので生の値がそのまま入る。ここを 32bit 版に
+// そろえて割ると、4 倍離れた番地を読む**別の正当な命令**になる。
+//
+// Why ゲストの word / long もこれで組むか: 68000 はビッグエンディアンなので、
+// ホスト (リトルエンディアン) の l16ui / l32i で読むとバイトが逆になる。
+// バイトずつ読んで slli / or で組めば、ホストのバイト順に依存しない
+// (m68k.cpp の read16 / read32 が同じ理由で同じ形をしている)。
+// l16ui を使う形は「ホスト側 2 整列」も前提に入り、検証面が増える。
+inline size_t l8ui(std::uint8_t* out, XReg at, XReg as, std::uint32_t off)
+{
+    return detail::rri8(out, 0x2u, 0x0u, as, at, off);
+}
+
+inline constexpr bool canByteOffset(std::uint32_t off)
+{
+    return off <= 255u;
+}
+
 // l16ui at, as, off  — 符号なし 16bit ロード。off は 0..510 の偶数。
 // 確認元: `l16ui a5, a12, 76` = 52 1c 26 / `l16ui a0, a1, 0` = 02 11 00
 //

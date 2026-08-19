@@ -124,13 +124,25 @@ private:
     // バイト書き込みが許されるようにはならない。
     //
     // 1 ブロックの上限は requiredSize が返す値なので、kMaxOps = 4 の
-    // 最悪ケースに余裕を見て 512 バイト取る。
-    static constexpr std::size_t kStagingBytes = 512;
+    // 最悪ケースに余裕を見て取る。
+    //
+    // **Tier B (読みガード) で 512 → 1024 へ広げた。** ガード付き 1 命令は
+    // EA 計算 + ガード + commit + バイト 4 本の合成 + 本体で、Tier A の
+    // 2-3 倍になる。加えて脱出用の出口の島が命令ごとに 1 つ増える。
+    // 足りなければ translate が諦めるだけなので正しさは損なわれないが、
+    // 諦めた分は素通りするので気づきにくい。
+    static constexpr std::size_t kStagingBytes = 1024;
     alignas(4) std::uint8_t staging_[kStagingBytes]{};
 
     BlockSlot* slots_ = nullptr;
     std::uint32_t slotCount_ = 0;
     ExecMemory* code_ = nullptr;
+    // 飽和したページに当たった回数。閾値を超えたら世代を捨てて数え直す。
+    //
+    // Why 即座に捨てないか: 1 回の飽和で全部の世代を捨てると、正常な
+    // ブロックまで再翻訳になる。まとまった数が溜まってからにする。
+    static constexpr std::uint32_t kSaturationResetThreshold = 64;
+    std::uint32_t saturatedSeen_ = 0;
     NegativeCache neg_{};
     // 直近に見た写像の世代。変わったら負の記憶を全部捨てる。
     std::uint32_t seenEpoch_ = 0;

@@ -1334,6 +1334,85 @@ TEST_CASE("l16ui / s16i がアセンブラと一致する")
     }
 }
 
+// 保証: l8ui のオフセットは割らずにそのまま imm8 へ入る。
+//
+// l32i (4 で割る) / l16ui (2 で割る) と粒度が違うので、そろえて割ると
+// 4 倍離れた番地を読む別の正当な命令になる。オフセット 1 / 3 / 17 /
+// 127 / 128 / 255 を混ぜてあるのは、割り算が入っていたらどれかで必ず
+// 食い違わせるため (0 と偶数だけだと 2 で割る実装を見逃す)。
+TEST_CASE("l8ui がアセンブラと一致する")
+{
+    std::uint8_t buf[8];
+    // l8ui a4, a2, 0
+    {
+        static constexpr std::uint8_t kWant[] = {0x42, 0x02, 0x00};
+        const std::size_t n = l8ui(buf, 4, 2, 0);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a4, a2, 0");
+    }
+    // l8ui a5, a2, 1
+    {
+        static constexpr std::uint8_t kWant[] = {0x52, 0x02, 0x01};
+        const std::size_t n = l8ui(buf, 5, 2, 1);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a5, a2, 1");
+    }
+    // l8ui a15, a14, 255
+    {
+        static constexpr std::uint8_t kWant[] = {0xF2, 0x0E, 0xFF};
+        const std::size_t n = l8ui(buf, 15, 14, 255);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a15, a14, 255");
+    }
+    // l8ui a2, a3, 0
+    {
+        static constexpr std::uint8_t kWant[] = {0x22, 0x03, 0x00};
+        const std::size_t n = l8ui(buf, 2, 3, 0);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a2, a3, 0");
+    }
+    // l8ui a7, a8, 17
+    {
+        static constexpr std::uint8_t kWant[] = {0x72, 0x08, 0x11};
+        const std::size_t n = l8ui(buf, 7, 8, 17);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a7, a8, 17");
+    }
+    // l8ui a11, a3, 128
+    {
+        static constexpr std::uint8_t kWant[] = {0xB2, 0x03, 0x80};
+        const std::size_t n = l8ui(buf, 11, 3, 128);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a11, a3, 128");
+    }
+    // l8ui a6, a6, 127
+    {
+        static constexpr std::uint8_t kWant[] = {0x62, 0x06, 0x7F};
+        const std::size_t n = l8ui(buf, 6, 6, 127);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a6, a6, 127");
+    }
+    // l8ui a9, a0, 255
+    {
+        static constexpr std::uint8_t kWant[] = {0x92, 0x00, 0xFF};
+        const std::size_t n = l8ui(buf, 9, 0, 255);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a9, a0, 255");
+    }
+    // l8ui a3, a15, 3
+    {
+        static constexpr std::uint8_t kWant[] = {0x32, 0x0F, 0x03};
+        const std::size_t n = l8ui(buf, 3, 15, 3);
+        expectBytes(buf, n, kWant, sizeof(kWant), "l8ui a3, a15, 3");
+    }
+
+    // l16ui と同じバイト列にならないこと。r フィールド (0x0 と 0x1) だけが
+    // 違う隣り合った符号なので、取り違えても「動くが別の命令」になる。
+    {
+        std::uint8_t other[8];
+        const std::size_t n = l8ui(buf, 4, 2, 2);
+        const std::size_t m = l16ui(other, 4, 2, 2);
+        REQUIRE(n == m);
+        CHECK(std::memcmp(buf, other, n) != 0);
+    }
+
+    CHECK(canByteOffset(0u));
+    CHECK(canByteOffset(255u));
+    CHECK_FALSE(canByteOffset(256u));
+}
+
 TEST_CASE("mov.n / neg がアセンブラと一致する")
 {
     std::uint8_t buf[8];

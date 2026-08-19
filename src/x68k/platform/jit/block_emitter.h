@@ -91,7 +91,75 @@ inline constexpr std::uint32_t kStateIrcOffset = 80;  // irc (u16)
 // 分岐 12 + 非分岐 4 x 3 が上限) なので bit31 は絶対に立たず、
 // 1 語に畳んでも情報が失われない。
 inline constexpr std::uint32_t kBranchTakenFlag = 0x80000000u;
-inline constexpr std::uint32_t kCycleMask = 0x7FFFFFFFu;
+
+// 戻り値の bit30。**読みガードが不成立で降りた**ことを伝える (G9)。
+//
+// このとき bit29-24 に「実際に実行し終えた命令数 k」が入る。呼び出し側は
+// k 命令ぶんだけ進んだものとして扱い、残りは step() に任せる。
+// **bit31 と同時には立たない。** ガードが付くのは読み形だけで、
+// 読み形は分岐ではないため (G11)。
+inline constexpr std::uint32_t kGuardExitFlag = 0x40000000u;
+inline constexpr std::uint32_t kGuardCountShift = 24;
+inline constexpr std::uint32_t kGuardCountMask = 0x3Fu;  // bit29-24
+// サイクルは 1 ブロックで最大 58 なので 24bit で足りる。
+inline constexpr std::uint32_t kCycleMask = 0x00FFFFFFu;
+
+// 戻り値を解く。**ヘッダに置いた純関数**なので、ホストで全数検査できる。
+//
+// Why not runner の中で直接ビットを見ないか: 符号化と復号が離れた場所に
+// あると、片方だけ変えたときに気づけない。1 つの関数にして、その関数を
+// テストが全数で回す形にしておく。
+struct BlockReturn
+{
+    std::uint32_t cycles = 0;
+    std::uint8_t ranOps = 0;
+    bool branchTaken = false;
+    bool guardExit = false;
+};
+
+constexpr BlockReturn decodeBlockReturn(std::uint32_t ret)
+{
+    BlockReturn r{};
+    r.branchTaken = (ret & kBranchTakenFlag) != 0;
+    r.guardExit = (ret & kGuardExitFlag) != 0;
+    r.cycles = ret & kCycleMask;
+    r.ranOps =
+        r.guardExit ? static_cast<std::uint8_t>((ret >> kGuardCountShift) & kGuardCountMask) : 0u;
+    return r;
+}
+
+// ガード脱出を受けたとき、ブロックは「進んだ」と言えるか (G10)。
+//
+// **k == 0 なら言えない。** 1 命令も実行せずに降りているので、状態は
+// 1 bit も変わっていない。そのまま kRan を返すと、呼び出し側は
+// 「0 サイクルで前へ進んだ」と読む。Machine::run はそれを halted と
+// 誤読して settle して抜けるか、同じブロックを 0 サイクルで回し続ける。
+//
+// Why not runner の中の if で済ませないか: runner は runBlock (ESP32 の
+// アセンブリ) に依存していてホストで走らせられない。判断だけを純関数に
+// 出せば、ホストのテストが全数で問える。
+constexpr bool guardExitMadeProgress(const BlockReturn& r)
+{
+    return r.ranOps != 0;
+}
+
+// 翻訳時に焼き込む「窓の実体」。
+//
+// **mappingEpoch を鍵に持つブロックへ焼く以外の用途に使ってはいけない。**
+// 窓を動かす経路 (setFastRam / setFastRamReadable / setFastRom / reset /
+// loadStateForTest) はすべて bumpMappingEpoch を呼び、実行前の鍵照合
+// (block_runner.cpp) が epoch を見る。だから焼いた値が古いまま走ることは
+// 原理的に無い (G8)。
+//
+// Why not ポインタで持たないか: ESP32-S3 のホストアドレスは 32bit だが、
+// ホストのテストは偽のアドレス空間 (ミニ解釈器の窓) へ写して走らせる。
+// u32 で持てば、生成コードが埋め込む定数としてそのまま扱える。
+struct EmitEnv
+{
+    std::uint32_t ramBaseAddr = 0;  // fastRam_ の先頭。0 は「窓なし」
+    std::uint32_t ramLimit = 0;     // fastRamLimit_
+    bool ramReadable = false;       // fastRamReadable_
+};
 
 // 生成コードのシグネチャ。call0 で呼ぶので、呼び出し側は callx0 のゲートウェイを通す。
 //
@@ -118,9 +186,14 @@ struct EmittedBlock
 //
 // 1 ブロックで要る 32bit 定数は、出口の pc / ir / irc (それぞれ 1 語ずつ、
 // ただし movi の -2048..2047 に収まれば消える) と、命令ごとのマスク・符号ビット・
-// MOVEQ の即値。kMaxOps = 4 の最悪ケース (ADD.l x 4) を数えて 24 に採ってある。
+// MOVEQ の即値。kMaxOps = 4 の最悪ケース (ADD.l x 4) を数えて 24 に採ってあった。
+//
+// **Tier B (読みガード) で 40 へ広げた。** ガード付き命令 1 つにつき
+// 「24bit マスク」「窓の先頭」「limit - size」の 3 定数が要り、さらに
+// 脱出用の出口の島が pc / ir / irc を持つ。前 2 つは全命令で共有できるので、
+// 実測の最悪 (ガード付き ADD.l × 4) でも 40 に収まる。
 // 溢れたら emit が false を返し、そのブロックは翻訳しない (保守的に諦める)。
-inline constexpr size_t kMaxLiterals = 24;
+inline constexpr size_t kMaxLiterals = 40;
 
 // BlockPlan を機械語へ落とす。
 //
@@ -133,15 +206,19 @@ inline constexpr size_t kMaxLiterals = 24;
 // 同一ページ内に保証している**ので、翻訳した時点で必ず読める。
 //
 // 戻り値: 発行できたら true。out と result が有効。
+// env は翻訳時の窓 (G8)。読み形を含む計画では、これが実行時の窓と
+// 一致していることを **epoch の鍵**が保証する。
+// env.ramReadable == false または env.ramBaseAddr == 0 なら、読み形を
+// 含む計画は発行を断る (G12)。
 [[nodiscard]] bool emitBlock(const BlockPlan& plan, std::uint16_t fallThroughIr,
-                             std::uint16_t fallThroughIrc, std::uint8_t* out, size_t capacity,
-                             EmittedBlock& result);
+                             std::uint16_t fallThroughIrc, const EmitEnv& env, std::uint8_t* out,
+                             size_t capacity, EmittedBlock& result);
 
 // plan を発行するのに要るバイト数を返す。**emitBlock と同じ経路で数える**ので、
 // 見積もりではなく実際の値。0 を返したら発行できない (許可されていない kind が
 // 混じっている、リテラルが溢れる)。
 [[nodiscard]] size_t requiredSize(const BlockPlan& plan, std::uint16_t fallThroughIr,
-                                  std::uint16_t fallThroughIrc);
+                                  std::uint16_t fallThroughIrc, const EmitEnv& env);
 
 }  // namespace x68k::jit
 

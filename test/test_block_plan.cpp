@@ -103,9 +103,38 @@ struct FakeGen
 // かつメモリを触らない」命令の集合を独立に組み立てて、それと突き合わせる。
 //
 // ここに入れてよいのは、次を全部満たす形だけ:
-//   - 実効アドレスがメモリを指さない (バスエラー / アドレスエラーが無い)
 //   - 不当命令・特権違反・トラップ・ゼロ除算に入らない
 //   - A レジスタもスタックも触らない (BSR / MOVEA / ADDA)
+//   - メモリに触るなら **読むだけ** で、実効アドレスが Tier B の
+//     許可 EA に入っている (下の specReadEa)
+//
+// **Tier B でメモリ読みが入った。** Tier A までは「実効アドレスが
+// メモリを指さない」ことが条件だったが、読み形は実行時ガードが
+// 「窓の中か」を確かめ、外れたら 1 bit も状態を変えずに step() へ
+// 降りる。だから「バスエラー / アドレスエラーが起きない」という
+// 性質は、静的な EA の制限ではなくガードが担うようになっている。
+// 書き方向は依然として入らない (ページ世代の更新を背負う)。
+
+// Tier B が読み形として受ける実効アドレス。
+//
+// 68000 の符号化から直接:
+//   mode 2 (An) / 3 (An)+ / 4 -(An)  拡張ワード無し
+//   mode 5 (d16,An)                  1 ワード
+//   mode 7 reg 0 (xxx).W             1 ワード
+//   mode 7 reg 1 (xxx).L             2 ワード
+//
+// mode 6 (d8,An,Xn) と 7.2/7.3 (PC 相対) は入れない。前者は拡張ワードの
+// インデックス解釈が要り、後者は翻訳時の PC に依存する。
+// mode 7.4 (即値) はメモリを読まないので、ここではなく Tier A の
+// 即値形が持つ。
+bool specReadEa(x68k::u32 mode, x68k::u32 reg)
+{
+    if (mode >= 2 && mode <= 5)
+    {
+        return true;
+    }
+    return mode == 7 && reg <= 1;
+}
 
 // MOVE.b/w/l Dn,Dm。
 bool specSafeMove(x68k::u16 op)
@@ -126,9 +155,16 @@ bool specSafeMove(x68k::u16 op)
     {
         return false;
     }
-    // 転送元は Dn / An / 即値。mode 7 の 0-3 は絶対番地と PC 相対で、
-    // 読み出しがメモリに触る。
+    // 転送元は Dn / An / 即値 / 読み形メモリ (Tier B)。
+    //
+    // 読み形は Dn 宛てだけ。An 宛て (MOVEA) は .w の符号拡張で本体が
+    // 別物になるので、Tier B の初回スコープには入っていない。
     const bool srcIsImmediate = srcMode == 7 && srcReg == 4;
+    const bool srcIsReadMemory = !srcIsImmediate && srcMode > 1 && specReadEa(srcMode, srcReg);
+    if (srcIsReadMemory)
+    {
+        return dstMode == 0;
+    }
     if (srcMode > 1 && !srcIsImmediate)
     {
         return false;
@@ -162,9 +198,15 @@ bool specSafeMisc(x68k::u16 op)
     // 単項演算は (op >> 8) & 0xF で判別する (実装の unary_ops と同じ)。
     const x68k::u32 opcodeBits = static_cast<x68k::u32>((op >> 8) & 0xFu);
     const x68k::u32 sizeField = static_cast<x68k::u32>((op >> 6) & 3u);
-    if (sizeField == 3 || mode != 0)
+    if (sizeField == 3)
     {
         return false;
+    }
+    if (mode != 0)
+    {
+        // TST <mem> は読むだけ (Tier B)。CLR <mem> は読んで書く RMW なので
+        // 入らない。
+        return opcodeBits == 0xAu && specReadEa(mode, reg);
     }
     return opcodeBits == 0xAu || opcodeBits == 0x2u;  // TST / CLR
 }
@@ -193,9 +235,12 @@ bool specSafeAlu(x68k::u16 op)
     }
     const x68k::u32 opmode = static_cast<x68k::u32>((op >> 6) & 7u);
     const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
+    const x68k::u32 reg = static_cast<x68k::u32>(op & 7u);
     if (mode != 0)
     {
-        return false;  // メモリまたは An を触る
+        // <mem>,Dn の読み方向だけ (Tier B)。opmode 3/7 は ADDA/SUBA/CMPA と
+        // MULU/MULS/DIVU/DIVS、opmode 4-6 はメモリへ書く方向。
+        return opmode <= 2 && specReadEa(mode, reg);
     }
     // opmode 3/7 は ADDA/SUBA/CMPA (A レジスタ) と MULU/MULS/DIVU/DIVS
     // (ゼロ除算)。opmode 4-6 は ADDX/SUBX/ABCD/SBCD/EOR/CMPM の特殊形。
@@ -569,10 +614,22 @@ TEST_SUITE("BlockPlanner")
                 continue;
             }
 
+            // 拡張ワードは **偶数の実効アドレス**を作る値にする。
+            //
+            // Why not 0x0000 と NOP 埋めのままにしないか: 読み形 (Tier B) が
+            // 入ったので、(xxx).L の 2 語が {0x0000, 0x4E71} だと実効アドレスが
+            // $00004E71 (奇数) になり、word / long の読みが**本物の
+            // アドレスエラー**に入る。すると PC は例外ベクタへ飛び、
+            // 「fallThroughPc へ来ない」= 命令長が違う、と読めてしまう。
+            // 落ちている 98 件は全部これで、命令長デコーダは正しかった。
+            //
+            // ここで見たいのは「計画した長さのぶん PC が進むか」なので、
+            // 例外に入らない値を置いて長さだけを問う。ガードが奇数を弾く
+            // ことは test_block_emitter.cpp が別に確かめる。
             code.reset(0x0800, 0x1800);
             code.poke16(kEntry, op);
             code.poke16(kEntry + 2, 0x0000);
-            code.poke16(kEntry + 4, 0x4E71);
+            code.poke16(kEntry + 4, 0x0100);
             code.poke16(kEntry + 6, 0x4E71);
 
             x68k::BlockPlan plan{};
@@ -587,8 +644,10 @@ TEST_SUITE("BlockPlanner")
                 continue;
             }
 
-            const StepResult notTaken = runOne({op, 0x0000}, 0x00);
-            const StepResult taken = runOne({op, 0x0000}, 0x1F);
+            // **code と同じ語を置く。** 片方だけ変えると、計画した命令と
+            // 実行した命令が違うものになる。
+            const StepResult notTaken = runOne({op, 0x0000, 0x0100}, 0x00);
+            const StepResult taken = runOne({op, 0x0000, 0x0100}, 0x1F);
             const bool isBranch = plan.end == x68k::BlockEnd::kBranch;
 
             // 不成立 (または非分岐) なら PC は fallThroughPc へ進む。

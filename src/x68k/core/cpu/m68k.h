@@ -292,6 +292,30 @@ public:
         fastRamReadable_ = readable;
     }
 
+    // 翻訳器 (JIT) が窓を生成コードへ焼くための読み取り口。
+    //
+    // **mappingEpoch を鍵に持つブロックへ焼く以外の用途に使ってはいけない。**
+    // 保持した瞬間から setFastRam / setFastRamReadable / setFastRom / reset /
+    // loadStateForTest で古くなり、それを知る手段は epoch の照合しかない。
+    // 上の 5 経路はすべて bumpMappingEpoch を呼ぶので、焼いた値が古いまま
+    // 実行されることは原理的に無い (実行前の鍵照合が epoch を見る)。
+    //
+    // Why not 「無効化を知れないから public にしない」を貫かないか: それが
+    // 却下理由だったのは、受け取り側が古さを検出できなかったから。ここでは
+    // 受け取り側が epoch を鍵に持ち、走る前に必ず照合する。**却下理由が
+    // 消えている前提でだけ開ける。**
+    struct CodeWindow
+    {
+        const u8* ramBase = nullptr;
+        u32 ramLimit = 0;
+        bool ramReadable = false;
+    };
+
+    [[nodiscard]] CodeWindow codeWindowForJit() const
+    {
+        return CodeWindow{fastRam_, fastRamLimit_, fastRamReadable_};
+    }
+
     // 仮想関数を通さずに読んでよい IPL-ROM の窓を教える。
     //
     // Why メイン RAM と別に持つか: CPU のメモリアクセスを実際に数えたら、

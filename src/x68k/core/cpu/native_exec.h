@@ -79,8 +79,19 @@ struct NativeStats
     u64 keyMissGen = 0;    // ページ世代不一致
     u64 keyMissStale = 0;  // kAlwaysStale で捨てた
     u64 translateFail = 0;
+    // 世代が飽和して翻訳できなくなり、全部捨てて数え直した回数。
+    u64 generationReset = 0;
     // 「翻訳できない」と覚えていたので再翻訳を省いた回数。
     u64 negativeHit = 0;  // 入口の命令からして翻訳できなかった
+    // 読みガードが不成立でブロックを降りた回数 (Tier B)。
+    //
+    // **blocksRun に対する比率を見る。** 高いままなら、(An) 経由の
+    // I/O ポーリングがガードを空回りさせている。その形は翻訳に成功して
+    // しまうので負のキャッシュが効かず、毎周「鍵照合 → 実行 → 不成立 →
+    // step()」を踏んで Tier A より遅くなりうる。
+    u64 guardExit = 0;
+    // そのうち 1 命令も進めずに降りた回数 (G10)。
+    u64 deferGuard = 0;
 };
 using NativeStatsFn = const NativeStats* (*)(void* context);
 

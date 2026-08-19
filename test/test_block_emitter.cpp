@@ -99,6 +99,19 @@ public:
     {
     }
 
+    // ゲスト RAM の窓を教える。読みガード付きの命令はここを l8ui で読む。
+    //
+    // **状態領域とは別の空間**として持つ。生成コードから見えるゲスト RAM の
+    // 先頭アドレスは kFakeWindow で、状態は 0 番地から sizeof(M68kState)。
+    // 重なりようがない値を選んであるので、どちらの領域でもないアドレスは
+    // その場で失敗にできる (踏んだら「テストが固まる」ではなく「落ちる」)。
+    void setGuestRam(std::uint32_t base, std::uint8_t* ram, std::size_t size)
+    {
+        ramBase_ = base;
+        ram_ = ram;
+        ramSize_ = size;
+    }
+
     XtensaRun run(std::size_t entry, std::uint32_t arg)
     {
         for (int i = 0; i < 16; ++i)
@@ -107,6 +120,7 @@ public:
         }
         a_[2] = arg;
         pc_ = entry;
+        touchedForbidden_ = false;
 
         // 発行するのは直線コードで、後方分岐は無い。上限は「1 命令 2 バイトで
         // バッファを舐め尽くす回数」より少し多め。無限ループになったら落とす。
@@ -122,6 +136,12 @@ public:
             // ret.n
             if ((w & 0xFFFFu) == 0xF00Du)
             {
+                if (touchedForbidden_)
+                {
+                    // 生成コードが a12-a15 に触った。実機なら祖先フレームを
+                    // 壊すが、ホストでは症状が出ない。ここで落とす。
+                    return {false, 0, "a12 以降 (窓の外) に触った"};
+                }
                 return {true, a_[2], nullptr};
             }
 
@@ -158,56 +178,80 @@ private:
         return v;
     }
 
-    // 生成コードは a2 (= M68kState の先頭) からの相対でしか触らない契約。
+    // 生成コードが触ってよいのは 2 つの領域だけ。
     //
-    // **範囲を外れたらその場で失敗にする。** ここを素通しにすると、
-    // プロローグを落とすような変異が「ホストのメモリを踏んで落ちる」形で
-    // 現れ、テストが緑にも赤にもならず固まる。
-    [[nodiscard]] bool inRange(std::uint32_t addr, std::size_t len) const
+    //   [0, sizeof(M68kState))         — a2 (= 状態の先頭) からの相対
+    //   [ramBase_, ramBase_ + ramSize_) — 読みガードを通ったゲスト RAM
+    //
+    // **どちらでもないアドレスはその場で失敗にする。** ここを素通しにすると、
+    // プロローグを落とすような変異や、ガードをすり抜けた読みが
+    // 「ホストのメモリを踏んで落ちる」形で現れ、テストが緑にも赤にもならず固まる。
+    //
+    // 戻り値は「その領域の実体へのポインタ」。解決できなければ nullptr を返し、
+    // outOfRange_ を立てる (呼び出し側は値を使わない)。
+    [[nodiscard]] std::uint8_t* resolve(std::uint32_t addr, std::size_t len)
     {
-        return static_cast<std::size_t>(addr) + len <= memSize_;
+        if (static_cast<std::size_t>(addr) + len <= memSize_)
+        {
+            return mem_ + addr;
+        }
+        if (ram_ != nullptr && addr >= ramBase_)
+        {
+            const std::size_t off = static_cast<std::size_t>(addr - ramBase_);
+            if (off + len <= ramSize_)
+            {
+                return ram_ + off;
+            }
+        }
+        outOfRange_ = true;
+        return nullptr;
     }
 
     [[nodiscard]] std::uint32_t load32(std::uint32_t addr)
     {
-        if (!inRange(addr, 4))
+        const std::uint8_t* at = resolve(addr, 4);
+        if (at == nullptr)
         {
-            outOfRange_ = true;
             return 0;
         }
         std::uint32_t v = 0;
-        std::memcpy(&v, mem_ + addr, 4);
+        std::memcpy(&v, at, 4);
         return v;
     }
     void store32(std::uint32_t addr, std::uint32_t v)
     {
-        if (!inRange(addr, 4))
+        std::uint8_t* at = resolve(addr, 4);
+        if (at == nullptr)
         {
-            outOfRange_ = true;
             return;
         }
-        std::memcpy(mem_ + addr, &v, 4);
+        std::memcpy(at, &v, 4);
     }
     [[nodiscard]] std::uint32_t load16(std::uint32_t addr)
     {
-        if (!inRange(addr, 2))
+        const std::uint8_t* at = resolve(addr, 2);
+        if (at == nullptr)
         {
-            outOfRange_ = true;
             return 0;
         }
         std::uint16_t v = 0;
-        std::memcpy(&v, mem_ + addr, 2);
+        std::memcpy(&v, at, 2);
         return v;
     }
     void store16(std::uint32_t addr, std::uint32_t v)
     {
-        if (!inRange(addr, 2))
+        std::uint8_t* at = resolve(addr, 2);
+        if (at == nullptr)
         {
-            outOfRange_ = true;
             return;
         }
         const std::uint16_t h = static_cast<std::uint16_t>(v & 0xFFFFu);
-        std::memcpy(mem_ + addr, &h, 2);
+        std::memcpy(at, &h, 2);
+    }
+    [[nodiscard]] std::uint32_t load8(std::uint32_t addr)
+    {
+        const std::uint8_t* at = resolve(addr, 1);
+        return at == nullptr ? 0u : static_cast<std::uint32_t>(*at);
     }
 
     // 1 命令。認識できたら pc_ を進めて nullptr を返す。
@@ -235,27 +279,33 @@ private:
                 }
                 std::uint32_t v = 0;
                 std::memcpy(&v, code_ + lit, 4);
-                a_[t] = v;
+                reg(static_cast<int>(t)) = v;
                 pc_ += 3;
                 return nullptr;
             }
             case 0x2u:  // RRI8 群
                 switch (r)
                 {
+                    case 0x0u:  // l8ui at, as, imm8
+                        // **オフセットを割らない。** l16ui (2 で割る) /
+                        // l32i (4 で割る) と粒度が違う。
+                        reg(static_cast<int>(t)) = load8(reg(static_cast<int>(s)) + imm8);
+                        pc_ += 3;
+                        return nullptr;
                     case 0x1u:  // l16ui at, as, imm8*2
-                        a_[t] = load16(a_[s] + imm8 * 2u);
+                        reg(static_cast<int>(t)) = load16(reg(static_cast<int>(s)) + imm8 * 2u);
                         pc_ += 3;
                         return nullptr;
                     case 0x2u:  // l32i at, as, imm8*4
-                        a_[t] = load32(a_[s] + imm8 * 4u);
+                        reg(static_cast<int>(t)) = load32(reg(static_cast<int>(s)) + imm8 * 4u);
                         pc_ += 3;
                         return nullptr;
                     case 0x5u:  // s16i
-                        store16(a_[s] + imm8 * 2u, a_[t]);
+                        store16(reg(static_cast<int>(s)) + imm8 * 2u, reg(static_cast<int>(t)));
                         pc_ += 3;
                         return nullptr;
                     case 0x6u:  // s32i
-                        store32(a_[s] + imm8 * 4u, a_[t]);
+                        store32(reg(static_cast<int>(s)) + imm8 * 4u, reg(static_cast<int>(t)));
                         pc_ += 3;
                         return nullptr;
                     case 0xAu:  // movi at, imm12 (s は imm[11:8])
@@ -265,14 +315,15 @@ private:
                         const std::int32_t v = (raw & 0x800u) != 0
                                                    ? static_cast<std::int32_t>(raw | 0xFFFFF000u)
                                                    : static_cast<std::int32_t>(raw);
-                        a_[t] = static_cast<std::uint32_t>(v);
+                        reg(static_cast<int>(t)) = static_cast<std::uint32_t>(v);
                         pc_ += 3;
                         return nullptr;
                     }
                     case 0xCu:  // addi at, as, imm8 (符号付き)
-                        a_[t] =
-                            a_[s] + static_cast<std::uint32_t>(static_cast<std::int32_t>(
-                                        static_cast<std::int8_t>(static_cast<std::uint8_t>(imm8))));
+                        reg(static_cast<int>(t)) =
+                            reg(static_cast<int>(s)) +
+                            static_cast<std::uint32_t>(static_cast<std::int32_t>(
+                                static_cast<std::int8_t>(static_cast<std::uint8_t>(imm8))));
                         pc_ += 3;
                         return nullptr;
                     default:
@@ -290,7 +341,7 @@ private:
                     const std::uint32_t sh = s | ((op1 & 1u) << 4);
                     const std::uint32_t mask = op2 + 1u;
                     const std::uint32_t m = mask >= 32u ? 0xFFFFFFFFu : ((1u << mask) - 1u);
-                    a_[r] = (a_[t] >> sh) & m;
+                    reg(static_cast<int>(r)) = (reg(static_cast<int>(t)) >> sh) & m;
                     pc_ += 3;
                     return nullptr;
                 }
@@ -302,42 +353,42 @@ private:
                 }
                 if (op2 == 0x2u && op1 == 0x0u)
                 {
-                    a_[r] = a_[s] | a_[t];
+                    reg(static_cast<int>(r)) = reg(static_cast<int>(s)) | reg(static_cast<int>(t));
                     pc_ += 3;
                     return nullptr;
                 }
                 if (op2 == 0x3u && op1 == 0x0u)
                 {
-                    a_[r] = a_[s] ^ a_[t];
+                    reg(static_cast<int>(r)) = reg(static_cast<int>(s)) ^ reg(static_cast<int>(t));
                     pc_ += 3;
                     return nullptr;
                 }
                 if (op2 == 0xCu && op1 == 0x0u)
                 {
-                    a_[r] = a_[s] - a_[t];
+                    reg(static_cast<int>(r)) = reg(static_cast<int>(s)) - reg(static_cast<int>(t));
                     pc_ += 3;
                     return nullptr;
                 }
                 if (op2 == 0x6u && op1 == 0x0u && s == 0u)
                 {
-                    a_[r] = 0u - a_[t];
+                    reg(static_cast<int>(r)) = 0u - reg(static_cast<int>(t));
                     pc_ += 3;
                     return nullptr;
                 }
                 if (op2 == 0x8u && op1 == 0x3u)
                 {
-                    if (a_[t] == 0u)
+                    if (reg(static_cast<int>(t)) == 0u)
                     {
-                        a_[r] = a_[s];
+                        reg(static_cast<int>(r)) = reg(static_cast<int>(s));
                     }
                     pc_ += 3;
                     return nullptr;
                 }
                 if (op2 == 0x9u && op1 == 0x3u)
                 {
-                    if (a_[t] != 0u)
+                    if (reg(static_cast<int>(t)) != 0u)
                     {
-                        a_[r] = a_[s];
+                        reg(static_cast<int>(r)) = reg(static_cast<int>(s));
                     }
                     pc_ += 3;
                     return nullptr;
@@ -347,7 +398,7 @@ private:
                     // slli ar, as, n。符号化されているのは 32 - n。
                     const std::uint32_t sa = t | (op2 << 4);
                     const std::uint32_t n = 32u - sa;
-                    a_[r] = n >= 32u ? 0u : (a_[s] << n);
+                    reg(static_cast<int>(r)) = n >= 32u ? 0u : (reg(static_cast<int>(s)) << n);
                     pc_ += 3;
                     return nullptr;
                 }
@@ -361,7 +412,8 @@ private:
                     const std::int32_t disp = (raw & 0x800u) != 0
                                                   ? static_cast<std::int32_t>(raw | 0xFFFFF000u)
                                                   : static_cast<std::int32_t>(raw);
-                    const bool take = sub == 0x1u ? (a_[s] == 0u) : (a_[s] != 0u);
+                    const bool take = sub == 0x1u ? (reg(static_cast<int>(s)) == 0u)
+                                                  : (reg(static_cast<int>(s)) != 0u);
                     pc_ += 3;
                     if (take)
                     {
@@ -373,15 +425,15 @@ private:
                 return "未知の BRI12 命令";
             }
             case 0xAu:  // add.n ar, as, at
-                a_[r] = a_[s] + a_[t];
+                reg(static_cast<int>(r)) = reg(static_cast<int>(s)) + reg(static_cast<int>(t));
                 pc_ += 2;
                 return nullptr;
             case 0x8u:  // l32i.n at, as, r*4
-                a_[t] = load32(a_[s] + r * 4u);
+                reg(static_cast<int>(t)) = load32(reg(static_cast<int>(s)) + r * 4u);
                 pc_ += 2;
                 return nullptr;
             case 0x9u:  // s32i.n
-                store32(a_[s] + r * 4u, a_[t]);
+                store32(reg(static_cast<int>(s)) + r * 4u, reg(static_cast<int>(t)));
                 pc_ += 2;
                 return nullptr;
             case 0xCu:  // movi.n as, imm7
@@ -390,7 +442,7 @@ private:
                 const std::int32_t v = (raw & 0x60u) == 0x60u
                                            ? static_cast<std::int32_t>(raw | 0xFFFFFF80u)
                                            : static_cast<std::int32_t>(raw);
-                a_[s] = static_cast<std::uint32_t>(v);
+                reg(static_cast<int>(s)) = static_cast<std::uint32_t>(v);
                 pc_ += 2;
                 return nullptr;
             }
@@ -399,7 +451,7 @@ private:
                 {
                     return "未知の RRRN 命令 (0xD)";
                 }
-                a_[t] = a_[s];
+                reg(static_cast<int>(t)) = reg(static_cast<int>(s));
                 pc_ += 2;
                 return nullptr;
             default:
@@ -409,14 +461,44 @@ private:
 
     void and_op(std::uint32_t r, std::uint32_t s, std::uint32_t t)
     {
-        a_[r] = a_[s] & a_[t];
+        reg(static_cast<int>(r)) = reg(static_cast<int>(s)) & reg(static_cast<int>(t));
     }
 
     const std::uint8_t* code_;
     std::size_t size_;
     std::uint8_t* mem_;
     std::size_t memSize_ = 0;
+    // ゲスト RAM の窓 (読みガードを通った命令だけが触る)。
+    std::uint32_t ramBase_ = 0;
+    std::uint8_t* ram_ = nullptr;
+    std::size_t ramSize_ = 0;
     bool outOfRange_ = false;
+    // **a12-a15 に触ったら即座に失敗させる。**
+    //
+    // 生成コードは a2-a11 しか使ってはいけない。呼び出し元の runBlock は
+    // `entry a1, 32` (call4 の窓) でコンパイルされるので、a12 以降は
+    // **窓の外 = 祖先フレームの生きた値**にあたる。書くと呼び出し元の
+    // さらに呼び出し元のローカル変数を静かに壊す。
+    //
+    // 実機では窓のオーバーフロー例外で初めて症状が出るので、呼び出し
+    // 深さに依存して散発的に現れ、原因から最も遠い形で壊れる。
+    // **一度実際に踏んでいる** (ゲートウェイが a12 を使っていた)。
+    //
+    // ホストのミニ解釈器は 16 本すべてを持つので、a12 を使う変異を入れても
+    // テストが全部通ってしまっていた。ここで縛れば、**既存の全テストが
+    // そのまま制約の検査になる**。
+    static constexpr int kMaxUsableReg = 11;
+    mutable bool touchedForbidden_ = false;
+
+    [[nodiscard]] std::uint32_t& reg(int i)
+    {
+        if (i > kMaxUsableReg)
+        {
+            touchedForbidden_ = true;
+        }
+        return a_[i];
+    }
+
     std::uint32_t a_[16] = {};
     std::size_t pc_ = 0;
 };
@@ -508,19 +590,38 @@ struct EmitResult
     bool ok = false;
 };
 
-EmitResult emit(const BlockPlan& plan, const FlatCode& code)
+// 偽のゲスト RAM 窓。
+//
+// 生成コードが読むホストアドレスは「窓の先頭 + マスク済みゲストアドレス」。
+// **状態領域 ([0, sizeof(M68kState)) = 84 バイト) と重ならない値**を選ぶ。
+// マスク済みゲストアドレスは高々 0xFFFFFF なので、下の基点なら
+// 状態領域へ落ちてくることはない。ミニ解釈器はこの 2 領域の外を
+// 触られたらその場で失敗にする。
+constexpr std::uint32_t kFakeWindow = 0x01000000u;
+
+jit::EmitEnv fakeEnv()
+{
+    return jit::EmitEnv{kFakeWindow, static_cast<std::uint32_t>(x68k::kMainRamSize), true};
+}
+
+EmitResult emit(const BlockPlan& plan, const FlatCode& code, const jit::EmitEnv& env)
 {
     EmitResult r{};
     const u16 ir = code.get16(plan.fallThroughPc);
     const u16 irc = code.get16(plan.fallThroughPc + 2);
-    const std::size_t need = jit::requiredSize(plan, ir, irc);
+    const std::size_t need = jit::requiredSize(plan, ir, irc, env);
     if (need == 0)
     {
         return r;
     }
     r.buffer.assign(need, 0xCC);
-    r.ok = jit::emitBlock(plan, ir, irc, r.buffer.data(), r.buffer.size(), r.info);
+    r.ok = jit::emitBlock(plan, ir, irc, env, r.buffer.data(), r.buffer.size(), r.info);
     return r;
+}
+
+EmitResult emit(const BlockPlan& plan, const FlatCode& code)
+{
+    return emit(plan, code, fakeEnv());
 }
 
 // M68kState を、生成コードから見えるのと同じ平坦なメモリに置いて走らせる。
@@ -562,7 +663,13 @@ struct NativeOutcome
     M68kState state{};
     std::uint32_t cycles = 0;
     bool branchTaken = false;
+    // 読みガードが不成立で降りたか (Tier B)。
+    bool guardExit = false;
+    std::uint8_t ranOps = 0;
 };
+
+// 参照側と生成側が**同じ実体**を見るゲスト RAM (定義は下)。
+std::vector<u8>& execRam();
 
 NativeOutcome runEmitted(const EmitResult& e, const M68kState& initial)
 {
@@ -579,6 +686,10 @@ NativeOutcome runEmitted(const EmitResult& e, const M68kState& initial)
     // M68kState の先頭アドレスを渡すが、解釈器のメモリ空間は mem 側なので、
     // ここでは 0 を渡して mem.base() を基点にする。
     XtensaCpu cpu(e.buffer.data(), e.buffer.size(), mem.base(), sizeof(M68kState));
+    // 読みガードを通った命令が読む先。**参照側 (runReference) と同じ配列**を
+    // 渡すので、両者は同じバイト列を見る。Tier B の命令はメモリを書かないので、
+    // どちらを先に走らせてもデータは汚れない。
+    cpu.setGuestRam(kFakeWindow, execRam().data(), execRam().size());
     const XtensaRun r = cpu.run(e.info.entryOffset, 0);
     if (!r.ok)
     {
@@ -587,8 +698,12 @@ NativeOutcome runEmitted(const EmitResult& e, const M68kState& initial)
     }
     out.ok = true;
     out.state = mem.store();
-    out.branchTaken = (r.ret & jit::kBranchTakenFlag) != 0;
-    out.cycles = r.ret & jit::kCycleMask;
+
+    const jit::BlockReturn decoded = jit::decodeBlockReturn(r.ret);
+    out.branchTaken = decoded.branchTaken;
+    out.cycles = decoded.cycles;
+    out.guardExit = decoded.guardExit;
+    out.ranOps = decoded.ranOps;
     return out;
 }
 
@@ -614,6 +729,33 @@ void ramPoke16(u32 a, u16 v)
 }
 
 // words を kEntry へ置き、initial から count 命令だけ回した結果を返す。
+// 読み形が読むデータ。**参照側と生成側で同じバイト列を見せる**ための種。
+//
+// runReference は毎回 execRam を 0 で埋め直すので、データはそこへ
+// 置き直さないと消える。テストが 1 箇所に書いておけば、参照実行の前に
+// 必ず同じ内容が復元される。
+struct GuestSeed
+{
+    u32 addr = 0;
+    std::vector<u8> bytes;
+};
+std::vector<GuestSeed>& guestSeeds()
+{
+    static std::vector<GuestSeed> s;
+    return s;
+}
+
+void applyGuestSeeds()
+{
+    for (const GuestSeed& seed : guestSeeds())
+    {
+        for (std::size_t i = 0; i < seed.bytes.size(); ++i)
+        {
+            execRam()[seed.addr + i] = seed.bytes[i];
+        }
+    }
+}
+
 M68kState runReference(const std::vector<u16>& words, const M68kState& initial, u32 count,
                        u32& cyclesOut)
 {
@@ -634,6 +776,8 @@ M68kState runReference(const std::vector<u16>& words, const M68kState& initial, 
         ramPoke16(at, w);
         at += 2;
     }
+    // **命令語を置いた後に種を撒く。** 順が逆だと NOP 埋めがデータを消す。
+    applyGuestSeeds();
 
     x68k::Machine m;
     x68k::MemoryMap map{};
@@ -711,12 +855,23 @@ void checkEquivalence(const std::vector<u16>& words, const M68kState& initial, c
     const EmitResult e = emit(plan, code);
     REQUIRE(e.ok);
 
+    // **生成側を走らせる前に種を撒く。** 生成側は execRam を直接読むので、
+    // 参照側 (runReference の中で撒く) と同じ内容にしておかないと、
+    // 「読めた値が違う」ことを状態の食い違いとして見てしまう。
+    std::fill(execRam().begin(), execRam().end(), 0);
+    applyGuestSeeds();
+
     const NativeOutcome native = runEmitted(e, initial);
     INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
     REQUIRE(native.ok);
 
+    // ガードが不成立で降りたなら、**実際に走った命令数**だけ参照側を回す。
+    // 出口は「その命令の直前の命令境界」なので、k 命令ぶんの状態と一致する
+    // はず (G7)。降りていなければ計画の全命令。
+    const u32 refCount = native.guardExit ? native.ranOps : plan.count;
+
     u32 refCycles = 0;
-    const M68kState want = runReference(words, initial, plan.count, refCycles);
+    const M68kState want = runReference(words, initial, refCount, refCycles);
 
     const bool branchTaken = native.branchTaken;
     compareStates(want, native.state, branchTaken, what);
@@ -725,6 +880,17 @@ void checkEquivalence(const std::vector<u16>& words, const M68kState& initial, c
     // 数万命令後に必ず割れる。**
     INFO("cycles");
     CHECK(native.cycles == refCycles);
+
+    if (native.guardExit)
+    {
+        // ガード脱出は分岐ではない (G9: bit31 と bit30 は同時に立たない)。
+        INFO("guard exit is not a branch");
+        CHECK_FALSE(branchTaken);
+        // 降りた地点は「まだ実行していない命令の手前」なので、
+        // 計画の全命令を走り切ってはいない。
+        CHECK(native.ranOps < plan.count);
+        return;
+    }
 
     if (plan.end == BlockEnd::kBranch)
     {
@@ -801,6 +967,33 @@ constexpr u16 leaAbsL(u32 dstAn)
     return static_cast<u16>(0x41F9u | (dstAn << 9));
 }
 
+// --- Tier B: メモリ読み形の命令語 ------------------------------------------
+//
+// EA の符号化は共通で mode<<3 | reg。呼び出し側が「どの mode を」を
+// 名前で選べるようにしておくと、テストが符号を組み間違えにくい。
+constexpr u32 kModeInd = 2u;      // (An)
+constexpr u32 kModePostInc = 3u;  // (An)+
+constexpr u32 kModePreDec = 4u;   // -(An)
+constexpr u32 kModeDisp = 5u;     // (d16,An)
+constexpr u32 kModeAbsW = 7u;     // (xxx).W  (reg = 0)
+constexpr u32 kModeAbsL = 7u;     // (xxx).L  (reg = 1)
+
+// MOVE.<size> <ea>,Dd
+constexpr u16 moveMemToDn(u32 sizeGroup, u32 dst, u32 mode, u32 reg)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dst << 9) | (mode << 3) | reg);
+}
+// TST.<size> <ea>
+constexpr u16 tstMem(u32 sizeField, u32 mode, u32 reg)
+{
+    return static_cast<u16>(0x4A00u | (sizeField << 6) | (mode << 3) | reg);
+}
+// ALU.<size> <ea>,Dd。group は $8/$9/$B/$C/$D、opmode は 0/1/2 = b/w/l
+constexpr u16 aluMemToDn(u32 group, u32 dst, u32 opmode, u32 mode, u32 reg)
+{
+    return static_cast<u16>((group << 12) | (dst << 9) | (opmode << 6) | (mode << 3) | reg);
+}
+
 constexpr u16 bcc(u32 cond, int disp8)
 {
     return static_cast<u16>(0x6000u | (cond << 8) | (static_cast<u32>(disp8) & 0xFFu));
@@ -843,7 +1036,7 @@ TEST_CASE("同じ計画からは同じバイト列が出る")
     // requiredSize が実際に書いた量と一致すること。
     // **これがずれると、次のブロックの先頭を踏む。**
     CHECK(jit::requiredSize(plan, code.get16(plan.fallThroughPc),
-                            code.get16(plan.fallThroughPc + 2)) == a.info.totalSize);
+                            code.get16(plan.fallThroughPc + 2), fakeEnv()) == a.info.totalSize);
     CHECK(a.info.totalSize == a.buffer.size());
 }
 
@@ -1278,6 +1471,613 @@ TEST_CASE("SR の上位バイトを壊さない")
     }
 }
 
+// --- Tier B: 読みガード -----------------------------------------------------
+//
+// 以下は「ガードが**成立する**」場合の同値性。窓の中を指すアドレスを与え、
+// 生成コードとインタプリタが同じ値を読んで同じ状態を作ることを問う。
+// 不成立側 (脱出) は別の TEST_CASE で扱う。
+
+namespace
+{
+
+// 読み形のテストで使うゲストアドレス。**偶数**にしておく
+// (奇数はガードが弾くので、成立側のテストには使えない)。
+constexpr u32 kDataAddr = 0x00040000u;
+
+// そこへ 4 バイト置く種を仕込む。ビッグエンディアンの組み立てを問うので、
+// **4 バイトとも違う値**にする (どれか 1 つでも入れ替わったら分かる)。
+void seedData(u32 addr, u8 b0, u8 b1, u8 b2, u8 b3)
+{
+    guestSeeds().clear();
+    guestSeeds().push_back(GuestSeed{addr, {b0, b1, b2, b3}});
+}
+
+void clearSeeds()
+{
+    guestSeeds().clear();
+}
+
+}  // namespace
+
+TEST_CASE("MOVE <mem>,Dn がインタプリタと一致する")
+{
+    // sizeGroup: $1 = byte / $2 = long / $3 = word。**$2 が long。**
+    for (u32 group : {0x1u, 0x2u, 0x3u})
+    {
+        for (u32 seed : {1u, 2u, 5u})
+        {
+            // (An) — 最頻の形。
+            {
+                seedData(kDataAddr, 0x12, 0x34, 0x56, 0x78);
+                M68kState s = makeState(seed);
+                s.a[2] = kDataAddr;
+                checkEquivalence({moveMemToDn(group, 1, kModeInd, 2)}, s, "MOVE (An),Dn");
+            }
+            // 符号ビットが立つ値。N フラグと、byte/word の切り出しを問う。
+            {
+                seedData(kDataAddr, 0x80, 0x00, 0x00, 0x01);
+                M68kState s = makeState(seed);
+                s.a[2] = kDataAddr;
+                checkEquivalence({moveMemToDn(group, 3, kModeInd, 2)}, s, "MOVE (An),Dn 負値");
+            }
+            // 全部 0。Z フラグ。
+            {
+                seedData(kDataAddr, 0x00, 0x00, 0x00, 0x00);
+                M68kState s = makeState(seed);
+                s.a[2] = kDataAddr;
+                checkEquivalence({moveMemToDn(group, 0, kModeInd, 2)}, s, "MOVE (An),Dn ゼロ");
+            }
+            // (An)+ — An が進むこと。
+            {
+                seedData(kDataAddr, 0xDE, 0xAD, 0xBE, 0xEF);
+                M68kState s = makeState(seed);
+                s.a[4] = kDataAddr;
+                checkEquivalence({moveMemToDn(group, 2, kModePostInc, 4)}, s, "MOVE (An)+,Dn");
+            }
+            // -(An) — 先に引いてから読むこと。
+            {
+                seedData(kDataAddr, 0xDE, 0xAD, 0xBE, 0xEF);
+                M68kState s = makeState(seed);
+                // 引いた結果が kDataAddr になるように置く。
+                s.a[5] = kDataAddr + (group == 0x1u ? 1u : (group == 0x2u ? 4u : 2u));
+                checkEquivalence({moveMemToDn(group, 6, kModePreDec, 5)}, s, "MOVE -(An),Dn");
+            }
+            // (d16,An) — 正負の変位。
+            {
+                seedData(kDataAddr, 0x01, 0x02, 0x03, 0x04);
+                M68kState s = makeState(seed);
+                s.a[3] = kDataAddr - 0x10u;
+                checkEquivalence({moveMemToDn(group, 1, kModeDisp, 3), 0x0010u}, s,
+                                 "MOVE (d16,An),Dn 正変位");
+                s.a[3] = kDataAddr + 0x10u;
+                checkEquivalence({moveMemToDn(group, 1, kModeDisp, 3), 0xFFF0u}, s,
+                                 "MOVE (d16,An),Dn 負変位");
+            }
+            // (xxx).L — 絶対アドレス。**ガードは翻訳時に消えている。**
+            {
+                seedData(kDataAddr, 0x11, 0x22, 0x33, 0x44);
+                M68kState s = makeState(seed);
+                checkEquivalence(
+                    {moveMemToDn(group, 7, kModeAbsL, 1), static_cast<u16>(kDataAddr >> 16),
+                     static_cast<u16>(kDataAddr & 0xFFFFu)},
+                    s, "MOVE (xxx).L,Dn");
+            }
+            // (xxx).W — 符号拡張される。小さい正の番地を使う。
+            {
+                seedData(0x00000400u, 0xAA, 0xBB, 0xCC, 0xDD);
+                M68kState s = makeState(seed);
+                checkEquivalence({moveMemToDn(group, 4, kModeAbsW, 0), 0x0400u}, s,
+                                 "MOVE (xxx).W,Dn");
+            }
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("A7 をバイトで触る (An)+ / -(An) は 2 進む")
+{
+    // **バイトでも A7 だけは 2 増減する** (スタックポインタが奇数に
+    // ならないための特例)。1 進む実装だと、この 2 つで a[7] が食い違う。
+    seedData(kDataAddr, 0x5A, 0xA5, 0x3C, 0xC3);
+
+    M68kState post = makeState(3);
+    post.a[7] = kDataAddr;
+    checkEquivalence({moveMemToDn(0x1u, 1, kModePostInc, 7)}, post, "MOVE.b (A7)+,Dn");
+
+    M68kState pre = makeState(3);
+    pre.a[7] = kDataAddr + 2u;
+    checkEquivalence({moveMemToDn(0x1u, 1, kModePreDec, 7)}, pre, "MOVE.b -(A7),Dn");
+
+    clearSeeds();
+}
+
+TEST_CASE("TST <mem> がインタプリタと一致する")
+{
+    for (u32 sizeField : {0u, 1u, 2u})
+    {
+        // 負・ゼロ・正の 3 通りでフラグを問う。
+        static constexpr u8 kPatterns[3][4] = {
+            {0x80, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x7F}};
+        for (const auto& pat : kPatterns)
+        {
+            seedData(kDataAddr, pat[0], pat[1], pat[2], pat[3]);
+            M68kState s = makeState(4);
+            s.a[2] = kDataAddr;
+            // **d[] を 1 つも書かないこと**が TST の要点。
+            checkEquivalence({tstMem(sizeField, kModeInd, 2)}, s, "TST (An)");
+
+            s.a[3] = kDataAddr;
+            checkEquivalence({tstMem(sizeField, kModePostInc, 3)}, s, "TST (An)+");
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("ALU <mem>,Dn がインタプリタと一致する")
+{
+    // group: $8 = OR / $9 = SUB / $B = CMP / $C = AND / $D = ADD
+    static constexpr u32 kGroups[] = {0x8u, 0x9u, 0xBu, 0xCu, 0xDu};
+    for (u32 group : kGroups)
+    {
+        for (u32 opmode : {0u, 1u, 2u})
+        {
+            for (u32 seed : {1u, 3u, 9u})
+            {
+                // 桁上がり / 桁借り / 溢れが出る値を混ぜる。
+                static constexpr u8 kPatterns[3][4] = {
+                    {0xFF, 0xFF, 0xFF, 0xFF}, {0x80, 0x00, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x01}};
+                for (const auto& pat : kPatterns)
+                {
+                    seedData(kDataAddr, pat[0], pat[1], pat[2], pat[3]);
+                    M68kState s = makeState(seed);
+                    s.a[2] = kDataAddr;
+                    checkEquivalence({aluMemToDn(group, 1, opmode, kModeInd, 2)}, s, "ALU (An),Dn");
+                }
+            }
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("読みガードの境界がインタプリタと一致する")
+{
+    // 窓の端ちょうど。**a == limit - size は成立、その先は不成立。**
+    //
+    // **「成立したこと」を明示的に問う。** 同値比較だけだと、ガードが
+    // 保守的に外れても checkEquivalence は「脱出した地点までは一致」で
+    // 緑になる。範囲を 1 バイト狭める変異は正しさを壊さないので、
+    // 諦めた回数を数えないかぎり永遠に見えない
+    // (保守的なフォールバックはテストの盲点になる)。
+    const u32 limit = static_cast<u32>(x68k::kMainRamSize);
+
+    for (u32 group : {0x1u, 0x2u, 0x3u})
+    {
+        const u32 size = group == 0x1u ? 1u : (group == 0x2u ? 4u : 2u);
+        {
+            // ちょうど収まる最後のアドレス。**脱出してはいけない。**
+            M68kState s = makeState(2);
+            s.a[2] = limit - size;
+            const std::vector<u16> words{moveMemToDn(group, 1, kModeInd, 2)};
+            checkEquivalence(words, s, "境界ちょうど (成立)");
+
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            std::fill(execRam().begin(), execRam().end(), 0);
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("size=", size, " addr=limit-size");
+            CHECK_FALSE(native.guardExit);
+        }
+        {
+            // 1 語外。ガードが不成立になり、**必ず脱出する**。
+            M68kState s = makeState(2);
+            s.a[2] = limit - size + 2u;  // 偶数を保ったまま外へ出す
+            const std::vector<u16> words{moveMemToDn(group, 1, kModeInd, 2)};
+            checkEquivalence(words, s, "境界の外 (不成立)");
+
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            std::fill(execRam().begin(), execRam().end(), 0);
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("size=", size, " addr=limit-size+2");
+            CHECK(native.guardExit);
+            CHECK(native.ranOps == 0);
+        }
+        {
+            // **窓の最初の 1 バイト外ちょうど (a == limit)。**
+            //
+            // 範囲を 1 だけ広げる変異は、word / long なら「そのアドレスが
+            // 奇数になる」ので整列判定に救われて見えない。**byte には
+            // 整列判定が無い**ので、ここだけが 1 バイト外の読みを捕まえる。
+            // 偶数刻みで外へ出すテストでは a == limit を踏まない。
+            M68kState s = makeState(2);
+            s.a[2] = limit;
+            const std::vector<u16> words{moveMemToDn(group, 1, kModeInd, 2)};
+
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            std::fill(execRam().begin(), execRam().end(), 0);
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("size=", size, " addr=limit ちょうど");
+            CHECK(native.guardExit);
+            CHECK(native.ranOps == 0);
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("窓の中を指す読みはガードを通り抜ける")
+{
+    // ガードが**成立する側**を数える。
+    //
+    // 諦めても正しさは壊れないので、「脱出しなかったこと」を問わないと
+    // ガードが保守的に外れていることに気づけない。上の境界テストと
+    // 合わせて、成立/不成立の両側を固定する。
+    seedData(kDataAddr, 0x12, 0x34, 0x56, 0x78);
+
+    for (u32 group : {0x1u, 0x2u, 0x3u})
+    {
+        for (u32 mode : {kModeInd, kModePostInc, kModePreDec, kModeDisp})
+        {
+            std::vector<u16> words{moveMemToDn(group, 1, mode, 2)};
+            if (mode == kModeDisp)
+            {
+                words.push_back(0x0000u);
+            }
+            M68kState s = makeState(3);
+            s.a[2] = mode == kModePreDec
+                         ? kDataAddr + (group == 0x1u ? 1u : (group == 0x2u ? 4u : 2u))
+                         : kDataAddr;
+
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            std::fill(execRam().begin(), execRam().end(), 0);
+            applyGuestSeeds();
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("group=", group, " mode=", mode);
+            CHECK_FALSE(native.guardExit);
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("ガード不成立で状態が 1 bit も変わらない")
+{
+    // **(An)+ の An が進んでいないこと**が要点 (G3/G4)。
+    // ガードより前に commit する実装だと、ここで a[] が食い違う。
+    for (u32 group : {0x2u, 0x3u})
+    {
+        for (u32 mode : {kModeInd, kModePostInc, kModePreDec})
+        {
+            M68kState s = makeState(6);
+            // 窓の外を指す。
+            s.a[4] = static_cast<u32>(x68k::kMainRamSize) + 0x1000u;
+            checkEquivalence({moveMemToDn(group, 1, mode, 4)}, s, "窓の外で脱出");
+        }
+    }
+
+    // 奇数アドレス。word / long は必ず不成立 (byte は成立する)。
+    for (u32 group : {0x2u, 0x3u})
+    {
+        M68kState s = makeState(6);
+        s.a[4] = kDataAddr + 1u;
+        checkEquivalence({moveMemToDn(group, 1, kModeInd, 4)}, s, "奇数アドレスで脱出");
+    }
+    // byte は奇数でも読める。
+    {
+        seedData(kDataAddr, 0x11, 0x99, 0x33, 0x44);
+        M68kState s = makeState(6);
+        s.a[4] = kDataAddr + 1u;
+        checkEquivalence({moveMemToDn(0x1u, 1, kModeInd, 4)}, s, "byte は奇数でも読める");
+        clearSeeds();
+    }
+}
+
+TEST_CASE("ブロックの途中で脱出したときの境界状態")
+{
+    // 先頭は必ず成立する命令、2 番目で脱出させる。
+    //
+    // **出口は「2 番目の命令の直前の命令境界」** (G7)。pc / ir / irc と
+    // サイクル (1 命令ぶんだけ) の 4 つを、参照側の 1 命令実行と比べる。
+    M68kState s = makeState(8);
+    s.a[4] = static_cast<u32>(x68k::kMainRamSize) + 0x2000u;  // 窓の外
+    checkEquivalence({moveq(0, 1), moveMemToDn(0x3u, 1, kModeInd, 4)}, s, "2 命令目で脱出");
+
+    // 3 命令目で脱出する形。**手前 2 命令ぶんのサイクルだけ返すこと。**
+    M68kState t = makeState(9);
+    t.a[5] = static_cast<u32>(x68k::kMainRamSize) + 0x2000u;
+    checkEquivalence({moveq(0, 7), moveq(1, -3), moveMemToDn(0x2u, 2, kModeInd, 5)}, t,
+                     "3 命令目で脱出");
+}
+
+TEST_CASE("-(An) が 0 からラップしてもインタプリタと一致する")
+{
+    // a[n] == 0 で -(An) すると 32bit で 0xFFFFFFFC へ回り込む。
+    // マスク後は 0x00FFFFFC で、2MB の窓の外なのでガードは不成立。
+    // **無マスクの環算**であることを、a[] の値そのもので問う。
+    M68kState s = makeState(5);
+    s.a[3] = 0;
+    checkEquivalence({moveMemToDn(0x2u, 1, kModePreDec, 3)}, s, "-(An) が 0 からラップ");
+}
+
+TEST_CASE("上位バイト付きアドレスは 24bit にマスクされる")
+{
+    // インタプリタは addr & 0x00FFFFFF で読む (m68k.cpp の read8/16/32)。
+    // **マスクを落とすと窓の外と判定してしまう** (偽の脱出) ので、
+    // ガードが成立して正しい値を読むことを問う。
+    seedData(kDataAddr, 0xC0, 0xFF, 0xEE, 0x00);
+    M68kState s = makeState(7);
+    s.a[2] = 0xFF000000u | kDataAddr;
+    checkEquivalence({moveMemToDn(0x2u, 1, kModeInd, 2)}, s, "上位バイト付き (An)");
+
+    // (An)+ なら a[] に**マスクしていない**値 + step が入る。
+    M68kState t = makeState(7);
+    t.a[2] = 0xFF000000u | kDataAddr;
+    checkEquivalence({moveMemToDn(0x2u, 1, kModePostInc, 2)}, t, "上位バイト付き (An)+");
+    clearSeeds();
+}
+
+TEST_CASE("読み形と分岐終端を混ぜたブロック")
+{
+    seedData(kDataAddr, 0x00, 0x00, 0x00, 0x00);
+    for (u32 cond : {0x6u, 0x7u})  // NE / EQ
+    {
+        M68kState s = makeState(4);
+        s.a[2] = kDataAddr;
+        // TST が Z を立て、その Z で分岐する。**ガードと分岐が同居する形。**
+        checkEquivalence({tstMem(2u, kModeInd, 2), bcc(cond, 6)}, s, "TST (An) + Bcc");
+    }
+    clearSeeds();
+}
+
+TEST_CASE("窓が読めない写像では読み形を発行しない")
+{
+    // G12: ROM 写像中 (ramReadable == false) やウォッチ中 (base == 0) は、
+    // 読み形を焼かない。**負のキャッシュに入っても、写像が戻れば
+    // epoch の変化で捨てられる。**
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({moveMemToDn(0x2u, 1, kModeInd, 2)}, plan, code));
+    const u16 ir = code.get16(plan.fallThroughPc);
+    const u16 irc = code.get16(plan.fallThroughPc + 2);
+
+    // 読める窓なら発行できる。
+    CHECK(jit::requiredSize(plan, ir, irc, fakeEnv()) > 0);
+
+    // 読めない写像。
+    jit::EmitEnv unreadable = fakeEnv();
+    unreadable.ramReadable = false;
+    CHECK(jit::requiredSize(plan, ir, irc, unreadable) == 0);
+
+    // 窓が無い (ウォッチ中)。
+    jit::EmitEnv noWindow = fakeEnv();
+    noWindow.ramBaseAddr = 0;
+    CHECK(jit::requiredSize(plan, ir, irc, noWindow) == 0);
+
+    // 窓が短すぎてそのサイズを一度も許さない。
+    jit::EmitEnv tiny = fakeEnv();
+    tiny.ramLimit = 2;
+    CHECK(jit::requiredSize(plan, ir, irc, tiny) == 0);
+
+    // Tier A だけの計画なら、窓が読めなくても発行できる
+    // (メモリを触らないので窓に依存しない)。
+    BlockPlan tierA{};
+    FlatCode codeA;
+    REQUIRE(buildPlan({moveq(1, 5)}, tierA, codeA));
+    CHECK(jit::requiredSize(tierA, codeA.get16(tierA.fallThroughPc),
+                            codeA.get16(tierA.fallThroughPc + 2), unreadable) > 0);
+}
+
+TEST_CASE("窓の外を指す絶対アドレスは翻訳時に弾く")
+{
+    // G6: 絶対アドレスは実効アドレスが翻訳時に決まるので、**その場で
+    // 判定する。** 走らせてから諦める形にすると、絶対に成立しない
+    // ガードを毎回踏むブロックができる。
+    FlatCode code;
+    BlockPlan plan{};
+    const u32 outside = static_cast<u32>(x68k::kMainRamSize) + 0x1000u;
+    REQUIRE(buildPlan({moveMemToDn(0x2u, 1, kModeAbsL, 1), static_cast<u16>(outside >> 16),
+                       static_cast<u16>(outside & 0xFFFFu)},
+                      plan, code));
+    CHECK(jit::requiredSize(plan, code.get16(plan.fallThroughPc),
+                            code.get16(plan.fallThroughPc + 2), fakeEnv()) == 0);
+
+    // 奇数の絶対アドレスも同じく積まない (word 以上)。
+    FlatCode oddCode;
+    BlockPlan oddPlan{};
+    const u32 odd = kDataAddr + 1u;
+    REQUIRE(buildPlan({moveMemToDn(0x2u, 1, kModeAbsL, 1), static_cast<u16>(odd >> 16),
+                       static_cast<u16>(odd & 0xFFFFu)},
+                      oddPlan, oddCode));
+    CHECK(jit::requiredSize(oddPlan, oddCode.get16(oddPlan.fallThroughPc),
+                            oddCode.get16(oddPlan.fallThroughPc + 2), fakeEnv()) == 0);
+}
+
+TEST_CASE("decodeBlockReturn が符号化を全数で解く")
+{
+    // 符号化と復号は 1 対でしか意味がないので、境界を全部問う。
+    for (std::uint32_t cycles : {0u, 1u, 58u, 0x00FFFFFFu})
+    {
+        {
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles);
+            CHECK(r.cycles == cycles);
+            CHECK_FALSE(r.branchTaken);
+            CHECK_FALSE(r.guardExit);
+            CHECK(r.ranOps == 0);
+        }
+        {
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles | jit::kBranchTakenFlag);
+            CHECK(r.cycles == cycles);
+            CHECK(r.branchTaken);
+            CHECK_FALSE(r.guardExit);
+        }
+        for (std::uint32_t k = 0; k < x68k::kMaxOps; ++k)
+        {
+            const std::uint32_t ret = cycles | jit::kGuardExitFlag | (k << jit::kGuardCountShift);
+            const jit::BlockReturn r = jit::decodeBlockReturn(ret);
+            CHECK(r.cycles == cycles);
+            CHECK(r.guardExit);
+            CHECK_FALSE(r.branchTaken);
+            CHECK(r.ranOps == k);
+        }
+    }
+}
+
+TEST_CASE("ガードより前に状態を書く命令が 1 つも無い")
+{
+    // G3 の機械検査。**バイト列を走査して確かめる。**
+    //
+    // 同値テストは「ガードが不成立になった場合」にしか commit の順序を
+    // 問えないが、こちらは発行されたコードそのものを見るので、
+    // 不成立を作れない形でも順序を固定できる。
+    //
+    // 生成コードが状態を書くのは kState (a3) 基底の s32i / s16i だけ。
+    // 先頭から最初の bnez (ガードの分岐) までの間に、それが 1 つも
+    // 現れないことを問う。
+    for (u32 group : {0x1u, 0x2u, 0x3u})
+    {
+        for (u32 mode : {kModeInd, kModePostInc, kModePreDec})
+        {
+            const std::vector<u16> words{moveMemToDn(group, 1, mode, 2)};
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+
+            // 最初の bnez を探す。BRI12: op0=0x6 / t=0x5。
+            std::size_t guardAt = e.buffer.size();
+            for (std::size_t i = e.info.entryOffset; i + 3 <= e.buffer.size(); ++i)
+            {
+                const bool isBnez =
+                    (e.buffer[i] & 0x0Fu) == 0x6u && ((e.buffer[i] >> 4) & 0x0Fu) == 0x5u;
+                if (isBnez)
+                {
+                    guardAt = i;
+                    break;
+                }
+            }
+            INFO("group=", group, " mode=", mode);
+            REQUIRE(guardAt < e.buffer.size());
+
+            // そこまでに kState 基底のストアが無いこと。
+            //
+            // s32i at, a3, off = RRI8 op0=2 / r=6 / s=3
+            // s16i at, a3, off = RRI8 op0=2 / r=5 / s=3
+            // s32i.n at, a3, off = RRRN op0=9 / s=3
+            bool wrote = false;
+            for (std::size_t i = e.info.entryOffset; i + 3 <= guardAt; ++i)
+            {
+                const std::uint32_t op0 = e.buffer[i] & 0x0Fu;
+                const std::uint32_t s = e.buffer[i + 1] & 0x0Fu;
+                const std::uint32_t r = (e.buffer[i + 1] >> 4) & 0x0Fu;
+                const bool isWideStore = op0 == 0x2u && s == 3u && (r == 6u || r == 5u);
+                const bool isNarrowStore = op0 == 0x9u && s == 3u;
+                if (isWideStore || isNarrowStore)
+                {
+                    wrote = true;
+                    break;
+                }
+            }
+            CHECK_FALSE(wrote);
+        }
+    }
+}
+
+TEST_CASE("ガード脱出の irc が実メモリの mem16(opPc + 2) と一致する")
+{
+    // I11: 出口の irc は導出値なので、**実メモリの語と突き合わせる**。
+    //
+    // 導出は 3 通り (次命令語 / 第 1 拡張ワード / long の上位語) に分かれる。
+    // どれか 1 つを間違えても、その形の命令が脱出したときにしか現れない。
+    // ここで全ての EA 形について、脱出後の irc を参照実行の irc と比べる。
+    const u32 outside = static_cast<u32>(x68k::kMainRamSize) + 0x1000u;
+
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const std::vector<Case> cases{
+        // 長さ 2: opPc + 2 は次の命令語 (ここでは後続の NOP)
+        {{moveMemToDn(0x2u, 1, kModeInd, 4)}, "(An) 単独"},
+        {{moveMemToDn(0x2u, 1, kModePostInc, 4)}, "(An)+ 単独"},
+        // 長さ 2 の**後ろに別の命令が続く**形。
+        //
+        // ここが要点: 脱出する命令がブロックの最後だと、irc は
+        // fallThroughIr でも ops[k+1].op でも同じ語になってしまい、
+        // 導出の分岐を区別できない。**後続の命令語が NOP 埋めと
+        // 違う値**になるように MOVEQ を置いて、取り違えを見えるようにする。
+        {{moveMemToDn(0x2u, 1, kModeInd, 4), moveq(5, 0x42)}, "(An) の後ろに MOVEQ"},
+        {{moveq(0, 3), moveMemToDn(0x2u, 1, kModeInd, 4), moveq(6, 0x21)},
+         "2 命令目が (An)、その後ろにも命令"},
+        // 長さ 4: opPc + 2 は第 1 拡張ワード
+        {{moveMemToDn(0x2u, 1, kModeDisp, 4), 0x1234u}, "(d16,An)"},
+        {{moveMemToDn(0x2u, 1, kModeDisp, 4), 0x1234u, moveq(7, 0x33)}, "(d16,An) の後ろに MOVEQ"},
+    };
+
+    for (const Case& c : cases)
+    {
+        M68kState s = makeState(11);
+        s.a[4] = outside;
+        // checkEquivalence が pc / ir / irc をまとめて参照側と比べる。
+        // **脱出したことも確かめる** (脱出しないと irc の導出を通らない)。
+        checkEquivalence(c.words, s, c.what);
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        std::fill(execRam().begin(), execRam().end(), 0);
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        INFO(std::string(c.what));
+        CHECK(native.guardExit);
+    }
+}
+
+TEST_CASE("0 進捗のガード脱出はブロックの成功にしない")
+{
+    // G10: k == 0 は「状態を 1 bit も変えずに降りた」なので、
+    // 呼び出し側は kDeferToStep を返さなければならない。
+    //
+    // **これが無いと Machine::run が used == 0 を halted と誤読する**か、
+    // 同じブロックを 0 サイクルで回し続ける。runner 本体は runBlock
+    // (ESP32 のアセンブリ) に依存してホストで走らせられないので、
+    // 判断の部分だけを純関数として問う。
+    for (std::uint32_t cycles : {0u, 4u, 12u})
+    {
+        const jit::BlockReturn zero =
+            jit::decodeBlockReturn(cycles | jit::kGuardExitFlag | (0u << jit::kGuardCountShift));
+        CHECK(zero.guardExit);
+        CHECK_FALSE(jit::guardExitMadeProgress(zero));
+
+        for (std::uint32_t k = 1; k < x68k::kMaxOps; ++k)
+        {
+            const jit::BlockReturn some =
+                jit::decodeBlockReturn(cycles | jit::kGuardExitFlag | (k << jit::kGuardCountShift));
+            CHECK(some.guardExit);
+            CHECK(jit::guardExitMadeProgress(some));
+        }
+    }
+}
+
 TEST_CASE("kMaxLiterals を超える計画は発行しない")
 {
     // リテラルが溢れたら false を返し、**中途半端なコードを渡さない**こと。
@@ -1290,29 +2090,29 @@ TEST_CASE("kMaxLiterals を超える計画は発行しない")
 
     const u16 ir = code.get16(plan.fallThroughPc);
     const u16 irc = code.get16(plan.fallThroughPc + 2);
-    const std::size_t need = jit::requiredSize(plan, ir, irc);
+    const std::size_t need = jit::requiredSize(plan, ir, irc, fakeEnv());
     REQUIRE(need > 0);
 
     std::vector<std::uint8_t> buf(need, 0xCC);
     jit::EmittedBlock info{};
     // 1 バイト足りないと必ず断ること。
-    CHECK_FALSE(jit::emitBlock(plan, ir, irc, buf.data(), need - 1, info));
-    CHECK(jit::emitBlock(plan, ir, irc, buf.data(), need, info));
+    CHECK_FALSE(jit::emitBlock(plan, ir, irc, fakeEnv(), buf.data(), need - 1, info));
+    CHECK(jit::emitBlock(plan, ir, irc, fakeEnv(), buf.data(), need, info));
 }
 
 TEST_CASE("空の計画は発行しない")
 {
     BlockPlan plan{};
     plan.count = 0;
-    CHECK(jit::requiredSize(plan, 0, 0) == 0);
+    CHECK(jit::requiredSize(plan, 0, 0, fakeEnv()) == 0);
     std::uint8_t buf[64];
     jit::EmittedBlock info{};
-    CHECK_FALSE(jit::emitBlock(plan, 0, 0, buf, sizeof(buf), info));
+    CHECK_FALSE(jit::emitBlock(plan, 0, 0, fakeEnv(), buf, sizeof(buf), info));
 
     // count が壊れている計画も断る (§4(d) のゴミ検査と同じ趣旨)。
     plan.count = x68k::kMaxOps + 1;
-    CHECK(jit::requiredSize(plan, 0, 0) == 0);
-    CHECK_FALSE(jit::emitBlock(plan, 0, 0, buf, sizeof(buf), info));
+    CHECK(jit::requiredSize(plan, 0, 0, fakeEnv()) == 0);
+    CHECK_FALSE(jit::emitBlock(plan, 0, 0, fakeEnv(), buf, sizeof(buf), info));
 }
 
 TEST_CASE("ADD.b / SUB.b / CMP.b のフラグを全数で突き合わせる")
@@ -1491,7 +2291,7 @@ TEST_CASE("kMaxOps いっぱいのブロックがリテラルを使い切らな�
         REQUIRE(plan.count == x68k::kMaxOps);
         INFO(std::string(c.what));
         CHECK(jit::requiredSize(plan, code.get16(plan.fallThroughPc),
-                                code.get16(plan.fallThroughPc + 2)) > 0);
+                                code.get16(plan.fallThroughPc + 2), fakeEnv()) > 0);
 
         // 実際に走らせても一致すること。
         u32 padAt = kEntry + static_cast<u32>(c.words.size()) * 2u;
@@ -1596,13 +2396,13 @@ TEST_CASE("発行したコードを ExecMemory へ置ける")
 
     const u16 ir = code.get16(plan.fallThroughPc);
     const u16 irc = code.get16(plan.fallThroughPc + 2);
-    const std::size_t need = jit::requiredSize(plan, ir, irc);
+    const std::size_t need = jit::requiredSize(plan, ir, irc, fakeEnv());
     REQUIRE(need > 0);
 
     std::uint8_t* slot = mem.allocate(need);
     REQUIRE(slot != nullptr);
     jit::EmittedBlock info{};
-    REQUIRE(jit::emitBlock(plan, ir, irc, slot, need, info));
+    REQUIRE(jit::emitBlock(plan, ir, irc, fakeEnv(), slot, need, info));
     CHECK(info.totalSize == need);
     CHECK(info.endsWithBranch);
     CHECK(info.branchTarget == plan.branchTarget);

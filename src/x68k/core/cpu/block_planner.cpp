@@ -71,6 +71,47 @@ bool aluOpFromGroupRead(u32 group, PlanAluOp& out)
     }
 }
 
+// I10: 読み形として受けてよい EA か。受けるなら eaMode を返す。
+//
+// **許可リスト。** mode 6 (d8,An,Xn) は拡張ワードの解釈が要り、7.2/7.3 は
+// PC 相対なので「翻訳時の PC」に依存する。7.4 (即値) はメモリを読まないので
+// Tier A の kMoveImmToDreg が既に持っている。どれもここでは受けない。
+//
+// mode 3/4 ((An)+ / -(An)) は An を動かす副作用があるが、**ガードが成立して
+// から** commit する形をエミッタが守る (G3/G4) ので受けてよい。
+bool readEaMode(u32 mode, u32 reg, u8& out)
+{
+    switch (mode)
+    {
+        case 2:
+            out = kEaIndirect;
+            return true;
+        case 3:
+            out = kEaPostInc;
+            return true;
+        case 4:
+            out = kEaPreDec;
+            return true;
+        case 5:
+            out = kEaDisp16;
+            return true;
+        case 7:
+            if (reg == 0)
+            {
+                out = kEaAbsShort;
+                return true;
+            }
+            if (reg == 1)
+            {
+                out = kEaAbsLong;
+                return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
 // MOVE.b/w/l Dn,Dm。src / dst とも mode 0 のときだけ受ける。
 bool planMove(u16 op, PlannedOp& out)
 {
@@ -89,12 +130,34 @@ bool planMove(u16 op, PlannedOp& out)
         return false;
     }
 
-    // 転送元は Dn / An / 即値だけ。mode 7 の 0-3 (絶対・PC 相対) は
-    // 読み出しがメモリに触る。
+    // 転送元は Dn / An / 即値 / **メモリ読み** (Tier B)。
     const bool srcIsImmediate = srcMode == 7 && srcReg == 4;
-    if (srcMode > 1 && !srcIsImmediate)
+    u8 srcEa = kEaNone;
+    const bool srcIsMemory = !srcIsImmediate && srcMode > 1 && readEaMode(srcMode, srcReg, srcEa);
+    if (srcMode > 1 && !srcIsImmediate && !srcIsMemory)
     {
         return false;
+    }
+
+    // メモリ読み形は Dn 宛てだけ。**MOVEA (dstMode == 1) は入れない。**
+    //
+    // Why not 一緒に入れないか: MOVEA.w は符号拡張して 32bit を書くので、
+    // ガードの後ろに繋ぐ本体が MOVE とは別物になる。入れるなら別の kind と
+    // 別のテストが要る。読み形の被覆はまず Dn 宛てで測る。
+    if (srcIsMemory)
+    {
+        if (dstMode != 0)
+        {
+            return false;
+        }
+        out.kind = PlanKind::kMoveMemToDreg;
+        out.eaMode = srcEa;
+        out.srcReg = static_cast<u8>(srcReg);
+        out.dstReg = static_cast<u8>(dstReg);
+        out.size = static_cast<u8>(size);
+        // groupMove は EA の形によらず 4 を返す (m68k_ops_move.cpp:68)。
+        out.cycles = 4;
+        return true;
     }
 
     // **byte で An に触る形は不当命令。** 68000 は例外を出す
@@ -166,11 +229,30 @@ bool planMisc(u16 op, PlannedOp& out)
     // 前例がある)。
     const u32 opcodeBits = static_cast<u32>((op >> 8) & 0xFu);
     const u32 sizeField = static_cast<u32>((op >> 6) & 3u);
-    if (sizeField == 3 || mode != 0)
+    if (sizeField == 3)
     {
         return false;
     }
     const u32 size = sizeField == 0 ? kByte : (sizeField == 1 ? kWord : kLong);
+
+    // TST <mem> (Tier B)。**読むだけで書かない**ので、ガードを通れば
+    // あとはフラグを立てるだけ。CLR は読んで書く RMW なので入れない
+    // (書き方向は世代更新とアドレスエラーを背負う)。
+    if (mode != 0)
+    {
+        u8 ea = kEaNone;
+        if (opcodeBits != 0xAu || !readEaMode(mode, reg, ea))
+        {
+            return false;
+        }
+        out.kind = PlanKind::kTstMem;
+        out.eaMode = ea;
+        out.srcReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(size);
+        // m68k_ops_group4.cpp:657 の TST は EA の形によらず 4。
+        out.cycles = 4;
+        return true;
+    }
 
     if (opcodeBits == 0xAu)  // TST Dn
     {
@@ -230,11 +312,47 @@ bool planAlu(u16 op, PlannedOp& out)
         return false;
     }
 
-    // mode 0 (Dn) だけを受ける。メモリを触らない = バスエラーも
-    // アドレスエラーも起きえない、という前提がここで閉じる。
-    if (mode != 0)
+    // mode 0 (Dn) と、Tier B の読み形メモリ EA を受ける。
+    //
+    // **読み方向 (opmode < 4) だけ。** メモリ方向はこの下で弾く。
+    const u32 reg = static_cast<u32>(op & 7u);
+    u8 ea = kEaNone;
+    const bool isMemoryRead = mode != 0 && readEaMode(mode, reg, ea);
+    if (mode != 0 && !isMemoryRead)
     {
         return false;
+    }
+
+    if (isMemoryRead)
+    {
+        // メモリ方向 (opmode 4/5/6) は書き込みなので入れない。
+        // **読み方向より先に見る。** 後に回すと $B の EOR <ea>,Dn
+        // (メモリ方向) を読み形として受けてしまう。
+        if ((opmode & 4u) != 0)
+        {
+            return false;
+        }
+        PlanAluOp memAluOp = PlanAluOp::kAdd;
+        const u32 memGroup = static_cast<u32>(op >> 12);
+        if (!aluOpFromGroupRead(memGroup, memAluOp))
+        {
+            return false;
+        }
+
+        // **byte で An を読む形は不当命令。** 68000 は .b の mode 1 を
+        // 持たないが、ここで受ける mode 2-5/7 は An の**中身**ではなく
+        // アドレスとして使うので .b でも正当。mode 1 は readEaMode が
+        // 既に弾いている。
+
+        out.kind = PlanKind::kAluMemToDreg;
+        out.eaMode = ea;
+        out.aluOp = memAluOp;
+        out.srcReg = static_cast<u8>(reg);
+        out.dstReg = static_cast<u8>((op >> 9) & 7u);
+        out.size = static_cast<u8>(aluSizeFromOpmode(opmode));
+        // 読み方向は EA の形によらず 4 (m68k_ops_alu.cpp の各 return)。
+        out.cycles = 4;
+        return true;
     }
 
     // メモリ方向 (opmode 4/5/6) + mode 0 は、群ごとに意味の違う特殊形になる。
@@ -394,14 +512,43 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
             // (xxx).W は符号拡張、(xxx).L は 2 語を連結。
             p.imm = length == 4 ? sext16(ext0) : longValue;
             break;
+
+        // --- Tier B: 読み形の EA が持つ定数 ---
+        //
+        // **effectiveAddressSlow (m68k.cpp:509-545) と同じ合成にする。**
+        //   mode 5    : (d16,An) の d16 を符号拡張 (514-518 行)
+        //   mode 7.0  : (xxx).W は符号拡張される (534 行)
+        //   mode 7.1  : (xxx).L は 2 語を連結 (537-541 行)
+        // mode 2/3/4 は拡張ワードを持たないので 0 のまま。
+        case PlanKind::kMoveMemToDreg:
+        case PlanKind::kTstMem:
+        case PlanKind::kAluMemToDreg:
+            switch (p.eaMode)
+            {
+                case kEaDisp16:
+                case kEaAbsShort:
+                    p.imm = sext16(ext0);
+                    break;
+                case kEaAbsLong:
+                    p.imm = longValue;
+                    break;
+                default:
+                    p.imm = 0;
+                    break;
+            }
+            break;
         default:
             break;
     }
 }
 
 bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 entryPc,
-                        BlockPlan& out)
+                        BlockPlan& out, const PlanCapabilities& caps)
 {
+    // 読み形を積んでよいか。**教わっていなければ積んでよい** (段 1 以前と
+    // 同じ挙動)。教わった場合、窓が使えないなら読み形の手前で終端する。
+    const bool readsAllowed = caps.canEmitReads == nullptr || caps.canEmitReads(caps.ctx);
+
     // entryPc == 0 は空きスロットの番兵なので、そこからは翻訳しない。
     //
     // Why 要るか: BlockPlan::entryPc の 0 は「このスロットは空」を意味する。
@@ -473,6 +620,17 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // I2: 許可リストに入ること。
         PlannedOp planned{};
         if (!planOne(op, pc, planned))
+        {
+            out.end = BlockEnd::kUnsupported;
+            break;
+        }
+
+        // **エミッタが発行できない読み形は、積まずに終端する。**
+        //
+        // 積んでしまうとエミッタがブロックを丸ごと拒否する。読み形の手前で
+        // 終端すれば、短くても翻訳できるブロックが残る。1 つ入っただけで
+        // 全部失うのは、入れる前より悪い。
+        if (!readsAllowed && planned.eaMode != 0)
         {
             out.end = BlockEnd::kUnsupported;
             break;

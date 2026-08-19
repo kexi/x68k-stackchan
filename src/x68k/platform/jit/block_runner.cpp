@@ -87,10 +87,61 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     const PlanSource src{&readCodeWord, &ctx};
     const PlanGenSource gen{&pageGeneration, &mappingEpochOf, &ctx};
 
+    const M68k::CodeWindow window = cpu.codeWindowForJit();
+    EmitEnv env{};
+    if constexpr (sizeof(void*) == 4)
+    {
+        env.ramBaseAddr =
+            static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(window.ramBase));
+        env.ramLimit = window.ramLimit;
+        env.ramReadable = window.ramReadable;
+    }
+
+    // **翻訳器にエミッタの都合を教える。**
+    //
+    // 窓が読めない (ROM 写像中など) なら、読み形を積んだ時点でエミッタが
+    // ブロックを丸ごと拒否する。手前で終端させれば短くても翻訳できる。
+    struct CapsCtx
+    {
+        const EmitEnv* env;
+    };
+    CapsCtx capsCtx{&env};
+    const PlanCapabilities caps{[](void* c) -> bool
+                                {
+                                    const EmitEnv& e = *static_cast<CapsCtx*>(c)->env;
+                                    return e.ramReadable && e.ramBaseAddr != 0 && e.ramLimit != 0;
+                                },
+                                &capsCtx};
+
     BlockPlan plan{};
-    if (!BlockPlanner::plan(src, gen, entryPc, plan))
+    if (!BlockPlanner::plan(src, gen, entryPc, plan, caps))
     {
         ++stats_.translateFail;
+        // **飽和したページが増えると翻訳できなくなる。**
+        if (map.generation(entryPc) == CodeGenMap::kAlwaysStale)
+        {
+            //
+            // 世代は 16bit で、1KB ページに 65,536 回書くと飽和して
+            // kAlwaysStale で止まる。スタックやワーク領域なら数秒で届く。
+            // 飽和したページ上のコードは I9 で永久に翻訳を拒否される。
+            //
+            // 実測: 翻訳失敗 190 万件の **99.6% がこれ**だった。
+            // どれも $000000 台 (メインメモリ) で、範囲外ではなく飽和。
+            //
+            // 世代を 0 へ戻せば再び翻訳できる。**キャッシュを全部捨てる
+            // のと同時にしかやってはいけない** (控えを持ったまま戻すと
+            // 「変わっていない」と誤判定する)。ここは reset() を呼ぶので
+            // その条件を満たす。
+            ++saturatedSeen_;
+            if (saturatedSeen_ >= kSaturationResetThreshold)
+            {
+                reset();
+                map.resetGenerations();
+                saturatedSeen_ = 0;
+                ++stats_.generationReset;
+            }
+        }
+
         rememberFailure(entryPc, nowGen);
         return nullptr;
     }
@@ -107,7 +158,13 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         return nullptr;
     }
 
-    const std::size_t need = requiredSize(plan, fallIr, fallIrc);
+    // 窓の実体を焼く (G8)。**plan が控えた mappingEpoch と同じ呼び出しの
+    // 中で読む。** 実行前の鍵照合が epoch を見るので、窓が動けば走る前に
+    // このブロックは捨てられる。
+    //
+    // ホストアドレスを u32 で持つのは、ESP32-S3 のポインタが 32bit だから。
+    // 32bit でない環境では読み形を焼かない (env が 0 のまま = G12 で断る)。
+    const std::size_t need = requiredSize(plan, fallIr, fallIrc, env);
     if (need == 0)
     {
         ++stats_.translateFail;
@@ -140,7 +197,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     // **通常の RAM へ発行してから写す。** IRAM へバイト書き込みをすると
     // LoadStoreError で落ちる (実機で踏んだ)。
     EmittedBlock emitted{};
-    if (!emitBlock(plan, fallIr, fallIrc, staging_, need, emitted))
+    if (!emitBlock(plan, fallIr, fallIrc, env, staging_, need, emitted))
     {
         ++stats_.translateFail;
         rememberFailure(entryPc, nowGen);
@@ -246,12 +303,36 @@ NativeResult BlockRunner::run(M68k& cpu)
     const std::uint32_t ret = runBlock(&cpu.state(), slot->code);
 
     ++stats_.blocksRun;
+
+    const BlockReturn decoded = decodeBlockReturn(ret);
+    const u32 cycles = decoded.cycles;
+
+    if (decoded.guardExit)
+    {
+        // 読みガードが不成立で降りた。**実際に走った命令数だけ数える。**
+        ++stats_.guardExit;
+        stats_.insnsRun += decoded.ranOps;
+
+        // G10: 1 命令も進んでいないなら kDeferToStep を返す。
+        //
+        // **これが無いと Machine::run が used == 0 を halted と誤読する**か、
+        // 同じブロックを 0 サイクルで回し続ける。ガードは状態を 1 bit も
+        // 変えずに降りているので、NativeExec の「何も起きなかった」という
+        // 事後条件をそのまま満たす。
+        if (!guardExitMadeProgress(decoded))
+        {
+            ++stats_.deferGuard;
+            return NativeResult{0, NativeExit::kDeferToStep};
+        }
+
+        // 途中まで進んだ。残りは step() が本物の read16 / read32 で実行し、
+        // そこで例外 (アドレスエラー / バスエラー) や I/O の副作用が起きる。
+        return NativeResult{cycles, NativeExit::kRan};
+    }
+
     stats_.insnsRun += slot->count;
 
-    const bool branchTaken = (ret & kBranchTakenFlag) != 0;
-    const u32 cycles = ret & ~kBranchTakenFlag;
-
-    if (branchTaken)
+    if (decoded.branchTaken)
     {
         // 設計 §5.2: プリフェッチを詰め直すのは成立側だけ。
         if (!cpu.branchTo(slot->branchTarget))

@@ -51,7 +51,35 @@ enum class PlanKind : u8
     kClrDreg,          // CLR.b/w/l Dn。dstReg = 対象
     kLeaDisp,          // LEA (An),An / (d16,An),An。imm = 符号拡張済み変位
     kLeaAbs,           // LEA (xxx).W/L,An。imm = アドレス
+
+    // --- Tier B: メモリを**読む**形 ---
+    //
+    // Tier A との違いは、実効アドレスが窓の中に入っているかを
+    // **実行時に確かめないと分からない**こと。翻訳器は読める前提で
+    // 焼き、生成コードがガードで確かめて、外れたら step() へ降りる。
+    //
+    // どれも eaMode に読み出し側の EA を持つ (kEaNone 以外)。
+    // 書く方向は入れない (世代更新とアドレスエラーを背負う)。
+    kMoveMemToDreg,  // MOVE.b/w/l <mem>,Dn。srcReg = An 番号 / eaMode / imm
+    kTstMem,         // TST.b/w/l <mem>
+    kAluMemToDreg,   // ADD/SUB/AND/OR/CMP.b/w/l <mem>,Dn。kEor は入れない
 };
+
+// PlannedOp::eaMode の値。
+//
+// 68000 の mode 番号をそのまま使い、mode 7 だけは reg を足して区別する
+// (7.0 と 7.1 は拡張ワード数も意味も違うので、1 つの値にまとめられない)。
+//
+// **mode 6 と 7.2/7.3 は入れない。** mode 6 は拡張ワードの解釈 (インデックス
+// レジスタとスケール) が要り、7.2/7.3 は PC 相対で「翻訳時の PC」に依存する。
+// どちらも Tier B の読みガードとは別の検証面になる。
+inline constexpr u8 kEaNone = 0;         // 読み形ではない (Tier A の kind)
+inline constexpr u8 kEaIndirect = 2;     // (An)
+inline constexpr u8 kEaPostInc = 3;      // (An)+
+inline constexpr u8 kEaPreDec = 4;       // -(An)
+inline constexpr u8 kEaDisp16 = 5;       // (d16,An)。imm = sext16(d16)
+inline constexpr u8 kEaAbsShort = 0x70;  // (xxx).W。imm = 符号拡張済みアドレス
+inline constexpr u8 kEaAbsLong = 0x71;   // (xxx).L。imm = アドレス
 
 enum class PlanAluOp : u8
 {
@@ -94,7 +122,12 @@ struct PlannedOp
     u32 imm;          // kMoveq の符号拡張済み即値
     u8 cycles;        // この命令のサイクル。分岐は「不成立側」の値
     u8 cond;          // kBranch の条件コード (0 = BRA、2..15 = Bcc)
-    u8 pad[2];
+    // 読み形の実効アドレス (kEaNone / kEaIndirect / ... / kEaAbsLong)。
+    // **Tier A の kind では必ず kEaNone。** エミッタはこの欄で
+    // 「ガード列を吐くかどうか」を決めるので、埋め忘れると
+    // ガード無しでメモリを読む形になる。
+    u8 eaMode;
+    u8 pad;
 };
 
 // ブロックへ入れる命令数の上限。

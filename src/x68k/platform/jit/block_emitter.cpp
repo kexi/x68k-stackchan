@@ -58,6 +58,23 @@ constexpr std::uint32_t kLogicClear = kCcrN | kCcrZ | kCcrV | kCcrC;
 // ADD / SUB が壊す 5 ビット (X も書く)。
 constexpr std::uint32_t kArithClear = kLogicClear | kCcrX;
 
+// ガード不成立で降りる出口 1 つぶんの控え。
+//
+// 分岐 (bnez) は出口の島より**前**に発行されるので、変位はその時点では
+// 決まらない。書き先だけ控えておき、島を吐き終えてからパッチする
+// (emitBranchExit が既に使っている「slot を控えて後から書く」方式と同じ)。
+struct PendingGuard
+{
+    std::uint8_t* slot = nullptr;  // bnez を書き込む場所
+    size_t insnPc = 0;             // その bnez の位置 (codeBase 相対)
+    std::uint32_t opIndex = 0;     // 何番目の命令のガードか
+};
+
+// ガード付き命令は 1 つにつき分岐 1 本。kMaxOps = 4 なので 4 で足りるが、
+// 1 命令が 2 本のガードを持つ形 (窓を 2 つ見るなど) へ広げたときに
+// 黙って溢れないよう倍取る。溢れたら failed で諦める。
+constexpr size_t kMaxPendingGuards = 8;
+
 // 発行の状態。1 パスぶん。
 //
 // リテラルは「集めるだけのパス」と「書くパス」で同じ順・同じ内容になる。
@@ -75,7 +92,26 @@ struct Emitter
     std::uint32_t literals[kMaxLiterals] = {};
     size_t literalCount = 0;
 
+    // 翻訳時の窓。読み形のガードと、焼き込むホストアドレスの出どころ。
+    EmitEnv env{};
+
+    // ガード脱出の控え。発行順に積み、出口の島を吐いてからパッチする。
+    PendingGuard guards[kMaxPendingGuards] = {};
+    size_t guardCount = 0;
+
     bool failed = false;
+
+    // ガードの分岐を 1 本控える。書き先は呼び出し側が slot() で取る。
+    void addGuard(std::uint8_t* slot, size_t insnPc, std::uint32_t opIndex)
+    {
+        if (guardCount >= kMaxPendingGuards)
+        {
+            failed = true;
+            return;
+        }
+        guards[guardCount] = PendingGuard{slot, insnPc, opIndex};
+        ++guardCount;
+    }
 
     // 同じ値のリテラルは共有する。
     //
@@ -395,10 +431,13 @@ void emitClrDreg(Emitter& e, const PlannedOp& op)
     emitStoreCcr(e, kTmpCcr, kLogicClear);
 }
 
-// AND / OR のレジスタ間形。フラグは setLogicFlags と同じ。
-void emitLogicAlu(Emitter& e, const PlannedOp& op)
+// AND / OR。**src は kTmpA に載っている前提。**
+//
+// レジスタ間形とメモリ読み形で、フラグの式も切り詰めも同じでなければ
+// ならない。src の出どころだけが違うので、載せるところを呼び出し側に
+// 出して本体を 1 本にする。
+void emitLogicAluCore(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
     l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
     if (op.aluOp == PlanAluOp::kAnd)
     {
@@ -411,6 +450,13 @@ void emitLogicAlu(Emitter& e, const PlannedOp& op)
     emitTruncate(e, kTmpC, kTmpC, op.size);
     emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
     emitLogicFlags(e, kTmpC, op.size);
+}
+
+// AND / OR のレジスタ間形。
+void emitLogicAlu(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLogicAluCore(e, op);
 }
 
 // ADD / SUB / CMP のレジスタ間形。V と C を分岐なしのビット演算で作る。
@@ -429,7 +475,8 @@ void emitLogicAlu(Emitter& e, const PlannedOp& op)
 //
 // CMP は値を書かず X も触らない (applyFlags(sr, r, false))。
 // ADD / SUB は X に C と同じ値を書く。
-void emitArithAlu(Emitter& e, const PlannedOp& op)
+// **src は kTmpA に載っている前提。**
+void emitArithAluCore(Emitter& e, const PlannedOp& op)
 {
     const std::uint32_t size = op.size;
     const std::uint32_t bits = sizeBits(size);
@@ -445,7 +492,6 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
     // 依存しているから。段 3 でレジスタに値を寝かせる最適化を入れて r の
     // 切り詰めを出口へ移した瞬間、V と C が上位の桁を拾い始める。
     // **等価性が別の場所の実装に依存している形は、崩れたことに気づけない。**
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
     l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
     emitTruncate(e, kTmpA, kTmpA, size);  // s
     emitTruncate(e, kTmpB, kTmpB, size);  // d
@@ -529,18 +575,375 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
     }
 }
 
-// 非分岐終端 / 分岐不成立の出口。pc / ir / irc を定数で書き、サイクル数を返す。
-void emitFallThroughExit(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc,
-                         std::uint32_t cycles)
+// ADD / SUB / CMP のレジスタ間形。
+void emitArithAlu(Emitter& e, const PlannedOp& op)
 {
-    emitConst(e, kTmpA, plan.fallThroughPc + 4u);
+    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitArithAluCore(e, op);
+}
+
+// 演算種別で本体を選ぶ。**レジスタ間形とメモリ読み形で同じ関数を通す。**
+// 片方だけに命令を足したときに食い違わないよう、選び方を 1 箇所にする。
+void emitAluBody(Emitter& e, const PlannedOp& op)
+{
+    const bool isLogic = op.aluOp == PlanAluOp::kAnd || op.aluOp == PlanAluOp::kOr;
+    if (isLogic)
+    {
+        emitLogicAluCore(e, op);
+        return;
+    }
+    const bool isArith =
+        op.aluOp == PlanAluOp::kAdd || op.aluOp == PlanAluOp::kSub || op.aluOp == PlanAluOp::kCmp;
+    if (isArith)
+    {
+        emitArithAluCore(e, op);
+        return;
+    }
+    // kEor は翻訳器が積まない。積まれたなら対応範囲がずれているので諦める。
+    e.failed = true;
+}
+
+// --- Tier B: 読みガード ----------------------------------------------------
+//
+// ここから下の 4 つが「メモリを読む形」の全部。守る不変条件は 3 つ:
+//
+//   G1 読みの同値   ガードが通ったとき読むバイト列は、インタプリタの
+//                   read8/16/32 が fast path を通ったときと同一
+//   G3 commit の順  アーキテクチャ状態への書き込みは、最後のガード分岐より
+//                   後にしか現れない ((An)+ / -(An) の An 更新を含む)
+//   G7 出口の状態   降りる先は「その命令の直前の命令境界」
+
+// ゲストアドレスの 24bit マスク。read8/16/32 が addr & kAddrMask で
+// 始めるのと同じ (m68k.cpp:256 / 271 / 301)。
+constexpr std::uint32_t kGuestAddrMask = 0x00FFFFFFu;
+
+// (An)+ / -(An) の増減幅。**A7 をバイトで触るときだけ 2。**
+// m68k.h:440-458 の step と同じ式。スタックポインタが奇数になると
+// アドレスエラーになるための特例。
+constexpr std::uint32_t eaStep(const PlannedOp& op)
+{
+    const bool isStackPointerByte = op.srcReg == 7 && op.size == 1;
+    return isStackPointerByte ? 2u : op.size;
+}
+
+// 読み形かどうか。
+constexpr bool isMemoryRead(const PlannedOp& op)
+{
+    return op.eaMode != kEaNone;
+}
+
+// 絶対アドレス形 (7.0 / 7.1) は実効アドレスが翻訳時定数。
+constexpr bool isAbsoluteEa(std::uint8_t eaMode)
+{
+    return eaMode == kEaAbsShort || eaMode == kEaAbsLong;
+}
+
+// G1 の条件を**翻訳時に**評価する (絶対アドレス形と、範囲の事前判定に使う)。
+//
+// byte : a < limit
+// word : (a & 1) == 0 かつ a + 1 < limit
+// long : (a & 1) == 0 かつ a + 3 < limit
+//
+// **奇数の判定を範囲より先に見る。** read16 / read32 が
+// takeAddressError を範囲判定より前に置いているのと同じ順序 (m68k.cpp:272/302)。
+bool guestReadFits(const EmitEnv& env, std::uint32_t addr, std::uint32_t size)
+{
+    const std::uint32_t a = addr & kGuestAddrMask;
+    const bool misaligned = size != 1 && (a & 1u) != 0;
+    if (misaligned)
+    {
+        return false;
+    }
+    // a + size - 1 < limit。**桁あふれさせない**ので引き算の形で見る。
+    if (env.ramLimit < size)
+    {
+        return false;
+    }
+    return a <= env.ramLimit - size;
+}
+
+// 実効アドレスを kTmpA へ作る。**状態は 1 bit も変えない** (G3)。
+//
+// mode 3 / 4 の An 更新はここではやらない。ガードが通ってから
+// emitCommitAddressRegister が行う (G4)。
+//
+// 無マスクの値 (commit に使う) を kTmpB に、マスク済みの
+// アクセス用アドレスを kTmpA に置く。
+void emitEffectiveAddress(Emitter& e, const PlannedOp& op)
+{
+    const std::uint32_t step = eaStep(op);
+
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.srcReg));
+    if (op.eaMode == kEaPreDec)
+    {
+        // -(An) は**引いてから**アクセスする (m68k.h:454-457)。
+        // 32bit 無マスクの環算なので、0 からのラップもそのまま再現される。
+        if (!canAddi(-static_cast<std::int32_t>(step)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpB, kTmpB, -static_cast<std::int32_t>(step));
+    }
+    else if (op.eaMode == kEaDisp16)
+    {
+        // (d16,An) = An + sext16(d16)。d16 は翻訳時定数 (m68k.cpp:514-518)。
+        if (op.imm != 0)
+        {
+            emitConst(e, kTmpConst, op.imm);
+            addN(e.slot(kNarrowLen), kTmpB, kTmpB, kTmpConst);
+        }
+    }
+
+    // アクセスに使うのはマスク済みの値だけ。**commit する値はマスクしない**
+    // (インタプリタも a[] には無マスクの値を書く)。
+    emitConst(e, kTmpConst, kGuestAddrMask);
+    and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
+}
+
+// ガード列。失敗を 1 本のビットへ畳んで分岐 1 つで降りる。
+//
+// **ここを通るまで状態を書かない** (G3)。分岐の変位は出口の島を吐いてから
+// パッチするので、ここでは場所だけ確保する。
+void emitReadGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
+{
+    const std::uint32_t size = op.size;
+
+    // 失敗ビットを kTmpD へ集める。
+    const bool needsAlignment = size != 1;
+    if (needsAlignment)
+    {
+        // 奇数なら bit0 が立つ。word / long だけが見る (read16:272 / read32:302)。
+        extui(e.slot(kWideLen), kTmpD, kTmpA, 0u, 1u);
+    }
+
+    // 範囲: (limit - size) - a の符号ビットが立てば範囲外。
+    //
+    // **limit - size は翻訳時定数**にできる。limit < size なら窓が
+    // その読みを絶対に許さないので、翻訳ごと諦める (下の呼び出し側で弾く)。
+    const std::uint32_t bound = e.env.ramLimit - size;
+    emitConst(e, kTmpConst, bound);
+    sub(e.slot(kWideLen), kTmpE, kTmpConst, kTmpA);
+    extui(e.slot(kWideLen), kTmpE, kTmpE, 31u, 1u);
+
+    if (needsAlignment)
+    {
+        or_(e.slot(kWideLen), kTmpD, kTmpD, kTmpE);
+    }
+    else
+    {
+        movN(e.slot(kNarrowLen), kTmpD, kTmpE);
+    }
+
+    // 失敗なら出口の島へ。**変位は後でパッチする。**
+    const size_t insnPc = e.codeBase + e.cursor;
+    std::uint8_t* slot = e.slot(kWideLen);
+    e.addGuard(slot, insnPc, opIndex);
+}
+
+// (An)+ / -(An) の An 更新を確定させる (G4)。**ガードが通ってから呼ぶ。**
+//
+// 値は 32bit 無マスクの環算。アクセス用に作ったマスク済みアドレスではなく、
+// kTmpB に残した無マスクの値を使う。
+void emitCommitAddressRegister(Emitter& e, const PlannedOp& op)
+{
+    if (op.eaMode == kEaPostInc)
+    {
+        // (An)+ は**読んだ後のアドレス**を書く。kTmpB は増やす前の値。
+        const std::uint32_t step = eaStep(op);
+        if (!canAddi(static_cast<std::int32_t>(step)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpC, kTmpB, static_cast<std::int32_t>(step));
+        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.srcReg));
+        return;
+    }
+    if (op.eaMode == kEaPreDec)
+    {
+        // -(An) は既に引いた値がアクセス先そのもの。
+        s32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.srcReg));
+    }
+}
+
+// ホストのバイト列から値を組む。**ビッグエンディアンで組む** (G1)。
+//
+// hostBase が翻訳時定数のときは l32r 1 本で済ませ、そうでなければ
+// 窓の先頭 + マスク済みアドレスを足す。読み先は kTmpA (マスク済み) 側。
+//
+// Why not l16ui / l32i で一気に読まないか: ゲストはビッグエンディアンで、
+// ホスト (Xtensa) はリトルエンディアン。まとめて読むとバイトが逆になり、
+// さらにホスト側の整列も前提に入る。バイトずつなら
+// m68k.cpp:282 / 311-312 と同じ式をそのまま写せる。
+void emitBigEndianLoad(Emitter& e, std::uint32_t size, bool addressIsConst,
+                       std::uint32_t constHostAddr)
+{
+    if (addressIsConst)
+    {
+        emitConst(e, kTmpE, constHostAddr);
+    }
+    else
+    {
+        emitConst(e, kTmpConst, e.env.ramBaseAddr);
+        addN(e.slot(kNarrowLen), kTmpE, kTmpConst, kTmpA);
+    }
+
+    if (size == 1)
+    {
+        l8ui(e.slot(kWideLen), kTmpC, kTmpE, 0u);
+        return;
+    }
+
+    // 上位バイトから順に読み、8 ビットずつ寄せて or する。
+    l8ui(e.slot(kWideLen), kTmpC, kTmpE, 0u);
+    for (std::uint32_t i = 1; i < size; ++i)
+    {
+        l8ui(e.slot(kWideLen), kTmpD, kTmpE, i);
+        slli(e.slot(kWideLen), kTmpC, kTmpC, 8u);
+        or_(e.slot(kWideLen), kTmpC, kTmpC, kTmpD);
+    }
+}
+
+// ALU の本体を「src が既にレジスタに載っている」形で出す。
+//
+// emitLogicAlu / emitArithAlu との違いは src の出どころだけ。フラグの式は
+// 同じでなければならないので、共通の本体 (emitAluBody) を両方から呼ぶ。
+void emitAluWithSrcInReg(Emitter& e, const PlannedOp& op, XReg srcReg)
+{
+    if (srcReg != kTmpA)
+    {
+        movN(e.slot(kNarrowLen), kTmpA, srcReg);
+    }
+    emitAluBody(e, op);
+}
+
+// 読み形 1 命令。ガード → commit → 読み → 本体、の順に出す。
+//
+// **順序が契約そのもの。** commit (An 更新) と本体 (d/sr への書き込み) は
+// どちらもアーキテクチャ状態を変えるので、ガードの分岐より後にしか
+// 現れてはいけない (G3)。
+void emitMemoryRead(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
+{
+    const std::uint32_t size = op.size;
+    const bool absolute = isAbsoluteEa(op.eaMode);
+
+    if (absolute)
+    {
+        // G6: 絶対アドレスは実効アドレスが翻訳時定数。**ガードを翻訳時に
+        // 評価する。** 成立ならガード無しで焼き、ホストアドレスまで
+        // 定数に畳む。不成立の命令はここへ来ない (呼び出し側が積まない)。
+        const std::uint32_t addr = op.imm & kGuestAddrMask;
+        if (!guestReadFits(e.env, addr, size))
+        {
+            e.failed = true;
+            return;
+        }
+        emitBigEndianLoad(e, size, /*addressIsConst=*/true, e.env.ramBaseAddr + addr);
+    }
+    else
+    {
+        emitEffectiveAddress(e, op);
+        if (e.failed)
+        {
+            return;
+        }
+        emitReadGuard(e, op, opIndex);
+        // --- ここから下はガードが通ったときだけ走る ---
+        emitCommitAddressRegister(e, op);
+        if (e.failed)
+        {
+            return;
+        }
+        emitBigEndianLoad(e, size, /*addressIsConst=*/false, 0u);
+    }
+
+    // 読めた値は kTmpC に、size で切り出し済みの形で入っている
+    // (バイトから組んだので上位は必ず 0)。
+    switch (op.kind)
+    {
+        case PlanKind::kMoveMemToDreg:
+            emitWriteDataRegister(e, op.dstReg, kTmpC, size);
+            emitLogicFlags(e, kTmpC, size);
+            return;
+        case PlanKind::kTstMem:
+            // **読むだけで書かない。**
+            emitLogicFlags(e, kTmpC, size);
+            return;
+        case PlanKind::kAluMemToDreg:
+            emitAluWithSrcInReg(e, op, kTmpC);
+            return;
+        default:
+            e.failed = true;
+            return;
+    }
+}
+
+// ガード脱出の出口で irc に入る語 = mem16(opPc + 2) を求める (I11)。
+//
+// **導出はここ 1 箇所だけに置く。** 出どころが 3 つに分かれるので、
+// 散らばると片方だけ直したときに気づけない。テストが全ケースで
+// 「実メモリの mem16(opPc + 2)」と突き合わせる。
+//
+//   長さ 2 (mode 2/3/4)  : opPc + 2 は**次の命令語**。
+//                          最後の命令なら fallThroughIr、そうでなければ
+//                          ops[k + 1].op (I4 が同一ページを保証している)
+//   長さ 4 (mode 5, 7.0) : opPc + 2 は第 1 拡張ワード。
+//                          imm は sext16 した値なので下位 16bit が原文
+//
+// **長さ 6 はここへ来ない。** 6 バイトになるのは (xxx).L だけで、絶対
+// アドレス形はガードを持たない (実効アドレスが翻訳時定数なので、G6 が
+// 翻訳時に判定して不成立なら積まない)。ガードを持たない命令は脱出の
+// 出口を作らないので、この関数の呼び出し対象にならない。
+// 「念のため」で長さ 6 を扱う枝を置くと、**テストが到達できない枝**が
+// 残り、壊れても誰も気づけなくなる。来たら諦める。
+//
+// 戻り値 false は「導出できない」。呼び出し側はその命令を積まない。
+bool guardExitIrc(const BlockPlan& plan, std::uint32_t k, std::uint16_t fallThroughIr,
+                  std::uint16_t& out)
+{
+    const PlannedOp& op = plan.ops[k];
+    if (op.length == 2)
+    {
+        const bool isLast = k + 1 >= plan.count;
+        out = isLast ? fallThroughIr : plan.ops[k + 1].op;
+        return true;
+    }
+    if (op.length == 4)
+    {
+        // sext16 は下位 16bit を変えないので、原文がそのまま取り出せる。
+        out = static_cast<std::uint16_t>(op.imm & 0xFFFFu);
+        return true;
+    }
+    return false;
+}
+
+// 命令境界の出口。pc / ir / irc を定数で書き、戻り値を返す。
+//
+// **nextInsnPc は「次に実行する命令語のアドレス」**で、出口の pc は
+// そこ + 4 になる (プリフェッチの契約: pc == 命令語 + 4、
+// ir == mem16(命令語)、irc == mem16(命令語 + 2))。
+//
+// 非分岐終端・分岐不成立・ガード脱出の 3 つが同じ形をしているので、
+// 1 つにまとめて retConst だけを変える。
+void emitBoundaryExit(Emitter& e, std::uint32_t nextInsnPc, std::uint16_t ir, std::uint16_t irc,
+                      std::uint32_t retConst)
+{
+    emitConst(e, kTmpA, nextInsnPc + 4u);
     s32i(e.slot(kWideLen), kTmpA, kState, kStatePcOffset);
     emitConst(e, kTmpA, ir);
     s16i(e.slot(kWideLen), kTmpA, kState, kStateIrOffset);
     emitConst(e, kTmpA, irc);
     s16i(e.slot(kWideLen), kTmpA, kState, kStateIrcOffset);
-    emitConst(e, kRet, cycles);
+    emitConst(e, kRet, retConst);
     retN(e.slot(kNarrowLen));
+}
+
+// 非分岐終端 / 分岐不成立の出口。
+void emitFallThroughExit(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc,
+                         std::uint32_t cycles)
+{
+    emitBoundaryExit(e, plan.fallThroughPc, ir, irc, cycles);
 }
 
 // 分岐の条件コードを評価して CCR から真偽を作る。
@@ -666,6 +1069,63 @@ void emitBranchExit(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::ui
     emitFallThroughExit(e, plan, ir, irc, plan.cyclesNotTaken);
 }
 
+// ガード脱出の出口を、終端出口の**後ろ**にまとめて並べる (§4 の「出口の島」)。
+//
+// **島は終端出口の後ろにしか置けない。** 途中に置くと、ガードを通った
+// 直線の実行がそのまま島へ落ちてしまう。後ろに置けば、届くのは
+// bnez で飛んできたときだけになる。
+//
+// 出口の状態は「その命令の直前の命令境界」(G7):
+//   pc     = opPc + 4      (次に実行する命令語 = opPc なので +4)
+//   ir     = ops[k].op     (その命令語そのもの)
+//   irc    = mem16(opPc+2) (guardExitIrc が導く)
+//   cycles = Σ ops[0..k-1] (その命令はまだ実行していない)
+//
+// ガード無しのブロックでは 1 バイトも吐かないので、既存の決定性テストと
+// バイト列が変わらない。
+void emitGuardExitIslands(Emitter& e, const BlockPlan& plan, std::uint16_t fallThroughIr)
+{
+    for (size_t g = 0; g < e.guardCount; ++g)
+    {
+        const PendingGuard& pending = e.guards[g];
+        const std::uint32_t k = pending.opIndex;
+        const PlannedOp& op = plan.ops[k];
+
+        std::uint16_t irc = 0;
+        if (!guardExitIrc(plan, k, fallThroughIr, irc))
+        {
+            e.failed = true;
+            return;
+        }
+
+        // その命令の手前までのサイクル。**その命令ぶんは足さない。**
+        std::uint32_t cycles = 0;
+        for (std::uint32_t i = 0; i < k; ++i)
+        {
+            cycles += plan.ops[i].cycles;
+        }
+
+        // 島の先頭 = この bnez の飛び先。
+        const size_t stubPc = e.codeBase + e.cursor;
+        const std::uint32_t ret = kGuardExitFlag | (k << kGuardCountShift) | (cycles & kCycleMask);
+        emitBoundaryExit(e, op.pc, op.op, irc, ret);
+
+        // 前方参照だった bnez をここでパッチする。
+        //
+        // **変位は codeBase 相対の差**なので、codeBase = 0 の集めるパスでも
+        // 本番でも同じ値になる (l32r と違って検査を遅らせなくてよい)。
+        const std::int32_t disp = static_cast<std::int32_t>(stubPc) -
+                                  (static_cast<std::int32_t>(pending.insnPc) + kBranchOrigin);
+        if (!canBranch12(disp))
+        {
+            e.failed = true;
+            return;
+        }
+        // 集めるパスでは slot が scratch を指すので、書いても無害。
+        bnez(pending.slot, kTmpD, disp);
+    }
+}
+
 // ブロック 1 本を吐く。集めるパスと本番で同じ経路を通る。
 void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc)
 {
@@ -737,6 +1197,13 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
             case PlanKind::kClrDreg:
                 emitClrDreg(e, op);
                 break;
+
+            // --- Tier B: メモリを読む形 ---
+            case PlanKind::kMoveMemToDreg:
+            case PlanKind::kTstMem:
+            case PlanKind::kAluMemToDreg:
+                emitMemoryRead(e, op, i);
+                break;
         }
         if (e.failed)
         {
@@ -752,17 +1219,60 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
     {
         emitFallThroughExit(e, plan, ir, irc, plan.cyclesNotTaken);
     }
+
+    emitGuardExitIslands(e, plan, ir);
+}
+
+// 読み形を含む計画を、この窓で発行してよいか (G6 / G12)。
+//
+// **翻訳時に決められることは翻訳時に決める。** 走らせてから諦める形にすると、
+// 「絶対に成立しないガード」を毎回踏むブロックができる。
+bool canEmitReads(const BlockPlan& plan, const EmitEnv& env)
+{
+    for (std::uint32_t i = 0; i < plan.count; ++i)
+    {
+        const PlannedOp& op = plan.ops[i];
+        if (!isMemoryRead(op))
+        {
+            continue;
+        }
+
+        // G12: 窓が無い / 読めない写像では、読み形を焼かない。
+        const bool windowUnusable = !env.ramReadable || env.ramBaseAddr == 0 || env.ramLimit == 0;
+        if (windowUnusable)
+        {
+            return false;
+        }
+
+        // 窓がこのサイズの読みを一度も許さないなら、ガードは常に不成立。
+        if (env.ramLimit < op.size)
+        {
+            return false;
+        }
+
+        // G6: 絶対アドレスは翻訳時にガードを評価する。**不成立なら積まない。**
+        if (isAbsoluteEa(op.eaMode) && !guestReadFits(env, op.imm, op.size))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 // リテラルを集めるパスを回して、必要な語数とコード長を得る。
-bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, size_t& literalCount,
-             size_t& codeLen)
+bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const EmitEnv& env,
+             size_t& literalCount, size_t& codeLen)
 {
     if (plan.count == 0 || plan.count > kMaxOps)
     {
         return false;
     }
+    if (!canEmitReads(plan, env))
+    {
+        return false;
+    }
     Emitter e{};
+    e.env = env;
     emitAll(e, plan, ir, irc);
     if (e.failed)
     {
@@ -776,11 +1286,11 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, size_t&
 }  // namespace
 
 size_t requiredSize(const BlockPlan& plan, std::uint16_t fallThroughIr,
-                    std::uint16_t fallThroughIrc)
+                    std::uint16_t fallThroughIrc, const EmitEnv& env)
 {
     size_t literalCount = 0;
     size_t codeLen = 0;
-    if (!measure(plan, fallThroughIr, fallThroughIrc, literalCount, codeLen))
+    if (!measure(plan, fallThroughIr, fallThroughIrc, env, literalCount, codeLen))
     {
         return 0;
     }
@@ -791,11 +1301,11 @@ size_t requiredSize(const BlockPlan& plan, std::uint16_t fallThroughIr,
 }
 
 bool emitBlock(const BlockPlan& plan, std::uint16_t fallThroughIr, std::uint16_t fallThroughIrc,
-               std::uint8_t* out, size_t capacity, EmittedBlock& result)
+               const EmitEnv& env, std::uint8_t* out, size_t capacity, EmittedBlock& result)
 {
     size_t literalCount = 0;
     size_t codeLen = 0;
-    if (!measure(plan, fallThroughIr, fallThroughIrc, literalCount, codeLen))
+    if (!measure(plan, fallThroughIr, fallThroughIrc, env, literalCount, codeLen))
     {
         return false;
     }
@@ -811,6 +1321,7 @@ bool emitBlock(const BlockPlan& plan, std::uint16_t fallThroughIr, std::uint16_t
     e.out = out;
     e.capacity = capacity;
     e.codeBase = codeBase;
+    e.env = env;
     emitAll(e, plan, fallThroughIr, fallThroughIrc);
     if (e.failed || e.cursor != codeLen || e.literalCount != literalCount)
     {

@@ -47,6 +47,25 @@ struct PlanGenSource
     void* ctx;
 };
 
+// 読み形をブロックへ入れてよいか。
+//
+// **翻訳器がエミッタの都合を知る唯一の口。** 読み形はガードで窓を検査する
+// ので、窓が使えない状態 (ROM 写像中で RAM が読めない、窓が未設定) では
+// 発行できない。
+//
+// Why 翻訳器に教えるのか: 教えないと、翻訳器が読み形を積んだブロックを
+// エミッタが**丸ごと**拒否する。読み形の手前で終端していれば短くても
+// 翻訳できたのに、1 つ入っただけで全部失うので、**入れる前より悪くなる**。
+// 実際に踏んだ (翻訳失敗 1,944 → 2,198,539、クロック 6493 → 6316)。
+//
+// 既定 (nullptr) は「入れてよい」。テストが窓を持たない場合に段 1 以前と
+// 同じ挙動になる。
+struct PlanCapabilities
+{
+    bool (*canEmitReads)(void* ctx);
+    void* ctx;
+};
+
 class BlockPlanner
 {
 public:
@@ -56,7 +75,8 @@ public:
     //         (呼び出し側は kDeferToStep を返して step() へ落とす)。
     //
     // false のとき out の中身は未規定。true のときだけ読むこと。
-    static bool plan(const PlanSource& src, const PlanGenSource& gen, u32 entryPc, BlockPlan& out);
+    static bool plan(const PlanSource& src, const PlanGenSource& gen, u32 entryPc, BlockPlan& out,
+                     const PlanCapabilities& caps = PlanCapabilities{});
 
     // 1 命令ぶんを解析する。
     //
