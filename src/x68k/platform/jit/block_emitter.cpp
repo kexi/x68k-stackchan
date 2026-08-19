@@ -163,6 +163,13 @@ constexpr std::uint32_t dOffset(std::uint32_t reg)
     return kStateDOffset + reg * 4u;
 }
 
+// a[reg] のバイトオフセット。最大 60 で s32i の範囲に収まり、
+// usp (64) / ssp (68) とは重ならない。
+constexpr std::uint32_t aOffset(std::uint32_t reg)
+{
+    return kStateAOffset + reg * 4u;
+}
+
 // サイズ (1/2/4 バイト) からビット数。
 constexpr std::uint32_t sizeBits(std::uint32_t size)
 {
@@ -233,6 +240,23 @@ void emitWriteDataRegister(Emitter& e, std::uint32_t reg, XReg valueReg, std::ui
 }
 
 // レジスタの下位 size バイトを取り出す (上位をゼロにする)。
+// 下位 16bit を符号拡張する。dst == src でもよい。**kTmpD を潰す。**
+//
+// Why not srai をエンコーダに足さないか: 足すと xtensa_encoder.h と
+// テストのミニ解釈器とエンコーダのテストの 3 箇所に検証面が増える。
+// extui / slli / sub は全部既存なので、追加の検証がゼロで済む。
+// 命令数の差は 2 で、MOVEA.w でしか通らない。
+//
+// 仕組み: w = 下位 16bit、sign = bit15 として w - (sign << 16)。
+// w=0x8000 なら 0x8000 - 0x10000 = 0xFFFF8000。w=0x7FFF ならそのまま。
+void emitSext16(Emitter& e, XReg dst, XReg src)
+{
+    extui(e.slot(kWideLen), dst, src, 0u, 16u);
+    extui(e.slot(kWideLen), kTmpD, src, 15u, 1u);
+    slli(e.slot(kWideLen), kTmpD, kTmpD, 16u);
+    sub(e.slot(kWideLen), dst, dst, kTmpD);
+}
+
 void emitTruncate(Emitter& e, XReg dstReg, XReg srcReg, std::uint32_t size)
 {
     if (size == 4)
@@ -275,6 +299,100 @@ void emitMove(Emitter& e, const PlannedOp& op)
     emitTruncate(e, kTmpC, kTmpA, op.size);
     emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
     emitLogicFlags(e, kTmpC, op.size);
+}
+
+// MOVE.w/l An,Dn。転送元が a[] になるだけで、あとは MOVE と同じ。
+//
+// interpreter は readEa mode 1 で符号拡張した値を writeEa / setLogicFlags へ
+// 渡すが、どちらも内部で size にマスクするので、切り詰めた値で等価。
+void emitMoveAregToDreg(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.srcReg));
+    emitTruncate(e, kTmpC, kTmpA, op.size);
+    emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
+    emitLogicFlags(e, kTmpC, op.size);
+}
+
+// MOVE.b/w/l #imm,Dn。**CCR は翻訳時に決まる。**
+//
+// 即値は planner が size でマスク済みなので、N と Z をここで畳める。
+void emitMoveImmToDreg(Emitter& e, const PlannedOp& op)
+{
+    emitConst(e, kTmpA, op.imm);
+    emitWriteDataRegister(e, op.dstReg, kTmpA, op.size);
+
+    const std::uint32_t signBit = 1u << (sizeBits(op.size) - 1u);
+    std::uint32_t ccr = 0;
+    if (op.imm == 0)
+    {
+        ccr |= kCcrZ;
+    }
+    if ((op.imm & signBit) != 0)
+    {
+        ccr |= kCcrN;
+    }
+    emitConst(e, kTmpCcr, ccr);
+    emitStoreCcr(e, kTmpCcr, kLogicClear);
+}
+
+// MOVEA.w/l。**フラグを 1 つも変えない。**
+//
+// emitStoreCcr を呼ばないことがそのまま「フラグ不変」の実装になっている。
+// MOVE と同じだろうと思って emitLogicFlags を足すと壊れる。
+//
+// .w は符号拡張して 32bit 全体を書く (m68k_ops_move.cpp の MOVEA 経路)。
+void emitMovea(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
+{
+    const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
+    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    if (op.size == 2)
+    {
+        emitSext16(e, kTmpA, kTmpA);
+    }
+    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+}
+
+// MOVEA #imm,An と LEA (xxx).W/L,An。どちらも「定数を a[] へ入れる」だけ。
+// 符号拡張は翻訳時に済んでいる。フラグは変えない。
+void emitLoadAregConst(Emitter& e, const PlannedOp& op)
+{
+    emitConst(e, kTmpA, op.imm);
+    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+}
+
+// LEA (An),An / (d16,An),An。**アドレスを求めるだけで読まない。**
+// フラグは変えない。
+void emitLeaDisp(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.srcReg));
+    if (op.imm != 0)
+    {
+        // 変位が 0 かどうかは翻訳時に決まるので、生成コードは決定的。
+        emitConst(e, kTmpB, op.imm);
+        addN(e.slot(kNarrowLen), kTmpA, kTmpA, kTmpB);
+    }
+    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+}
+
+// TST.b/w/l Dn。**読むだけで d[] には書かない。**
+// N/Z を立て V/C をクリア。X は保存 (kLogicClear に X が無い)。
+void emitTstDreg(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitTruncate(e, kTmpC, kTmpA, op.size);
+    emitLogicFlags(e, kTmpC, op.size);
+}
+
+// CLR.b/w/l Dn。**CCR は翻訳時に決まる** (結果が必ず 0 なので Z=1)。
+//
+// 68000 の CLR は読んでから書く RMW だが、mode 0 の読みは
+// readEaForModify が d[] を返すだけで副作用が無い。だから読まずに書ける。
+void emitClrDreg(Emitter& e, const PlannedOp& op)
+{
+    emitConst(e, kTmpC, 0);
+    emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
+    emitConst(e, kTmpCcr, kCcrZ);
+    emitStoreCcr(e, kTmpCcr, kLogicClear);
 }
 
 // AND / OR のレジスタ間形。フラグは setLogicFlags と同じ。
@@ -592,21 +710,32 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 e.failed = true;
                 break;
 
-            // --- Tier A: planner は積むが、エミッタはまだ発行できない ---
-            //
-            // **必ず failed を立てる。** 立て忘れると「何も発行しないまま
-            // 成功したことにする」形になり、その命令が実行されずに飛ばされる。
-            // 翻訳器の対応範囲がエミッタより先に広がったときの安全弁。
+            // --- Tier A: メモリに触れず例外も起きない形 ---
             case PlanKind::kMoveAregToDreg:
+                emitMoveAregToDreg(e, op);
+                break;
             case PlanKind::kMoveImmToDreg:
+                emitMoveImmToDreg(e, op);
+                break;
             case PlanKind::kMoveaDregToAreg:
+                emitMovea(e, op, /*srcIsAddressRegister=*/false);
+                break;
             case PlanKind::kMoveaAregToAreg:
+                emitMovea(e, op, /*srcIsAddressRegister=*/true);
+                break;
             case PlanKind::kMoveaImmToAreg:
-            case PlanKind::kTstDreg:
-            case PlanKind::kClrDreg:
-            case PlanKind::kLeaDisp:
             case PlanKind::kLeaAbs:
-                e.failed = true;
+                // どちらも「翻訳時に決まった定数を a[] へ入れる」だけ。
+                emitLoadAregConst(e, op);
+                break;
+            case PlanKind::kLeaDisp:
+                emitLeaDisp(e, op);
+                break;
+            case PlanKind::kTstDreg:
+                emitTstDreg(e, op);
+                break;
+            case PlanKind::kClrDreg:
+                emitClrDreg(e, op);
                 break;
         }
         if (e.failed)

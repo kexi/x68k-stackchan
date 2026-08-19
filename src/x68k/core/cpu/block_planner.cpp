@@ -365,6 +365,40 @@ bool BlockPlanner::planOne(u16 op, u32 pc, PlannedOp& out)
     }
 }
 
+// 拡張ワード由来の即値を PlannedOp へ畳む。
+//
+// **読み方は interpreter と揃える。** readEaSlow の 7.4 (即値) と
+// effectiveAddressSlow の mode 5 / 7.0 / 7.1 が、それぞれどう合成して
+// いるかに合わせる。ずれると値が静かに変わる。
+void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
+{
+    const auto sext16 = [](u16 v)
+    { return static_cast<u32>(static_cast<s32>(static_cast<s16>(v))); };
+    const u32 longValue = (static_cast<u32>(ext0) << 16) | ext1;
+
+    switch (p.kind)
+    {
+        case PlanKind::kMoveImmToDreg:
+            // size でマスクする。byte は下位バイトだけ。
+            p.imm = p.size == 4 ? longValue : (p.size == 1 ? (ext0 & 0xFFu) : ext0);
+            break;
+        case PlanKind::kMoveaImmToAreg:
+            // MOVEA.w は符号拡張して 32bit 全体を書く。
+            p.imm = p.size == 4 ? longValue : sext16(ext0);
+            break;
+        case PlanKind::kLeaDisp:
+            // (An) 形 (length == 2) は変位を持たない。
+            p.imm = length == 4 ? sext16(ext0) : 0;
+            break;
+        case PlanKind::kLeaAbs:
+            // (xxx).W は符号拡張、(xxx).L は 2 語を連結。
+            p.imm = length == 4 ? sext16(ext0) : longValue;
+            break;
+        default:
+            break;
+    }
+}
+
 bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 entryPc,
                         BlockPlan& out)
 {
@@ -469,8 +503,12 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // 拡張ワードも窓の中にあること (I3 の残り)。
         // 段 1 の許可リストで 4 バイトになるのは Bcc.w だけだが、
         // 命令ごとに書き分けると足したときに漏れるので長さから回す。
+        // **2 語まで集める。** MOVE.l #imm と LEA (xxx).L は 6 バイトで
+        // 拡張が 2 語ある。1 語しか持たないと即値の上位が落ちる。
         bool extensionsReadable = true;
         u16 lastExtension = 0;
+        u16 extension[2] = {0, 0};
+        u32 extensionCount = 0;
         for (u32 offset = 2; offset < length; offset += 2)
         {
             if (!src.read16(src.ctx, pc + offset, lastExtension))
@@ -478,12 +516,24 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
                 extensionsReadable = false;
                 break;
             }
+            if (extensionCount < 2)
+            {
+                extension[extensionCount] = lastExtension;
+                ++extensionCount;
+            }
         }
         if (!extensionsReadable)
         {
             out.end = BlockEnd::kWindowExit;
             break;
         }
+
+        // 拡張ワード由来の即値を確定させる。
+        //
+        // planOne は命令語だけから決まる欄を埋めるので、拡張ワードに
+        // 入っている値はここで畳む (planBranch が飛び先の基準だけを置き、
+        // 変位をここで足すのと同じ役割分担)。
+        foldImmediate(planned, extension[0], extension[1], length);
 
         const bool isBranch = planned.kind == PlanKind::kBranch;
         if (isBranch)

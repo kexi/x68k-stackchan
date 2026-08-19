@@ -760,6 +760,47 @@ constexpr u16 aluReg(u32 group, u32 dst, u32 opmode, u32 src)
 {
     return static_cast<u16>((group << 12) | (dst << 9) | (opmode << 6) | src);
 }
+// MOVE.<size> As,Dd / MOVEA.<size> <src>,Ad
+constexpr u16 moveSrcAn(u32 sizeGroup, u32 dst, u32 srcAn)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dst << 9) | (1u << 3) | srcAn);
+}
+constexpr u16 moveaFromDn(u32 sizeGroup, u32 dstAn, u32 srcDn)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dstAn << 9) | (1u << 6) | srcDn);
+}
+constexpr u16 moveaFromAn(u32 sizeGroup, u32 dstAn, u32 srcAn)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dstAn << 9) | (1u << 6) | (1u << 3) | srcAn);
+}
+// MOVE.<size> #imm,Dd (拡張ワードは呼び出し側が words に続けて置く)
+constexpr u16 moveImm(u32 sizeGroup, u32 dst)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dst << 9) | (7u << 3) | 4u);
+}
+// TST.<size> Dn / CLR.<size> Dn。sizeField は 0/1/2 = b/w/l
+constexpr u16 tstDn(u32 sizeField, u32 reg)
+{
+    return static_cast<u16>(0x4A00u | (sizeField << 6) | reg);
+}
+constexpr u16 clrDn(u32 sizeField, u32 reg)
+{
+    return static_cast<u16>(0x4200u | (sizeField << 6) | reg);
+}
+// LEA (An),Ad / (d16,An),Ad / (xxx).L,Ad
+constexpr u16 leaInd(u32 dstAn, u32 srcAn)
+{
+    return static_cast<u16>(0x41D0u | (dstAn << 9) | srcAn);
+}
+constexpr u16 leaDisp(u32 dstAn, u32 srcAn)
+{
+    return static_cast<u16>(0x41E8u | (dstAn << 9) | srcAn);
+}
+constexpr u16 leaAbsL(u32 dstAn)
+{
+    return static_cast<u16>(0x41F9u | (dstAn << 9));
+}
+
 constexpr u16 bcc(u32 cond, int disp8)
 {
     return static_cast<u16>(0x6000u | (cond << 8) | (static_cast<u32>(disp8) & 0xFFu));
@@ -979,41 +1020,104 @@ TEST_CASE("分岐成立側の出口が pc / ir / irc を書かない")
     CHECK(ircStores == 1);
 }
 
-// エミッタが対応していない種別は、発行せずに諦める。
+// Tier A: メモリに触れず例外も起きない形が、インタプリタと一致する。
 //
-// **翻訳器の対応範囲がエミッタより先に広がることがある。** Tier A は
-// planner に先に入れたので、その間このブロックは翻訳されない。
-//
-// 危ないのは「何も発行しないまま成功したことにする」形で、そうなると
-// その命令が実行されずに飛ばされる (ゲストの状態が静かにずれる)。
-// switch に default を置かず全種別を列挙してあるので、種別を足した人は
-// ここへ必ず来る。
-TEST_CASE("エミッタが対応していない種別は発行を諦める")
+// **フラグの扱いが命令ごとに違うのが要点。**
+//   MOVE / TST : N/Z を立て V/C クリア、X 保存
+//   CLR        : Z=1、N/V/C=0、X 保存
+//   MOVEA / LEA: **1 つも変えない**
+// checkEquivalence は sr を丸ごと比べるので、余計に触れば必ず落ちる。
+TEST_CASE("MOVE An,Dn がインタプリタと一致する")
 {
-    const PlanKind unimplemented[] = {
-        PlanKind::kMoveAregToDreg,  PlanKind::kMoveImmToDreg,  PlanKind::kMoveaDregToAreg,
-        PlanKind::kMoveaAregToAreg, PlanKind::kMoveaImmToAreg, PlanKind::kTstDreg,
-        PlanKind::kClrDreg,         PlanKind::kLeaDisp,        PlanKind::kLeaAbs,
-    };
-    for (const PlanKind kind : unimplemented)
+    // .w は上位が捨てられ、.l は全体が入る。bit15 が立つ値を必ず通す。
+    for (u32 group : {0x2u, 0x3u})
     {
-        CAPTURE(static_cast<int>(kind));
-        BlockPlan plan{};
-        plan.entryPc = 0x1000;
-        plan.count = 1;
-        plan.end = BlockEnd::kUnsupported;
-        plan.fallThroughPc = 0x1002;
-        plan.cyclesNotTaken = 4;
-        plan.ops[0].pc = 0x1000;
-        plan.ops[0].length = 2;
-        plan.ops[0].kind = kind;
-        plan.ops[0].size = 2;
-        plan.ops[0].cycles = 4;
+        for (u32 seed : {1u, 7u, 19u})
+        {
+            M68kState s = makeState(seed);
+            s.a[1] = 0xFFFF8000u;  // 符号ビットが立つ
+            s.a[2] = 0x00007FFFu;
+            for (u32 src : {1u, 2u})
+            {
+                checkEquivalence({moveSrcAn(group, 3, src)}, s, "MOVE An,Dn");
+            }
+        }
+    }
+}
 
-        std::vector<std::uint8_t> buf(512, 0);
-        x68k::jit::EmittedBlock emitted{};
-        CHECK_FALSE(x68k::jit::emitBlock(plan, 0x4E71, 0x4E71, buf.data(), buf.size(), emitted));
-        CHECK(x68k::jit::requiredSize(plan, 0x4E71, 0x4E71) == 0);
+TEST_CASE("MOVE #imm,Dn がインタプリタと一致する")
+{
+    struct Case
+    {
+        u32 group;
+        std::vector<u16> ext;
+    };
+    const Case cases[] = {
+        {0x3u, {0x0000}},         {0x3u, {0x8000}}, {0x3u, {0x7FFF}}, {0x2u, {0x1234, 0x5678}},
+        {0x2u, {0x8000, 0x0000}}, {0x1u, {0x0042}}, {0x1u, {0x0080}},
+    };
+    for (const Case& c : cases)
+    {
+        for (u32 seed : {2u, 11u})
+        {
+            std::vector<u16> words{moveImm(c.group, 4)};
+            words.insert(words.end(), c.ext.begin(), c.ext.end());
+            checkEquivalence(words, makeState(seed), "MOVE #imm,Dn");
+        }
+    }
+}
+
+TEST_CASE("MOVEA がインタプリタと一致する")
+{
+    // **フラグを 1 つも変えない**ことを問う。makeState は sr の下位 5bit に
+    // seed を入れるので、余計に触れば sr の比較で落ちる。
+    for (u32 group : {0x2u, 0x3u})
+    {
+        for (u32 seed : {3u, 13u, 29u})
+        {
+            M68kState s = makeState(seed);
+            s.d[1] = 0xFFFF8000u;  // .w の符号拡張を問う
+            s.d[2] = 0x00007FFFu;
+            s.a[3] = 0xFFFF8000u;
+            checkEquivalence({moveaFromDn(group, 5, 1)}, s, "MOVEA Dn,An");
+            checkEquivalence({moveaFromDn(group, 5, 2)}, s, "MOVEA Dn,An");
+            checkEquivalence({moveaFromAn(group, 5, 3)}, s, "MOVEA An,An");
+        }
+    }
+}
+
+TEST_CASE("TST / CLR がインタプリタと一致する")
+{
+    for (u32 sizeField : {0u, 1u, 2u})
+    {
+        for (u32 seed : {4u, 17u, 31u})
+        {
+            M68kState s = makeState(seed);
+            s.d[0] = 0u;           // Z が立つ
+            s.d[1] = 0x80000000u;  // .l の N が立つ
+            s.d[2] = 0x0000FF00u;  // .b は 0、.w は非 0
+            for (u32 reg : {0u, 1u, 2u})
+            {
+                checkEquivalence({tstDn(sizeField, reg)}, s, "TST Dn");
+                // CLR は上位バイトの保存も問う (.b/.w)
+                checkEquivalence({clrDn(sizeField, reg)}, s, "CLR Dn");
+            }
+        }
+    }
+}
+
+TEST_CASE("LEA がインタプリタと一致する")
+{
+    // **フラグを変えない。** アドレスを求めるだけで読まない。
+    for (u32 seed : {5u, 23u})
+    {
+        M68kState s = makeState(seed);
+        checkEquivalence({leaInd(4, 1)}, s, "LEA (An),An");
+        // 変位は正負の両方。0x8000 は負変位になる。
+        checkEquivalence({leaDisp(4, 1), 0x0010}, s, "LEA (d16,An),An");
+        checkEquivalence({leaDisp(4, 1), 0x8000}, s, "LEA (負変位,An),An");
+        checkEquivalence({leaDisp(4, 1), 0x7FFF}, s, "LEA (最大変位,An),An");
+        checkEquivalence({leaAbsL(4), 0x0012, 0x3456}, s, "LEA (xxx).L,An");
     }
 }
 
