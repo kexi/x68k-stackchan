@@ -52,3 +52,5 @@ __pycache__/
 # clang-tidy 用のビルドディレクトリ。just tidy が作る。
 # ローカルの絶対パスと Nix ストアのパスが埋まるので追跡しない。
 build-tidy/
+# 計測のたびに作る使い捨ての比較ビルド (build-dc0 / build-jit など)
+build-*/
