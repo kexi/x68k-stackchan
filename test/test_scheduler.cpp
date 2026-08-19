@@ -1427,6 +1427,21 @@ TEST_SUITE("イベント駆動")
             CHECK(map.generation(target) == x68k::CodeGenMap::kAlwaysStale);
         }
 
+        SUBCASE("世代配列の差し替えは写像の変化として扱う")
+        {
+            // **生成コードが世代配列のポインタを焼く**設計なので、
+            // 差し替えられたことを知る手段が要る。setFastRam / setFastRom と
+            // 同じ性質なので、同じ扱いにする。
+            //
+            // これが無いと、差し替え後も古いポインタへ書き続けるブロックが
+            // 残る。症状が原因から遠い形で壊れる。
+            auto& map = m.cpu().codeGenMap();
+            static std::vector<std::uint16_t> other(64, 0);
+            const x68k::u32 before = map.mappingEpoch();
+            map.setStorage(other.data(), static_cast<x68k::u32>(other.size()));
+            CHECK(map.mappingEpoch() != before);
+        }
+
         SUBCASE("未配線なら全ページが常に古い扱いになる")
         {
             // **未配線は「常に有効」に化けやすい。**

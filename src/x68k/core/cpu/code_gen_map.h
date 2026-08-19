@@ -71,8 +71,19 @@ public:
     static constexpr std::uint16_t kAlwaysStale = 0xFFFFu;
 
     // 世代の配列を教わる。length はページ数。
+    //
+    // **写像の世代も進める。** 生成コードがこの配列のポインタを焼くなら、
+    // 差し替えられたことを知る手段が要る。setFastRam / setFastRom と
+    // まったく同じ性質 (「実体が変わったので、それを前提にしたものは
+    // 全部捨てるべき」) なので、同じ扱いにする。
+    //
+    // Why not 「初期化時に 1 回だけ呼ぶ約束」で済ませないか: 約束は
+    // 破れるし、破れたときの失敗が「古いポインタへ書き続ける」形で
+    // 症状が原因から遠い。**pull 型の枠組みに例外を作らない。**
+    // 初期化時の 1 回なら epoch が 1 進むだけで代償はゼロ。
     void setStorage(std::uint16_t* generations, u32 pageCount)
     {
+        bumpMappingEpoch();
         gen_ = generations;
         pageCount_ = generations != nullptr ? pageCount : 0;
     }
