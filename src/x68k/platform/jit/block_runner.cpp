@@ -64,8 +64,31 @@ void BlockRunner::reset()
 
 BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
 {
+    // **満杯からの回復。** ここに回復経路が無かったせいで、実機 45 秒の
+    // うち翻訳器はほぼ全期間停止していた (実測 14,815,340 回 = 諦めた
+    // 回数の 99.997%)。
+    //
+    // Why not 満杯のたびに捨てるか: 捨てる費用は常駐ブロックの再翻訳
+    // まるごとなので、要求のたびに捨てるとキャッシュが永久に冷たいまま
+    // になる (スラッシング)。要求が閾値まで積もってから 1 回だけ捨てる。
+    //
+    // Why not eviction にしないか: 実行可能メモリはバンプアロケータ
+    // (used_ を進めるだけ) なので、個別のブロックだけ解放できない。
+    // 段 3 の課題として温存し、ここでは「全部捨てる」で回復させる。
     if (codeFull_)
     {
+        ++stats_.fullDeferred;
+        if (++fullSeen_ >= kCapacityResetThreshold)
+        {
+            // reset() が codeFull_ を false へ戻し、スロットと負の記憶も
+            // 一緒に捨てる。**世代は捨てない** (飽和の回復とは別の話で、
+            // 世代を 0 へ戻すのは控えを全部捨てたときだけという条件は
+            // reset() だけでは満たせるが、ここで一緒にやると
+            // 「満杯」と「飽和」の統計が混ざる)。
+            reset();
+            fullSeen_ = 0;
+            ++stats_.capacityReset;
+        }
         return nullptr;
     }
 
@@ -303,20 +326,36 @@ NativeResult BlockRunner::run(M68k& cpu)
 
     if (!hit)
     {
-        if (slot->code != nullptr)
+        if (slot->code == nullptr)
+        {
+            // 空きスロット (コールドミス)。**ここを数えていなかったので、
+            // 取りこぼしの最大成分が統計から消えていた。**
+            ++stats_.keyMissCold;
+        }
+        else
         {
             // 鍵が外れた理由を分けて数える。段 3 の判断材料になる。
-            if (nowGen == CodeGenMap::kAlwaysStale)
+            //
+            // **判定 (hit) の順序と帰属の順序は別物。** hit は
+            // kAlwaysStale を世代一致より先に見る (§5.5 の正しさの根拠) が、
+            // ここでタグより先に見ると、居座りブロックのページが飽和して
+            // いるだけでスロット衝突が「飽和」に化ける。実機ではページ 0
+            // が真っ先に飽和するので、衝突 151 万件がまるごと誤帰属された。
+            //
+            // タグを先に見れば、飽和を数える時点で slot->page は entryPc の
+            // ページと同一が保証され、keyMissStale は「自分のページの飽和」
+            // だけを意味する。
+            if (slot->entryPc != entryPc)
             {
-                ++stats_.keyMissStale;
+                ++stats_.keyMissTag;
             }
             else if (slot->mappingEpoch != map.mappingEpoch())
             {
                 ++stats_.keyMissEpoch;
             }
-            else if (slot->entryPc != entryPc)
+            else if (nowGen == CodeGenMap::kAlwaysStale)
             {
-                ++stats_.keyMissTag;
+                ++stats_.keyMissStale;
             }
             else
             {

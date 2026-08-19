@@ -953,6 +953,23 @@ bool reserveMemory()
     //
     // **どちらも失敗してよい。** 取れなければ JIT を教わらないので、
     // 現行インタプリタのまま動く (挙動は 1 ビットも変わらない)。
+    // **実行可能メモリを最初に取る。** これだけ MALLOC_CAP_EXEC で、
+    // 実行できる IRAM からしか取れない。スロットや負のキャッシュは
+    // MALLOC_CAP_INTERNAL なので DRAM でも IRAM でも満たせてしまい、
+    // 先に取ると実行可能な側を食って acquire を失敗させる。
+    //
+    // 実際に踏んだ: スロット 20KB + 負のキャッシュ 16KB を先に取った
+    // ビルドで「実行可能メモリを確保できません」になり、JIT がまるごと
+    // 無効化された (さらに IPL-ROM も内部 SRAM から溢れて PSRAM へ落ち、
+    // インタプリタ単体より遅い状態で起動していた)。
+    //
+    // Why not 全部 MALLOC_CAP_EXEC にするか: 実行可能 IRAM は最も希少で、
+    // データにしか使わないものを置くと本当に必要な生成コードが入らない。
+    // **希少な順に取る**のが確保順の原則。
+    if (!g_jitCode.acquire(kJitCodeBytes))
+    {
+        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)");
+    }
     g_jitSlots = static_cast<x68k::jit::BlockSlot*>(heap_caps_calloc(
         kJitSlots, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (g_jitSlots == nullptr)
@@ -964,10 +981,6 @@ bool reserveMemory()
     if (g_jitNeg == nullptr)
     {
         ESP_LOGW(kTag, "JIT の負のキャッシュを置けません (再翻訳が減りません)");
-    }
-    if (!g_jitCode.acquire(kJitCodeBytes))
-    {
-        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)");
     }
 
     // コードページの世代は内部 SRAM に置く。ブロックの入口で毎回引くので、
@@ -1839,9 +1852,17 @@ private:
                      (unsigned long long)st->deferInterrupt,
                      (unsigned long long)st->deferUnsupported,
                      (unsigned long long)st->translateFail);
-            ESP_LOGI(kTag, "[jit] 鍵外れ: タグ %llu / 写像 %llu / 世代 %llu / 飽和 %llu",
+            ESP_LOGI(kTag,
+                     "[jit] 鍵外れ: タグ %llu / 写像 %llu / 世代 %llu / 飽和 %llu / 空き %llu",
                      (unsigned long long)st->keyMissTag, (unsigned long long)st->keyMissEpoch,
-                     (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale);
+                     (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale,
+                     (unsigned long long)st->keyMissCold);
+            // **収支が閉じているかを出す。** 諦めた回数と理由の合計が
+            // 合わないなら、無勘定の早期 return がある (実際に踏んだ)。
+            ESP_LOGI(kTag, "[jit] 満杯で諦めた %llu / 満杯で捨てた %llu (収支 %lld)",
+                     (unsigned long long)st->fullDeferred, (unsigned long long)st->capacityReset,
+                     (long long)st->deferUnsupported - (long long)st->negativeHit -
+                         (long long)st->translateFail - (long long)st->fullDeferred);
             // ガード脱出の内訳。**blocksRun に対する比率で読む。**
             // guardExit が 10% を超えるなら (An) 経由の I/O が空回りしている。
             // selfPageExit が 0.1% を超えるなら、自ページ脱出のブラックリストが

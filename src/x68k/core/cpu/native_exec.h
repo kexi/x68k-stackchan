@@ -79,6 +79,20 @@ struct NativeStats
     u64 keyMissGen = 0;    // ページ世代不一致
     u64 keyMissStale = 0;  // kAlwaysStale で捨てた
     u64 translateFail = 0;
+    // **コード領域が満杯で翻訳を試みもしなかった回数。**
+    //
+    // ここにカウンタが無かったせいで、実機 45 秒の「未対応 14,815,821」の
+    // うち 99.997% が実は満杯だったことに気づけなかった。
+    // deferUnsupported == negativeHit + translateFail + fullDeferred が
+    // 成り立つ (収支が閉じる) ことをテストで縛る。
+    u64 fullDeferred = 0;
+    // 空きスロットを引いた回数 (コールドミス)。
+    //
+    // 鍵外れの帰属は slot->code != nullptr の中でしか数えていないので、
+    // 空きスロットの取りこぼしはどのカウンタにも乗らなかった。
+    u64 keyMissCold = 0;
+    // 満杯から回復するために全部捨てた回数。
+    u64 capacityReset = 0;
     // 世代が飽和して翻訳できなくなり、全部捨てて数え直した回数。
     u64 generationReset = 0;
     // 分岐で終端したブロックの実行回数 (direct chaining の的)。

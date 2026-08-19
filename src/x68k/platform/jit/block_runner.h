@@ -114,7 +114,20 @@ private:
     [[nodiscard]] std::uint32_t slotIndex(std::uint32_t pc) const
     {
         // PC は必ず偶数なので 1 bit 落としてから畳む。
-        return (pc >> 1) & (slotCount_ - 1);
+        //
+        // **下位ビットだけで畳むと 2*slotCount_ バイト周期の番地が全部
+        // 衝突する。** 512 スロットなら 1KB 周期で、2MB に散った常駐部と
+        // サブルーチン群に対して系統的に当たる。ページ番号のビットを
+        // 混ぜて散らす (negative_cache.h が同じ罠を踏んで直した形)。
+        //
+        // Why not >> 11 か: 512 スロット (マスク 0x1FF = ビット 0-8) だと、
+        // pc のビット 10 は (pc >> 1) でビット 9 へ行って**マスクの外へ
+        // 落ち**、(pc >> 11) にも乗らないので索引から完全に消える。
+        // その結果ちょうど 1KB 離れた 2 番地が必ず衝突したままになる
+        // ——**直そうとした当の周期が残る**。>> 10 ならビット 10 が
+        // 索引のビット 0 に入り、1KB 周期も 2KB 周期も完全に散る
+        // (16 番地 → 8 スロット だったものが 16 スロットになる)。
+        return ((pc >> 1) ^ (pc >> 10)) & (slotCount_ - 1);
     }
 
     // 発行はここへ書き、確定するときに実行可能メモリへ 32bit 単位で写す。
@@ -150,6 +163,13 @@ private:
     // Why 即座に捨てないか: 1 回の飽和で全部の世代を捨てると、正常な
     // ブロックまで再翻訳になる。まとまった数が溜まってからにする。
     static constexpr std::uint32_t kSaturationResetThreshold = 64;
+
+    // 満杯のまま何回諦めたら全部捨てるか。
+    //
+    // 捨てる費用は常駐ブロック (16KB / 平均 100-200 バイト = 100 本前後)
+    // の再翻訳。それを取り返せるだけの要求が積もってから捨てる。
+    // 小さすぎるとスラッシング、大きすぎると現状同様の長い凍結になる。
+    static constexpr std::uint32_t kCapacityResetThreshold = 8192;
     std::uint32_t saturatedSeen_ = 0;
     NegativeCache neg_{};
     // 直近に見た写像の世代。変わったら負の記憶を全部捨てる。
@@ -157,6 +177,8 @@ private:
     NativeStats stats_{};
     // 実行可能メモリを使い切ったら、それ以上翻訳しない。
     bool codeFull_ = false;
+    // 満杯のまま諦めた回数 (kCapacityResetThreshold に達したら捨てる)。
+    std::uint32_t fullSeen_ = 0;
 
     // --- Tier D: 動的分岐 (RTS / JSR) の飛び先を受け取る 1 語 ---
     //

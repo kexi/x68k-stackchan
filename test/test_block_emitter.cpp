@@ -43,6 +43,7 @@
 #include "cpu/m68k_alu.h"
 #include "cpu/m68k_types.h"
 #include "jit/block_emitter.h"
+#include "jit/block_runner.h"
 #include "jit/exec_memory.h"
 #include "jit/negative_cache.h"
 #include "jit/xtensa_encoder.h"
@@ -4832,4 +4833,689 @@ TEST_CASE("発行したコードを ExecMemory へ置ける")
     REQUIRE(host.ok);
     CHECK(host.buffer.size() == need);
     CHECK(std::memcmp(slot, host.buffer.data(), need) == 0);
+}
+
+// ============================================================================
+// BlockRunner の勘定と回復 — 「動いているが効いていない」を検出する
+// ============================================================================
+//
+// ## ここで問うのは「正しさ」ではない
+//
+// このファイルの他のテストは全部「生成コードがインタプリタと同じ状態を作るか」
+// を問うている。**それが 694 件あって、以下の 3 つの欠陥を 1 件も検出できなかった。**
+//
+//   1. コード領域が満杯になると二度と回復せず、翻訳器が永久に停止していた
+//      (実機 45 秒で「諦めた」14,815,821 回のうち 99.997% がこれ)
+//   2. スロット索引が下位ビットだけで畳んでいて、1KB 周期の番地が全部衝突
+//   3. 鍵外れの理由の帰属順序が誤っていて、衝突 151 万件が「飽和」に化けていた
+//
+// **3 つとも正しさを 1 ビットも壊さない。** 諦めた分はインタプリタが実行するので
+// 状態は常に正しい。統計の帰属が狂っても状態は正しい。だから状態を比べる
+// テストでは永遠に見えない (MEMORY.md「保守的なフォールバックはテストの盲点になる」)。
+//
+// 見えるようにするには問いを変えるしかない。以下の 3 種類を使う。
+//
+//   **勘定の保存** — 諦めた回数が理由別の内訳と一致するか (T1)。
+//     破れていれば「どのカウンタにも乗らない早期 return がある」ことを意味する。
+//     欠陥 1 と 3 はどちらもこの形で、**この 1 本だけで 45 秒ログの時点で
+//     機械的に暴けたはず**だった。
+//   **生存性** — 悪い状態に入った後、有限回以内に抜け出せるか (T2/T3)。
+//     「正しく諦め続ける」は正しさのテストを全部通る。抜け出すことは別に問う。
+//   **分散** — 索引が実際に散っているか (T4)。
+//
+// ## ホストで実行できないものを、どうやってホストで検査するか
+//
+// **runBlock はホストで std::abort() する** (exec_memory.cpp)。吐くのは Xtensa の
+// 機械語なので、Mac の CPU に食わせるわけにいかない。つまり
+// **翻訳が成功した瞬間に run() はホストで落ちる。**
+//
+// そこで、以下のテストは全部「翻訳が成功しない」状態で run() を回す。
+// 窓を読めなくしておく (setFastRamReadable(false)) と peekCodeWord が false を
+// 返し、BlockPlanner::plan がそこで諦める。翻訳は必ず失敗し、run() は
+// runBlock へ届く前に kDeferToStep で戻る。
+//
+// **それでも欠陥 1/2/3 の経路は全部通る。** 満杯の判定も、スロット索引も、
+// 鍵外れの帰属も、翻訳の成否より手前にあるからである。
+
+namespace runner_accounting
+{
+
+// 諦めた回数の内訳。**この 3 つの和が deferUnsupported と一致しなければ
+// ならない** (T1)。
+//
+// run() が nullptr を受け取って deferUnsupported を数える経路は 1 つしかなく、
+// その手前で translate() が nullptr を返す理由は
+//   満杯 (fullDeferred) / 負の記憶 (negativeHit) / 翻訳失敗 (translateFail)
+// の 3 つで尽きている。**尽きていなければ、どのカウンタにも乗らない
+// 早期 return があるということ。**
+std::uint64_t deferBreakdown(const x68k::NativeStats& s)
+{
+    return s.negativeHit + s.translateFail + s.fullDeferred;
+}
+
+// **勘定が閉じているか。** 全シナリオの終端で必ず呼ぶ。
+void checkDeferAccounting(const x68k::NativeStats& s, const char* what)
+{
+    INFO(std::string(what));
+    INFO("deferUnsupported=", s.deferUnsupported, " negativeHit=", s.negativeHit,
+         " translateFail=", s.translateFail, " fullDeferred=", s.fullDeferred);
+    CHECK(s.deferUnsupported == deferBreakdown(s));
+}
+
+// BlockRunner を回すための最小の台。
+//
+// **Machine を丸ごと立てる。** インタプリタとまったく同じ CPU に対して
+// NativeExec として刺さる形でしか、run() の入口の事前条件
+// (pc == 命令語 + 4、mustDeferToStep、mappingEpoch) を本物にできない。
+struct Harness
+{
+    static constexpr std::uint32_t kSlots = 512;
+    // 世代を直接叩いて飽和を作るためのページ数。実機と同じ 1KB ページ。
+    static constexpr std::uint32_t kPages = kGenPages;
+
+    x68k::Machine machine;
+    std::vector<u8> ram;
+    std::vector<std::uint16_t> gen;
+    std::vector<x68k::jit::BlockSlot> slots;
+    std::vector<x68k::jit::NegEntry> negEntries;
+    x68k::jit::ExecMemory code;
+    x68k::jit::BlockRunner runner;
+
+    // codeBytes を小さくすると、少ない翻訳で満杯にできる。
+    explicit Harness(std::size_t codeBytes = 65536)
+        : ram(x68k::kMainRamSize, 0), gen(kPages, 0), slots(kSlots), negEntries(256)
+    {
+        x68k::MemoryMap map{};
+        map.mainRam = ram.data();
+        machine.setMemory(map);
+        machine.reset();
+        machine.cpu().codeGenMap().setStorage(gen.data(), static_cast<u32>(gen.size()));
+
+        // **翻訳できる命令列を置く。** MOVEQ は窓もメモリも要らない
+        // (レジスタだけで閉じる) ので、ホストの 64bit ポインタで窓が
+        // 焼けない環境でも計画と発行が通る。満杯の判定へ届かせるには
+        // ここまで通す必要がある。
+        for (u32 a = kEntry - 0x400; a < kEntry + 0x4000; a += 2)
+        {
+            ram[a] = 0x70;      // MOVEQ #0,D0
+            ram[a + 1] = 0x00;  //
+        }
+
+        // **窓を読める状態にする。** Machine::reset の直後は ROM 写像中
+        // ($000000 に IPL-ROM が見える) なので fastRamReadable が false で、
+        // peekCodeWord が必ず失敗する。その状態だと翻訳は計画の手前で
+        // 諦めてしまい、満杯の判定 (allocate) まで届かない。
+        cpu().setFastRamReadable(true);
+
+        REQUIRE(code.acquire(codeBytes));
+        runner.setStorage(slots.data(), kSlots, &code);
+        runner.setNegativeStorage(negEntries.data(), static_cast<std::uint32_t>(negEntries.size()));
+        REQUIRE(runner.isReady());
+    }
+
+    x68k::M68k& cpu()
+    {
+        return machine.cpu();
+    }
+
+    const x68k::NativeStats& stats() const
+    {
+        return runner.stats();
+    }
+
+    // **窓を読めなくする。** これで peekCodeWord が必ず false を返し、
+    // BlockPlanner::plan が諦める = 翻訳が成功しない = runBlock へ届かない。
+    // 満杯の判定・スロット索引・鍵外れの帰属はどれも翻訳の手前にあるので、
+    // この状態でも問いたい経路は全部通る。
+    void makeTranslationImpossible()
+    {
+        cpu().setFastRamReadable(false);
+    }
+
+    // 負の記憶を外す。
+    //
+    // **多数の番地を訪ねるテストでだけ使う。** 表 (256 件) が溢れると
+    // 追い出しが起き、一度覚えた番地でも再び翻訳を試みる。窓を外して
+    // あれば翻訳は失敗するので正しさには影響しないが、
+    // 「毎回 translateFail で落ちる」ことが保証されると筋が読みやすい。
+    void disableNegativeCache()
+    {
+        runner.setNegativeStorage(nullptr, 0);
+    }
+
+    // entryPc から 1 回だけ run() を呼ぶ。
+    //
+    // **入口の事前条件を本物のインタプリタに作らせる** (pc == 命令語 + 4)。
+    // 手で pc を組むと、契約を取り違えたときにテストが先に壊れる。
+    x68k::NativeResult runAt(u32 entryPc)
+    {
+        cpu().refillPrefetchForTest(entryPc);
+        return x68k::jit::BlockRunner::runThunk(&runner, cpu());
+    }
+
+    // **実装が pc をどのスロットへ写すかを、実装に訊く。**
+    //
+    // slotIndex() は private なので呼べない。テスト側で式を再現すると
+    // **同じ式を 2 度書くだけ**になり、式を変える変異を素通りさせる。
+    // 実装の観測可能な副作用から突き止める。
+    //
+    // 手順: 全スロットへ「この pc とは違う番地の先客」を置いてから 1 回
+    // 訪ねる。実装が選んだ 1 つだけがタグ外れとして読まれ、**そのスロットの
+    // 先客だけが translate 後に書き換わらずに残る**…のではなく、
+    // より単純に: 先客の entryPc をスロットごとに違う値にしておけば、
+    // 訪ねた後に keyMissTag が 1 増えることは分かっても「どれか」は分からない。
+    //
+    // そこで**先客を 1 スロットにだけ置く**方式を使う。候補 i に先客を置いて
+    // 訪ね、タグ外れが増えたら当たり (増えなければ実装は別のスロットを見て
+    // いて、そこは空きなので keyMissCold が増える)。
+    //
+    // **翻訳は必ず失敗させる。** 鍵が外れると translate へ落ちるので、
+    // 成功するとホストでは runBlock が abort する。窓を読めなくするだけでは
+    // 負のキャッシュが溢れた後に再び翻訳を試みてしまうため、
+    // **命令語を奇数番地にして peekCodeWord を確実に失敗させる**のではなく、
+    // 窓を外したうえで負のキャッシュを無効化 (容量 0) して、
+    // 毎回 translateFail で落ちる形にする。
+    std::uint32_t runnerSlotIndex(u32 pc)
+    {
+        REQUIRE_FALSE(cpu().codeWindowForJit().ramReadable);
+        static std::uint8_t probeCode[4] = {0, 0, 0, 0};
+
+        std::uint32_t found = kSlots;
+        for (std::uint32_t i = 0; i < kSlots; ++i)
+        {
+            for (std::uint32_t j = 0; j < kSlots; ++j)
+            {
+                slots[j] = x68k::jit::BlockSlot{};
+            }
+            slots[i].entryPc = pc ^ 0x2u;  // pc とは必ず違う値
+            slots[i].mappingEpoch = cpu().codeGenMap().mappingEpoch();
+            slots[i].page = pc >> x68k::CodeGenMap::kPageShift;
+            slots[i].pageGen = cpu().codeGenMap().generation(pc);
+            slots[i].count = 1;
+            slots[i].code = probeCode;
+
+            const std::uint64_t before = stats().keyMissTag;
+            runAt(pc);
+            if (stats().keyMissTag == before + 1)
+            {
+                found = i;
+                break;
+            }
+        }
+        for (std::uint32_t j = 0; j < kSlots; ++j)
+        {
+            slots[j] = x68k::jit::BlockSlot{};
+        }
+        REQUIRE(found < kSlots);
+        return found;
+    }
+
+    // ページを直接 65,536 回叩いて飽和させる。
+    //
+    // **テスト対象 (BlockRunner) を経由しない。** run() を回して飽和させようと
+    // すると回数が現実的でなくなるうえ、作りたい状態と測りたい振る舞いが
+    // 混ざる。世代配列は外から与えている実体なので、直接叩けば済む。
+    void saturatePage(u32 addr)
+    {
+        x68k::CodeGenMap& map = cpu().codeGenMap();
+        while (map.generation(addr) != x68k::CodeGenMap::kAlwaysStale)
+        {
+            map.touch(addr);
+        }
+        REQUIRE(map.generation(addr) == x68k::CodeGenMap::kAlwaysStale);
+    }
+};
+
+// 索引の再現。**実装と同じ式をここに書く**ので、これ自体は実装の正しさの
+// 根拠にならない。使うのは「同じスロットに写る別の番地」を作るためだけで、
+// 分散そのものは T4 が実装の観測可能な振る舞い (keyMissTag) で問う。
+std::uint32_t foldedIndex(u32 pc, std::uint32_t slotCount)
+{
+    return ((pc >> 1) ^ (pc >> 10)) & (slotCount - 1);
+}
+
+}  // namespace runner_accounting
+
+// --- T1: 勘定の保存 ---------------------------------------------------------
+
+TEST_CASE("諦めた回数は理由別カウンタの合計と常に一致する")
+{
+    // **保存則: deferUnsupported == negativeHit + translateFail + fullDeferred**
+    //
+    // これが破れることは「どのカウンタにも乗らずに諦めた経路がある」ことと
+    // 同値である。欠陥 1 (満杯で諦めた 1481 万回がどこにも乗らず「未対応命令」
+    // に見えていた) は、まさにこの破れだった。
+    //
+    // **単一の状態ではなく、諦め方の異なる 3 つの状態を全部通す。** 1 つの
+    // 経路だけで確かめると、他の経路に無勘定の return が増えても気づけない。
+    using namespace runner_accounting;
+
+    SUBCASE("翻訳失敗で諦め続けても収支が閉じる")
+    {
+        Harness h;
+        h.makeTranslationImpossible();
+        for (int i = 0; i < 64; ++i)
+        {
+            const u32 pc = 0x2000u + static_cast<u32>(i) * 4u;
+            CHECK(h.runAt(pc).exit == x68k::NativeExit::kDeferToStep);
+        }
+        // 諦めていること自体を先に確かめる (0 == 0 で通る空虚な保存を避ける)。
+        CHECK(h.stats().deferUnsupported > 0);
+        checkDeferAccounting(h.stats(), "翻訳失敗のみ");
+    }
+
+    SUBCASE("負の記憶が効いた後も収支が閉じる")
+    {
+        // 同じ番地を叩き直すと、2 回目以降は負の記憶で translate を省く。
+        // **省いた分も内訳に乗らなければ収支が破れる。**
+        Harness h;
+        h.makeTranslationImpossible();
+        for (int i = 0; i < 32; ++i)
+        {
+            CHECK(h.runAt(0x2000u).exit == x68k::NativeExit::kDeferToStep);
+        }
+        CHECK(h.stats().negativeHit > 0);
+        checkDeferAccounting(h.stats(), "負の記憶あり");
+    }
+
+    SUBCASE("満杯で諦めた分も内訳に乗る")
+    {
+        // **欠陥 1 の直接の回帰テスト。** 満杯の早期 return が数えられて
+        // いなければ、ここで deferUnsupported だけが増えて収支が破れる。
+        //
+        // 満杯にする手は「ExecMemory を外から使い切る」。code_ は外が
+        // 与えている実体なので、テストが直接 allocate して空にできる。
+        // こうすると translate() は計画も発行も通ったうえで
+        // code_->allocate() に断られ、そこで codeFull_ を立てる。
+        // **成功した翻訳は 1 本も無いので runBlock へは行かない。**
+        Harness h;
+        REQUIRE(h.code.allocate(h.code.capacity()) != nullptr);
+        REQUIRE(h.code.allocate(4) == nullptr);
+
+        for (int i = 0; i < 64; ++i)
+        {
+            const u32 pc = kEntry + static_cast<u32>(i) * 2u;
+            CHECK(h.runAt(pc).exit == x68k::NativeExit::kDeferToStep);
+        }
+        // 満杯の経路を実際に通ったこと。通っていなければ以下の保存則は
+        // 満杯について何も言っていない。
+        CHECK(h.stats().fullDeferred > 0);
+        checkDeferAccounting(h.stats(), "コード領域が満杯");
+    }
+}
+
+// --- T2: 満杯からの回復 (生存性) --------------------------------------------
+
+TEST_CASE("コード領域が満杯になっても有限回で翻訳器が回復する")
+{
+    // **これは「正しさ」ではなく「生存性」のテストである。**
+    //
+    // 満杯のまま永久に諦め続けても、諦めた命令はインタプリタが実行するので
+    // **状態は 1 ビットも狂わない**。だから状態を比べるテストをいくら足しても
+    // この欠陥は永遠に見えない (MEMORY.md「保守的なフォールバックはテストの
+    // 盲点になる」)。実機ではこれが 45 秒間ずっと続いていた。
+    //
+    // 問うべきは「悪い状態に入った後、有限回以内に出られるか」である。
+    using namespace runner_accounting;
+
+    Harness h;
+    // 外から使い切って満杯にする。以後 translate() は入口で諦める。
+    REQUIRE(h.code.allocate(h.code.capacity()) != nullptr);
+
+    // 翻訳可能な pc を叩き続ける。**同じ pc でよい** — 実機で起きていたのも
+    // 「常駐ルーチンを回し続けているのに翻訳が再開しない」という形だった。
+    //
+    // 上限は閾値の定数倍。回復経路が無ければここで尽きる。
+    constexpr std::uint32_t kThreshold = 8192;  // BlockRunner::kCapacityResetThreshold
+    constexpr std::uint32_t kBudget = kThreshold * 4;
+
+    bool recovered = false;
+    std::uint32_t calls = 0;
+    for (; calls < kBudget; ++calls)
+    {
+        h.runAt(kEntry);
+        if (h.stats().capacityReset > 0)
+        {
+            recovered = true;
+            break;
+        }
+    }
+
+    INFO("calls=", calls, " fullDeferred=", h.stats().fullDeferred,
+         " capacityReset=", h.stats().capacityReset);
+    // **有限回以内に回復したこと。** 落ちるなら回復経路が無い。
+    CHECK(recovered);
+    // 閾値の定数倍以内であること (回復はするが遅すぎる、を許さない)。
+    CHECK(calls <= kBudget);
+
+    // 回復したなら、実行可能メモリは巻き戻っていて再び切り出せる。
+    // **「reset を呼んだ」ではなく「また翻訳できる状態になった」を問う。**
+    CHECK(h.code.used() < h.code.capacity());
+    CHECK(h.code.allocate(4) != nullptr);
+
+    checkDeferAccounting(h.stats(), "満杯からの回復");
+}
+
+// --- T3: 反スラッシング (逆向きの上限) --------------------------------------
+
+TEST_CASE("捨て直しは閾値ぶん諦めるまで起きない")
+{
+    // **T2 の逆向きの上限。** 「回復する」だけを問うと、満杯を見るたびに
+    // reset する実装 (閾値 1) でも通ってしまう。それはキャッシュを永久に
+    // 冷たいままにするスラッシングで、満杯で凍るのと同じくらい遅い。
+    // 生存性のテストには必ず「やりすぎない」側の上限を対にして置く。
+    using namespace runner_accounting;
+
+    constexpr std::uint32_t kThreshold = 8192;  // BlockRunner::kCapacityResetThreshold
+
+    SUBCASE("満杯でも飽和でもない負荷では 1 回も捨てない")
+    {
+        Harness h;  // 既定の 64KB。埋まらない。
+        // **翻訳を成功させない。** 成功するとホストでは runBlock (Xtensa の
+        // 機械語) を呼んで abort する。ここで問うのは翻訳の成否より手前の
+        // 判断なので、失敗させたままでも問える。
+        h.makeTranslationImpossible();
+
+        for (int i = 0; i < 256; ++i)
+        {
+            h.runAt(kEntry + static_cast<u32>(i % 8) * 2u);
+        }
+
+        INFO("fullDeferred=", h.stats().fullDeferred, " capacityReset=", h.stats().capacityReset);
+        CHECK(h.stats().fullDeferred == 0);  // 前提の確認
+        CHECK(h.stats().capacityReset == 0);
+        CHECK(h.stats().generationReset == 0);
+
+        checkDeferAccounting(h.stats(), "スラッシングなし");
+    }
+
+    SUBCASE("満杯でも閾値に届くまでは捨てない")
+    {
+        // **これが M (閾値を小さくする) を殺す本体。**
+        //
+        // 満杯にしたうえで、閾値の手前まで叩く。捨てる費用は常駐ブロックの
+        // 再翻訳まるごとなので、要求が積もる前に捨ててはいけない。
+        // **窓は読めるままにする。** 読めなくすると計画の段階で諦めて
+        // しまい、満杯の判定 (allocate) まで届かない = codeFull_ が立たない。
+        // 満杯にしておけば翻訳は必ず入口で諦めるので、成功して runBlock へ
+        // 行く心配はない。
+        Harness h;
+        REQUIRE(h.code.allocate(h.code.capacity()) != nullptr);
+
+        // 1 回目で allocate に断られて codeFull_ が立つ。この 1 回は
+        // translateFail に数えられ、fullDeferred には乗らない。
+        h.runAt(kEntry);
+        REQUIRE(h.stats().translateFail == 1u);
+        REQUIRE(h.stats().fullDeferred == 0u);
+
+        // **1 回ごとに「まだ捨てていない」ことを確かめながら進む。**
+        //
+        // Why not 閾値の手前までまとめて回してから 1 回だけ見るか:
+        // 閾値を小さくする変異では、途中で捨てた瞬間にコード領域が空くので
+        // **次の翻訳が成功して runBlock (ホストでは abort) へ落ちる**。
+        // それだと落ち方が SIGABRT になり、「何を破ったのか」が読めない。
+        // 毎回見れば、捨てた最初の 1 回をアサーションとして捕まえられる。
+        for (std::uint32_t i = 0; i < kThreshold - 1u; ++i)
+        {
+            h.runAt(kEntry);
+            if (h.stats().capacityReset != 0u)
+            {
+                INFO("捨て直しが早すぎる: ", i + 2u, " 回目 (閾値 ", kThreshold, ")");
+                CHECK(h.stats().capacityReset == 0u);
+                return;
+            }
+        }
+
+        INFO("fullDeferred=", h.stats().fullDeferred, " capacityReset=", h.stats().capacityReset);
+        // 満杯の経路を確かに通っていること (通っていなければ以下は空虚)。
+        CHECK(h.stats().fullDeferred == kThreshold - 1u);
+        // **閾値に 1 回足りないので、まだ捨てていないこと。**
+        CHECK(h.stats().capacityReset == 0);
+        // 実行可能メモリも巻き戻っていないこと。
+        CHECK(h.code.allocate(4) == nullptr);
+
+        // もう 1 回叩けば閾値に届き、そこで初めて捨てる。
+        h.runAt(kEntry);
+        CHECK(h.stats().capacityReset == 1);
+
+        checkDeferAccounting(h.stats(), "閾値の境界");
+    }
+}
+
+// --- T4: 索引の分散 ---------------------------------------------------------
+
+TEST_CASE("1KB 周期に並ぶ番地がスロット全体へ散る")
+{
+    // **欠陥 2 の回帰テスト。** 索引が (pc >> 1) & mask だったとき、
+    // 2 * slotCount バイト周期 (512 スロットなら 1KB) の番地は**全部同じ
+    // スロット**に落ちた。2MB に散った常駐部とサブルーチン群に対して
+    // 系統的に当たる形で、実機では鍵外れの 21.5% がこれだった。
+    //
+    // **正しさは壊れない** (タグ照合が必ず外すので別番地のコードは走らない)。
+    // 壊れるのは速度だけなので、状態を比べるテストには映らない。
+    //
+    // ## ここで何を「保証」と呼ぶか
+    //
+    // 「N 個の pc が N 個の異なるスロットに写る」は**成り立たない**。
+    // 512 スロット (マスク 0x1FF = 索引ビット 0-8) では、pc のビット 10 が
+    // (pc >> 1) のビット 9 へ行ってマスクの外へ落ち、(pc >> 11) にも乗らない。
+    // **ビット 10 は索引から完全に消える**ので、1KB だけ離れた 2 番地は
+    // 必ず衝突する (下の SUBCASE がその事実を固定している)。
+    //
+    // したがって保証するのは「衝突が畳み込みの周期で系統的に起きないこと」
+    // — 具体的には **2KB 周期では全部散り、1KB 周期でも半数まで散る**こと。
+    // 直す前は 16 個が 1 個へ潰れていたので、これでも桁違いに違う。
+    using namespace runner_accounting;
+
+    constexpr std::uint32_t kSlots = Harness::kSlots;
+    constexpr int kCount = 16;
+
+    SUBCASE("2KB 周期なら全部が別のスロットへ行く")
+    {
+        // ビット 10 を跨がない周期。ここは完全に散らなければならない。
+        constexpr u32 kStride = 4u * kSlots;  // 2048
+        std::vector<std::uint32_t> seen;
+        for (int i = 0; i < kCount; ++i)
+        {
+            seen.push_back(foldedIndex(kEntry + static_cast<u32>(i) * kStride, kSlots));
+        }
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        INFO("distinct = ", seen.size(), " / ", kCount);
+        CHECK(seen.size() == static_cast<std::size_t>(kCount));
+    }
+
+    SUBCASE("1KB 周期でも半数以上へ散る")
+    {
+        // **直す前はここが 1 だった。** 畳み込みを外すと 16 個が 1 個へ潰れる。
+        constexpr u32 kStride = 2u * kSlots;  // 1024
+        std::vector<std::uint32_t> seen;
+        for (int i = 0; i < kCount; ++i)
+        {
+            seen.push_back(foldedIndex(kEntry + static_cast<u32>(i) * kStride, kSlots));
+        }
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        INFO("distinct = ", seen.size(), " / ", kCount);
+        // **全数散ること。** 半数で妥協すると、ビット 10 が索引から
+        // 落ちている状態 (16 → 8 スロット) を緑のまま通してしまう。
+        CHECK(seen.size() == static_cast<std::size_t>(kCount));
+    }
+
+    SUBCASE("ちょうど 1KB 離れた番地が別のスロットへ写る")
+    {
+        // **直そうとした当の周期が残っていないこと。**
+        //
+        // 畳み込みが (pc >> 11) だと、512 スロット (マスク 0x1FF) では
+        // pc のビット 10 が索引から完全に消え、1KB 離れた 2 番地が必ず
+        // 衝突したままになる。「散らした」つもりで元の周期が残る形なので、
+        // ビット 10 だけが違う組を名指しで問う。
+        for (u32 pc = kEntry; pc < kEntry + 0x8000u; pc += 2u)
+        {
+            REQUIRE(foldedIndex(pc, kSlots) != foldedIndex(pc ^ 0x400u, kSlots));
+        }
+    }
+
+    SUBCASE("実装の振る舞いでも 2KB 周期の番地が共存できる")
+    {
+        // 索引式の再現 (上の 3 つ) は**同じ式を 2 度書いただけ**なので、
+        // 実装を問うたことにならない。畳み込みを外す変異はテスト側の
+        // foldedIndex を変えないため、上の 3 つは素通りする。
+        // **実装の観測可能な振る舞いで裏を取る。**
+        //
+        // 手順: 2KB 周期の番地を 1 つずつスロットへ「居座らせ」てから、
+        // もう一度全部を訪ねる。散っていれば全員が自分のスロットに残って
+        // いるのでタグ外れは 1 件も出ない。畳み込みを外すと全員が同じ
+        // スロットへ落ち、最後の 1 つ以外は追い出されてタグ外れになる。
+        Harness h;
+        // 翻訳は成功させない (ホストでは runBlock が abort する)。スロット索引と
+        // 鍵外れの帰属はどちらも翻訳の手前なので、失敗させたままで問える。
+        h.makeTranslationImpossible();
+        // 索引の探索は同じ pc を何百回も訪ねるので、表が溢れて追い出しが
+        // 起きないよう外しておく。
+        h.disableNegativeCache();
+        constexpr u32 kStride = 4u * kSlots;
+
+        // **実装に「この pc はどのスロットか」を訊いて回る。**
+        //
+        // Why not スロットへ先客を置いて訪ね直す形にしないか: 鍵が合うと
+        // それは「当たり」なので run() が生成コードを呼ぶ。ホストでは
+        // runBlock が abort するため、**当たりを作ってはいけない**。
+        // 索引だけを訊き出して、衝突の有無はテスト側で数える。
+        std::vector<std::uint32_t> where;
+        for (int i = 0; i < kCount; ++i)
+        {
+            where.push_back(h.runnerSlotIndex(kEntry + static_cast<u32>(i) * kStride));
+        }
+
+        std::vector<std::uint32_t> uniq = where;
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+        INFO("distinct slots = ", uniq.size(), " / ", kCount);
+        // **N 個の pc が N 個の異なるスロットへ写ること。**
+        // 畳み込みを外すと 2KB 周期は全部スロット 0 へ落ち、ここが 1 になる。
+        CHECK(uniq.size() == static_cast<std::size_t>(kCount));
+
+        checkDeferAccounting(h.stats(), "索引の分散");
+    }
+}
+
+// --- T5: 帰属の排他性 -------------------------------------------------------
+
+TEST_CASE("スロット衝突は居座りブロックのページが飽和していてもタグに数える")
+{
+    // **欠陥 3 の回帰テスト。**
+    //
+    // 鍵照合は世代を `slot->page` (= そのスロットの**先客**のページ) から
+    // 引く。空きスロットなら 0 で、ページ 0 は例外ベクタ表と Human68k の
+    // ワーク領域なので起動後すぐ 65,536 回書かれて飽和する。
+    //
+    // 飽和すると `nowGen == kAlwaysStale` が**どのスロットのどの取りこぼしでも**
+    // 成立する。帰属の if-else が kAlwaysStale をタグより先に見ていたため、
+    // 本来「スロット衝突」であるものが**まとめて「飽和」に化けた**。
+    // 実機ではこれで衝突 151 万件が誤帰属され、対策の方向を丸ごと見誤った。
+    //
+    // **判定 (hit) の順序は変えていない。** kAlwaysStale を世代一致より先に
+    // 見るのは正しさの根拠がある (§5.5)。変えたのは帰属の順序だけで、
+    // このテストは「正しさの順序」と「説明の順序」が別物であることを固定する。
+    using namespace runner_accounting;
+
+    Harness h;
+    h.makeTranslationImpossible();
+
+    // 同じスロットへ写る 2 つの番地を用意する。
+    //
+    // Why not 「ビット 10 だけ違う番地」にしないか: それが必ず衝突するのは
+    // **索引の欠陥そのもの**で、直した今は衝突しない。衝突する組は
+    // 索引を実際に引いて探す。こうしておけば索引式が変わっても
+    // このテストの前提は壊れない (衝突は必ずどこかに存在する — 番地の
+    // 数がスロット数より多いので鳩の巣原理)。
+    constexpr std::uint32_t kSlots = Harness::kSlots;
+    const u32 pc1 = kEntry;
+    u32 pc2 = 0;
+    for (u32 cand = kEntry + 2u; cand < kEntry + 0x40000u; cand += 2u)
+    {
+        if (foldedIndex(cand, kSlots) == foldedIndex(pc1, kSlots))
+        {
+            pc2 = cand;
+            break;
+        }
+    }
+    REQUIRE(pc2 != 0u);
+    REQUIRE(foldedIndex(pc1, kSlots) == foldedIndex(pc2, kSlots));
+    REQUIRE(pc1 != pc2);
+
+    // pc1 をスロットへ居座らせる。**翻訳は成功しないので、居座らせるには
+    // スロットを直接書く** (テスト対象を経由せず状態を作る)。
+    x68k::jit::BlockSlot& slot = h.slots[foldedIndex(pc1, kSlots)];
+    slot.entryPc = pc1;
+    slot.mappingEpoch = h.cpu().codeGenMap().mappingEpoch();
+    slot.page = pc1 >> x68k::CodeGenMap::kPageShift;
+    slot.pageGen = h.cpu().codeGenMap().generation(pc1);
+    slot.count = 1;
+    // code != nullptr でないと帰属の if-else へ入らない (空きは keyMissCold)。
+    // **実行はされない** (タグが外れるので translate へ落ちる)。
+    static const std::uint8_t kDummyCode[4] = {0, 0, 0, 0};
+    slot.code = kDummyCode;
+
+    // **先客のページを飽和させる。** 65,536 回の touch を直接叩く
+    // (テスト対象を経由せず状態を作る)。
+    h.saturatePage(pc1);
+    REQUIRE(h.cpu().codeGenMap().generation(pc1) == x68k::CodeGenMap::kAlwaysStale);
+
+    const std::uint64_t tagBefore = h.stats().keyMissTag;
+    const std::uint64_t staleBefore = h.stats().keyMissStale;
+
+    // pc2 を訪ねる。先客は pc1 なのでタグが外れる。同時に先客のページは
+    // 飽和しているので kAlwaysStale も成立する。**どちらに数えるか。**
+    h.runAt(pc2);
+
+    INFO("keyMissTag ", tagBefore, " -> ", h.stats().keyMissTag);
+    INFO("keyMissStale ", staleBefore, " -> ", h.stats().keyMissStale);
+    // **タグに数えること。** これが実体 (別の番地がスロットを取り合っている)。
+    CHECK(h.stats().keyMissTag == tagBefore + 1);
+    // **飽和は 1 も動かないこと。** 動くなら衝突が飽和に化けている。
+    CHECK(h.stats().keyMissStale == staleBefore);
+
+    checkDeferAccounting(h.stats(), "帰属の排他性");
+}
+
+// --- T6: コールドミスが数えられている ---------------------------------------
+
+TEST_CASE("空きスロットを引いたらコールドミスとして数える")
+{
+    // **欠陥 3 の片割れ。** 鍵外れの帰属は `slot->code != nullptr` の中でしか
+    // 数えていなかったので、**空きスロットの取りこぼしはどのカウンタにも
+    // 乗らなかった**。起動直後は全部が空きなので、これは取りこぼしの
+    // 最大成分でありながら統計から完全に消えていた。
+    //
+    // 「見えないものは直せない」形の欠陥で、正しさは 1 ビットも壊れない。
+    using namespace runner_accounting;
+
+    Harness h;
+    h.makeTranslationImpossible();
+
+    // 全部が空きスロットの状態から、別々のスロットへ写る番地を訪ねる。
+    constexpr std::uint32_t kSlots = Harness::kSlots;
+    constexpr int kCount = 8;
+    constexpr u32 kStride = 4u * kSlots;  // 2KB: 完全に散る周期
+
+    for (int i = 0; i < kCount; ++i)
+    {
+        h.runAt(kEntry + static_cast<u32>(i) * kStride);
+    }
+
+    INFO("keyMissCold=", h.stats().keyMissCold, " keyMissTag=", h.stats().keyMissTag,
+         " keyMissStale=", h.stats().keyMissStale, " keyMissGen=", h.stats().keyMissGen,
+         " keyMissEpoch=", h.stats().keyMissEpoch);
+    // **1 回ずつ数えられていること。**
+    CHECK(h.stats().keyMissCold == static_cast<std::uint64_t>(kCount));
+    // 空きスロットは他のどの理由にも数えられないこと (排他)。
+    CHECK(h.stats().keyMissTag == 0);
+    CHECK(h.stats().keyMissStale == 0);
+    CHECK(h.stats().keyMissGen == 0);
+    CHECK(h.stats().keyMissEpoch == 0);
+
+    checkDeferAccounting(h.stats(), "コールドミス");
 }
