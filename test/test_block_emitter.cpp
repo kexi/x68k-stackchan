@@ -5166,7 +5166,9 @@ TEST_CASE("コード領域が満杯になっても有限回で翻訳器が回復
     // 「常駐ルーチンを回し続けているのに翻訳が再開しない」という形だった。
     //
     // 上限は閾値の定数倍。回復経路が無ければここで尽きる。
-    constexpr std::uint32_t kThreshold = 8192;  // BlockRunner::kCapacityResetThreshold
+    // **実装の定数を読む。** 写すと、値を変えたときにテストの前提だけが
+    // 古くなって「回復しない」と嘘の失敗をする (実際に踏んだ)。
+    constexpr std::uint32_t kThreshold = x68k::jit::BlockRunner::kCapacityResetThreshold;
     constexpr std::uint32_t kBudget = kThreshold * 4;
 
     bool recovered = false;
@@ -5206,7 +5208,7 @@ TEST_CASE("捨て直しは閾値ぶん諦めるまで起きない")
     // 生存性のテストには必ず「やりすぎない」側の上限を対にして置く。
     using namespace runner_accounting;
 
-    constexpr std::uint32_t kThreshold = 8192;  // BlockRunner::kCapacityResetThreshold
+    constexpr std::uint32_t kThreshold = x68k::jit::BlockRunner::kCapacityResetThreshold;
 
     SUBCASE("満杯でも飽和でもない負荷では 1 回も捨てない")
     {
