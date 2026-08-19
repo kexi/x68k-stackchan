@@ -216,6 +216,37 @@ bool specSafeMisc(x68k::u16 op)
         return mode == 2 || mode == 5 || (mode == 7 && reg <= 1);
     }
 
+    // --- Tier E: MOVEM.L の 2 形 ---
+    //
+    // **符号化から直接組む。** MOVEM は 0100 1d00 1s mmm rrr で、
+    //   d (bit10) : 0 = レジスタからメモリへ / 1 = メモリからレジスタへ
+    //   s (bit6)  : 0 = .W / 1 = .L
+    // 受けるのは次の 2 つだけ。d と mmm が独立に動かせないことが要点で、
+    // 「読みは (An)+ だけ / 書きは -(An) だけ」という対応が入れ替わったら
+    // 別の命令になる。
+    //   d=1, s=1, mode 3 : MOVEM.L (An)+,<regs>
+    //   d=0, s=1, mode 4 : MOVEM.L <regs>,-(An)
+    //
+    // .W (s=0) と、他の EA (mode 2/5/6/7)、および存在しない組み合わせ
+    // (読みの mode 4 / 書きの mode 3) はどれも受けない。
+    const bool isMovemEncoding = (op & 0xFB80u) == 0x4880u;
+    if (isMovemEncoding)
+    {
+        // EXT.W ($4880-$4887) は MOVEM のマスクに当たるが mode 0 なので
+        // ここで先に外れる (実装も m68k_length.h も同じ順序)。
+        const bool isMemoryToRegister = (op & 0x0400u) != 0;
+        const bool isLong = (op & 0x0040u) != 0;
+        if (!isLong)
+        {
+            return false;
+        }
+        if (isMemoryToRegister)
+        {
+            return mode == 3;  // (An)+ だけ
+        }
+        return mode == 4;  // -(An) だけ
+    }
+
     // 単項演算は (op >> 8) & 0xF で判別する (実装の unary_ops と同じ)。
     const x68k::u32 opcodeBits = static_cast<x68k::u32>((op >> 8) & 0xFu);
     const x68k::u32 sizeField = static_cast<x68k::u32>((op >> 6) & 3u);
@@ -1437,6 +1468,322 @@ TEST_SUITE("BlockPlanner")
     //
     // 256 ブロックぶんを内部 SRAM から確保する前提で kMaxOps = 4 を選んで
     // いるので、暗黙のパディングで膨らむと確保が破綻する。
+    // --- Tier E: MOVEM.L の 2 形 -------------------------------------------
+
+    // T-P2: レジスタ本数が範囲外の MOVEM は、**積まずに**手前で終端すること。
+    //
+    // 何を保証するか: 本数が 0 本または 5 本以上の MOVEM に出会ったら、
+    // その命令をブロックへ入れずに切る。手前で切れていれば短くても
+    // 翻訳できるブロックが残るが、積んでからエミッタに拒否させると
+    // **1 つ入っただけでブロック全部を失う** (Tier B で実測した轍:
+    // 翻訳失敗 1,944 → 2,198,539 / クロック 6493 → 6316)。
+    //
+    // 終端理由が kUnsupported ではなく kMovemTooManyRegs で立つことも問う。
+    // 「MOVEM を知らない」と「MOVEM だが本数が多すぎる」で次の一手が違う。
+    //
+    // 落ちる変異:
+    //   - plan() の上限検査を丸ごと消す (本数 5 以上が積まれる)
+    //   - transfers == 0 の検査だけ消す (マスク 0 が積まれる)
+    //   - 上限を kMovemMaxTransfers から 16 へ広げる
+    //   - 終端理由を kUnsupported にまとめる (原因が見えなくなる)
+    TEST_CASE("本数が範囲外の MOVEM は手前で終端して積まれない")
+    {
+        FlatCode code;
+        FakeGen gen;
+        const auto gsrc = gen.source();
+
+        struct Case
+        {
+            x68k::u16 op;
+            x68k::u16 mask;
+            unsigned transfers;
+            const char* what;
+        };
+
+        // 0 本と 5 本以上。**両端を問う。** 上限 4 本ちょうどは下の
+        // 「受理される」検査が別に押さえる。
+        const std::vector<Case> rejected = {
+            {0x4CD8u, 0x0000u, 0, "(An)+ 形 / マスク 0"},
+            {0x48E0u, 0x0000u, 0, "-(An) 形 / マスク 0"},
+            {0x4CD8u, 0x001Fu, 5, "(An)+ 形 / 5 本"},
+            {0x48E0u, 0x001Fu, 5, "-(An) 形 / 5 本"},
+            {0x4CD8u, 0xFFFFu, 16, "(An)+ 形 / 16 本"},
+            {0x48E0u, 0xFFFFu, 16, "-(An) 形 / 16 本"},
+        };
+
+        for (const Case& c : rejected)
+        {
+            INFO(c.what);
+            // 手前に MOVEQ を置く。**0 命令にすると「積まなかった」と
+            // 「そもそも計画できなかった」が区別できない。**
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x7000u);      // MOVEQ #0,D0
+            code.poke16(kEntry + 2, c.op);     // MOVEM
+            code.poke16(kEntry + 4, c.mask);   // レジスタマスク
+            code.poke16(kEntry + 6, 0x4E71u);  // NOP
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            // MOVEQ だけが積まれ、MOVEM は入っていない。
+            CHECK(plan.count == 1u);
+            CHECK(plan.end == x68k::BlockEnd::kMovemTooManyRegs);
+            // 積まれていないことを kind でも確かめる (count だけだと
+            // 「MOVEM を積んで MOVEQ を落とした」形と区別できない)。
+            CHECK(plan.ops[0].kind == x68k::PlanKind::kMoveq);
+            // fallThroughPc は MOVEM の**手前**を指す。ここがずれると
+            // インタプリタが MOVEM を飛ばして再開する。
+            CHECK(plan.fallThroughPc == kEntry + 2);
+        }
+
+        // **上限ちょうど (4 本) は受理される。** 「常に終端する」実装と
+        // 区別するために要る。これが無いと上限検査を
+        // 「MOVEM を全部弾く」に書き換えても落ちない。
+        for (const x68k::u16 op :
+             {static_cast<x68k::u16>(0x4CD8u), static_cast<x68k::u16>(0x48E0u)})
+        {
+            INFO(op);
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x7000u);
+            code.poke16(kEntry + 2, op);
+            code.poke16(kEntry + 4, 0x000Fu);  // D0-D3 の 4 本
+            code.poke16(kEntry + 6, 0x4E71u);
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            CHECK(plan.count == 2u);
+            CHECK(plan.ops[1].kind == (op == 0x4CD8u ? x68k::PlanKind::kMovemPostIncToRegs
+                                                     : x68k::PlanKind::kMovemRegsToPredec));
+        }
+    }
+
+    // T-P3: MOVEM のサイクル数がインタプリタの return 式と一致すること。
+    //
+    // 何を保証するか: 本数 1..4 の全点で、計画したサイクルが実際に
+    // step() を回した値と一致する。JIT の契約は「インタプリタとビット単位で
+    // 同一」なので、ここがずれると rasterNumber() の 317 サイクル粒度が
+    // 数万命令後に必ず割れる。
+    //
+    // **基底が方向で違う** (m68k_ops_group4.cpp:420 と 482):
+    //   (An)+,<regs> : 12 + count * 8
+    //   <regs>,-(An) :  8 + count * 8
+    // 片方から導くと必ず 4 ずれる。両方向を全点で回すのはそのため。
+    //
+    // 落ちる変異:
+    //   - 基底 8 と 12 を入れ替える
+    //   - per-reg を 8 から 4 にする (.W の値)
+    //   - 基底を片方だけにして両方向で使い回す
+    TEST_CASE("MOVEM のサイクル数がインタプリタと一致する")
+    {
+        FlatCode code;
+        FakeGen gen;
+        const auto gsrc = gen.source();
+
+        // 本数 n のマスクを D0 から順に立てて作る。
+        const auto maskOf = [](unsigned n) { return static_cast<x68k::u16>((1u << n) - 1u); };
+
+        for (unsigned n = 1; n <= x68k::kMovemMaxTransfers; ++n)
+        {
+            for (const x68k::u16 op :
+                 {static_cast<x68k::u16>(0x4CD8u), static_cast<x68k::u16>(0x48E0u)})
+            {
+                INFO("本数 " << n << " / op " << op);
+                const x68k::u16 mask = maskOf(n);
+
+                code.reset(0x0800, 0x1800);
+                code.poke16(kEntry, op);
+                code.poke16(kEntry + 2, mask);
+                // 後続は許可リストの外 (SWAP) にして 1 命令で切る。
+                code.poke16(kEntry + 4, 0x4840u);
+                code.poke16(kEntry + 6, 0x4840u);
+                const auto src = code.source();
+
+                x68k::BlockPlan plan{};
+                REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+                REQUIRE(plan.count == 1u);
+
+                // 実際に 68000 を回した値と突き合わせる。
+                const StepResult ran = runOne({op, mask}, 0);
+                REQUIRE_FALSE(ran.halted);
+                CHECK(plan.cyclesNotTaken == ran.cycles);
+                // MOVEM は条件を持たないので成立側も同じ値。
+                CHECK(plan.cyclesTaken == ran.cycles);
+
+                // 式そのものも名指しで固定する。実行との一致だけだと、
+                // インタプリタ側が壊れたときに両方ずれて緑のままになる。
+                const x68k::u32 base = op == 0x4CD8u ? 12u : 8u;
+                CHECK(plan.ops[0].cycles == base + n * 8u);
+            }
+        }
+    }
+
+    // T-P4: 欄の割り当てと、**MOVEM がブロックを切らない**こと。
+    //
+    // 何を保証するか:
+    //   - imm にレジスタマスクの**生値**が入る (正規化しない)
+    //   - eaMode が読み = kEaPostInc / 書き = kEaPreDec
+    //   - eaRegOf() が An 番号を返す (読みは srcReg / 書きは dstReg)
+    //   - MOVEM の**後ろに命令が積まれる** (区間が切れない)
+    //
+    // 最後が Tier E の目的そのもの。MOVEM を isBlockTerminator に入れると
+    // 「対応したのに区間が伸びない」形になり、被覆率が 1 命令も増えない。
+    //
+    // 落ちる変異:
+    //   - imm を正規化する (ビット反転して入れる)
+    //   - eaMode を kEaNone のままにする
+    //   - isMemoryWriteKind から kMovemRegsToPredec を外す (eaRegOf が
+    //     srcReg を返し、関係ないレジスタが減る)
+    //   - isBlockTerminator に MOVEM を足す (後続が積まれなくなる)
+    TEST_CASE("MOVEM の欄が規約どおりで、後続の命令が積まれる")
+    {
+        FlatCode code;
+        FakeGen gen;
+        const auto gsrc = gen.source();
+
+        // マスクは**非対称**な値を選ぶ。0xFF のような対称値だと、
+        // ビット反転する変異を入れても同じ値になって落ちない。
+        constexpr x68k::u16 kMask = 0x0143u;  // D0,D1,D6,A0 の 4 本
+
+        SUBCASE("読み形 MOVEM.L (A5)+,<regs>")
+        {
+            // $4CD8 + 5 = A5 を EA レジスタにする。
+            constexpr x68k::u16 kOp = 0x4CD8u + 5u;
+
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, kOp);
+            code.poke16(kEntry + 2, kMask);
+            code.poke16(kEntry + 4, 0x7001u);  // MOVEQ #1,D0。**後続**
+            code.poke16(kEntry + 6, 0x4840u);  // SWAP。ここで切れる
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+
+            // **MOVEM が終端になっていない。** 後続の MOVEQ まで積まれる。
+            REQUIRE(plan.count == 2u);
+            CHECK(plan.ops[1].kind == x68k::PlanKind::kMoveq);
+
+            const x68k::PlannedOp& p = plan.ops[0];
+            CHECK(p.kind == x68k::PlanKind::kMovemPostIncToRegs);
+            // マスクは生値のまま。
+            CHECK(p.imm == kMask);
+            CHECK(p.eaMode == x68k::kEaPostInc);
+            CHECK(p.size == 4u);
+            CHECK(p.length == 4u);
+            // 読み形の EA レジスタは srcReg。
+            CHECK(x68k::eaRegOf(p) == 5u);
+            CHECK(p.srcReg == 5u);
+            // 読みの窓が要る / 書きの窓は要らない。
+            CHECK(x68k::needsReadWindow(p.kind, p.eaMode));
+            CHECK_FALSE(x68k::needsWriteWindow(p.kind));
+            CHECK_FALSE(x68k::isMemoryWriteKind(p.kind));
+            // **ブロックを切る形ではない。**
+            CHECK_FALSE(x68k::isBlockTerminator(p.kind));
+        }
+
+        SUBCASE("書き形 MOVEM.L <regs>,-(A3)")
+        {
+            // $48E0 + 3 = A3 を EA レジスタにする。
+            constexpr x68k::u16 kOp = 0x48E0u + 3u;
+
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, kOp);
+            code.poke16(kEntry + 2, kMask);
+            code.poke16(kEntry + 4, 0x7001u);  // MOVEQ #1,D0。**後続**
+            code.poke16(kEntry + 6, 0x4840u);
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+
+            REQUIRE(plan.count == 2u);
+            CHECK(plan.ops[1].kind == x68k::PlanKind::kMoveq);
+
+            const x68k::PlannedOp& p = plan.ops[0];
+            CHECK(p.kind == x68k::PlanKind::kMovemRegsToPredec);
+            CHECK(p.imm == kMask);
+            CHECK(p.eaMode == x68k::kEaPreDec);
+            CHECK(p.size == 4u);
+            CHECK(p.length == 4u);
+            // **書き形の EA レジスタは dstReg。** ここが srcReg だと
+            // 関係ないレジスタが減る。
+            CHECK(x68k::eaRegOf(p) == 3u);
+            CHECK(p.dstReg == 3u);
+            // 書きの窓が要る / 読みの窓は要らない。
+            CHECK(x68k::needsWriteWindow(p.kind));
+            CHECK(x68k::isMemoryWriteKind(p.kind));
+            CHECK_FALSE(x68k::needsReadWindow(p.kind, p.eaMode));
+            CHECK_FALSE(x68k::isBlockTerminator(p.kind));
+        }
+
+        // **MOVEM を 2 つ並べても切れない。** 区間が繋がることが Tier E の
+        // 目的なので、連続した MOVEM が 1 本のブロックに入ることを問う。
+        SUBCASE("MOVEM が 2 つ続けて積まれる")
+        {
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x48E0u + 7u);      // MOVEM.L <regs>,-(A7)
+            code.poke16(kEntry + 2, 0x0003u);       // 2 本
+            code.poke16(kEntry + 4, 0x4CD8u + 7u);  // MOVEM.L (A7)+,<regs>
+            code.poke16(kEntry + 6, 0x0003u);       // 2 本
+            code.poke16(kEntry + 8, 0x4840u);       // SWAP。ここで切れる
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            CHECK(plan.count == 2u);
+            CHECK(plan.ops[0].kind == x68k::PlanKind::kMovemRegsToPredec);
+            CHECK(plan.ops[1].kind == x68k::PlanKind::kMovemPostIncToRegs);
+            CHECK(plan.end == x68k::BlockEnd::kUnsupported);
+            // サイクルは 2 命令ぶんの和。書き 8+16=24 / 読み 12+16=28。
+            CHECK(plan.cyclesNotTaken == 24u + 28u);
+        }
+    }
+
+    // 受理する MOVEM の符号を名指しで固定する。
+    //
+    // 全数の突き合わせ (planOne の許可リスト) は「テストが書いた仕様」と
+    // 「実装」の一致しか言わない。**両方が同じ誤りをしていると素通りする**
+    // ので、2 形の符号そのものをここで押さえる。
+    //
+    // 落ちる変異:
+    //   - 読みと書きの mode を取り違える (3 と 4 の入れ替え)
+    //   - d ビット (bit10) を反転する
+    //   - .W ($4C98 / $48A0) を受ける
+    TEST_CASE("MOVEM は .L の (An)+ と -(An) の 2 形だけを受ける")
+    {
+        const auto accepts = [](x68k::u16 op)
+        {
+            x68k::PlannedOp p{};
+            return x68k::BlockPlanner::planOne(op, kEntry, p);
+        };
+
+        for (x68k::u32 reg = 0; reg < 8; ++reg)
+        {
+            INFO(reg);
+            // 受ける 2 形。
+            CHECK(accepts(static_cast<x68k::u16>(0x4CD8u + reg)));  // .L (An)+,<regs>
+            CHECK(accepts(static_cast<x68k::u16>(0x48E0u + reg)));  // .L <regs>,-(An)
+
+            // **方向と EA の組が入れ替わった形は受けない** (68000 に無い符号)。
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x4CE0u + reg)));  // .L -(An),<regs>
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x48D8u + reg)));  // .L <regs>,(An)+
+
+            // .W は両方向とも受けない。
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x4C98u + reg)));  // .W (An)+,<regs>
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x48A0u + reg)));  // .W <regs>,-(An)
+
+            // 他の EA (mode 2 / 5 / 7.0 / 7.1) も受けない。
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x4CD0u + reg)));  // .L (An),<regs>
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x4CE8u + reg)));  // .L (d16,An),<regs>
+            CHECK_FALSE(accepts(static_cast<x68k::u16>(0x48D0u + reg)));  // .L <regs>,(An)
+        }
+        // 絶対形も受けない。
+        CHECK_FALSE(accepts(0x4CF8u));  // MOVEM.L (xxx).W,<regs>
+        CHECK_FALSE(accepts(0x4CF9u));  // MOVEM.L (xxx).L,<regs>
+        CHECK_FALSE(accepts(0x48F8u));  // MOVEM.L <regs>,(xxx).W
+    }
+
     TEST_CASE("BlockPlan の大きさが見積もりどおり")
     {
         CHECK(x68k::kMaxOps == 4);

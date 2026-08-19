@@ -344,6 +344,50 @@ bool planMisc(u16 op, PlannedOp& out)
         return true;
     }
 
+    // --- Tier E: MOVEM.L の 2 形 ---
+    //
+    // **受けるのは 2 つの符号だけ。**
+    //   MOVEM.L (An)+,<regs> : 0100 1100 11 011 rrr = $4CD8 + rrr
+    //   MOVEM.L <regs>,-(An) : 0100 1000 11 100 rrr = $48E0 + rrr
+    //
+    // Why not 他の形も受けないか: 実測 (400M サイクル、Human68k 起動) では
+    // MOVEM の **100%** がこの 2 形だった (.W が 0 件、(An)+ と -(An) 以外の
+    // EA が 0 件)。残りを受けても被覆は 1 命令も増えず、代わりに
+    // 「レジスタ順が逆になる形」「拡張ワードを持つ EA」「符号拡張が要る .W」を
+    // それぞれ別の検証面として背負う。
+    //
+    // **とくに方向と EA の組は入れ替えられない。** 読みは (An)+ だけ、
+    // 書きは -(An) だけ。読みの mode 4 (MOVEM.L -(An),<regs>) と書きの
+    // mode 3 (MOVEM.L <regs>,(An)+) は 68000 に存在しない符号なので、
+    // マスクを $FFF8 にして d ビットと mode を同時に固定する。
+    //
+    // レジスタマスクは拡張ワードなので、ここでは埋まらない。plan() 側の
+    // foldImmediate が imm へ入れ、本数の検査もそこで行う。
+    const bool isMovemPostIncToRegs = (op & 0xFFF8u) == 0x4CD8u;
+    if (isMovemPostIncToRegs)
+    {
+        out.kind = PlanKind::kMovemPostIncToRegs;
+        out.eaMode = kEaPostInc;
+        // **EA の An 番号は srcReg** (読み形の欄)。eaRegOf() の規約。
+        out.srcReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(kLong);
+        // cycles は本数で決まるので **foldImmediate が入れる。**
+        // ここで 0 のまま置くと「サイクル 0 の命令」に見えるが、
+        // 本数はレジスタマスク (拡張ワード) を読むまで分からない。
+        return true;
+    }
+
+    const bool isMovemRegsToPredec = (op & 0xFFF8u) == 0x48E0u;
+    if (isMovemRegsToPredec)
+    {
+        out.kind = PlanKind::kMovemRegsToPredec;
+        out.eaMode = kEaPreDec;
+        // **EA の An 番号は dstReg** (書き形の欄)。eaRegOf() の規約。
+        out.dstReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(kLong);
+        return true;
+    }
+
     // 単項 TST / CLR : 0100 oooo ss mmm rrr。
     // **判別ビットは (op >> 8) & 0xF。** 実装の unary_ops が switch している
     // 値と揃える (ここを (op >> 9) & 7 で書いて TST を丸ごと取りこぼした
@@ -684,6 +728,39 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
                     break;
             }
             break;
+
+        // --- Tier E: MOVEM.L のレジスタマスクとサイクル ---
+        //
+        // 拡張ワードはレジスタマスクそのもの (EA の定数ではない)。
+        // **生値をそのまま入れる。** ビットとレジスタの対応は方向で逆転する
+        // (-(An) は A7 から D0 へ / m68k_ops_group4.cpp:397-405) が、
+        // ここでは正規化しない。解釈をエミッタ 1 箇所に閉じておかないと、
+        // planner とエミッタが別々に逆転させて二重に打ち消す。
+        //
+        // **サイクルは本数で決まるのでここで入れる。** planOne は命令語
+        // だけを見るので本数を知らない。インタプリタの return 式と同じ形に
+        // する (m68k_ops_group4.cpp:420 と 482):
+        //   (An)+,<regs> : 12 + count * 8   (.L の per-reg は 8)
+        //   <regs>,-(An) :  8 + count * 8
+        // 基底が 4 違う。片方から導くと必ずずれる。
+        case PlanKind::kMovemPostIncToRegs:
+        case PlanKind::kMovemRegsToPredec:
+        {
+            p.imm = ext0;
+            u32 count = 0;
+            for (u32 bit = 0; bit < 16; ++bit)
+            {
+                if (((p.imm >> bit) & 1u) != 0)
+                {
+                    ++count;
+                }
+            }
+            const u32 base = p.kind == PlanKind::kMovemPostIncToRegs ? 12u : 8u;
+            // 本数の上限は plan() が別に検査する。ここは 4 本までなら
+            // 12 + 4*8 = 44 で u8 に収まる。
+            p.cycles = static_cast<u8>(base + count * 8u);
+            break;
+        }
         default:
             break;
     }
@@ -895,6 +972,45 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // 生成コードの自ページガードが受け持つ (G13)。ここで飛び先を
         // 自ページ判定にかけると、**自分のページへの再帰呼び出しを
         // 積めなくする**だけで何も守らない。
+        //
+        // **kMovemRegsToPredec もここへ来ない。** isMemoryWriteKind には
+        // 入るが eaMode が kEaPreDec なので絶対形の条件が成立しない。
+        // これは幸運ではなく必要な性質で、MOVEM の imm は**アドレスではなく
+        // レジスタマスク**である。絶対形の条件を外すと、マスク $8000 を
+        // 「番地 $8000 への書き込み」と読んで自ページ判定にかける。
+        // 書き形を足すときは imm が何を指しているかを必ず確かめること。
+
+        // Tier E: MOVEM の本数が上限を超える形は、積まずに終端する。
+        //
+        // **手前で終端するのが要点。** 積んでからエミッタに丸ごと拒否させると、
+        // 「1 つ入っただけでブロック全部を失う」形になる。Tier B の
+        // canEmitReads で一度踏んだ轍 (block_planner.h の冒頭)。
+        //
+        // 本数 0 も弾く。マスクが 0 の MOVEM は 1 本も転送しない正当な命令
+        // だが、生成コードは「アクセス 0 回でポインタも動かない」特例になる。
+        // 実測で 0 件なので、被覆を 1 命令も失わずに検証面を 1 つ減らせる。
+        const bool isMovem = planned.kind == PlanKind::kMovemPostIncToRegs ||
+                             planned.kind == PlanKind::kMovemRegsToPredec;
+        if (isMovem)
+        {
+            u32 transfers = 0;
+            for (u32 bit = 0; bit < 16; ++bit)
+            {
+                if (((planned.imm >> bit) & 1u) != 0)
+                {
+                    ++transfers;
+                }
+            }
+            const bool tooManyOrEmpty = transfers == 0 || transfers > kMovemMaxTransfers;
+            if (tooManyOrEmpty)
+            {
+                // **kUnsupported と別の理由にする。** 「MOVEM を知らない」と
+                // 「MOVEM だが本数が多すぎる」で次の一手が違う (block_plan.h)。
+                out.end = BlockEnd::kMovemTooManyRegs;
+                break;
+            }
+        }
+
         const bool isAbsoluteWriteTarget =
             isMemoryWriteKind(planned.kind) &&
             (planned.eaMode == kEaAbsShort || planned.eaMode == kEaAbsLong);

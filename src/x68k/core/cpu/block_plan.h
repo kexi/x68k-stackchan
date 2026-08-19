@@ -95,6 +95,26 @@ enum class PlanKind : u8
     // A7 そのもので、EA の合成を通らない。
     kRts,  // RTS。A7 から戻り先を読んで飛ぶ。レジスタ欄は使わない
     kJsr,  // JSR <ea>。dstReg = An 番号 (書き形と同じ「転送先」の欄)
+
+    // --- Tier E: MOVEM.L の 2 形 ---
+    //
+    // 1 命令で最大 4 本のレジスタを連続番地へ読み書きする。Tier B/C との
+    // 違いは**アクセスが 1 回では終わらない**こと。窓の検査は「先頭から
+    // 末尾まで全部が窓の中か」を 1 度で問い、途中で割れる形は積まない。
+    //
+    // **ブロックを切らない。** 飛び先を持たないので isBlockTerminator には
+    // 入れない。区間が MOVEM で切れなくなることが Tier E の目的そのもの。
+    //
+    // imm はレジスタマスク 16bit の**生値**。ビットとレジスタの対応は
+    // 方向で逆転する (-(An) は A7 から D0 へ) が、**正規化しない。**
+    // 解釈をエミッタ 1 箇所に閉じておけば、planner とエミッタで別々に
+    // 逆転させて二重に打ち消す事故が起きない。
+    //
+    // eaMode は形から一意に決まる (読み = kEaPostInc / 書き = kEaPreDec)
+    // が、**それでも埋める。** エミッタの窓ガードは eaMode で分岐するので、
+    // kEaNone のままだと「EA を持たない形」として読まれる。
+    kMovemPostIncToRegs,  // MOVEM.L (An)+,<regs>。srcReg = An (読み形の欄)
+    kMovemRegsToPredec,   // MOVEM.L <regs>,-(An)。dstReg = An (書き形の欄)
 };
 
 // PlannedOp::eaMode の値。
@@ -139,6 +159,14 @@ enum class BlockEnd : u8
     // 動的分岐 (RTS / JSR) で終端。飛び先は実行時にしか分からないので、
     // BlockPlan::branchTarget は使わない (生成コードがメールボックスへ書く)。
     kDynamicBranch,
+    // MOVEM のレジスタ本数が kMovemMaxTransfers を超える (または 0) 手前で終端。
+    //
+    // **kUnsupported と分けてある。** 「MOVEM に対応していない」と
+    // 「MOVEM だが本数が多すぎる」は、対処がまったく違う。前者は符号を
+    // 足す話で、後者は上限を上げるか諦めるかの話。1 本のカウンタに
+    // まとめると、どちらで落ちているか分からなくなる。
+    // このプロジェクトは統計の粒度で 3 度失敗している (§段 0-D の教訓)。
+    kMovemTooManyRegs,
 };
 
 // ブロック内の 1 命令。命令語とデコード済みの意味を両方持つ (冒頭の理由)。
@@ -178,7 +206,12 @@ constexpr bool isMemoryWriteKind(PlanKind kind)
     // レジスタ」として返し、A7 以外が減る形になる。
     //
     // JSR がスタックへ書くことの取り扱いは needsWriteWindow() が別に持つ。
-    return kind == PlanKind::kMoveDregToMem || kind == PlanKind::kClrMem;
+    //
+    // **kMovemRegsToPredec は入れる。** MOVEM <regs>,-(An) の EA レジスタは
+    // dstReg に置いてあるので、eaRegOf() が dstReg を返す必要がある。
+    // 読み形 (kMovemPostIncToRegs) は srcReg なのでここへは入れない。
+    return kind == PlanKind::kMoveDregToMem || kind == PlanKind::kClrMem ||
+           kind == PlanKind::kMovemRegsToPredec;
 }
 
 // ゲスト RAM へ書く形か。**翻訳器が「書きの窓」を要求する対象。**
@@ -246,6 +279,19 @@ constexpr u8 eaRegOf(const PlannedOp& op)
 // 実測した内部 SRAM の空き 48,351 バイトに収まる。
 // 伸ばす変更は、割り込み受理点のずれを検査するテストを必ず通すこと。
 inline constexpr u32 kMaxOps = 4;
+
+// MOVEM 1 命令が動かしてよいレジスタの本数の上限。
+//
+// **4 にしてある。** 実測 (400M サイクル、Human68k 起動) では MOVEM の
+// 99.8% が 1〜4 本で、5 本以上は 0.2% しかない。上限を外すと 1 命令が
+// 最大 16 回のメモリアクセスへ展開され、生成コードの長さが 1 命令で
+// ブロック全体ぶんを超える。
+//
+// **これは割り込み受理の遅れの上限でもある** (kMaxOps と同じ理由)。
+// ブロック実行中はデバイスに時間を渡さないので、1 命令が長いほど
+// 新たに立った割り込みが遅れる。伸ばす変更は kMaxOps と同じく、
+// 受理点のずれを検査するテストを通すこと。
+inline constexpr u32 kMovemMaxTransfers = 4;
 
 struct BlockPlan
 {
