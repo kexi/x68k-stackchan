@@ -1811,6 +1811,16 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 e.failed = true;
                 break;
 
+            // --- 段 0-E: planner は積むが、エミッタはまだ吐けない ---
+            case PlanKind::kMovemPostIncToRegs:
+            case PlanKind::kMovemRegsToPredec:
+                // M1 で planner の受理率だけ先に測っている段階。
+                // **ここを黙って通してはいけない** ので明示的に断る。
+                // 断ればブロックが翻訳されず step() が担うだけで、
+                // 正しさは変わらない (許可リスト方式の性質)。
+                e.failed = true;
+                break;
+
             // --- Tier A: メモリに触れず例外も起きない形 ---
             case PlanKind::kMoveAregToDreg:
                 emitMoveAregToDreg(e, op);
