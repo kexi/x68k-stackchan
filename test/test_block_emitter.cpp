@@ -4235,6 +4235,155 @@ TEST_CASE("decodeBlockReturn が符号化を全数で解く")
     CHECK_FALSE(jit::decodeBlockReturn(jit::kSelfPageExitFlag).selfPageExit);
 }
 
+TEST_CASE("nextBranch が飛び先の出どころを取り違えない")
+{
+    // 保証すること: ブロックの戻り値とスロットの状態から決まる「次の飛び先」は、
+    // 静的分岐ならスロットの branchTarget、動的分岐ならメールボックス、
+    // それ以外なら「飛ばない」であること。
+    //
+    // **出どころを取り違えても型は通る** (どちらも u32) ので、テストが
+    // 名指しで問う以外に守る手が無い。動的分岐スロットの branchTarget は
+    // 設計上つねに 0 なので、取り違えると branchTo(0) — リセットベクタ相当へ
+    // 飛ぶ。runner 本体は runBlock (ESP32 のアセンブリ) に依存してホストで
+    // 走らせられないので、判断の部分だけを純関数として問う。
+    constexpr std::uint32_t kStaticTarget = 0x00FC0100u;
+    constexpr std::uint32_t kMailbox = 0x00001234u;
+
+    for (std::uint32_t cycles : {0u, 12u, 58u})
+    {
+        SUBCASE("静的分岐が成立したらスロットの branchTarget へ飛ぶ")
+        {
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles | jit::kBranchTakenFlag);
+            const jit::BranchDecision d = jit::nextBranch(r, kStaticTarget, kMailbox);
+            CHECK(d.shouldBranch());
+            // 落ちる変異 (M10 の裏): 出どころをメールボックスにする
+            CHECK(d.source == jit::BranchSource::kStaticTarget);
+            // 落ちる変異 (M13): staticTarget + 2 を返す
+            CHECK(d.target == kStaticTarget);
+            CHECK(d.target != kMailbox);
+        }
+
+        SUBCASE("動的分岐ならメールボックスへ飛ぶ (branchTarget ではない)")
+        {
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles | jit::kDynamicBranchFlag);
+            const jit::BranchDecision d = jit::nextBranch(r, kStaticTarget, kMailbox);
+            // 落ちる変異 (M12): dynamicBranch を一切ディスパッチしない
+            CHECK(d.shouldBranch());
+            // 落ちる変異 (M10): 出どころを staticTarget にする
+            CHECK(d.source == jit::BranchSource::kMailbox);
+            CHECK(d.target == kMailbox);
+            CHECK(d.target != kStaticTarget);
+        }
+
+        SUBCASE("動的分岐スロットの branchTarget は 0 なので取り違えは 0 番地行きになる")
+        {
+            // 実機で起きる形をそのまま置く。動的分岐のスロットは
+            // branchTarget を埋めない (翻訳時に飛び先が決まらない)。
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles | jit::kDynamicBranchFlag);
+            const jit::BranchDecision d = jit::nextBranch(r, 0u, kMailbox);
+            CHECK(d.shouldBranch());
+            CHECK(d.source == jit::BranchSource::kMailbox);
+            // **ここが 0 になったら実機はリセットベクタへ飛ぶ。**
+            CHECK(d.target == kMailbox);
+            CHECK(d.target != 0u);
+        }
+
+        SUBCASE("分岐しないブロックはどこへも飛ばない")
+        {
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles);
+            const jit::BranchDecision d = jit::nextBranch(r, kStaticTarget, kMailbox);
+            CHECK_FALSE(d.shouldBranch());
+            CHECK(d.source == jit::BranchSource::kNone);
+        }
+
+        SUBCASE("ガード脱出はどこへも飛ばない")
+        {
+            // 途中で降りているので、分岐の判断はそもそも走っていない。
+            for (std::uint32_t k = 0; k <= x68k::kMaxOps; ++k)
+            {
+                const std::uint32_t base =
+                    cycles | jit::kGuardExitFlag | (k << jit::kGuardCountShift);
+                for (std::uint32_t extra : {0u, jit::kSelfPageExitFlag})
+                {
+                    const jit::BlockReturn r = jit::decodeBlockReturn(base | extra);
+                    const jit::BranchDecision d = jit::nextBranch(r, kStaticTarget, kMailbox);
+                    CHECK_FALSE(d.shouldBranch());
+                    CHECK(d.source == jit::BranchSource::kNone);
+                }
+            }
+        }
+    }
+
+    // --- 排他性: 出どころは戻り値の全空間で高々 1 つ ---
+    //
+    // 4 つのフラグの全組み合わせを回し、「静的とメールボックスが同時に
+    // 選ばれることはない」「ガード脱出が立っていたら必ず飛ばない」を問う。
+    // decodeBlockReturn が排他を保っているので nextBranch は素直に書けるが、
+    // **どちらか片方だけ緩めた変異**をここで殺す。
+    for (std::uint32_t bits = 0; bits < 16u; ++bits)
+    {
+        std::uint32_t ret = 42u;
+        if ((bits & 1u) != 0)
+        {
+            ret |= jit::kBranchTakenFlag;
+        }
+        if ((bits & 2u) != 0)
+        {
+            ret |= jit::kGuardExitFlag;
+        }
+        if ((bits & 4u) != 0)
+        {
+            ret |= jit::kDynamicBranchFlag;
+        }
+        if ((bits & 8u) != 0)
+        {
+            ret |= jit::kSelfPageExitFlag;
+        }
+        const jit::BlockReturn r = jit::decodeBlockReturn(ret);
+        const jit::BranchDecision d = jit::nextBranch(r, kStaticTarget, kMailbox);
+
+        // ガード脱出が立っていたら、他に何が立っていても飛ばない。
+        if (r.guardExit)
+        {
+            CHECK(d.source == jit::BranchSource::kNone);
+        }
+        // 飛ぶなら、target は必ずその出どころの値と一致する。
+        // **どちらの出どころでも他方の値にはならない。**
+        if (d.source == jit::BranchSource::kStaticTarget)
+        {
+            CHECK(d.target == kStaticTarget);
+            CHECK(d.target != kMailbox);
+            CHECK(r.branchTaken);
+        }
+        if (d.source == jit::BranchSource::kMailbox)
+        {
+            CHECK(d.target == kMailbox);
+            CHECK(d.target != kStaticTarget);
+            CHECK(r.dynamicBranch);
+            // **静的が立っていたら動的は選ばれない。** 生成コードは
+            // bit31 と bit29 を同時に立てないので実機では起きないが、
+            // 起きても静的が勝つ (メールボックスは書かれていない)。
+            CHECK_FALSE(r.branchTaken);
+        }
+        // 飛ばないと決めたなら、分岐フラグはどちらも立っていない
+        // (ガード脱出でない限り)。**ディスパッチ漏れをここで殺す。**
+        if (!d.shouldBranch() && !r.guardExit)
+        {
+            CHECK_FALSE(r.branchTaken);
+            CHECK_FALSE(r.dynamicBranch);
+        }
+    }
+
+    // constexpr で解けること。**実行時の分岐に化けていないこと**を型で問う。
+    static_assert(
+        jit::nextBranch(jit::decodeBlockReturn(jit::kBranchTakenFlag), 0x1000u, 0x2000u).target ==
+        0x1000u);
+    static_assert(
+        jit::nextBranch(jit::decodeBlockReturn(jit::kDynamicBranchFlag), 0x1000u, 0x2000u).target ==
+        0x2000u);
+    static_assert(!jit::nextBranch(jit::decodeBlockReturn(0u), 0x1000u, 0x2000u).shouldBranch());
+}
+
 TEST_CASE("ガードより前に状態を書く命令が 1 つも無い")
 {
     // G3 の機械検査。**バイト列を走査して確かめる。**

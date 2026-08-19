@@ -432,31 +432,35 @@ NativeResult BlockRunner::run(M68k& cpu)
 
     stats_.insnsRun += slot->count;
 
-    if (decoded.branchTaken)
+    // **飛び先の決定は純関数に出してある** (block_emitter.h の nextBranch)。
+    // ここは決まった答えに従うだけ。runner は runBlock (ESP32 のアセンブリ)
+    // に依存していてホストで走らせられないので、if をここに書くと
+    // 「静的とメールボックスのどちらから飛び先を採ったか」をホストの
+    // テストが一切問えなくなる (guardExitMadeProgress と同じ手口)。
+    const BranchDecision decision = nextBranch(decoded, slot->branchTarget, branchMailbox_);
+
+    if (decision.source == BranchSource::kMailbox)
     {
-        // 設計 §5.2: プリフェッチを詰め直すのは成立側だけ。
-        if (!cpu.branchTo(slot->branchTarget))
-        {
-            // I7 が翻訳時に奇数を弾いているので通常は起きない。
-            // 起きたら branchTo が既にアドレスエラーへ入っている。
-            return NativeResult{cycles, NativeExit::kRan};
-        }
-        return NativeResult{cycles, NativeExit::kRan};
+        ++stats_.dynamicBranch;
     }
 
-    if (decoded.dynamicBranch)
+    if (decision.shouldBranch())
     {
-        // Tier D (G21): 飛び先はメールボックスにある。生成コードが
-        // 直前に書いているので、必ず今回の実行の値。
+        // 設計 §5.2: プリフェッチを詰め直すのは成立側だけ。
         //
-        // **branchTarget は見ない。** 動的分岐のスロットではその欄は 0 のまま
-        // (翻訳時に飛び先が決まらないので、埋めると「確定した飛び先」と
-        // 読み違えられる)。
-        ++stats_.dynamicBranch;
-        // 飛び先の奇数は生成コードのガードが弾いている (G22) ので通常は
-        // 起きないが、branchTo の戻り値は無視しない。起きたなら branchTo が
+        // 静的分岐の奇数は I7 が翻訳時に、動的分岐の奇数は生成コードの
+        // ガード (G22) が弾いているので通常は起きない。起きたら branchTo が
         // 既にアドレスエラーへ入っており、そのまま返してよい。
-        (void)cpu.branchTo(branchMailbox_);
+        //
+        // **ここに残る 2 行はホストで検査できない。** 純関数に出せるのは
+        // 「飛ぶか」と「どこへ」の判断までで、branchTo を実際に呼ぶ行は
+        // runBlock 経由でしか到達しないため、テストで殺せる変異にならない
+        // (decision.target を slot->branchTarget に戻す変異、shouldBranch を
+        // 無視して常に飛ぶ変異は、いずれもホストのテストを素通りする)。
+        // 残す代わりに **判断を一切含まない形**に保つ: 条件は shouldBranch
+        // そのまま、引数は decision.target そのまま。ここに if を足したり
+        // 別の値を渡したりしたくなったら、それは nextBranch 側へ動かす。
+        (void)cpu.branchTo(decision.target);
     }
 
     return NativeResult{cycles, NativeExit::kRan};

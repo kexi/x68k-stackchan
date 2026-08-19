@@ -188,6 +188,77 @@ constexpr bool guardExitMadeProgress(const BlockReturn& r)
     return r.ranOps != 0;
 }
 
+// ブロックを抜けた後、次にどこへ飛ぶか。**飛び先の出どころを型で分ける。**
+//
+// 静的分岐と動的分岐は「飛ぶ」点では同じだが、**飛び先の出どころが違う**。
+// 静的は翻訳時に確定した BlockSlot::branchTarget、動的は生成コードが
+// 直前に書いたメールボックス。取り違えても型は通り、どちらも u32 なので
+// コンパイラは何も言わない。ここを列挙で分けておけば、テストが
+// 「どちらから採ったか」を直接問える。
+enum class BranchSource : std::uint8_t
+{
+    // 飛ばない。ガード脱出、分岐不成立、非分岐終端。
+    kNone,
+    // 翻訳時に確定した飛び先 (BlockSlot::branchTarget)。
+    kStaticTarget,
+    // 生成コードがメールボックスへ書いた飛び先 (Tier D)。
+    kMailbox,
+};
+
+// nextBranch の答え。
+//
+// **source が kNone なら target は見ない。** 0 を「飛び先 0」と読ませない
+// ために、飛ぶ/飛ばないを target とは別の欄で持つ。
+struct BranchDecision
+{
+    BranchSource source = BranchSource::kNone;
+    std::uint32_t target = 0;
+
+    [[nodiscard]] constexpr bool shouldBranch() const
+    {
+        return source != BranchSource::kNone;
+    }
+};
+
+// ブロックの戻り値とスロットの状態から、次にどこへ飛ぶかを決める。
+//
+// staticTarget は BlockSlot::branchTarget、mailbox は runner の
+// メールボックスに**今入っている値**。呼び出し側は返った target を
+// そのまま M68k::branchTo へ渡すだけでよい。
+//
+// Why not runner の中の if で済ませないか: guardExitMadeProgress と同じ
+// 理由。runner は runBlock (ESP32 のアセンブリ) に依存していてホストで
+// 走らせられず、if を runner に置くと「どちらの飛び先を採ったか」を
+// ホストのテストが一切問えない。実際、動的分岐スロットの branchTarget は
+// 設計上つねに 0 なので、取り違えると branchTo(0) — リセットベクタ相当へ
+// 飛ぶ。テストは全通過するのに実機だけが暴走する、原因から最も遠い形。
+//
+// Why not 飛び先の u32 だけを返さないか: 「飛ばない」を 0 で表すと、
+// 「番地 0 へ飛ぶ」と区別できない。区別を捨てると、ディスパッチを丸ごと
+// 消す変異が「target が 0 のまま」として通る。
+constexpr BranchDecision nextBranch(const BlockReturn& r, std::uint32_t staticTarget,
+                                    std::uint32_t mailbox)
+{
+    // **ガード脱出が最優先。** 途中で降りているので、分岐の判断は
+    // そもそも走っていない。decodeBlockReturn 側でも branchTaken /
+    // dynamicBranch とは排他だが、ここでも明示して二重に閉じる。
+    if (r.guardExit)
+    {
+        return BranchDecision{};
+    }
+    if (r.branchTaken)
+    {
+        return BranchDecision{BranchSource::kStaticTarget, staticTarget};
+    }
+    if (r.dynamicBranch)
+    {
+        return BranchDecision{BranchSource::kMailbox, mailbox};
+    }
+    // 分岐不成立か非分岐終端。pc は生成コードが既に fallThroughPc へ
+    // 書いていて、ir / irc も詰め終わっている。何もしない。
+    return BranchDecision{};
+}
+
 // 翻訳時に焼き込む「窓の実体」。
 //
 // **mappingEpoch を鍵に持つブロックへ焼く以外の用途に使ってはいけない。**
