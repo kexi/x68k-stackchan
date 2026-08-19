@@ -3004,9 +3004,9 @@ TEST_CASE("書き形いっぱいのブロックがリテラルを使い切らな
                                                code.get16(plan.fallThroughPc + 2), fakeEnv());
     INFO("need=", need);
     CHECK(need > 0);
-    // BlockRunner::kStagingBytes (1024) に収まること。**収まらないと
+    // BlockRunner::kStagingBytes (1536) に収まること。**収まらないと
     // translate が黙って諦める。**
-    CHECK(need <= 1024);
+    CHECK(need <= 1536);
 
     // 走らせても一致すること。
     M68kState s = makeState(2);
@@ -3015,6 +3015,73 @@ TEST_CASE("書き形いっぱいのブロックがリテラルを使い切らな
     s.a[4] = kWriteAddr + 0x20u;
     s.a[5] = kWriteAddr + 0x30u;
     checkEquivalence(words, s, "CLR.l x 4");
+}
+
+// staging に収まることを **全 EA モード** で問う。
+//
+// **1 つの形しか測らないと、最悪ケースを見落とす。** 既存のテストは
+// CLR.l (An) だけを測っていたが、実際の最悪は -(An) / (An)+ で、
+// 旧上限 1024 に対して余裕が 10 バイトを切っていた。
+//
+// 溢れたときの症状は例外でも赤いテストでもなく、**translate が黙って
+// 諦める**こと。被覆がじわじわ落ちるだけなので、原因に辿り着けない。
+// だから上限そのものを検査対象にする。
+TEST_CASE("どの EA モードでも staging に収まる")
+{
+    struct ModeCase
+    {
+        std::uint8_t mode;
+        const char* name;
+    };
+    const ModeCase modes[] = {
+        {kModeInd, "(An)"},
+        {kModePostInc, "(An)+"},
+        {kModePreDec, "-(An)"},
+        {kModeDisp, "(d16,An)"},
+    };
+
+    std::size_t worst = 0;
+    const char* worstName = "";
+    for (const ModeCase& m : modes)
+    {
+        for (const std::uint8_t size : {1u, 2u, 4u})
+        {
+            for (const bool isClr : {false, true})
+            {
+                BlockPlan plan{};
+                plan.entryPc = kEntry;
+                plan.count = static_cast<std::uint8_t>(x68k::kMaxOps);
+                plan.page = kEntry >> 10;
+                plan.end = BlockEnd::kUnsupported;
+                plan.fallThroughPc = kEntry + x68k::kMaxOps * 8u;
+                for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+                {
+                    PlannedOp& op = plan.ops[i];
+                    op.pc = kEntry + i * 8u;
+                    op.length = 2;
+                    op.kind = isClr ? PlanKind::kClrMem : PlanKind::kMoveDregToMem;
+                    op.size = static_cast<std::uint8_t>(size);
+                    op.cycles = isClr ? 6 : 4;
+                    op.eaMode = m.mode;
+                    op.srcReg = 1;
+                    op.dstReg = 2;
+                }
+                const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
+                if (need > worst)
+                {
+                    worst = need;
+                    worstName = m.name;
+                }
+            }
+        }
+    }
+
+    INFO("最悪 ", worst, " バイト (", worstName, ")");
+    CHECK(worst > 0);
+    CHECK(worst <= 1536);
+    // **余裕が 20% を切ったら気づけるようにする。** 命令やガードを 1 つ
+    // 足しただけで崖に戻るので、上限ぎりぎりで通っている状態を許さない。
+    CHECK(worst <= 1536 * 4 / 5);
 }
 
 TEST_CASE("書きガード脱出の irc が実メモリの mem16(opPc + 2) と一致する")

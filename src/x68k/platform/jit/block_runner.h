@@ -131,7 +131,13 @@ private:
     // 2-3 倍になる。加えて脱出用の出口の島が命令ごとに 1 つ増える。
     // 足りなければ translate が諦めるだけなので正しさは損なわれないが、
     // 諦めた分は素通りするので気づきにくい。
-    static constexpr std::size_t kStagingBytes = 1024;
+    //
+    // **Tier C (書きガード) で 1024 → 1536 へ広げた。** 実測の最悪
+    // (CLR.l (An) x 4) が 949 バイトで、1024 に対して余裕が 7% しか無かった。
+    // 書き 1 命令は「ガード 3 本 + touch 2 組 + バイト 4 本の store + 島 2 つ」
+    // で読み形の 1.5 倍近くあり、命令を 1 つ足しただけで超える。
+    // 超えたら黙って諦める (素通りする) 形なので、先に広げておく。
+    static constexpr std::size_t kStagingBytes = 1536;
     alignas(4) std::uint8_t staging_[kStagingBytes]{};
 
     BlockSlot* slots_ = nullptr;

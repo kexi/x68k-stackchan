@@ -1783,6 +1783,18 @@ bool canEmitWritesIn(const EmitEnv& env)
     {
         return false;
     }
+    // `.l` の生成コードは a + 3 を**マスクせずに** page へ落とす
+    // (インタプリタの touch(a + 3) が m68k.cpp:378 でそうしているのに合わせる)。
+    // 範囲ガードが a <= limit - 4 を通しているので、limit がここに収まれば
+    // a + 3 は 24bit を超えない。
+    //
+    // **超えると extui(.., 10, 14) が上位を落として別のページを触る。**
+    // インタプリタ側は範囲外として数えないので、そこで世代が割れる。
+    // 現実の窓 (メイン RAM 2MB) では起きないが、「起きない」に頼らない。
+    if (env.ramLimit > 0x00FFFFFDu)
+    {
+        return false;
+    }
     // G19: 範囲ガード成立 ⇒ touch 対象ページが配列の中、を導けること。
     //
     // これがあるから生成コードから `page < pageCount_` の判定を消せる。
