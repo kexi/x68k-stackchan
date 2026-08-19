@@ -1427,6 +1427,24 @@ TEST_SUITE("イベント駆動")
             CHECK(map.generation(target) == x68k::CodeGenMap::kAlwaysStale);
         }
 
+        SUBCASE("書き換わらない領域は固定の世代を返す")
+        {
+            // **ROM のコードが 1 ブロックも翻訳されない**問題への答え。
+            // 世代配列はメインメモリぶんしか無いので、$FE0000 の IPL-ROM は
+            // 範囲外として kAlwaysStale になり、翻訳器の I9 が拒否していた。
+            // 実測で実行の 23% が ROM からなので、まるごと捨てていた。
+            auto& map = m.cpu().codeGenMap();
+
+            // 配線済みなら ROM は固定値、範囲外の I/O は kAlwaysStale。
+            CHECK(map.generation(x68k::kIplromBase) == x68k::CodeGenMap::kImmutable);
+            CHECK(map.generation(x68k::kIplromEnd - 2) == x68k::CodeGenMap::kImmutable);
+            // 端の外は含まない。
+            CHECK(map.generation(x68k::kIplromEnd) == x68k::CodeGenMap::kAlwaysStale);
+            CHECK(map.generation(x68k::kIplromBase - 2) == x68k::CodeGenMap::kAlwaysStale);
+            // メインメモリは従来どおり配列を引く。
+            CHECK(map.generation(0x1000) != x68k::CodeGenMap::kImmutable);
+        }
+
         SUBCASE("世代配列の差し替えは写像の変化として扱う")
         {
             // **生成コードが世代配列のポインタを焼く**設計なので、

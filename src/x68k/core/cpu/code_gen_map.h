@@ -70,6 +70,12 @@ public:
     // 元に戻せるのはキャッシュを全部捨てたときだけ (resetGenerations)。
     static constexpr std::uint16_t kAlwaysStale = 0xFFFFu;
 
+    // 書き換わらない領域の世代。**この値は動かない。**
+    //
+    // 0 でも 1 でもよいが、「まだ書かれていない RAM ページ (0)」と
+    // 区別が付く方が、統計を読むときに取り違えない。
+    static constexpr std::uint16_t kImmutable = 0xFFFEu;
+
     // 世代の配列を教わる。length はページ数。
     //
     // **写像の世代も進める。** 生成コードがこの配列のポインタを焼くなら、
@@ -124,6 +130,22 @@ public:
         }
     }
 
+    // 書き換わらない領域 (ROM) を教わる。
+    //
+    // **ROM のコードが 1 ブロックも翻訳されない**問題への答え。世代配列は
+    // メインメモリぶんしか無いので、$FE0000 の IPL-ROM は範囲外として
+    // kAlwaysStale になり、翻訳器の I9 が拒否していた。実測で**実行の
+    // 23% が ROM から**なので、まるごと捨てていたことになる。
+    //
+    // ROM は書き換わらないので、世代は「常に同じ値」でよい。0 を返すと
+    // 「まだ書かれていない RAM ページ」と区別が付かないが、鍵には
+    // mappingEpoch も入っているので、写像が変われば落ちる。
+    void setImmutableRange(u32 base, u32 length)
+    {
+        immutableBase_ = base;
+        immutableEnd_ = length != 0 ? base + length : base;
+    }
+
     // ページの現在の世代。
     //
     // 範囲外は kAlwaysStale を返す。0 を返すと「まだ一度も書かれていない
@@ -131,7 +153,14 @@ public:
     [[nodiscard]] std::uint16_t generation(u32 addr) const
     {
         const u32 page = addr >> kPageShift;
-        return page < pageCount_ ? gen_[page] : kAlwaysStale;
+        if (page < pageCount_)
+        {
+            return gen_[page];
+        }
+        // 書き換わらない領域なら固定の世代を返す。**ここだけが
+        // kAlwaysStale を返さない範囲外**で、根拠は「書き換わらない」こと。
+        const bool isImmutable = addr >= immutableBase_ && addr < immutableEnd_;
+        return isImmutable ? kImmutable : kAlwaysStale;
     }
 
     // 全部の世代を進める。実体が差し替わったときに使う
@@ -187,6 +216,9 @@ private:
     std::uint16_t* gen_ = nullptr;
     u32 pageCount_ = 0;
     u32 mappingEpoch_ = 0;
+    // 書き換わらない領域 (ROM)。既定は空 (base == end)。
+    u32 immutableBase_ = 0;
+    u32 immutableEnd_ = 0;
 };
 
 }  // namespace x68k

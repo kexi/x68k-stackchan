@@ -70,6 +70,15 @@ void SystemBus::publishFastRam()
     // ウォッチは書き込みだけを見張る仕組みなので、読み出し専用のこの窓には
     // 関係しない。止める必要が無い。
     fastPathCpu_->setFastRom(mem_.iplRom, kIplromBase, kIplromSize);
+
+    // **ROM は書き換わらないので、世代を固定値で返してよい。**
+    //
+    // 世代配列はメインメモリぶんしか無いため、$FE0000 は範囲外として
+    // kAlwaysStale になり、翻訳器の I9 が「常に古い」と見て拒否していた。
+    // 実測で**実行の 23% が ROM から**なので、まるごと捨てていた。
+    //
+    // 窓と同じ場所で教えるので、片方だけ更新して食い違うことがない。
+    fastPathCpu_->codeGenMap().setImmutableRange(kIplromBase, kIplromSize);
 }
 
 SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
