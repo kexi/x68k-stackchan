@@ -65,15 +65,27 @@ constexpr std::uint32_t kArithClear = kLogicClear | kCcrX;
 // (emitBranchExit が既に使っている「slot を控えて後から書く」方式と同じ)。
 struct PendingGuard
 {
-    std::uint8_t* slot = nullptr;  // bnez を書き込む場所
-    size_t insnPc = 0;             // その bnez の位置 (codeBase 相対)
+    std::uint8_t* slot = nullptr;  // 分岐を書き込む場所
+    size_t insnPc = 0;             // その分岐の位置 (codeBase 相対)
     std::uint32_t opIndex = 0;     // 何番目の命令のガードか
+    // 分岐が「0 のとき飛ぶ」か (beqz)。false なら bnez。
+    //
+    // 自ページ判定は「page(a) - plan.page == 0 なら脱出」なので beqz、
+    // 範囲・整列の判定は「失敗ビットが立ったら脱出」なので bnez。
+    bool branchOnZero = false;
+    // 分岐に使うレジスタ。範囲ガードは kTmpD、自ページガードは kTmpE を使う。
+    XReg reg = 0;
+    // 島の戻り値へ足す追加のビット (kSelfPageExitFlag)。
+    //
+    // **島は (opIndex, extraRetFlags) の組で分かれる。** 同じ命令でも
+    // 通常の脱出と自ページ脱出では戻り値が違うので、同じ島へは飛ばせない。
+    std::uint32_t extraRetFlags = 0;
 };
 
-// ガード付き命令は 1 つにつき分岐 1 本。kMaxOps = 4 なので 4 で足りるが、
-// 1 命令が 2 本のガードを持つ形 (窓を 2 つ見るなど) へ広げたときに
-// 黙って溢れないよう倍取る。溢れたら failed で諦める。
-constexpr size_t kMaxPendingGuards = 8;
+// ガード付き命令は 1 つにつき分岐 1 本 (読み) か最大 3 本 (書きの `.l`:
+// 範囲 + 自ページ page(a) + 自ページ page(a+3))。kMaxOps = 4 なので
+// 4 x 3 = 12 が上限。溢れたら failed で諦める。
+constexpr size_t kMaxPendingGuards = 12;
 
 // 発行の状態。1 パスぶん。
 //
@@ -102,14 +114,15 @@ struct Emitter
     bool failed = false;
 
     // ガードの分岐を 1 本控える。書き先は呼び出し側が slot() で取る。
-    void addGuard(std::uint8_t* slot, size_t insnPc, std::uint32_t opIndex)
+    void addGuard(std::uint8_t* slot, size_t insnPc, std::uint32_t opIndex, bool branchOnZero,
+                  XReg reg, std::uint32_t extraRetFlags)
     {
         if (guardCount >= kMaxPendingGuards)
         {
             failed = true;
             return;
         }
-        guards[guardCount] = PendingGuard{slot, insnPc, opIndex};
+        guards[guardCount] = PendingGuard{slot, insnPc, opIndex, branchOnZero, reg, extraRetFlags};
         ++guardCount;
     }
 
@@ -620,9 +633,11 @@ constexpr std::uint32_t kGuestAddrMask = 0x00FFFFFFu;
 // (An)+ / -(An) の増減幅。**A7 をバイトで触るときだけ 2。**
 // m68k.h:440-458 の step と同じ式。スタックポインタが奇数になると
 // アドレスエラーになるための特例。
+// **An 番号は eaRegOf() から取る。** 読み形は srcReg、書き形は dstReg。
+// 直書きに戻すと、書き形で「関係ないアドレスレジスタが 2 進む」形になる。
 constexpr std::uint32_t eaStep(const PlannedOp& op)
 {
-    const bool isStackPointerByte = op.srcReg == 7 && op.size == 1;
+    const bool isStackPointerByte = eaRegOf(op) == 7 && op.size == 1;
     return isStackPointerByte ? 2u : op.size;
 }
 
@@ -673,7 +688,7 @@ void emitEffectiveAddress(Emitter& e, const PlannedOp& op)
 {
     const std::uint32_t step = eaStep(op);
 
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.srcReg));
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
     if (op.eaMode == kEaPreDec)
     {
         // -(An) は**引いてから**アクセスする (m68k.h:454-457)。
@@ -738,7 +753,7 @@ void emitReadGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
     // 失敗なら出口の島へ。**変位は後でパッチする。**
     const size_t insnPc = e.codeBase + e.cursor;
     std::uint8_t* slot = e.slot(kWideLen);
-    e.addGuard(slot, insnPc, opIndex);
+    e.addGuard(slot, insnPc, opIndex, /*branchOnZero=*/false, kTmpD, /*extraRetFlags=*/0u);
 }
 
 // (An)+ / -(An) の An 更新を確定させる (G4)。**ガードが通ってから呼ぶ。**
@@ -757,13 +772,13 @@ void emitCommitAddressRegister(Emitter& e, const PlannedOp& op)
             return;
         }
         addi(e.slot(kWideLen), kTmpC, kTmpB, static_cast<std::int32_t>(step));
-        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.srcReg));
+        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(eaRegOf(op)));
         return;
     }
     if (op.eaMode == kEaPreDec)
     {
         // -(An) は既に引いた値がアクセス先そのもの。
-        s32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.srcReg));
+        s32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
     }
 }
 
@@ -879,6 +894,338 @@ void emitMemoryRead(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
     }
 }
 
+// --- Tier C: 書きガード ----------------------------------------------------
+//
+// 読み形 (Tier B) に対して増える不変条件は 4 つ:
+//
+//   G13 ページ凍結  生成コードは plan.page に属するバイトを 1 つも書かない。
+//                   書き先が自ページなら、その命令の直前の命令境界で脱出する
+//   G14 書きの同値  書くバイト値・位置と、**touch の回数と引数**が
+//                   write8/16/32 の fast path と同一。`.l` は同一ページでも
+//                   touch(a) / touch(a+3) の 2 回。畳まない
+//   G16 touch の位置 最後のガードの後・ゲスト RAM store の前
+//   G17 絶対形の二重防御 翻訳時に判定して積まないのに加え、**実行時ガードも吐く**
+
+// ページ番号のビット幅。ゲストアドレスは 24bit、ページは 1KB なので 14bit。
+// **extui の maskimm は 1..16 なので 14 は入る。**
+constexpr std::uint32_t kPageShift = 10;
+constexpr std::uint32_t kPageBits = 24u - kPageShift;
+
+// 世代の飽和値。CodeGenMap::kAlwaysStale と同じ値。
+//
+// Why not code_gen_map.h を include しないか: block_emitter.h の
+// kStateDOffset と同じ流儀。生成コードが埋め込むのは**翻訳時に確定した
+// 数値**であって core/ の型ではない。ここで数値として書き直しておくと、
+// テストが「core/ の定義と一致すること」を static_assert で別に問える。
+constexpr std::uint32_t kAlwaysStaleGen = 0xFFFFu;
+
+// 書き形かどうか。
+constexpr bool isMemoryWrite(const PlannedOp& op)
+{
+    return isMemoryWriteKind(op.kind);
+}
+
+// G15 の条件を**翻訳時に**評価する (絶対形の事前判定に使う)。
+//
+// **読みガードと同式・同一実装を共用する。** write8/16/32 の fastRamHas*
+// (m68k.h:346-358) は read 側とまったく同じ `a + size - 1 < limit` で、
+// 整列判定の位置 (範囲より前) も同じ。違うのは `fastRamReadable_` を
+// 見ないことだけで、それは guestReadFits の外にある。
+bool guestWriteFits(const EmitEnv& env, std::uint32_t addr, std::uint32_t size)
+{
+    return guestReadFits(env, addr, size);
+}
+
+// 書き先が自ブロックのページに掛かるか (G13 を翻訳時に評価する)。
+//
+// **`.l` は両端を見る。** write32 は page(a) と page(a+3) の 2 ページに
+// touch する (m68k.cpp:377-378)。片方だけだと、ページ境界を跨いだ長語書きで
+// 自ページの端 (先頭 3 バイトか末尾 1 バイト) を黙って書く。
+bool writeHitsPage(std::uint32_t addr, std::uint32_t size, std::uint32_t page)
+{
+    const std::uint32_t a = addr & kGuestAddrMask;
+    const std::uint32_t last = (a + size - 1u) & kGuestAddrMask;
+    return (a >> kPageShift) == page || (last >> kPageShift) == page;
+}
+
+// 自ページ判定を 1 本吐く (G13)。**kTmpA (マスク済みアドレス) を読むだけ。**
+//
+// byteOffset は 0 (先頭) か size-1 (末尾)。`.l` は 0 と 3 の 2 本吐く。
+//
+// Why not 「page(a) == page かつ page(a+3) == page」を 1 本に畳まないか:
+// 畳めるのは「両方一致」であって、要るのは「どちらか一致」。or をとって
+// 1 本にすることは**できる** (2 つの差の積が 0 かを見る等) が、
+// ページ境界を跨ぐ長語では 2 つの差が別の値になるので、掛け算か
+// もう 1 つの比較が要る。分岐 1 本の差でしかないので、
+// **1 判定 = 1 分岐**の形をそろえて読めるようにする。
+void emitSelfPageGuard(Emitter& e, std::uint32_t opIndex, std::uint32_t byteOffset,
+                       std::uint32_t page)
+{
+    // page(a + byteOffset)。byteOffset は 0 か 3 なので、
+    // マスク済みアドレスに足してから 24bit を保つ。
+    if (byteOffset == 0)
+    {
+        extui(e.slot(kWideLen), kTmpE, kTmpA, kPageShift, kPageBits);
+    }
+    else
+    {
+        if (!canAddi(static_cast<std::int32_t>(byteOffset)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpE, kTmpA, static_cast<std::int32_t>(byteOffset));
+        // **足してから 24bit へ丸め直す。** a は 24bit に収まっているが、
+        // 0x00FFFFFF + 3 は 25bit になる。インタプリタの touch(a + 3) は
+        // 丸めずに `(a+3) >> 10` を使う (m68k.cpp:378 が a+3 をそのまま
+        // 渡し、CodeGenMap::touch は範囲外を数えない) ので、ここでも
+        // マスクしないほうが同値。**マスクしない。**
+        //
+        // ただし範囲ガードが a <= limit - 4 を通しているので、
+        // a + 3 < limit <= 0x00FFFFFF + 1 で 24bit を超えない。
+        extui(e.slot(kWideLen), kTmpE, kTmpE, kPageShift, kPageBits);
+    }
+    emitConst(e, kTmpConst, page);
+    sub(e.slot(kWideLen), kTmpE, kTmpE, kTmpConst);
+
+    // 差が 0 (= 自ページ) なら島へ。**beqz** で、範囲ガードの bnez とは逆。
+    const size_t insnPc = e.codeBase + e.cursor;
+    std::uint8_t* slot = e.slot(kWideLen);
+    e.addGuard(slot, insnPc, opIndex, /*branchOnZero=*/true, kTmpE, kSelfPageExitFlag);
+}
+
+// touch を 1 回吐く (G14/G16)。飽和つき、分岐なし。
+//
+// **kTmpA (マスク済みアドレス) から毎回ページを作り直す。** ガードで作った
+// ページ番号を使い回せば数命令減るが、`.l` は a と a+3 の 2 つを別々に
+// 数えるので、どのみち片方は作り直す。1 つの形にそろえておく。
+//
+// 生成コードから `page < pageCount_` の判定を消してよい根拠は翻訳時に作る:
+// canEmitWritesIn が `(genPageCount << 10) >= ramLimit` を要求しているので、
+// 範囲ガード `a <= limit - size` の成立から `page(a), page(a+3) < pageCount`
+// が導ける (G19)。条件を満たさない env では書き形を焼かない。
+//
+// **kTmpConst / kTmpD / kTmpE を潰す。** ゲスト RAM の store より前に呼ぶこと。
+void emitTouch(Emitter& e, std::uint32_t byteOffset, const PlannedOp& op)
+{
+    // page = (a + byteOffset) >> 10
+    if (byteOffset == 0)
+    {
+        extui(e.slot(kWideLen), kTmpD, kTmpA, kPageShift, kPageBits);
+    }
+    else
+    {
+        if (!canAddi(static_cast<std::int32_t>(byteOffset)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpD, kTmpA, static_cast<std::int32_t>(byteOffset));
+        extui(e.slot(kWideLen), kTmpD, kTmpD, kPageShift, kPageBits);
+    }
+    // &gen_[page] = genBase + page * 2 (u16 の配列)
+    slli(e.slot(kWideLen), kTmpD, kTmpD, 1u);
+    emitConst(e, kTmpConst, e.env.genBaseAddr);
+    addN(e.slot(kNarrowLen), kTmpD, kTmpConst, kTmpD);
+
+    // cur = gen_[page]
+    l16ui(e.slot(kWideLen), kTmpE, kTmpD, 0u);
+    // 飽和判定: cur - kAlwaysStale が 0 なら据え置き。
+    emitConst(e, kTmpConst, kAlwaysStaleGen);
+    sub(e.slot(kWideLen), kTmpConst, kTmpE, kTmpConst);
+    // cur + 1 を作ってから、飽和なら cur へ戻す。
+    //
+    // **飽和させる理由はインタプリタと同じ** (CodeGenMap::touch)。
+    // 単純な ++ だと 65,536 回の書き込みで元の値へ戻り、書き換えられた
+    // ページが「変わっていない」と判定される。ここで畳むと JIT ON/OFF で
+    // 世代が割れる。
+    addi(e.slot(kWideLen), kTmpB, kTmpE, 1);
+    moveqz(e.slot(kWideLen), kTmpB, kTmpE, kTmpConst);
+    // **s16i なので上位 16bit は落ちる。** cur + 1 が 0x10000 になるのは
+    // cur == 0xFFFF のときだけで、そのときは moveqz が cur へ戻している。
+    s16i(e.slot(kWideLen), kTmpB, kTmpD, 0u);
+
+    // op は使わないが、シグネチャを touch 対象の命令と結びつけておく
+    // (将来サイズごとに形を変えたくなったときに、呼び出し側を直さずに済む)。
+    (void)op;
+}
+
+// ゲスト RAM へビッグエンディアンで書く (G14)。
+//
+// **write8/16/32 の代入文をそのまま写す** (m68k.cpp:342 / 359-360 / 379-382)。
+// バイトずつ書けばホストのバイト順にも整列にも依存しない。
+//
+// 値は valueReg の下位 size バイト。**valueReg は切り出し済みでなくてよい**
+// (s8i が下位 8bit しか書かないので、上位は落ちる)。
+// hostAddrReg にホストアドレス (窓の先頭 + マスク済みアドレス) が要る。
+void emitBigEndianStore(Emitter& e, XReg hostAddrReg, XReg valueReg, std::uint32_t size)
+{
+    if (size == 1)
+    {
+        s8i(e.slot(kWideLen), valueReg, hostAddrReg, 0u);
+        return;
+    }
+    // 上位バイトから順に置く。write16 / write32 の代入の並びと同じ。
+    for (std::uint32_t i = 0; i < size; ++i)
+    {
+        const std::uint32_t shift = (size - 1u - i) * 8u;
+        if (shift == 0)
+        {
+            // 最下位バイトはシフト不要。s8i が下位 8bit だけを書く。
+            s8i(e.slot(kWideLen), valueReg, hostAddrReg, i);
+            continue;
+        }
+        extui(e.slot(kWideLen), kTmpD, valueReg, shift, 8u);
+        s8i(e.slot(kWideLen), kTmpD, hostAddrReg, i);
+    }
+}
+
+// 書きガード列 (G15)。**読みガードと同一実装を共用する。**
+//
+// 式が同じなら実装も同じにする。別々に書くと、片方だけ直したときに
+// 「読みでは弾くが書きでは通す」形ができ、失敗はホストメモリを踏むという
+// 最も遠い形で出る。
+void emitWriteGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
+{
+    emitReadGuard(e, op, opIndex);
+}
+
+// 書き形 1 命令。
+//
+// 順序が契約そのもの (G3/G16):
+//
+//   [EA 計算]      レジスタを読むだけ。状態は 1 bit も変えない
+//   [ガード 1]     整列 + 範囲 (bnez → 通常の島)
+//   [ガード 2,3]   自ページ (beqz → 自ページの島)。`.l` は 2 本
+//   --- ここから下が commit ---
+//   [An 更新]      (An)+ / -(An)
+//   [touch]        `.l` は 2 回。**畳まない**
+//   [RAM store]    ビッグエンディアン、バイト順まで同じ
+//   [CCR]          MOVE は setLogicFlags 相当 / CLR は Z=1,N=V=C=0
+//
+// **CLR の読み脚は吐かない (G20)。** インタプリタは readEaForModify で
+// 一度読むが、戻り値を捨てる (m68k_ops_group4.cpp:606-607)。ガードが
+// 成立する範囲では read8/16/32 の fast path に副作用が無い (touch しない /
+// faulted も立たない) ので、状態に対する同値は読まなくても保たれる。
+// 窓が読めない写像との両立は翻訳器が受け持つ (kClrMem は readsAllowed も要る)。
+void emitMemoryWrite(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32_t page)
+{
+    const std::uint32_t size = op.size;
+    const bool absolute = isAbsoluteEa(op.eaMode);
+
+    if (absolute)
+    {
+        // G17 (a): 翻訳時の性能フィルタ。不成立の命令はここへ来ない
+        // (翻訳器が積まない / canEmitWrites が断る)。
+        const std::uint32_t addr = op.imm & kGuestAddrMask;
+        if (!guestWriteFits(e.env, addr, size) || writeHitsPage(addr, size, page))
+        {
+            e.failed = true;
+            return;
+        }
+        // G17 (b): **積んだ絶対形にも mode 2-5 と同一のガード列を吐く。**
+        //
+        // 読み側 (G6) は畳んで消しているが、書きで畳み間違えると窓の外の
+        // ホストメモリを**書く** = ヒープ破壊で、被害の半径が違う。
+        // アドレスを kTmpA へ定数で置くだけにすれば、以降のガード・touch・
+        // store は動的 EA とまったく同じ発行経路を通る。
+        // **畳み専用の経路が存在しなくなる**ので、テストが到達できない分岐が
+        // 生まれず、翻訳時判定の変異は「ガード脱出が増える」という
+        // 観測可能な形でしか現れない。
+        emitConst(e, kTmpA, addr);
+    }
+    else
+    {
+        emitEffectiveAddress(e, op);
+        if (e.failed)
+        {
+            return;
+        }
+    }
+
+    emitWriteGuard(e, op, opIndex);
+    emitSelfPageGuard(e, opIndex, 0u, page);
+    if (size == 4)
+    {
+        // `.l` は 2 ページに掛かりうる (write32 が touch(a) と touch(a+3) を
+        // 別々に呼ぶのと同じ理由)。
+        emitSelfPageGuard(e, opIndex, size - 1u, page);
+    }
+    if (e.failed)
+    {
+        return;
+    }
+
+    // --- ここから下はガードが全部通ったときだけ走る (G3) ---
+
+    // (An)+ / -(An) の An 更新。**絶対形では kTmpB が未定義**なので呼ばない。
+    if (!absolute)
+    {
+        emitCommitAddressRegister(e, op);
+        if (e.failed)
+        {
+            return;
+        }
+    }
+
+    // 書く値を kTmpC へ。
+    //
+    // MOVE は d[srcReg] をそのまま (s8i が下位バイトだけ書くので切り出し不要)。
+    // ただし **CCR は切り出した値から作る**ので、そこは別に切り出す。
+    // CLR は 0。
+    const bool isClear = op.kind == PlanKind::kClrMem;
+    if (isClear)
+    {
+        movi(e.slot(kWideLen), kTmpC, 0);
+    }
+    else
+    {
+        l32i(e.slot(kWideLen), kTmpC, kState, dOffset(op.srcReg));
+    }
+
+    // touch (G14/G16)。**ゲスト RAM の store より前。**
+    //
+    // **`.l` は同一ページでも 2 回。畳まない。** 飽和つきなので回数が
+    // 意味を持つ: gen が 0xFFFE のとき、2 回なら 0xFFFF (飽和) で止まるが
+    // 1 回なら 0xFFFF。次の書きで JIT ON は据え置き、JIT OFF は…と
+    // 見えるが、実際に割れるのは 0xFFFD からの `.l` で、
+    // インタプリタは 0xFFFF (飽和) / 畳んだ変異体は 0xFFFE になる。
+    emitTouch(e, 0u, op);
+    if (e.failed)
+    {
+        return;
+    }
+    if (size == 4)
+    {
+        emitTouch(e, size - 1u, op);
+        if (e.failed)
+        {
+            return;
+        }
+    }
+
+    // ホストアドレス = 窓の先頭 + マスク済みアドレス。
+    //
+    // **絶対形でも定数に畳まない。** 畳む経路を作らないのが G17 (b) の要点。
+    emitConst(e, kTmpConst, e.env.ramBaseAddr);
+    addN(e.slot(kNarrowLen), kTmpE, kTmpConst, kTmpA);
+    emitBigEndianStore(e, kTmpE, kTmpC, size);
+
+    // CCR。
+    if (isClear)
+    {
+        // CLR は結果が必ず 0 なので**翻訳時に決まる**
+        // (m68k_ops_group4.cpp:608-610: N/V/C をクリアして Z を立てる)。
+        emitConst(e, kTmpCcr, kCcrZ);
+        emitStoreCcr(e, kTmpCcr, kLogicClear);
+        return;
+    }
+    // MOVE は書いた値から N/Z (setLogicFlags、m68k_ops_move.cpp:67)。
+    // **size で切り出してから渡す** (切り出していないと Z が立たない)。
+    emitTruncate(e, kTmpC, kTmpC, size);
+    emitLogicFlags(e, kTmpC, size);
+}
+
 // ガード脱出の出口で irc に入る語 = mem16(opPc + 2) を求める (I11)。
 //
 // **導出はここ 1 箇所だけに置く。** 出どころが 3 つに分かれるので、
@@ -890,13 +1237,14 @@ void emitMemoryRead(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
 //                          ops[k + 1].op (I4 が同一ページを保証している)
 //   長さ 4 (mode 5, 7.0) : opPc + 2 は第 1 拡張ワード。
 //                          imm は sext16 した値なので下位 16bit が原文
+//   長さ 6 (mode 7.1)    : opPc + 2 は (xxx).L の**上位語**。
+//                          imm は 2 語の連結なので上位 16bit が原文
 //
-// **長さ 6 はここへ来ない。** 6 バイトになるのは (xxx).L だけで、絶対
-// アドレス形はガードを持たない (実効アドレスが翻訳時定数なので、G6 が
-// 翻訳時に判定して不成立なら積まない)。ガードを持たない命令は脱出の
-// 出口を作らないので、この関数の呼び出し対象にならない。
-// 「念のため」で長さ 6 を扱う枝を置くと、**テストが到達できない枝**が
-// 残り、壊れても誰も気づけなくなる。来たら諦める。
+// **長さ 6 は Tier C で来るようになった。** 読み側 (G6) は絶対形のガードを
+// 翻訳時に畳んで消しているので島を作らないが、書き側は G17 (b) で
+// **積んだ絶対形にも実行時ガードを吐く**。畳み間違いの帰結が
+// 「窓の外のホストメモリを書く」= ヒープ破壊なので、読みと違って網を残す。
+// その結果、(xxx).L の書きが脱出しうる = 長さ 6 の島が要る。
 //
 // 戻り値 false は「導出できない」。呼び出し側はその命令を積まない。
 bool guardExitIrc(const BlockPlan& plan, std::uint32_t k, std::uint16_t fallThroughIr,
@@ -913,6 +1261,16 @@ bool guardExitIrc(const BlockPlan& plan, std::uint32_t k, std::uint16_t fallThro
     {
         // sext16 は下位 16bit を変えないので、原文がそのまま取り出せる。
         out = static_cast<std::uint16_t>(op.imm & 0xFFFFu);
+        return true;
+    }
+    if (op.length == 6)
+    {
+        // (xxx).L は longValue = (ext0 << 16) | ext1 なので、
+        // 第 1 拡張ワード (= mem16(opPc + 2)) は上位 16bit。
+        //
+        // **6 バイトになるのは (xxx).L だけ。** 段 1-3 の許可リストで
+        // 他に 6 バイトの形が無いことは instructionLength が保証する。
+        out = static_cast<std::uint16_t>((op.imm >> 16) & 0xFFFFu);
         return true;
     }
     return false;
@@ -1085,32 +1443,75 @@ void emitBranchExit(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::ui
 // バイト列が変わらない。
 void emitGuardExitIslands(Emitter& e, const BlockPlan& plan, std::uint16_t fallThroughIr)
 {
+    // 既に吐いた島の位置。**(opIndex, extraRetFlags) の組で共有する。**
+    //
+    // `.l` の書きは自ページ判定を 2 本持つが、どちらも同じ出口の状態
+    // (同じ命令の手前の境界、同じ戻り値) へ降りる。島を 2 つ吐いても
+    // 正しいが、コードが無駄に伸びて codeFull_ の崖が近くなる。
+    // 通常の脱出と自ページ脱出は戻り値が違うので、**同じ島にはできない**。
+    struct Island
+    {
+        std::uint32_t opIndex = 0;
+        std::uint32_t extraRetFlags = 0;
+        size_t stubPc = 0;
+        bool valid = false;
+    };
+    Island islands[kMaxPendingGuards] = {};
+    size_t islandCount = 0;
+
     for (size_t g = 0; g < e.guardCount; ++g)
     {
         const PendingGuard& pending = e.guards[g];
         const std::uint32_t k = pending.opIndex;
         const PlannedOp& op = plan.ops[k];
 
-        std::uint16_t irc = 0;
-        if (!guardExitIrc(plan, k, fallThroughIr, irc))
+        // 同じ (opIndex, extraRetFlags) の島が既にあれば、そこへ飛ばす。
+        size_t stubPc = 0;
+        bool found = false;
+        for (size_t i = 0; i < islandCount; ++i)
         {
-            e.failed = true;
-            return;
+            const bool sameExit = islands[i].valid && islands[i].opIndex == k &&
+                                  islands[i].extraRetFlags == pending.extraRetFlags;
+            if (sameExit)
+            {
+                stubPc = islands[i].stubPc;
+                found = true;
+                break;
+            }
         }
 
-        // その命令の手前までのサイクル。**その命令ぶんは足さない。**
-        std::uint32_t cycles = 0;
-        for (std::uint32_t i = 0; i < k; ++i)
+        if (!found)
         {
-            cycles += plan.ops[i].cycles;
+            std::uint16_t irc = 0;
+            if (!guardExitIrc(plan, k, fallThroughIr, irc))
+            {
+                e.failed = true;
+                return;
+            }
+
+            // その命令の手前までのサイクル。**その命令ぶんは足さない。**
+            std::uint32_t cycles = 0;
+            for (std::uint32_t i = 0; i < k; ++i)
+            {
+                cycles += plan.ops[i].cycles;
+            }
+
+            // 島の先頭 = この分岐の飛び先。
+            stubPc = e.codeBase + e.cursor;
+            const std::uint32_t ret = kGuardExitFlag | pending.extraRetFlags |
+                                      (k << kGuardCountShift) | (cycles & kCycleMask);
+            emitBoundaryExit(e, op.pc, op.op, irc, ret);
+
+            if (islandCount >= kMaxPendingGuards)
+            {
+                e.failed = true;
+                return;
+            }
+            islands[islandCount] = Island{k, pending.extraRetFlags, stubPc, true};
+            ++islandCount;
         }
 
-        // 島の先頭 = この bnez の飛び先。
-        const size_t stubPc = e.codeBase + e.cursor;
-        const std::uint32_t ret = kGuardExitFlag | (k << kGuardCountShift) | (cycles & kCycleMask);
-        emitBoundaryExit(e, op.pc, op.op, irc, ret);
-
-        // 前方参照だった bnez をここでパッチする。
+        // 前方参照だった分岐をここでパッチする。
         //
         // **変位は codeBase 相対の差**なので、codeBase = 0 の集めるパスでも
         // 本番でも同じ値になる (l32r と違って検査を遅らせなくてよい)。
@@ -1122,7 +1523,18 @@ void emitGuardExitIslands(Emitter& e, const BlockPlan& plan, std::uint16_t fallT
             return;
         }
         // 集めるパスでは slot が scratch を指すので、書いても無害。
-        bnez(pending.slot, kTmpD, disp);
+        //
+        // **beqz と bnez を取り違えると条件が反転する。** 自ページ判定は
+        // 「差が 0 なら脱出」(beqz)、範囲・整列は「失敗ビットが立ったら脱出」
+        // (bnez)。控えた側で選び分ける。
+        if (pending.branchOnZero)
+        {
+            beqz(pending.slot, pending.reg, disp);
+        }
+        else
+        {
+            bnez(pending.slot, pending.reg, disp);
+        }
     }
 }
 
@@ -1204,6 +1616,13 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
             case PlanKind::kAluMemToDreg:
                 emitMemoryRead(e, op, i);
                 break;
+
+            // --- Tier C: メモリへ書く形 ---
+            case PlanKind::kMoveDregToMem:
+            case PlanKind::kClrMem:
+                // 自ページ判定に plan.page が要る (G13)。
+                emitMemoryWrite(e, op, i, plan.page);
+                break;
         }
         if (e.failed)
         {
@@ -1223,6 +1642,64 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
     emitGuardExitIslands(e, plan, ir);
 }
 
+// 書き形を含む計画を、この窓で発行してよいか (G17 (a) / G19)。
+//
+// **翻訳時に決められることは翻訳時に決める。** 実行時ガードは別に吐く
+// (G17 (b)) が、翻訳時に「必ず脱出する」と分かる形を積むと、
+// 毎周ガードを踏むだけのブロックができる。
+bool canEmitWritesFor(const BlockPlan& plan, const EmitEnv& env)
+{
+    for (std::uint32_t i = 0; i < plan.count; ++i)
+    {
+        const PlannedOp& op = plan.ops[i];
+        if (!isMemoryWrite(op))
+        {
+            continue;
+        }
+
+        // G19: 窓と世代配列がそろっていないと、書き形は焼けない。
+        if (!canEmitWritesIn(env))
+        {
+            return false;
+        }
+
+        // 窓がこのサイズの書きを一度も許さないなら、ガードは常に不成立。
+        if (env.ramLimit < op.size)
+        {
+            return false;
+        }
+
+        // CLR <mem> は読み脚を省いている (G20)。省略の前提は
+        // 「ガードが成立する範囲では read8/16/32 の fast path に副作用が
+        // 無い」ことで、それは fastRamReadable_ が立っているときだけ成り立つ。
+        //
+        // 翻訳器 (canEmitWrites / readsAllowed) が先に弾いているが、
+        // **エミッタ単体でも正しく断れるようにする** (テストが env を
+        // 直接渡して requiredSize を問う形を取る)。
+        const bool clearNeedsReadableWindow = op.kind == PlanKind::kClrMem && !env.ramReadable;
+        if (clearNeedsReadableWindow)
+        {
+            return false;
+        }
+
+        // G17 (a): 絶対アドレスは実効アドレスが翻訳時定数なので、
+        // **範囲・整列・自ページを翻訳時に判定して不成立なら積まない。**
+        if (isAbsoluteEa(op.eaMode))
+        {
+            const std::uint32_t addr = op.imm & kGuestAddrMask;
+            if (!guestWriteFits(env, addr, op.size))
+            {
+                return false;
+            }
+            if (writeHitsPage(addr, op.size, plan.page))
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // 読み形を含む計画を、この窓で発行してよいか (G6 / G12)。
 //
 // **翻訳時に決められることは翻訳時に決める。** 走らせてから諦める形にすると、
@@ -1232,7 +1709,11 @@ bool canEmitReads(const BlockPlan& plan, const EmitEnv& env)
     for (std::uint32_t i = 0; i < plan.count; ++i)
     {
         const PlannedOp& op = plan.ops[i];
-        if (!isMemoryRead(op))
+        // **書き形はここでは見ない。** eaMode だけで判定すると書き形も
+        // 読み形として扱われ、窓が読めない写像 (ROM 写像中) で書き形まで
+        // 断ってしまう。書き経路は fastRamReadable_ を見ない
+        // (m68k.cpp:331-334) ので、そこで断るのは保守的すぎる。
+        if (!isMemoryRead(op) || isMemoryWrite(op))
         {
             continue;
         }
@@ -1271,6 +1752,10 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const E
     {
         return false;
     }
+    if (!canEmitWritesFor(plan, env))
+    {
+        return false;
+    }
     Emitter e{};
     e.env = env;
     emitAll(e, plan, ir, irc);
@@ -1284,6 +1769,29 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const E
 }
 
 }  // namespace
+
+bool canEmitWritesIn(const EmitEnv& env)
+{
+    const bool windowUnusable = env.ramBaseAddr == 0 || env.ramLimit == 0;
+    if (windowUnusable)
+    {
+        return false;
+    }
+    // 世代配列が無いと touch を再現できない。**諦める** (G12 と同種)。
+    const bool genUnusable = env.genBaseAddr == 0 || env.genPageCount == 0;
+    if (genUnusable)
+    {
+        return false;
+    }
+    // G19: 範囲ガード成立 ⇒ touch 対象ページが配列の中、を導けること。
+    //
+    // これがあるから生成コードから `page < pageCount_` の判定を消せる。
+    // 満たさない env で焼くと、窓の端の書きが**世代配列の外へ s16i する**。
+    // 桁あふれさせないよう割り算の形で見る (pageCount << 10 は 32bit を
+    // 超えうる)。
+    const std::uint32_t coveredPages = (env.ramLimit + (1u << kPageShift) - 1u) >> kPageShift;
+    return coveredPages <= env.genPageCount;
+}
 
 size_t requiredSize(const BlockPlan& plan, std::uint16_t fallThroughIr,
                     std::uint16_t fallThroughIrc, const EmitEnv& env)

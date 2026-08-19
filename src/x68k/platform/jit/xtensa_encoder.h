@@ -178,6 +178,25 @@ inline constexpr bool canByteOffset(std::uint32_t off)
     return off <= 255u;
 }
 
+// s8i at, as, off  — 8bit ストア。off は 0..255。
+// 確認元: `s8i a4, a2, 0` = 42 42 00 / `s8i a5, a2, 1` = 52 42 01
+//         `s8i a15, a14, 255` = f2 4e ff / `s8i a7, a8, 128` = 72 48 80
+//         `s8i a11, a3, 17` = b2 43 11 / `s8i a0, a1, 3` = 02 41 03
+//
+// **オフセットは割らない。** l8ui と同じ粒度 (r フィールドが 0x0 → 0x4 に
+// 変わるだけ)。s16i (2 で割る) / s32i (4 で割る) にそろえて割ると、
+// 2 倍・4 倍離れた番地を書く**別の正当な命令**になる。読みなら値が狂うだけだが、
+// 書きだと窓の中の無関係な番地を潰す。
+//
+// Why ゲストの word / long もこれで組むか: l8ui と同じ理由。68000 は
+// ビッグエンディアンなので、ホスト (リトルエンディアン) の s16i / s32i で
+// 書くとバイトが逆になる。バイトずつ書けば m68k.cpp の write16 / write32 の
+// 代入文をそのまま写せる (ホスト側の整列も前提に入らない)。
+inline size_t s8i(std::uint8_t* out, XReg at, XReg as, std::uint32_t off)
+{
+    return detail::rri8(out, 0x2u, 0x4u, as, at, off);
+}
+
 // l16ui at, as, off  — 符号なし 16bit ロード。off は 0..510 の偶数。
 // 確認元: `l16ui a5, a12, 76` = 52 1c 26 / `l16ui a0, a1, 0` = 02 11 00
 //

@@ -63,6 +63,14 @@ struct PlanGenSource
 struct PlanCapabilities
 {
     bool (*canEmitReads)(void* ctx);
+    // 書き形をブロックへ入れてよいか (Tier C)。
+    //
+    // 読みと条件が違う。**書き経路は fastRamReadable_ を見ない**ので
+    // (m68k.cpp:331-334 — ROM 写像中も RAM へは書ける)、窓が読めない
+    // 写像でも書き形は焼ける。代わりに世代配列が要る (touch を再現するため)。
+    //
+    // 既定 (nullptr) は canEmitReads と同じく「入れてよい」。
+    bool (*canEmitWrites)(void* ctx);
     void* ctx;
 };
 

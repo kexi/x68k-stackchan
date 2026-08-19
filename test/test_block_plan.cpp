@@ -149,11 +149,15 @@ bool specSafeMove(x68k::u16 op)
     const x68k::u32 dstMode = static_cast<x68k::u32>((op >> 6) & 7u);
     const x68k::u32 size = group == 1 ? 1u : (group == 2 ? 4u : 2u);
 
-    // 転送先は Dn か An。メモリへ書く形はアドレスエラーとページ世代の
-    // 更新を背負うので安全ではない。
+    // 転送先がメモリ (Tier C)。**転送元は Dn だけ。**
+    //
+    // <mem>,<mem> は 1 命令にガードが 2 組要り、#imm,<mem> は拡張ワードが
+    // EA と即値に分かれて PlannedOp の imm 欄に両方入らない。どちらも別設計。
     if (dstMode > 1)
     {
-        return false;
+        const x68k::u32 dstReg = static_cast<x68k::u32>((op >> 9) & 7u);
+        // 書き形の EA は読み形と同じ集合 (実効アドレスの計算経路が同じ)。
+        return srcMode == 0 && specReadEa(dstMode, dstReg);
     }
     // 転送元は Dn / An / 即値 / 読み形メモリ (Tier B)。
     //
@@ -204,9 +208,14 @@ bool specSafeMisc(x68k::u16 op)
     }
     if (mode != 0)
     {
-        // TST <mem> は読むだけ (Tier B)。CLR <mem> は読んで書く RMW なので
-        // 入らない。
-        return opcodeBits == 0xAu && specReadEa(mode, reg);
+        // TST <mem> は読むだけ (Tier B)、CLR <mem> は書く形 (Tier C)。
+        //
+        // CLR は読んで書く RMW だが、**読み値は捨てられる**
+        // (m68k_ops_group4.cpp:606-607)。ガードが成立する範囲では
+        // read8/16/32 の fast path に副作用が無いので、生成コードは
+        // 読みを吐かない (G20)。
+        const bool isTstOrClr = opcodeBits == 0xAu || opcodeBits == 0x2u;
+        return isTstOrClr && specReadEa(mode, reg);
     }
     return opcodeBits == 0xAu || opcodeBits == 0x2u;  // TST / CLR
 }

@@ -92,6 +92,14 @@ struct NativeStats
     u64 guardExit = 0;
     // そのうち 1 命令も進めずに降りた回数 (G10)。
     u64 deferGuard = 0;
+    // 自ページ書き換えでブロックを降りた回数 (Tier C の G13/G18)。
+    //
+    // **blocksRun に対する比率を見る。0.1% を超えたら要注意。**
+    // この脱出は負のキャッシュへ「世代不問」を焼くので、その番地は
+    // mappingEpoch が動くまで JIT を失う。正しさは壊れないが、
+    // 一度きりの自己パッチ (起動時にコード近傍のフラグを書く類) でも
+    // 同じ扱いになるので、諦めすぎている可能性がここにしか映らない。
+    u64 selfPageExit = 0;
 };
 using NativeStatsFn = const NativeStats* (*)(void* context);
 

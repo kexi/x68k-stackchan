@@ -99,6 +99,27 @@ public:
         return gen_ != nullptr;
     }
 
+    // 世代配列の実体。**生成コードへ焼く以外の用途に使ってはいけない。**
+    //
+    // setFastRam / codeWindowForJit と同じ性質で、保持した瞬間から
+    // setStorage で古くなり、それを知る手段は mappingEpoch の照合しかない。
+    // setStorage が bumpMappingEpoch を呼ぶので、焼いた値が古いまま
+    // 実行されることは原理的に無い (実行前の鍵照合が epoch を見る)。
+    //
+    // Why 開けるか: Tier C の生成コードは touch を写す。写すには
+    // 「どの配列の何番目」を知る必要があり、関数呼び出しにすると
+    // 生成コードが葉でなくなる (call0 と windowed の繋ぎ目が要る)。
+    // その繋ぎ目の正しさはホストでは一切検査できない。
+    [[nodiscard]] std::uint16_t* storage() const
+    {
+        return gen_;
+    }
+
+    [[nodiscard]] u32 pageCount() const
+    {
+        return pageCount_;
+    }
+
     // 書き込みを記録する。**分岐を持たない**。
     //
     // Why 条件を付けないか: 「翻訳済みのページだけ数える」ようにすると、

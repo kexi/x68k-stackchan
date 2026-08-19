@@ -112,6 +112,17 @@ bool readEaMode(u32 mode, u32 reg, u8& out)
     }
 }
 
+// 書き形として受けてよい EA か (Tier C)。受けるなら eaMode を返す。
+//
+// **読み形と同じ集合。** 実効アドレスの計算はまったく同じ経路
+// (effectiveAddress / effectiveAddressSlow) を通るので、受ける形を分ける
+// 理由が無い。分けると「読みでは受けるが書きでは受けない」形ができ、
+// 片方だけ壊れたときに気づけない。
+bool writeEaMode(u32 mode, u32 reg, u8& out)
+{
+    return readEaMode(mode, reg, out);
+}
+
 // MOVE.b/w/l Dn,Dm。src / dst とも mode 0 のときだけ受ける。
 bool planMove(u16 op, PlannedOp& out)
 {
@@ -123,11 +134,38 @@ bool planMove(u16 op, PlannedOp& out)
 
     const u32 size = moveSizeFromGroup(group);
 
-    // 転送先は Dn か An だけ。メモリへ書く形は codeGen_ の世代更新と
-    // アドレスエラーを背負うので Tier A には入れない。
+    // 転送先がメモリ (Tier C)。**転送元は Dn だけ**を受ける。
+    //
+    // Why not <mem>,<mem> も入れないか: 読みガードと書きガードが 1 命令の
+    // 中に 2 つ並び、脱出の島も 2 つ要る。しかも読みが成立して書きが
+    // 不成立という組み合わせで「読みの副作用 ((An)+ の An 更新) だけ
+    // 済んだ状態」を作らないよう、2 つのガードをまとめて先に評価する
+    // 別の形が要る。まず片側だけで被覆を測る。
+    //
+    // Why not #imm,<mem> も入れないか: 拡張ワードが EA のものと即値の
+    // ものに分かれ、foldImmediate が 1 つの imm 欄に両方を持てない。
+    // PlannedOp を 20 バイトに保つ制約と正面から当たるので、別途設計が要る。
     if (dstMode > 1)
     {
-        return false;
+        u8 dstEa = kEaNone;
+        if (!writeEaMode(dstMode, dstReg, dstEa))
+        {
+            return false;
+        }
+        // 転送元は Dn だけ。An / 即値 / メモリは受けない。
+        if (srcMode != 0)
+        {
+            return false;
+        }
+        out.kind = PlanKind::kMoveDregToMem;
+        out.eaMode = dstEa;
+        out.srcReg = static_cast<u8>(srcReg);
+        // **EA の An 番号は dstReg**。eaRegOf() の規約 (block_plan.h)。
+        out.dstReg = static_cast<u8>(dstReg);
+        out.size = static_cast<u8>(size);
+        // groupMove は EA の形にもサイズにもよらず 4 (m68k_ops_move.cpp:68)。
+        out.cycles = 4;
+        return true;
     }
 
     // 転送元は Dn / An / 即値 / **メモリ読み** (Tier B)。
@@ -235,23 +273,37 @@ bool planMisc(u16 op, PlannedOp& out)
     }
     const u32 size = sizeField == 0 ? kByte : (sizeField == 1 ? kWord : kLong);
 
-    // TST <mem> (Tier B)。**読むだけで書かない**ので、ガードを通れば
-    // あとはフラグを立てるだけ。CLR は読んで書く RMW なので入れない
-    // (書き方向は世代更新とアドレスエラーを背負う)。
+    // TST <mem> (Tier B) と CLR <mem> (Tier C)。
+    //
+    // TST は読むだけ。CLR は読んで書く RMW だが、**読み値は捨てられる**
+    // (m68k_ops_group4.cpp:606-607 が readEaForModify の戻り値を使わない)。
+    // ガードが成立する範囲では read8/16/32 の fast path に副作用が無いので、
+    // 生成コードは読みを 1 つも吐かない (G20)。
     if (mode != 0)
     {
         u8 ea = kEaNone;
-        if (opcodeBits != 0xAu || !readEaMode(mode, reg, ea))
+        if (opcodeBits == 0xAu && readEaMode(mode, reg, ea))
         {
-            return false;
+            out.kind = PlanKind::kTstMem;
+            out.eaMode = ea;
+            out.srcReg = static_cast<u8>(reg);
+            out.size = static_cast<u8>(size);
+            // m68k_ops_group4.cpp:657 の TST は EA の形によらず 4。
+            out.cycles = 4;
+            return true;
         }
-        out.kind = PlanKind::kTstMem;
-        out.eaMode = ea;
-        out.srcReg = static_cast<u8>(reg);
-        out.size = static_cast<u8>(size);
-        // m68k_ops_group4.cpp:657 の TST は EA の形によらず 4。
-        out.cycles = 4;
-        return true;
+        if (opcodeBits == 0x2u && writeEaMode(mode, reg, ea))
+        {
+            out.kind = PlanKind::kClrMem;
+            out.eaMode = ea;
+            // **EA の An 番号は dstReg**。eaRegOf() の規約 (block_plan.h)。
+            out.dstReg = static_cast<u8>(reg);
+            out.size = static_cast<u8>(size);
+            // m68k_ops_group4.cpp:611 の CLR は EA の形にもサイズにもよらず 6。
+            out.cycles = 6;
+            return true;
+        }
+        return false;
     }
 
     if (opcodeBits == 0xAu)  // TST Dn
@@ -520,9 +572,15 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         //   mode 7.0  : (xxx).W は符号拡張される (534 行)
         //   mode 7.1  : (xxx).L は 2 語を連結 (537-541 行)
         // mode 2/3/4 は拡張ワードを持たないので 0 のまま。
+        // --- Tier C: 書き形の EA が持つ定数 ---
+        //
+        // 実効アドレスの合成は読み形とまったく同じ (effectiveAddressSlow を
+        // 通るのが読み書きどちらでも同じ関数なので、分ける理由が無い)。
         case PlanKind::kMoveMemToDreg:
         case PlanKind::kTstMem:
         case PlanKind::kAluMemToDreg:
+        case PlanKind::kMoveDregToMem:
+        case PlanKind::kClrMem:
             switch (p.eaMode)
             {
                 case kEaDisp16:
@@ -548,6 +606,8 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
     // 読み形を積んでよいか。**教わっていなければ積んでよい** (段 1 以前と
     // 同じ挙動)。教わった場合、窓が使えないなら読み形の手前で終端する。
     const bool readsAllowed = caps.canEmitReads == nullptr || caps.canEmitReads(caps.ctx);
+    // 書き形を積んでよいか (Tier C)。読みと条件が違う (block_planner.h)。
+    const bool writesAllowed = caps.canEmitWrites == nullptr || caps.canEmitWrites(caps.ctx);
 
     // entryPc == 0 は空きスロットの番兵なので、そこからは翻訳しない。
     //
@@ -630,7 +690,24 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // 積んでしまうとエミッタがブロックを丸ごと拒否する。読み形の手前で
         // 終端すれば、短くても翻訳できるブロックが残る。1 つ入っただけで
         // 全部失うのは、入れる前より悪い。
-        if (!readsAllowed && planned.eaMode != 0)
+        const bool isWrite = isMemoryWriteKind(planned.kind);
+        const bool isRead = planned.eaMode != kEaNone && !isWrite;
+        if (isRead && !readsAllowed)
+        {
+            out.end = BlockEnd::kUnsupported;
+            break;
+        }
+        if (isWrite && !writesAllowed)
+        {
+            out.end = BlockEnd::kUnsupported;
+            break;
+        }
+        // **CLR <mem> は読みの許可も要る (G20)。** 生成コードは読みを
+        // 吐かないが、それは「ガードが成立する範囲では read8/16/32 の
+        // fast path に副作用が無い」ことに乗った省略。窓が読めない写像
+        // (ROM 写像中) では、インタプリタの読みは ROM かバスへ落ちて
+        // 別の値を返し、バスエラーにも入りうる。**省略の前提が消える。**
+        if (planned.kind == PlanKind::kClrMem && !readsAllowed)
         {
             out.end = BlockEnd::kUnsupported;
             break;
@@ -692,6 +769,31 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // 入っている値はここで畳む (planBranch が飛び先の基準だけを置き、
         // 変位をここで足すのと同じ役割分担)。
         foldImmediate(planned, extension[0], extension[1], length);
+
+        // G17 (a): 絶対アドレスの書きが**自ブロックのページ**を指すなら、
+        // 積まずに終端する。
+        //
+        // 実効アドレスが翻訳時に決まっているので、積んでも
+        // 「必ず自ページ脱出するブロック」にしかならない。しかも脱出は
+        // runner に負のキャッシュを焼かせる (再翻訳の止血) ので、
+        // 積むと**その番地の JIT を epoch が動くまで失う**。
+        //
+        // 動的 EA (mode 2-5) は実行時にしか分からないので、そちらは
+        // 生成コードのガードが受け持つ (G13)。
+        //
+        // **`.l` は両端を見る。** write32 は page(a) と page(a+3) の 2 ページに
+        // touch する (m68k.cpp:377-378)。片方だけだと、ページ境界を跨いだ
+        // 長語書きで自ページの端を黙って書く。
+        if (isWrite && (planned.eaMode == kEaAbsShort || planned.eaMode == kEaAbsLong))
+        {
+            const u32 addr = planned.imm & 0x00FFFFFFu;
+            const u32 last = (addr + planned.size - 1u) & 0x00FFFFFFu;
+            if (pageOf(addr) == entryPage || pageOf(last) == entryPage)
+            {
+                out.end = BlockEnd::kUnsupported;
+                break;
+            }
+        }
 
         const bool isBranch = planned.kind == PlanKind::kBranch;
         if (isBranch)

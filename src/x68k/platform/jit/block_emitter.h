@@ -101,8 +101,20 @@ inline constexpr std::uint32_t kBranchTakenFlag = 0x80000000u;
 inline constexpr std::uint32_t kGuardExitFlag = 0x40000000u;
 inline constexpr std::uint32_t kGuardCountShift = 24;
 inline constexpr std::uint32_t kGuardCountMask = 0x3Fu;  // bit29-24
-// サイクルは 1 ブロックで最大 58 なので 24bit で足りる。
-inline constexpr std::uint32_t kCycleMask = 0x00FFFFFFu;
+
+// 戻り値の bit23。**自ページ書き換えで降りた** (G13/G18)。
+//
+// bit30 (ガード脱出) に**加えて**立つ。ふつうのガード脱出と区別が要るのは、
+// この形が step() の書き込みで**そのページの世代を必ず上げる**から。
+// 次に同じ entryPc へ来ると鍵が世代で外れ、毎周まるごと再翻訳になる。
+// 負のキャッシュは (pc, gen) 一致でしか効かず、gen が毎回動くので素通りする。
+// runner はこのビットを見て「世代不問」の印を焼き、再翻訳の嵐を止める。
+inline constexpr std::uint32_t kSelfPageExitFlag = 0x00800000u;
+
+// サイクルは 1 ブロックで最大 58 なので 23bit で足りる。
+// **bit23 を kSelfPageExitFlag に譲ったので 24bit → 23bit。** 58 << 23 なので
+// 失うものは無い。
+inline constexpr std::uint32_t kCycleMask = 0x007FFFFFu;
 
 // 戻り値を解く。**ヘッダに置いた純関数**なので、ホストで全数検査できる。
 //
@@ -115,6 +127,8 @@ struct BlockReturn
     std::uint8_t ranOps = 0;
     bool branchTaken = false;
     bool guardExit = false;
+    // 自ページ書き換えで降りたか (G13/G18)。**guardExit と同時にしか立たない。**
+    bool selfPageExit = false;
 };
 
 constexpr BlockReturn decodeBlockReturn(std::uint32_t ret)
@@ -125,6 +139,10 @@ constexpr BlockReturn decodeBlockReturn(std::uint32_t ret)
     r.cycles = ret & kCycleMask;
     r.ranOps =
         r.guardExit ? static_cast<std::uint8_t>((ret >> kGuardCountShift) & kGuardCountMask) : 0u;
+    // **guardExit が立っていなければ見ない。** 立っていない戻り値の bit23 は
+    // サイクル数の一部ではないが (kCycleMask から外れている)、
+    // 「自ページ脱出は必ずガード脱出でもある」を復号側でも保つ。
+    r.selfPageExit = r.guardExit && (ret & kSelfPageExitFlag) != 0;
     return r;
 }
 
@@ -159,6 +177,14 @@ struct EmitEnv
     std::uint32_t ramBaseAddr = 0;  // fastRam_ の先頭。0 は「窓なし」
     std::uint32_t ramLimit = 0;     // fastRamLimit_
     bool ramReadable = false;       // fastRamReadable_
+
+    // --- Tier C: 書き形が要る窓 ---
+    //
+    // CodeGenMap の世代配列 (u16 の並び)。生成コードは touch を写すために
+    // ここを l16ui / s16i で直に触る。**焼いてよい根拠は ramBaseAddr と同じ**
+    // で、CodeGenMap::setStorage が bumpMappingEpoch を呼ぶ (G8)。
+    std::uint32_t genBaseAddr = 0;  // 0 は「世代配列なし」
+    std::uint32_t genPageCount = 0;
 };
 
 // 生成コードのシグネチャ。call0 で呼ぶので、呼び出し側は callx0 のゲートウェイを通す。
@@ -193,7 +219,13 @@ struct EmittedBlock
 // 脱出用の出口の島が pc / ir / irc を持つ。前 2 つは全命令で共有できるので、
 // 実測の最悪 (ガード付き ADD.l × 4) でも 40 に収まる。
 // 溢れたら emit が false を返し、そのブロックは翻訳しない (保守的に諦める)。
-inline constexpr size_t kMaxLiterals = 40;
+//
+// **Tier C (書きガード) で 56 へ広げた。** 書き 1 命令は読み形の定数
+// (24bit マスク / 窓の先頭 / limit - size) に加えて「世代配列の先頭」
+// 「kAlwaysStale (0xFFFF)」「自ページ番号 (ROM ブロックだと movi に
+// 収まらない)」を要り、脱出の島が命令ごとに 2 つ (通常 / 自ページ) に増える。
+// 実測の最悪 (CLR.l (An) × 4) でも 56 に収まることをテストが問う。
+inline constexpr size_t kMaxLiterals = 56;
 
 // BlockPlan を機械語へ落とす。
 //
@@ -219,6 +251,24 @@ inline constexpr size_t kMaxLiterals = 40;
 // 混じっている、リテラルが溢れる)。
 [[nodiscard]] size_t requiredSize(const BlockPlan& plan, std::uint16_t fallThroughIr,
                                   std::uint16_t fallThroughIrc, const EmitEnv& env);
+
+// この窓で書き形を焼いてよいか (G19)。
+//
+// **翻訳器へ教えるための口。** 満たさない env で書き形を積むと、エミッタが
+// ブロックを丸ごと拒否する。手前で終端させれば短くても翻訳できる
+// (PlanCapabilities::canEmitWrites がこれを呼ぶ)。
+//
+// 条件:
+//   ramBaseAddr != 0 かつ ramLimit != 0     — 窓がある
+//   genBaseAddr != 0 かつ genPageCount != 0 — 世代配列がある (touch の宛先)
+//   (genPageCount << 10) >= ramLimit        — **範囲ガード成立 ⇒ ページ番号が
+//                                              配列の中**。これがあるから
+//                                              生成コードから page < pageCount の
+//                                              判定を消せる
+//
+// **ramReadable は課さない。** 書き経路は fastRamReadable_ を見ない
+// (m68k.cpp:331-334 — ROM 写像中も RAM へは書ける)。
+[[nodiscard]] bool canEmitWritesIn(const EmitEnv& env);
 
 }  // namespace x68k::jit
 

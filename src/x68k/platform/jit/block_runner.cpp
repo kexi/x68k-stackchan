@@ -95,6 +95,12 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
             static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(window.ramBase));
         env.ramLimit = window.ramLimit;
         env.ramReadable = window.ramReadable;
+        // 世代配列も焼く (Tier C)。**plan が控えた mappingEpoch と同じ
+        // 呼び出しの中で読む** (G8 と同じ論法)。CodeGenMap::setStorage が
+        // bumpMappingEpoch を呼ぶので、差し替われば走る前に鍵が外れる。
+        env.genBaseAddr =
+            static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(map.storage()));
+        env.genPageCount = map.pageCount();
     }
 
     // **翻訳器にエミッタの都合を教える。**
@@ -110,6 +116,16 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
                                 {
                                     const EmitEnv& e = *static_cast<CapsCtx*>(c)->env;
                                     return e.ramReadable && e.ramBaseAddr != 0 && e.ramLimit != 0;
+                                },
+                                // 書き形の条件 (G19)。**ramReadable は要らない**
+                                // (書き経路は見ない、m68k.cpp:331-334)。代わりに
+                                // 世代配列が要る (touch を再現するため) のと、
+                                // 「範囲ガード成立 ⇒ ページ番号が配列内」が
+                                // 導けることを条件にする。
+                                [](void* c) -> bool
+                                {
+                                    const EmitEnv& e = *static_cast<CapsCtx*>(c)->env;
+                                    return canEmitWritesIn(e);
                                 },
                                 &capsCtx};
 
@@ -309,9 +325,27 @@ NativeResult BlockRunner::run(M68k& cpu)
 
     if (decoded.guardExit)
     {
-        // 読みガードが不成立で降りた。**実際に走った命令数だけ数える。**
+        // ガードが不成立で降りた。**実際に走った命令数だけ数える。**
         ++stats_.guardExit;
         stats_.insnsRun += decoded.ranOps;
+
+        if (decoded.selfPageExit)
+        {
+            // G13/G18: 自ページ書き換えで降りた。
+            //
+            // **このあと step() が書いて、そのページの世代を必ず上げる。**
+            // 次に同じ entryPc へ来ると鍵が世代で外れ、毎周まるごと
+            // 再翻訳になる。ふつうの負のキャッシュは (pc, gen) 一致でしか
+            // 効かないので、gen が毎回動くと素通りする。
+            // **世代を鍵から外した印**を焼くことでしか止められない。
+            //
+            // 保守的すぎる面がある (一度きりの自己パッチでも epoch が
+            // 動くまでその番地の JIT を失う) ので、selfPageExit を数えて
+            // blocksRun に対する比率を見る。0.1% を超えるなら、
+            // 「N 回までは許す」等の再設計を検討する材料になる。
+            ++stats_.selfPageExit;
+            neg_.insert(entryPc, NegativeCache::kAnyGen);
+        }
 
         // G10: 1 命令も進んでいないなら kDeferToStep を返す。
         //

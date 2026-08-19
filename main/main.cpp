@@ -1837,6 +1837,13 @@ private:
             ESP_LOGI(kTag, "[jit] 鍵外れ: タグ %llu / 写像 %llu / 世代 %llu / 飽和 %llu",
                      (unsigned long long)st->keyMissTag, (unsigned long long)st->keyMissEpoch,
                      (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale);
+            // ガード脱出の内訳。**blocksRun に対する比率で読む。**
+            // guardExit が 10% を超えるなら (An) 経由の I/O が空回りしている。
+            // selfPageExit が 0.1% を超えるなら、自ページ脱出のブラックリストが
+            // 過剰 (正しさは壊れないが JIT を諦めすぎている)。
+            ESP_LOGI(kTag, "[jit] ガード脱出 %llu (0 進捗 %llu / 自ページ %llu)",
+                     (unsigned long long)st->guardExit, (unsigned long long)st->deferGuard,
+                     (unsigned long long)st->selfPageExit);
             // **統計が 0 のときに自己診断できるようにする。**
             // 経路が違えば tryNative は呼ばれないので、統計は 0 のまま。
             ESP_LOGI(kTag, "[jit] 経路: イベント駆動 %s / JIT %s",

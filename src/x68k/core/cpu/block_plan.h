@@ -63,6 +63,23 @@ enum class PlanKind : u8
     kMoveMemToDreg,  // MOVE.b/w/l <mem>,Dn。srcReg = An 番号 / eaMode / imm
     kTstMem,         // TST.b/w/l <mem>
     kAluMemToDreg,   // ADD/SUB/AND/OR/CMP.b/w/l <mem>,Dn。kEor は入れない
+
+    // --- Tier C: メモリへ**書く**形 ---
+    //
+    // Tier B に対して背負うものが 2 つ増える。
+    //
+    //   ページ世代の更新 (CodeGenMap::touch) — 回数まで含めて同値にする。
+    //     .l は同一ページでも 2 回 (m68k.cpp:377-378)。畳むと飽和の
+    //     タイミングが JIT ON/OFF で割れる (G14)
+    //   自ページ書き換え — 書き先が自ブロックのページなら、焼いた定数
+    //     (ops / 出口の ir/irc) が実行中に古くなる。**書く前に脱出**する
+    //     (G13)
+    //
+    // **EA レジスタは dstReg に置く。** 読み形は srcReg に置いているので、
+    // 「データフローの向きの欄」という規約で分ける。参照は必ず
+    // eaRegOf() を通すこと (直書きすると読み形と書き形で静かに割れる)。
+    kMoveDregToMem,  // MOVE.b/w/l Dn,<mem>。srcReg = Dn / dstReg = An 番号
+    kClrMem,         // CLR.b/w/l <mem>。dstReg = An 番号
 };
 
 // PlannedOp::eaMode の値。
@@ -129,6 +146,29 @@ struct PlannedOp
     u8 eaMode;
     u8 pad;
 };
+
+// メモリへ書く形か (Tier C)。
+//
+// **kind で判定する。** eaMode だけを見ると読み形と区別が付かない。
+constexpr bool isMemoryWriteKind(PlanKind kind)
+{
+    return kind == PlanKind::kMoveDregToMem || kind == PlanKind::kClrMem;
+}
+
+// 実効アドレスの An 番号がどちらの欄に入っているか。
+//
+// **PlannedOp を 20 バイトに保つために欄を流用している。** 読み形は
+// srcReg (メモリが転送元)、書き形は dstReg (メモリが転送先)。
+// 「データフローの向きの欄」という規約なので読めば分かるが、
+// 参照が散らばると片方だけ直したときに気づけない。
+//
+// ここを直書き (op.srcReg) に戻すと、書き形は (An)+ の An を srcReg
+// (= 転送元の Dn 番号) から取ることになり、**関係ないアドレスレジスタが
+// 進む**。MOVE.b D0,-(A7) の「A7 だけ 2 減る」特例も同時に外れる。
+constexpr u8 eaRegOf(const PlannedOp& op)
+{
+    return isMemoryWriteKind(op.kind) ? op.dstReg : op.srcReg;
+}
 
 // ブロックへ入れる命令数の上限。
 //

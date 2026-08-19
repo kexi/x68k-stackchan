@@ -44,6 +44,24 @@ struct NegEntry
 class NegativeCache
 {
 public:
+    // 「世代によらず翻訳しない」を表す番兵 (Tier C の G18)。
+    //
+    // **CodeGenMap::kAlwaysStale と同じ値を流用している。** 流用してよいのは、
+    // BlockRunner::rememberFailure が kAlwaysStale の世代を**決して格納しない**
+    // から (覚えても次回必ず外れるので無駄、という理由で弾いている)。
+    // したがって 0xFFFF は格納値として空いていて、別の意味を与えられる。
+    //
+    // Why 要るか: 自ページ書き換えで脱出したブロックは、その後 step() が
+    // 書いて**そのページの世代を上げる**。次に同じ entryPc へ来ると鍵が
+    // 世代で外れ、毎周まるごと再翻訳になる。負のキャッシュは (pc, gen) 一致で
+    // しか効かないので、gen が毎回動くと素通りする。世代を鍵から外した
+    // 印を焼くことでしか止められない。
+    //
+    // 消えるのは mappingEpoch が動いたとき (呼び出し側が clear() する) だけ。
+    // **一度きりの自己パッチでも epoch が動くまで JIT を失う**という
+    // 保守的すぎる面があるので、NativeStats::selfPageExit で観測する。
+    static constexpr std::uint16_t kAnyGen = 0xFFFFu;
+
     // 表を教わる。**count は 2 の冪でなければならない** (マスクで畳むため)。
     void setStorage(NegEntry* entries, std::uint32_t count)
     {
@@ -68,7 +86,12 @@ public:
             return false;
         }
         const NegEntry& e = entries_[index(pc)];
-        return e.pc == pc && e.pageGen == gen;
+        if (e.pc != pc)
+        {
+            return false;
+        }
+        // 世代不問の印なら、今の世代を問わず「翻訳しない」。
+        return e.pageGen == kAnyGen || e.pageGen == gen;
     }
 
     // 失敗を覚える。
