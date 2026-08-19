@@ -979,6 +979,44 @@ TEST_CASE("分岐成立側の出口が pc / ir / irc を書かない")
     CHECK(ircStores == 1);
 }
 
+// エミッタが対応していない種別は、発行せずに諦める。
+//
+// **翻訳器の対応範囲がエミッタより先に広がることがある。** Tier A は
+// planner に先に入れたので、その間このブロックは翻訳されない。
+//
+// 危ないのは「何も発行しないまま成功したことにする」形で、そうなると
+// その命令が実行されずに飛ばされる (ゲストの状態が静かにずれる)。
+// switch に default を置かず全種別を列挙してあるので、種別を足した人は
+// ここへ必ず来る。
+TEST_CASE("エミッタが対応していない種別は発行を諦める")
+{
+    const PlanKind unimplemented[] = {
+        PlanKind::kMoveAregToDreg,  PlanKind::kMoveImmToDreg,  PlanKind::kMoveaDregToAreg,
+        PlanKind::kMoveaAregToAreg, PlanKind::kMoveaImmToAreg, PlanKind::kTstDreg,
+        PlanKind::kClrDreg,         PlanKind::kLeaDisp,        PlanKind::kLeaAbs,
+    };
+    for (const PlanKind kind : unimplemented)
+    {
+        CAPTURE(static_cast<int>(kind));
+        BlockPlan plan{};
+        plan.entryPc = 0x1000;
+        plan.count = 1;
+        plan.end = BlockEnd::kUnsupported;
+        plan.fallThroughPc = 0x1002;
+        plan.cyclesNotTaken = 4;
+        plan.ops[0].pc = 0x1000;
+        plan.ops[0].length = 2;
+        plan.ops[0].kind = kind;
+        plan.ops[0].size = 2;
+        plan.ops[0].cycles = 4;
+
+        std::vector<std::uint8_t> buf(512, 0);
+        x68k::jit::EmittedBlock emitted{};
+        CHECK_FALSE(x68k::jit::emitBlock(plan, 0x4E71, 0x4E71, buf.data(), buf.size(), emitted));
+        CHECK(x68k::jit::requiredSize(plan, 0x4E71, 0x4E71) == 0);
+    }
+}
+
 TEST_CASE("MOVEQ がインタプリタと一致する")
 {
     for (int imm : {0, 1, -1, 127, -128, 0x40, -0x40})

@@ -591,6 +591,23 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 // I6 が「分岐は末尾のみ」を保証しているので、本体には来ない。
                 e.failed = true;
                 break;
+
+            // --- Tier A: planner は積むが、エミッタはまだ発行できない ---
+            //
+            // **必ず failed を立てる。** 立て忘れると「何も発行しないまま
+            // 成功したことにする」形になり、その命令が実行されずに飛ばされる。
+            // 翻訳器の対応範囲がエミッタより先に広がったときの安全弁。
+            case PlanKind::kMoveAregToDreg:
+            case PlanKind::kMoveImmToDreg:
+            case PlanKind::kMoveaDregToAreg:
+            case PlanKind::kMoveaAregToAreg:
+            case PlanKind::kMoveaImmToAreg:
+            case PlanKind::kTstDreg:
+            case PlanKind::kClrDreg:
+            case PlanKind::kLeaDisp:
+            case PlanKind::kLeaAbs:
+                e.failed = true;
+                break;
         }
         if (e.failed)
         {
