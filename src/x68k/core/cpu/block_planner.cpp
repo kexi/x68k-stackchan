@@ -229,6 +229,44 @@ bool planMove(u16 op, PlannedOp& out)
     return true;
 }
 
+// JSR の実効アドレスとして受けてよい形か (Tier D)。
+//
+// **mode 3/4 は受けない。** 68000 の JSR は制御アドレッシングしか取らず、
+// (An)+ / -(An) は符号としては通っても正当な命令ではない。インタプリタ側は
+// effectiveAddress がそれらを黙って計算してしまうが、その形は
+// 「実機の JSR」ではないので**エミュレータの現在の挙動をわざわざ写す価値が無い**。
+// 受けなければブロックがそこで切れるだけで、正しさは step() が持つ。
+//
+// **mode 0/1 も受けない。** JSR Dn / JSR An は effectiveAddress が
+// halted を立てる形 (m68k.cpp) で、実行器の「例外に入らない」契約と
+// 相容れない。
+bool jsrEaMode(u32 mode, u32 reg, u8& out)
+{
+    switch (mode)
+    {
+        case 2:
+            out = kEaIndirect;
+            return true;
+        case 5:
+            out = kEaDisp16;
+            return true;
+        case 7:
+            if (reg == 0)
+            {
+                out = kEaAbsShort;
+                return true;
+            }
+            if (reg == 1)
+            {
+                out = kEaAbsLong;
+                return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
 // $4 から、メモリに触れず例外も起きない 3 系統だけを拾う。
 //
 // Why not NEGX/NEG/NOT Dn も入れないか: X と累積 Z が絡む。planAlu が
@@ -237,6 +275,51 @@ bool planMisc(u16 op, PlannedOp& out)
 {
     const u32 mode = static_cast<u32>((op >> 3) & 7u);
     const u32 reg = static_cast<u32>(op & 7u);
+
+    // --- Tier D: RTS / JSR ---
+    //
+    // **判定を LEA / 単項演算より先に置く。** RTS ($4E75) は
+    // LEA のマスク ($F1C0 == $41C0) にも単項のマスクにも当たらないので順序は
+    // 問題にならないが、JSR ($4E80-$4EBF) は単項演算の判別ビット
+    // ((op >> 8) & 0xF == 0xE) の範囲に入る。後に回すと取りこぼす。
+    //
+    // 判定の順序は m68k_ops_group4.cpp の実装に合わせてある。
+
+    if (op == 0x4E75u)  // RTS
+    {
+        out.kind = PlanKind::kRts;
+        // m68k_ops_group4.cpp:101 の RTS は 16。
+        out.cycles = 16;
+        // **eaMode を持たない。** A7 からの読みは EA の合成を通らない。
+        out.eaMode = kEaNone;
+        // **size を必ず埋める。** エミッタの読みガードは op.size から
+        // 「窓の上限 - size」を作る。0 のままだと bound が limit そのものに
+        // なり、**窓の末尾 3 バイトで範囲外を読む**。
+        // 状態の意味としては「A7 から read32 する」なので 4。
+        out.size = static_cast<u8>(kLong);
+        return true;
+    }
+
+    const bool isJsr = (op & 0xFFC0u) == 0x4E80u;
+    if (isJsr)
+    {
+        u8 ea = kEaNone;
+        if (!jsrEaMode(mode, reg, ea))
+        {
+            return false;
+        }
+        out.kind = PlanKind::kJsr;
+        out.eaMode = ea;
+        // **EA の An 番号は dstReg。** 読み形は srcReg に置くという規約
+        // (block_plan.h) に対し、JSR の EA は「読む元」ではないので
+        // 書き形と同じ欄にそろえる。参照は eaRegOf() を通さない
+        // (isMemoryWriteKind が kJsr を含まないので dstReg を直に読む)。
+        out.dstReg = static_cast<u8>(reg);
+        out.size = static_cast<u8>(kLong);
+        // m68k_ops_group4.cpp:370 の JSR は EA の形によらず 16。
+        out.cycles = 16;
+        return true;
+    }
 
     // LEA <ea>,An : 0100 rrr 111 mmm rrr
     //
@@ -581,6 +664,12 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         case PlanKind::kAluMemToDreg:
         case PlanKind::kMoveDregToMem:
         case PlanKind::kClrMem:
+        // --- Tier D: JSR の飛び先 EA が持つ定数 ---
+        //
+        // 合成は読み形・書き形とまったく同じ。effectiveAddressSlow を通るのが
+        // どの向きでも同じ関数なので、分ける理由が無い。
+        // **kRts はここへ来ない** (eaMode が kEaNone なので imm を持たない)。
+        case PlanKind::kJsr:
             switch (p.eaMode)
             {
                 case kEaDisp16:
@@ -608,6 +697,9 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
     const bool readsAllowed = caps.canEmitReads == nullptr || caps.canEmitReads(caps.ctx);
     // 書き形を積んでよいか (Tier C)。読みと条件が違う (block_planner.h)。
     const bool writesAllowed = caps.canEmitWrites == nullptr || caps.canEmitWrites(caps.ctx);
+    // 動的分岐 (Tier D) を積んでよいか。**既定 (nullptr) は「入れてよい」。**
+    const bool dynamicBranchAllowed =
+        caps.canEmitDynamicBranch == nullptr || caps.canEmitDynamicBranch(caps.ctx);
 
     // entryPc == 0 は空きスロットの番兵なので、そこからは翻訳しない。
     //
@@ -690,14 +782,27 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // 積んでしまうとエミッタがブロックを丸ごと拒否する。読み形の手前で
         // 終端すれば、短くても翻訳できるブロックが残る。1 つ入っただけで
         // 全部失うのは、入れる前より悪い。
-        const bool isWrite = isMemoryWriteKind(planned.kind);
-        const bool isRead = planned.eaMode != kEaNone && !isWrite;
+        // **needsReadWindow / needsWriteWindow を通す。** eaMode を直に見ると
+        // Tier D を取りこぼす: RTS は A7 から read32 するのに eaMode が
+        // kEaNone で、JSR は -(A7) へ write32 するのに eaMode は飛び先を指す。
+        const bool isWrite = needsWriteWindow(planned.kind);
+        const bool isRead = needsReadWindow(planned.kind, planned.eaMode);
         if (isRead && !readsAllowed)
         {
             out.end = BlockEnd::kUnsupported;
             break;
         }
         if (isWrite && !writesAllowed)
+        {
+            out.end = BlockEnd::kUnsupported;
+            break;
+        }
+        // 動的分岐 (Tier D) は飛び先の置き場 (メールボックス) が要る。
+        //
+        // **読み・書きの許可とは別の条件。** 窓が全部そろっていても
+        // メールボックスが未配線なら焼けないので、そこで終端する。
+        if (isBlockTerminator(planned.kind) && planned.kind != PlanKind::kBranch &&
+            !dynamicBranchAllowed)
         {
             out.end = BlockEnd::kUnsupported;
             break;
@@ -784,7 +889,16 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         // **`.l` は両端を見る。** write32 は page(a) と page(a+3) の 2 ページに
         // touch する (m68k.cpp:377-378)。片方だけだと、ページ境界を跨いだ
         // 長語書きで自ページの端を黙って書く。
-        if (isWrite && (planned.eaMode == kEaAbsShort || planned.eaMode == kEaAbsLong))
+        //
+        // **kJsr はここへ来ない。** JSR の絶対形 EA は**飛び先**であって
+        // 書き先ではない。書き先は常に -(A7) で、実行時にしか分からないので
+        // 生成コードの自ページガードが受け持つ (G13)。ここで飛び先を
+        // 自ページ判定にかけると、**自分のページへの再帰呼び出しを
+        // 積めなくする**だけで何も守らない。
+        const bool isAbsoluteWriteTarget =
+            isMemoryWriteKind(planned.kind) &&
+            (planned.eaMode == kEaAbsShort || planned.eaMode == kEaAbsLong);
+        if (isAbsoluteWriteTarget)
         {
             const u32 addr = planned.imm & 0x00FFFFFFu;
             const u32 last = (addr + planned.size - 1u) & 0x00FFFFFFu;
@@ -793,6 +907,49 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
                 out.end = BlockEnd::kUnsupported;
                 break;
             }
+        }
+
+        // I7 の Tier D 版: JSR の飛び先が**翻訳時に分かっていて奇数**なら
+        // 積まずに終端する。refillPrefetch がアドレスエラーへ入るので、
+        // 実行器の「例外に入らない」契約と相容れない。
+        //
+        // 動的な EA (mode 2 / 5) の飛び先は実行時にしか分からないので、
+        // 生成コードのガードが受け持つ。
+        const bool isAbsoluteJumpTarget =
+            planned.kind == PlanKind::kJsr &&
+            (planned.eaMode == kEaAbsShort || planned.eaMode == kEaAbsLong);
+        if (isAbsoluteJumpTarget && (planned.imm & 1u) != 0)
+        {
+            out.end = BlockEnd::kUnsupported;
+            break;
+        }
+
+        // --- Tier D: 動的分岐で終端する ---
+        //
+        // **kBranch と同じく必ずブロック末尾** (I6)。飛び先が翻訳済みか
+        // どうかはここでは分からないので、必ず切る。
+        //
+        // 違うのは、飛び先が BlockPlan に入らないこと。生成コードが
+        // 実行時に求めてメールボックスへ書く。**branchTarget は 0 のまま**に
+        // しておく (使うと「翻訳時に確定した飛び先」と読み違えられる)。
+        const bool isDynamicBranch =
+            planned.kind == PlanKind::kRts || planned.kind == PlanKind::kJsr;
+        if (isDynamicBranch)
+        {
+            out.ops[out.count] = planned;
+            ++out.count;
+            out.end = BlockEnd::kDynamicBranch;
+            // **fallThroughPc は nextPc のまま。** 動的分岐が成立すれば
+            // runner が branchTo で pc / ir / irc を作り直すので使われないが、
+            // ガード不成立で降りたときの島は「その命令の手前」を書くので、
+            // ここが未定義だと出口の状態が壊れる。
+            out.fallThroughPc = nextPc;
+            // **成立側と不成立側でサイクルが同じ。** 条件分岐と違って
+            // RTS / JSR は必ず飛ぶ。ガードが不成立なら 1 命令も実行せずに
+            // 降りるので、そのときは島が「手前まで」の値を返す。
+            out.cyclesNotTaken += planned.cycles;
+            out.cyclesTaken += planned.cycles;
+            break;
         }
 
         const bool isBranch = planned.kind == PlanKind::kBranch;

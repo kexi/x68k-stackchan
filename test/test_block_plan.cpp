@@ -191,6 +191,23 @@ bool specSafeMisc(x68k::u16 op)
     const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
     const x68k::u32 reg = static_cast<x68k::u32>(op & 7u);
 
+    // --- Tier D: 動的分岐 ---
+    //
+    // **LEA / 単項演算より先に見る。** JSR ($4E80-$4EBF) は単項演算の
+    // 判別ビット ((op >> 8) & 0xF == 0xE) の範囲に入るので、後に回すと
+    // 「単項でもないので false」になって取りこぼす。
+    if (op == 0x4E75u)  // RTS
+    {
+        return true;
+    }
+    const bool isJsr = (op & 0xFFC0u) == 0x4E80u;
+    if (isJsr)
+    {
+        // **制御アドレッシングだけ。** (An)+ / -(An) は 68000 の JSR には
+        // 無く、mode 0/1 は effectiveAddress が halted を立てる形。
+        return mode == 2 || mode == 5 || (mode == 7 && reg <= 1);
+    }
+
     const bool isLea = (op & 0xF1C0u) == 0x41C0u;
     if (isLea)
     {
@@ -509,6 +526,27 @@ TEST_SUITE("BlockPlanner")
             }
 
             const bool isBranch = plan.end == x68k::BlockEnd::kBranch;
+            // 動的分岐 (RTS / JSR) は**条件を持たない**ので、成立側と
+            // 不成立側で同じサイクルになる。CCR をどちらにしても値は同じ。
+            const bool isDynamicBranch = plan.end == x68k::BlockEnd::kDynamicBranch;
+            if (isDynamicBranch)
+            {
+                const StepResult ran = runOne({op, 0x0000}, 0x00);
+                ++checked;
+                const bool bothSidesMatch =
+                    ran.cycles == plan.cyclesTaken && ran.cycles == plan.cyclesNotTaken;
+                if (!bothSidesMatch)
+                {
+                    if (mismatched == 0)
+                    {
+                        firstBad = op;
+                        firstWant = ran.cycles;
+                        firstGot = plan.cyclesTaken;
+                    }
+                    ++mismatched;
+                }
+                continue;
+            }
 
             // 不成立側 (分岐でなければこちらだけ)。
             // CCR = 0 なら BEQ/BCS/BMI/BVS などが不成立になる。
@@ -658,6 +696,26 @@ TEST_SUITE("BlockPlanner")
             const StepResult notTaken = runOne({op, 0x0000, 0x0100}, 0x00);
             const StepResult taken = runOne({op, 0x0000, 0x0100}, 0x1F);
             const bool isBranch = plan.end == x68k::BlockEnd::kBranch;
+            // 動的分岐 (RTS / JSR) は**必ず飛ぶ**ので fallThroughPc へ来ない。
+            // 飛び先は翻訳時に決まらない (plan.branchTarget は 0 のまま) ので、
+            // ここでは「fallThroughPc へ来ないこと」を許すだけにする。
+            // 飛び先の一致は test_block_emitter.cpp が実行で確かめる。
+            const bool isDynamicBranch = plan.end == x68k::BlockEnd::kDynamicBranch;
+            if (isDynamicBranch)
+            {
+                // fallThroughPc は「不成立側」ではなく「次の命令」。
+                // 長さの検査だけは通しておく。
+                ++checkedLength;
+                if (plan.fallThroughPc != kEntry + plan.ops[0].length)
+                {
+                    if (badLength == 0)
+                    {
+                        firstBadLength = op;
+                    }
+                    ++badLength;
+                }
+                continue;
+            }
 
             // 不成立 (または非分岐) なら PC は fallThroughPc へ進む。
             const StepResult* fell = nullptr;
@@ -995,8 +1053,11 @@ TEST_SUITE("BlockPlanner")
         SUBCASE("kUnsupported: 許可リストの外の命令")
         {
             code.reset(0x0800, 0x1800);
-            code.poke16(kEntry, 0x7000);      // MOVEQ
-            code.poke16(kEntry + 2, 0x4E75);  // RTS。許可リストの外
+            code.poke16(kEntry, 0x7000);  // MOVEQ
+            // **RTS は Tier D で許可リストへ入った。** 未対応の代表として
+            // SWAP D0 ($4840) を使う。長さは 2 で確定する (I1 は通る) が、
+            // planOne が受けないので kUnsupported で切れる。
+            code.poke16(kEntry + 2, 0x4840);  // SWAP D0。許可リストの外
             const auto src = code.source();
 
             x68k::BlockPlan plan{};
@@ -1092,11 +1153,102 @@ TEST_SUITE("BlockPlanner")
         const auto gsrc = gen.source();
 
         code.reset(0x0800, 0x1800);
-        code.poke16(kEntry, 0x4E75);  // RTS。許可リストの外
+        // **RTS は Tier D で許可リストへ入った。** 1 命令も積めない形として
+        // SWAP D0 ($4840) を使う (長さは決まるが planOne が受けない)。
+        code.poke16(kEntry, 0x4840);  // SWAP D0。許可リストの外
         const auto src = code.source();
 
         x68k::BlockPlan plan{};
         CHECK_FALSE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+    }
+
+    // 翻訳器がエミッタの都合を受け取り、**積む前に終端する**こと。
+    //
+    // Why これが要るか: 積んでしまうとエミッタがブロックを**丸ごと**拒否する。
+    // 手前で終端していれば短くても翻訳できたのに、1 つ入っただけで全部失う
+    // ので、入れる前より悪くなる。Tier B で実際に踏んでいる
+    // (翻訳失敗 1,944 → 2,198,539、クロック 6493 → 6316)。
+    //
+    // **Tier D は eaMode だけでは判定できない。** RTS は A7 から read32 する
+    // のに eaMode が kEaNone で、JSR は -(A7) へ write32 するのに eaMode は
+    // 飛び先を指す。needsReadWindow / needsWriteWindow を通さないと、
+    // どちらも「窓を要らない形」に見える。
+    TEST_CASE("エミッタが焼けない形は積まずに終端する")
+    {
+        FlatCode code;
+        FakeGen gen;
+        const auto gsrc = gen.source();
+
+        // 「何を禁じるか」を 1 つずつ切り替えられる箱。
+        struct Caps
+        {
+            bool reads = true;
+            bool writes = true;
+            bool dynamic = true;
+        };
+
+        const auto makeCaps = [](Caps& c)
+        {
+            return x68k::PlanCapabilities{[](void* ctx) { return static_cast<Caps*>(ctx)->reads; },
+                                          [](void* ctx) { return static_cast<Caps*>(ctx)->writes; },
+                                          [](void* ctx)
+                                          { return static_cast<Caps*>(ctx)->dynamic; }, &c};
+        };
+
+        struct Case
+        {
+            std::vector<x68k::u16> words;  // kEntry から並べる語
+            Caps caps;
+            const char* what;
+        };
+
+        // どれも先頭に MOVEQ を置く。**手前まで積めていること**を問うため
+        // (0 命令になると「積まなかった」と「そもそも計画できなかった」が
+        // 区別できない)。
+        const std::vector<Case> cases = {
+            // RTS: 読みの窓が要る。**eaMode は kEaNone なので、
+            // eaMode で判定する実装はここを通してしまう。**
+            //
+            // 落ちる変異: needsReadWindow から kRts を外す
+            {{0x7000u, 0x4E75u}, Caps{false, true, true}, "RTS と読み禁止"},
+            // JSR: 書きの窓が要る。**isMemoryWriteKind は kJsr を含まない**
+            // ので、そちらで判定する実装はここを通してしまう。
+            //
+            // 落ちる変異: needsWriteWindow から kJsr を外す
+            {{0x7000u, 0x4E93u}, Caps{true, false, true}, "JSR (A3) と書き禁止"},
+            // どちらもメールボックスが要る。
+            //
+            // 落ちる変異: dynamicBranchAllowed の判定を消す
+            {{0x7000u, 0x4E75u}, Caps{true, true, false}, "RTS と動的分岐禁止"},
+            {{0x7000u, 0x4E93u}, Caps{true, true, false}, "JSR と動的分岐禁止"},
+        };
+
+        for (const Case& c : cases)
+        {
+            INFO(c.what);
+            code.reset(0x0800, 0x1800);
+            x68k::u32 at = kEntry;
+            for (const x68k::u16 w : c.words)
+            {
+                code.poke16(at, w);
+                at += 2;
+            }
+            const auto src = code.source();
+
+            Caps caps = c.caps;
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan, makeCaps(caps)));
+            // MOVEQ だけを積んで、その次で終端している。
+            CHECK(plan.count == 1u);
+            CHECK(plan.end == x68k::BlockEnd::kUnsupported);
+
+            // **禁止を解けば積む。** 「常に終端する」実装と区別する。
+            Caps allowed{};
+            x68k::BlockPlan allowedPlan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, allowedPlan, makeCaps(allowed)));
+            CHECK(allowedPlan.count == 2u);
+            CHECK(allowedPlan.end == x68k::BlockEnd::kDynamicBranch);
+        }
     }
 
     // 分岐のサイクル数を名指しで固定する。

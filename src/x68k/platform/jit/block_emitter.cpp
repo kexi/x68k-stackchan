@@ -82,10 +82,20 @@ struct PendingGuard
     std::uint32_t extraRetFlags = 0;
 };
 
-// ガード付き命令は 1 つにつき分岐 1 本 (読み) か最大 3 本 (書きの `.l`:
-// 範囲 + 自ページ page(a) + 自ページ page(a+3))。kMaxOps = 4 なので
-// 4 x 3 = 12 が上限。溢れたら failed で諦める。
-constexpr size_t kMaxPendingGuards = 12;
+// ガード付き命令 1 つが持つ分岐の本数。
+//
+//   読み (Tier B)   1 本 — 整列 + 範囲を 1 本のビットに畳んである
+//   書き (Tier C)   最大 3 本 — 範囲 + 自ページ page(a) + 自ページ page(a+3)
+//   JSR  (Tier D)   4 本 — **飛び先の整列**が上の 3 本に加わる
+//   RTS  (Tier D)   2 本 — 範囲 + 戻り先の整列
+//
+// **上限は 4 x 3 + 4 = 16。** kMaxOps = 4 だが、動的分岐は末尾 1 つだけ
+// (I6/G23) なので「書き形 3 つ + JSR 1 つ」が最悪。12 のままだと
+// その形が黙って諦められる (素通りする) ので、先に広げておく。
+//
+// 溢れたら failed で諦める。正しさは損なわれないが、諦めた分は
+// 素通りするので気づきにくい。**テストが最悪ケースを名指しで問う。**
+constexpr size_t kMaxPendingGuards = 16;
 
 // 発行の状態。1 パスぶん。
 //
@@ -1226,6 +1236,220 @@ void emitMemoryWrite(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std
     emitLogicFlags(e, kTmpC, size);
 }
 
+// --- Tier D: 動的分岐 (RTS / JSR) --------------------------------------------
+//
+// Tier B/C に対して増える不変条件は 3 つ:
+//
+//   G21 飛び先の受け渡し 生成コードは飛び先を EmitEnv::mailboxAddr の 1 語へ
+//                        s32i で書き、戻り値に kDynamicBranchFlag を立てる。
+//                        **M68kState には 1 語も足さない** (§5.1 の同一性を
+//                        比較から外す欄を作らないため)
+//   G22 飛び先の整列     refillPrefetch は奇数でアドレスエラーへ入る。
+//                        **奇数と分かった時点で、状態を 1 bit も変えずに脱出する**
+//   G23 末尾のみ         kBranch と同じく必ずブロック末尾 (I6)。本体には来ない
+
+// 動的分岐か (Tier D)。
+constexpr bool isDynamicBranch(const PlannedOp& op)
+{
+    return op.kind == PlanKind::kRts || op.kind == PlanKind::kJsr;
+}
+
+// 飛び先をメールボックスへ書き、動的分岐の出口を吐く (G21)。
+//
+// **pc / ir / irc を書かない。** 分岐成立側 (emitBranchExit) と同じ理由で、
+// 飛び先のプリフェッチはページの外を読みうる。runner が branchTo で詰め直す。
+//
+// targetReg に飛び先 (32bit 無マスク) が入っている前提。
+// **インタプリタも refillPrefetch へ無マスクの値を渡す** (m68k.cpp:180)。
+// マスクするのはバスへ出す瞬間だけなので、ここでマスクすると
+// $43FF0540 のような上位バイト付きベクタで pc が食い違う。
+void emitDynamicBranchExit(Emitter& e, XReg targetReg, std::uint32_t cycles)
+{
+    emitConst(e, kTmpConst, e.env.mailboxAddr);
+    s32i(e.slot(kWideLen), targetReg, kTmpConst, 0u);
+    emitConst(e, kRet, cycles | kDynamicBranchFlag);
+    retN(e.slot(kNarrowLen));
+}
+
+// 飛び先が奇数なら脱出するガードを 1 本吐く (G22)。
+//
+// **範囲ガードと同じ「失敗ビットが立ったら bnez」の形。** targetReg の bit0 を
+// 取り出して分岐する。extraRetFlags は 0 (自ページ脱出ではない)。
+//
+// **kTmpD を潰す。** 呼び出し側は targetReg に kTmpD を使わないこと。
+void emitTargetAlignGuard(Emitter& e, XReg targetReg, std::uint32_t opIndex)
+{
+    extui(e.slot(kWideLen), kTmpD, targetReg, 0u, 1u);
+    const size_t insnPc = e.codeBase + e.cursor;
+    std::uint8_t* slot = e.slot(kWideLen);
+    e.addGuard(slot, insnPc, opIndex, /*branchOnZero=*/false, kTmpD, /*extraRetFlags=*/0u);
+}
+
+// RTS。**順序が契約そのもの。**
+//
+//   [a7 を読む]      レジスタを読むだけ。状態は 1 bit も変えない
+//   [ガード 1]       整列 + 範囲 (read32 の fast path に入るか)
+//   [戻り先を読む]   ビッグエンディアンで 4 バイト
+//   [ガード 2]       **戻り先が奇数なら脱出。A7 を進める前に。**
+//   --- ここから下が commit ---
+//   [A7 += 4]
+//   [メールボックス] 飛び先を書く
+//   [出口]           kDynamicBranchFlag を立てて戻る
+//
+// **「戻り先が奇数なら A7 を進めない」が要点。** インタプリタは A7 を進めて
+// から refillPrefetch でアドレスエラーになる (m68k_ops_group4.cpp:96-102) が、
+// ネイティブは 1 bit も変えずに降りて step() に再演させる。
+//
+// Why not インタプリタの検査列を移植しないか: ガードは「fast path を通るか」の
+// **述語**であって、インタプリタの手順の写しではない。降りた先が
+// 「その命令の直前の命令境界」(G7) でありさえすれば、残りは step() が
+// 本物の read32 / refillPrefetch で実行し、そこでアドレスエラーが積まれる。
+// 途中まで真似ると、A7 だけ進んだ状態で例外フレームが積まれて**二重に進む**。
+void emitRts(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32_t cycles)
+{
+    // a7 を kTmpB (無マスク) と kTmpA (マスク済み) へ。
+    // **emitEffectiveAddress は通さない。** あれは eaMode で分岐する形で、
+    // RTS は eaMode を持たない (kEaNone)。通すと (An) 扱いで
+    // eaRegOf(op) = srcReg = 0 になり、**A0 をスタックポインタとして読む**。
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitConst(e, kTmpConst, kGuestAddrMask);
+    and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
+
+    // ガード 1: read32 の fast path に入るか。**読み形とまったく同じ式**を
+    // 使う (emitReadGuard は op.size を見るので、size は 4 でなければならない)。
+    emitReadGuard(e, op, opIndex);
+
+    // --- ここから下はガード 1 が通ったときだけ走る ---
+    //
+    // **まだ状態は書かない。** 読むだけなので、ここで降りても G7 を満たす。
+    emitBigEndianLoad(e, 4u, /*addressIsConst=*/false, 0u);
+    // 戻り先は kTmpC にある。**kTmpD / kTmpE は emitBigEndianLoad が潰している。**
+
+    // ガード 2: 戻り先が奇数なら脱出 (G22)。**A7 を進める前。**
+    emitTargetAlignGuard(e, kTmpC, opIndex);
+
+    // --- ここから下はガードが全部通ったときだけ走る (G3) ---
+
+    // A7 += 4。**無マスクの値に足す** (インタプリタも a[7] には
+    // マスクしない値を書く: st_.a[7] = st_.a[7] + 4)。
+    addi(e.slot(kWideLen), kTmpB, kTmpB, 4);
+    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+
+    emitDynamicBranchExit(e, kTmpC, cycles);
+}
+
+// JSR。**書き形 (Tier C) の骨格をそのまま使う。**
+//
+//   [EA 計算]        飛び先を求める。レジスタを読むだけ
+//   [ガード 1]       **飛び先が奇数なら脱出** (G22)。積む前に
+//   [A7 - 4 を作る]  積む先。まだ書かない
+//   [ガード 2]       整列 + 範囲 (write32 の fast path に入るか)
+//   [ガード 3,4]     自ページ (beqz)。`.l` なので 2 本
+//   --- ここから下が commit ---
+//   [A7 -= 4]
+//   [touch x2]       write32 は page(a) と page(a+3) の 2 回。**畳まない**
+//   [RAM store]      戻り先を 4 バイト、ビッグエンディアンで
+//   [メールボックス] 飛び先を書く
+//   [出口]
+//
+// **飛び先の整列ガードを積む前に置く。** インタプリタは積んでから
+// refillPrefetch でアドレスエラーになるが、ネイティブは 1 bit も変えずに
+// 降りて step() に再演させる (RTS と同じ理屈)。
+//
+// returnAddr は翻訳時定数。JSR が番地 X で長さ L なら、命令語の fetch で
+// pc = X + 6、拡張ワードで (L - 2) 進むので pc = X + L + 4。
+// インタプリタの returnAddr = pc - 4 は **X + L**、つまり次の命令のアドレス。
+void emitJsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32_t page,
+             std::uint32_t cycles)
+{
+    const bool absolute = isAbsoluteEa(op.eaMode);
+
+    // --- 飛び先を kTmpCcr へ ---
+    //
+    // **kTmpCcr を飛び先の置き場に使う。** 以降のガード列と touch と store が
+    // kTmpA/B/C/D/E/kTmpConst を全部潰すので、それらの外に置く必要がある。
+    // JSR は CCR を 1 bit も触らない (m68k_ops_group4.cpp:354-371) ので、
+    // 組み立て中の CCR を置く場所は空いている。
+    if (absolute)
+    {
+        // 翻訳時定数。**奇数は翻訳器が積まない** (I7 の Tier D 版) ので、
+        // 実行時ガードは要らない…が、**吐く。**
+        //
+        // Why 吐くか: G17 (b) と同じ論法。畳み専用の経路を作らないことで、
+        // テストが到達できない分岐が生まれず、翻訳時判定の変異は
+        // 「ガード脱出が増える」という観測可能な形でしか現れない。
+        emitConst(e, kTmpCcr, op.imm);
+    }
+    else
+    {
+        // mode 2 / 5。**emitEffectiveAddress は使わない。**
+        //
+        // あれは kTmpB に無マスクの EA、kTmpA にマスク済みを置き、
+        // mode 3/4 の commit のために kTmpB を残す約束になっている。
+        // JSR の EA は「積む先」ではないので、その約束を持ち込むと
+        // 下の A7 の計算と kTmpB を取り合う。飛び先だけを直に組む。
+        l32i(e.slot(kWideLen), kTmpCcr, kState, aOffset(op.dstReg));
+        const bool hasDisplacement = op.eaMode == kEaDisp16 && op.imm != 0;
+        if (hasDisplacement)
+        {
+            emitConst(e, kTmpConst, op.imm);
+            addN(e.slot(kNarrowLen), kTmpCcr, kTmpCcr, kTmpConst);
+        }
+    }
+
+    // ガード 1: 飛び先が奇数なら脱出 (G22)。**積む前。**
+    emitTargetAlignGuard(e, kTmpCcr, opIndex);
+
+    // --- 積む先 (A7 - 4) を kTmpB (無マスク) と kTmpA (マスク済み) へ ---
+    //
+    // **まだ a[7] へ書かない。** ガードが全部通ってから commit する (G3)。
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    addi(e.slot(kWideLen), kTmpB, kTmpB, -4);
+    emitConst(e, kTmpConst, kGuestAddrMask);
+    and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
+
+    // ガード 2: write32 の fast path に入るか。**読み形と同一実装**
+    // (emitReadGuard = emitWriteGuard)。op.size は 4。
+    emitReadGuard(e, op, opIndex);
+
+    // ガード 3/4: 自ページ (G13)。`.l` なので両端を見る。
+    emitSelfPageGuard(e, opIndex, 0u, page);
+    emitSelfPageGuard(e, opIndex, 3u, page);
+    if (e.failed)
+    {
+        return;
+    }
+
+    // --- ここから下はガードが全部通ったときだけ走る (G3) ---
+
+    // A7 -= 4。**無マスクの値** (インタプリタも a[7] にはマスクしない値を書く)。
+    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+
+    // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
+    emitTouch(e, 0u, op);
+    if (e.failed)
+    {
+        return;
+    }
+    emitTouch(e, 3u, op);
+    if (e.failed)
+    {
+        return;
+    }
+
+    // 戻り先 (翻訳時定数) をホストへ書く。
+    //
+    // **kTmpC へ置く。** emitTouch が kTmpB / kTmpD / kTmpE / kTmpConst を
+    // 潰しているので、touch より後に作る。
+    emitConst(e, kTmpC, op.pc + op.length);
+    emitConst(e, kTmpConst, e.env.ramBaseAddr);
+    addN(e.slot(kNarrowLen), kTmpE, kTmpConst, kTmpA);
+    emitBigEndianStore(e, kTmpE, kTmpC, 4u);
+
+    // **CCR は触らない。** JSR はフラグを 1 bit も変えない。
+    emitDynamicBranchExit(e, kTmpCcr, cycles);
+}
+
 // ガード脱出の出口で irc に入る語 = mem16(opPc + 2) を求める (I11)。
 //
 // **導出はここ 1 箇所だけに置く。** 出どころが 3 つに分かれるので、
@@ -1545,8 +1769,10 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
     movN(e.slot(kNarrowLen), kState, kRet);
 
     const bool endsWithBranch = plan.end == BlockEnd::kBranch;
-    // 分岐は必ず末尾 (I6) なので、本体として吐くのはその手前まで。
-    const std::uint32_t bodyCount = endsWithBranch ? plan.count - 1u : plan.count;
+    const bool endsWithDynamicBranch = plan.end == BlockEnd::kDynamicBranch;
+    // 分岐も動的分岐も必ず末尾 (I6/G23) なので、本体として吐くのはその手前まで。
+    const bool endsWithJump = endsWithBranch || endsWithDynamicBranch;
+    const std::uint32_t bodyCount = endsWithJump ? plan.count - 1u : plan.count;
 
     for (std::uint32_t i = 0; i < bodyCount; ++i)
     {
@@ -1578,7 +1804,10 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 }
                 break;
             case PlanKind::kBranch:
-                // I6 が「分岐は末尾のみ」を保証しているので、本体には来ない。
+            case PlanKind::kRts:
+            case PlanKind::kJsr:
+                // I6 / G23 が「飛ぶ形は末尾のみ」を保証しているので、
+                // 本体には来ない。
                 e.failed = true;
                 break;
 
@@ -1633,6 +1862,19 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
     if (endsWithBranch)
     {
         emitBranchExit(e, plan, ir, irc);
+    }
+    else if (endsWithDynamicBranch)
+    {
+        const std::uint32_t last = plan.count - 1u;
+        const PlannedOp& op = plan.ops[last];
+        if (op.kind == PlanKind::kRts)
+        {
+            emitRts(e, op, last, plan.cyclesTaken);
+        }
+        else
+        {
+            emitJsr(e, op, last, plan.page, plan.cyclesTaken);
+        }
     }
     else
     {
@@ -1700,6 +1942,60 @@ bool canEmitWritesFor(const BlockPlan& plan, const EmitEnv& env)
     return true;
 }
 
+// 動的分岐を含む計画を、この窓で発行してよいか (Tier D)。
+//
+// **翻訳時に決められることは翻訳時に決める** (canEmitReads / canEmitWritesFor
+// と同じ流儀)。
+bool canEmitDynamicBranchFor(const BlockPlan& plan, const EmitEnv& env)
+{
+    for (std::uint32_t i = 0; i < plan.count; ++i)
+    {
+        const PlannedOp& op = plan.ops[i];
+        if (!isDynamicBranch(op))
+        {
+            continue;
+        }
+
+        // 飛び先の置き場が無ければ焼けない。
+        if (!canEmitDynamicBranchIn(env))
+        {
+            return false;
+        }
+
+        // **RTS の窓の条件はここでは見ない。** needsReadWindow が kRts を
+        // 読み形に含めているので、canEmitReads が「窓が読めること」と
+        // 「limit >= 4」を既に問うている。ここで重ねると、片方だけ直したときに
+        // もう片方が黙って通る形ができる。
+        if (op.kind == PlanKind::kRts)
+        {
+            continue;
+        }
+
+        // JSR は -(A7) へ write32 する。**書き形と同じ窓の条件が要る**が、
+        // isMemoryWriteKind が kJsr を含まないので canEmitWritesFor は
+        // 見ていない。ここで見る (G19)。
+        if (!canEmitWritesIn(env))
+        {
+            return false;
+        }
+        if (env.ramLimit < 4u)
+        {
+            return false;
+        }
+
+        // **飛び先の絶対形は翻訳時に整列を判定する。** 奇数なら
+        // 実行時ガードが必ず不成立になるので、毎周踏むだけのブロックになる。
+        // 翻訳器 (I7 の Tier D 版) が先に弾いているが、エミッタ単体でも
+        // 断れるようにする。
+        const bool isAbsoluteTarget = isAbsoluteEa(op.eaMode);
+        if (isAbsoluteTarget && (op.imm & 1u) != 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 // 読み形を含む計画を、この窓で発行してよいか (G6 / G12)。
 //
 // **翻訳時に決められることは翻訳時に決める。** 走らせてから諦める形にすると、
@@ -1709,11 +2005,19 @@ bool canEmitReads(const BlockPlan& plan, const EmitEnv& env)
     for (std::uint32_t i = 0; i < plan.count; ++i)
     {
         const PlannedOp& op = plan.ops[i];
-        // **書き形はここでは見ない。** eaMode だけで判定すると書き形も
-        // 読み形として扱われ、窓が読めない写像 (ROM 写像中) で書き形まで
-        // 断ってしまう。書き経路は fastRamReadable_ を見ない
+        // **書き形と動的分岐はここでは見ない。** eaMode だけで判定すると
+        // 書き形も読み形として扱われ、窓が読めない写像 (ROM 写像中) で
+        // 書き形まで断ってしまう。書き経路は fastRamReadable_ を見ない
         // (m68k.cpp:331-334) ので、そこで断るのは保守的すぎる。
-        if (!isMemoryRead(op) || isMemoryWrite(op))
+        //
+        // **JSR も同じ理由で外す。** JSR の eaMode は**飛び先**であって
+        // 読む先ではない。ここで読み形として扱うと、ROM 写像中に
+        // 「RAM へ積むだけの JSR」まで断ることになる。JSR がスタックへ
+        // 書くために要る窓は canEmitDynamicBranchFor が別に見る。
+        //
+        // needsReadWindow (block_plan.h) と**同じ集合**にそろえてある。
+        // 片方だけ直すと、翻訳器とエミッタで「読み形とは何か」が割れる。
+        if (!needsReadWindow(op.kind, op.eaMode))
         {
             continue;
         }
@@ -1756,6 +2060,10 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const E
     {
         return false;
     }
+    if (!canEmitDynamicBranchFor(plan, env))
+    {
+        return false;
+    }
     Emitter e{};
     e.env = env;
     emitAll(e, plan, ir, irc);
@@ -1769,6 +2077,12 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const E
 }
 
 }  // namespace
+
+bool canEmitDynamicBranchIn(const EmitEnv& env)
+{
+    // 飛び先の置き場が無ければ、飛び先を runner へ渡す手段が無い。
+    return env.mailboxAddr != 0;
+}
 
 bool canEmitWritesIn(const EmitEnv& env)
 {
@@ -1865,6 +2179,7 @@ bool emitBlock(const BlockPlan& plan, std::uint16_t fallThroughIr, std::uint16_t
     result.totalSize = total;
     result.branchTarget = plan.branchTarget;
     result.endsWithBranch = plan.end == BlockEnd::kBranch;
+    result.endsWithDynamicBranch = plan.end == BlockEnd::kDynamicBranch;
     return true;
 }
 

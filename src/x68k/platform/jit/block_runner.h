@@ -55,7 +55,9 @@ struct BlockSlot
     const std::uint8_t* code = nullptr;
     // 分岐で終端したか (戻り値の bit31 を見てよいか)。
     bool endsWithBranch = false;
-    // 分岐成立時の飛び先。
+    // 動的分岐で終端したか (戻り値の bit29 を見てよいか、Tier D)。
+    bool endsWithDynamicBranch = false;
+    // 分岐成立時の飛び先。**動的分岐では使わない** (メールボックスを見る)。
     std::uint32_t branchTarget = 0;
 };
 
@@ -155,6 +157,29 @@ private:
     NativeStats stats_{};
     // 実行可能メモリを使い切ったら、それ以上翻訳しない。
     bool codeFull_ = false;
+
+    // --- Tier D: 動的分岐 (RTS / JSR) の飛び先を受け取る 1 語 ---
+    //
+    // 生成コードはここへ s32i で飛び先を書き、戻り値に kDynamicBranchFlag を
+    // 立てる。run() はビットを見てからこの語を読み、M68k::branchTo へ渡す。
+    //
+    // **アドレスを生成コードへ焼いてよい根拠。** このメンバは BlockRunner の
+    // 中にあり、runner 自身が動かない限り不変。setStorage / setNegativeStorage /
+    // reset はどれも**他のメンバを差し替えるだけで this を動かさない**ので、
+    // 焼いた値が古くなる経路が存在しない。窓 (ramBaseAddr) と違って
+    // mappingEpoch による保護が要らないのはこのため。
+    //
+    // Why not M68kState へ 1 語足さないか: 出口の契約 (§5.1) が
+    // 「M68kState はインタプリタで実行し終えた直後とビット単位で同一」を
+    // 言っている。インタプリタが一度も書かない欄を足すと、その欄を
+    // **同一性の比較から外さねばならなくなる**。一度外した欄は、以後どんな
+    // 書き漏らしも検出できない。
+    //
+    // Why not 実行のたびにゼロへ戻さないか: 動的分岐が成立したときだけ読み、
+    // そのときは必ず生成コードが直前に書いている。古い値が残っていても
+    // 読む条件 (bit29) が立たないので届かない。ゼロ埋めはホットパスに
+    // 1 store を足すだけで、何も守らない。
+    std::uint32_t branchMailbox_ = 0;
 };
 
 }  // namespace x68k::jit

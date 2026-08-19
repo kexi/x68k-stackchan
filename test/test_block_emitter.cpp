@@ -126,6 +126,18 @@ public:
         genSize_ = size;
     }
 
+    // 動的分岐 (Tier D) が飛び先を置く 1 語。
+    //
+    // **ゲスト RAM とも世代配列とも状態領域とも別の空間**として持つ。
+    // 4 つとも重ならない値を選んであるので、飛び先の書き先を間違える変異は
+    // 「別の領域を潰す」ではなく「範囲外を触った」として落ちる。
+    void setMailbox(std::uint32_t base, std::uint8_t* box, std::size_t size)
+    {
+        mailboxBase_ = base;
+        mailbox_ = box;
+        mailboxSize_ = size;
+    }
+
     XtensaRun run(std::size_t entry, std::uint32_t arg)
     {
         for (int i = 0; i < 16; ++i)
@@ -223,6 +235,14 @@ private:
             if (off + len <= genSize_)
             {
                 return gen_ + off;
+            }
+        }
+        if (mailbox_ != nullptr && addr >= mailboxBase_)
+        {
+            const std::size_t off = static_cast<std::size_t>(addr - mailboxBase_);
+            if (off + len <= mailboxSize_)
+            {
+                return mailbox_ + off;
             }
         }
         outOfRange_ = true;
@@ -513,6 +533,10 @@ private:
     std::uint32_t genBase_ = 0;
     std::uint8_t* gen_ = nullptr;
     std::size_t genSize_ = 0;
+    // 動的分岐の飛び先を置く 1 語 (Tier D)。
+    std::uint32_t mailboxBase_ = 0;
+    std::uint8_t* mailbox_ = nullptr;
+    std::size_t mailboxSize_ = 0;
     bool outOfRange_ = false;
     // **a12-a15 に触ったら即座に失敗させる。**
     //
@@ -651,6 +675,23 @@ constexpr std::uint32_t kFakeGenWindow = 0x02000000u;
 // 世代配列のページ数。2MB / 1KB = 2048。
 constexpr u32 kGenPages = x68k::kMainRamSize >> x68k::CodeGenMap::kPageShift;
 
+// 生成コードから見えるメールボックスの先頭アドレス (Tier D)。
+//
+// **状態領域ともゲスト RAM の窓とも世代配列とも重ならない値**にする。
+// 4 領域とも重ならないので、飛び先の書き先を間違える変異は「ゲスト RAM を
+// 潰す」でも「世代を潰す」でもなく「範囲外を触った」として落ちる。
+constexpr std::uint32_t kFakeMailbox = 0x03000000u;
+
+// 生成コードが飛び先を書き込む 1 語。**参照側は書かない。**
+//
+// runner の branchMailbox_ に相当する。ミニ解釈器へは 4 バイトの領域として
+// 渡し、テストは走らせた後にここを読んで飛び先を問う。
+std::uint32_t& execMailbox()
+{
+    static std::uint32_t storage = 0;
+    return storage;
+}
+
 jit::EmitEnv fakeEnv()
 {
     jit::EmitEnv env{};
@@ -659,6 +700,7 @@ jit::EmitEnv fakeEnv()
     env.ramReadable = true;
     env.genBaseAddr = kFakeGenWindow;
     env.genPageCount = kGenPages;
+    env.mailboxAddr = kFakeMailbox;
     return env;
 }
 
@@ -725,6 +767,10 @@ struct NativeOutcome
     bool guardExit = false;
     // 自ページ書き換えで降りたか (Tier C の G13/G18)。
     bool selfPageExit = false;
+    // 動的な飛び先へ分岐したか (Tier D)。
+    bool dynamicBranch = false;
+    // そのときメールボックスに書かれていた飛び先。
+    std::uint32_t mailbox = 0;
     std::uint8_t ranOps = 0;
 };
 
@@ -757,6 +803,12 @@ NativeOutcome runEmitted(const EmitResult& e, const M68kState& initial)
     cpu.setGuestRam(kFakeWindow, execRam().data(), execRam().size());
     cpu.setGenMap(kFakeGenWindow, reinterpret_cast<std::uint8_t*>(execGen().data()),
                   execGen().size() * sizeof(std::uint16_t));
+    // 動的分岐の飛び先の置き場 (Tier D)。**走らせる前に潰しておく。**
+    // 前回の値が残っていると、飛び先を 1 語も書かない変異が
+    // 「たまたま前回と同じ値」で通ってしまう。
+    execMailbox() = 0xDEADBEEFu;
+    cpu.setMailbox(kFakeMailbox, reinterpret_cast<std::uint8_t*>(&execMailbox()),
+                   sizeof(std::uint32_t));
     const XtensaRun r = cpu.run(e.info.entryOffset, 0);
     if (!r.ok)
     {
@@ -771,6 +823,8 @@ NativeOutcome runEmitted(const EmitResult& e, const M68kState& initial)
     out.cycles = decoded.cycles;
     out.guardExit = decoded.guardExit;
     out.selfPageExit = decoded.selfPageExit;
+    out.dynamicBranch = decoded.dynamicBranch;
+    out.mailbox = execMailbox();
     out.ranOps = decoded.ranOps;
     return out;
 }
@@ -1061,8 +1115,11 @@ void checkEquivalence(const std::vector<u16>& words, const M68kState& initial, c
     execRam() = refRam;
     execGen() = refGen;
 
-    const bool branchTaken = native.branchTaken;
-    compareStates(want, native.state, branchTaken, what);
+    // **動的分岐も pc / ir / irc を書かない契約。** 静的分岐の成立側と
+    // 同じ理由 (飛び先のプリフェッチはページの外を読みうる) なので、
+    // その 3 つを比較から外し、代わりに飛び先を別に問う。
+    const bool skipPrefetch = native.branchTaken || native.dynamicBranch;
+    compareStates(want, native.state, skipPrefetch, what);
 
     // サイクル数。**ここがずれると rasterNumber の 317 サイクル粒度が
     // 数万命令後に必ず割れる。**
@@ -1072,11 +1129,30 @@ void checkEquivalence(const std::vector<u16>& words, const M68kState& initial, c
     if (native.guardExit)
     {
         // ガード脱出は分岐ではない (G9: bit31 と bit30 は同時に立たない)。
+        // **動的分岐とも同時には立たない** (G21 の排他)。
         INFO("guard exit is not a branch");
-        CHECK_FALSE(branchTaken);
+        CHECK_FALSE(native.branchTaken);
+        CHECK_FALSE(native.dynamicBranch);
         // 降りた地点は「まだ実行していない命令の手前」なので、
         // 計画の全命令を走り切ってはいない。
         CHECK(native.ranOps < plan.count);
+        return;
+    }
+
+    const bool branchTaken = native.branchTaken;
+
+    if (plan.end == BlockEnd::kDynamicBranch)
+    {
+        // **必ず飛ぶ。** RTS / JSR は条件を持たない。
+        INFO("dynamic branch taken");
+        CHECK(native.dynamicBranch);
+        CHECK_FALSE(branchTaken);
+        // **飛び先はメールボックスから来る。** 参照側の pc から逆算する。
+        // インタプリタは refillPrefetch(target) を通るので pc == target + 4。
+        //
+        // ここが同値テストの本体。**飛び先を 1 bit でも間違えると落ちる。**
+        INFO("dynamic branch target");
+        CHECK(native.mailbox == want.pc - 4u);
         return;
     }
 
@@ -1097,6 +1173,8 @@ void checkEquivalence(const std::vector<u16>& words, const M68kState& initial, c
     {
         CHECK_FALSE(branchTaken);
     }
+    // 動的分岐で終端していない計画は、bit29 を決して立てない。
+    CHECK_FALSE(native.dynamicBranch);
 }
 
 // 既定の窓で検査する。**大半のテストはこちらを呼ぶ。**
@@ -1205,9 +1283,35 @@ constexpr u16 clrMem(u32 sizeField, u32 mode, u32 reg)
     return static_cast<u16>(0x4200u | (sizeField << 6) | (mode << 3) | reg);
 }
 
+// --- Tier D: 動的分岐の命令語 ----------------------------------------------
+
+constexpr u16 kRtsOp = 0x4E75u;
+// JSR <ea>。mode / reg は EA の符号化そのまま。
+constexpr u16 jsr(u32 mode, u32 reg)
+{
+    return static_cast<u16>(0x4E80u | (mode << 3) | reg);
+}
+
 constexpr u16 bcc(u32 cond, int disp8)
 {
     return static_cast<u16>(0x6000u | (cond << 8) | (static_cast<u32>(disp8) & 0xFFu));
+}
+
+// 生成コードを**命令の切れ目に沿って**歩く。
+//
+// Why not バイトごとに走査しないか: Xtensa は 2 バイト命令と 3 バイト命令が
+// 混ざる可変長で、3 バイト命令の途中のバイトも「別の正当な命令」に見える。
+// バイトごとに見ると、l32r のリテラル参照や movi の即値が s16i / s32i.n に
+// 化けて**偽の検出**になる (実際に踏んだ)。
+//
+// 命令長は op0 (下位 4bit) で決まる。0x8-0xD が 2 バイトの短縮形で、
+// 残りは 3 バイト。**発行器が使う命令の範囲でしか正しくない**が、
+// ミニ解釈器が知らない命令を拒否するので、範囲外が混ざればそちらで落ちる。
+std::size_t xtensaInsnLength(std::uint8_t first)
+{
+    const std::uint32_t op0 = first & 0x0Fu;
+    const bool isNarrow = op0 >= 0x8u && op0 <= 0xDu;
+    return isNarrow ? 2u : 3u;
 }
 
 M68kState makeState(u32 seed)
@@ -3169,6 +3273,804 @@ TEST_CASE("書きガード脱出の irc が実メモリの mem16(opPc + 2) と�
     (void)selfPageAddr;
 }
 
+// --- Tier D: 動的分岐 (RTS / JSR) -------------------------------------------
+//
+// 静的分岐 (Tier A の Bcc) との違いは、飛び先が**実行時にしか分からない**こと。
+// 生成コードはそれをメールボックスへ書き、runner が branchTo へ渡す。
+//
+// **飛び先の一致がここでの同値性の中心。** checkEquivalence が
+// 「メールボックスの値 == 参照側の pc - 4」を問うので、飛び先を 1 bit でも
+// 間違える変異は必ず落ちる。
+
+namespace
+{
+
+// 動的分岐のテストで使うスタックアドレス。**偶数**で、コードのページ
+// (kEntry = 0x2000 → ページ 8) から十分離す。
+constexpr u32 kStackAddr = 0x00050000u;
+
+// 飛び先として使うアドレス。**偶数**にする (奇数はガードが弾く)。
+constexpr u32 kTargetAddr = 0x00060000u;
+
+// スタックへ 32bit の戻り先を積んだ状態を作る。
+void seedReturnAddress(u32 stackAddr, u32 returnTo)
+{
+    guestSeeds().clear();
+    guestSeeds().push_back(
+        GuestSeed{stackAddr,
+                  {static_cast<u8>(returnTo >> 24), static_cast<u8>(returnTo >> 16),
+                   static_cast<u8>(returnTo >> 8), static_cast<u8>(returnTo)}});
+}
+
+}  // namespace
+
+TEST_CASE("RTS がインタプリタと一致する")
+{
+    for (u32 seed : {1u, 3u, 7u})
+    {
+        // 素直な形。A7 が窓の中を指し、戻り先も偶数。
+        {
+            seedReturnAddress(kStackAddr, kTargetAddr);
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kRtsOp}, s, "RTS");
+        }
+        // 戻り先の 4 バイトが全部違う値。**ビッグエンディアンの組み立て**を問う。
+        // どれか 1 バイトでも入れ替わったら飛び先が変わって落ちる。
+        {
+            seedReturnAddress(kStackAddr, 0x00123456u);
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kRtsOp}, s, "RTS 戻り先が 4 バイトとも違う");
+        }
+        // 上位バイト付きの戻り先。**マスクしないこと**を問う。
+        //
+        // X68000 の IOCS は未初期化ベクタに $43FF0540 のような値を埋める。
+        // インタプリタは refillPrefetch へ無マスクで渡し、pc にもその値が入る
+        // (m68k.cpp:180 のコメント)。生成コードがここでマスクすると、
+        // pc が $00FF0540 になって食い違う。
+        {
+            seedReturnAddress(kStackAddr, 0x43FF0540u);
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kRtsOp}, s, "RTS 上位バイト付きの戻り先");
+        }
+        // 戻り先が 0。
+        {
+            seedReturnAddress(kStackAddr, 0x00000000u);
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kRtsOp}, s, "RTS 戻り先が 0");
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("RTS が A7 を 4 進める")
+{
+    // **飛び先だけでなく A7 も見る。** compareStates が a[7] を比べるので
+    // checkEquivalence だけでも落ちるが、進む向きと量を名指しで固定する。
+    seedReturnAddress(kStackAddr, kTargetAddr);
+    M68kState s = makeState(2);
+    s.a[7] = kStackAddr;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({kRtsOp});
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+    CHECK(native.dynamicBranch);
+    CHECK(native.state.a[7] == kStackAddr + 4u);
+    CHECK(native.mailbox == kTargetAddr);
+    clearSeeds();
+}
+
+TEST_CASE("RTS は世代を 1 つも上げない")
+{
+    // **RTS は読むだけ。** touch を吐く変異はここで落ちる
+    // (checkEquivalence の compareMemory でも落ちるが、名指しで固定する)。
+    seedReturnAddress(kStackAddr, kTargetAddr);
+    M68kState s = makeState(5);
+    s.a[7] = kStackAddr;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({kRtsOp});
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+    for (std::size_t i = 0; i < execGen().size(); ++i)
+    {
+        if (execGen()[i] != 0)
+        {
+            INFO("page ", i, " generation moved to ", execGen()[i]);
+            CHECK(execGen()[i] == 0);
+            break;
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("RTS の戻り先が奇数なら A7 を 1 bit も動かさない")
+{
+    // **これが Tier D の要点。** インタプリタは A7 を進めてから
+    // refillPrefetch でアドレスエラーへ入る (m68k_ops_group4.cpp:96-102) が、
+    // ネイティブは 1 bit も変えずに降りて step() に再演させる。
+    //
+    // 落ちる変異: 奇数ガードを A7 の更新より後ろへ動かす
+    seedReturnAddress(kStackAddr, 0x00060001u);  // 奇数
+    M68kState s = makeState(4);
+    s.a[7] = kStackAddr;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({kRtsOp});
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+
+    // ガード脱出で降りた。**動的分岐ではない。**
+    CHECK(native.guardExit);
+    CHECK_FALSE(native.dynamicBranch);
+    CHECK(native.ranOps == 0);
+    CHECK(native.cycles == 0);
+
+    // **状態が 1 bit も変わっていない。** 出口の pc / ir / irc は
+    // 「その命令の直前の命令境界」を指すので、そこだけは別に見る。
+    M68kState want = s;
+    want.pc = kEntry + 4u;
+    want.ir = kRtsOp;
+    // **irc は「この命令の次の語」= mem16(opPc + 2)。** buildPlan が使う
+    // FlatCode は置いた語以外がゼロなので、そこから引く
+    // (定数で書くと、埋め方を変えたときに気づけない)。
+    want.irc = code.get16(kEntry + 2u);
+    compareStates(want, native.state, /*skipPrefetch=*/false, "RTS 奇数戻り先で脱出");
+    clearSeeds();
+}
+
+TEST_CASE("RTS のスタックが窓の外なら降りる")
+{
+    struct Case
+    {
+        u32 a7;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        // 奇数の A7。read32 がアドレスエラーへ入る形。
+        {kStackAddr + 1u, "A7 が奇数"},
+        // 窓の末尾を跨ぐ。a + 3 < limit を満たさない。
+        {static_cast<u32>(x68k::kMainRamSize) - 2u, "A7 + 3 が窓の外"},
+        {static_cast<u32>(x68k::kMainRamSize), "A7 が窓のちょうど外"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        clearSeeds();
+        M68kState s = makeState(6);
+        s.a[7] = c.a7;
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan({kRtsOp}, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        resetExecRam({kRtsOp});
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+        REQUIRE(native.ok);
+
+        CHECK(native.guardExit);
+        CHECK_FALSE(native.dynamicBranch);
+        CHECK(native.ranOps == 0);
+
+        M68kState want = s;
+        want.pc = kEntry + 4u;
+        want.ir = kRtsOp;
+        want.irc = code.get16(kEntry + 2u);
+        compareStates(want, native.state, /*skipPrefetch=*/false, c.what);
+    }
+    clearSeeds();
+}
+
+TEST_CASE("RTS の窓の境界がインタプリタと一致する")
+{
+    // 窓の末尾ちょうどに収まる A7 は通り、1 バイトでも出れば降りる。
+    //
+    // **境界の値を名指しで問う。** `<` を `<=` にする変異はここでしか落ちない。
+    const u32 limit = static_cast<u32>(x68k::kMainRamSize);
+    for (u32 a7 : {limit - 4u, limit - 6u})
+    {
+        INFO("a7 = ", a7);
+        seedReturnAddress(a7, kTargetAddr);
+        M68kState s = makeState(8);
+        s.a[7] = a7;
+        // ガードが成立するので、インタプリタと丸ごと一致するはず。
+        checkEquivalence({kRtsOp}, s, "RTS 窓の末尾ぎりぎり");
+    }
+    clearSeeds();
+}
+
+TEST_CASE("JSR がインタプリタと一致する")
+{
+    for (u32 seed : {1u, 3u, 6u})
+    {
+        // (An) — 最頻の形。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            s.a[3] = kTargetAddr;
+            checkEquivalence({jsr(kModeInd, 3)}, s, "JSR (An)");
+        }
+        // (d16,An) — 正の変位。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            s.a[4] = kTargetAddr;
+            checkEquivalence({jsr(kModeDisp, 4), 0x0100u}, s, "JSR (d16,An) 正");
+        }
+        // (d16,An) — 負の変位。**符号拡張**を問う。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            s.a[4] = kTargetAddr;
+            checkEquivalence({jsr(kModeDisp, 4), 0xFF00u}, s, "JSR (d16,An) 負");
+        }
+        // (xxx).W — 符号拡張された絶対アドレス。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({jsr(kModeAbsW, 0), 0x1000u}, s, "JSR (xxx).W");
+        }
+        // (xxx).L — 2 語の連結。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({jsr(kModeAbsL, 1), static_cast<u16>(kTargetAddr >> 16),
+                              static_cast<u16>(kTargetAddr & 0xFFFFu)},
+                             s, "JSR (xxx).L");
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("JSR が積む戻り先が次の命令のアドレス")
+{
+    // **長さごとに戻り先が変わる。** インタプリタの returnAddr = pc - 4 は
+    // 「この命令の次のアドレス」で、JSR の長さ L に対して entryPc + L。
+    // ここを op.pc + 2 に固定する変異は、(d16,An) と (xxx).L で落ちる。
+    struct Case
+    {
+        std::vector<u16> words;
+        u32 length;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{jsr(kModeInd, 3)}, 2u, "JSR (An)"},
+        {{jsr(kModeDisp, 4), 0x0000u}, 4u, "JSR (d16,An)"},
+        {{jsr(kModeAbsW, 0), 0x1000u}, 4u, "JSR (xxx).W"},
+        {{jsr(kModeAbsL, 1), 0x0006u, 0x0000u}, 6u, "JSR (xxx).L"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        clearSeeds();
+        M68kState s = makeState(2);
+        s.a[7] = kStackAddr;
+        s.a[3] = kTargetAddr;
+        s.a[4] = kTargetAddr;
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        REQUIRE(plan.ops[0].length == c.length);
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        resetExecRam(c.words);
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+        REQUIRE(native.ok);
+        REQUIRE(native.dynamicBranch);
+
+        // A7 が 4 減っている。
+        CHECK(native.state.a[7] == kStackAddr - 4u);
+        // 積まれた戻り先がビッグエンディアンで、値は entryPc + length。
+        const u32 want = kEntry + c.length;
+        const u32 pushed = (static_cast<u32>(execRam()[kStackAddr - 4]) << 24) |
+                           (static_cast<u32>(execRam()[kStackAddr - 3]) << 16) |
+                           (static_cast<u32>(execRam()[kStackAddr - 2]) << 8) |
+                           execRam()[kStackAddr - 1];
+        CHECK(pushed == want);
+    }
+    clearSeeds();
+}
+
+TEST_CASE("JSR がスタックの 2 ページぶんの世代を上げる")
+{
+    // **write32 は page(a) と page(a+3) を別々に touch する** (m68k.cpp:377-378)。
+    // 畳む変異は、同一ページでも「世代が 2 でなく 1」で落ちる。
+    clearSeeds();
+    M68kState s = makeState(3);
+    s.a[7] = kStackAddr;
+    s.a[3] = kTargetAddr;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({jsr(kModeInd, 3)}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({jsr(kModeInd, 3)});
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+    REQUIRE(native.dynamicBranch);
+
+    // 積み先は kStackAddr - 4。同一ページなので 1 ページが 2 進む。
+    const u32 page = (kStackAddr - 4u) >> x68k::CodeGenMap::kPageShift;
+    CHECK(execGen()[page] == 2);
+}
+
+TEST_CASE("JSR の飛び先が奇数ならスタックを 1 bit も動かさない")
+{
+    // インタプリタは積んでから refillPrefetch でアドレスエラーへ入るが、
+    // ネイティブは 1 bit も変えずに降りて step() に再演させる。
+    //
+    // 落ちる変異: 飛び先の整列ガードを積んだ後ろへ動かす
+    //
+    // **動的 EA でしか作れない。** 絶対形の奇数は翻訳器が積まない。
+    clearSeeds();
+    M68kState s = makeState(4);
+    s.a[7] = kStackAddr;
+    s.a[3] = kTargetAddr + 1u;  // 奇数
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({jsr(kModeInd, 3)}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({jsr(kModeInd, 3)});
+    resetExecGen();
+    const std::vector<u8> before = execRam();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+
+    CHECK(native.guardExit);
+    CHECK_FALSE(native.dynamicBranch);
+    CHECK(native.ranOps == 0);
+
+    M68kState want = s;
+    want.pc = kEntry + 4u;
+    want.ir = jsr(kModeInd, 3);
+    want.irc = code.get16(kEntry + 2u);
+    compareStates(want, native.state, /*skipPrefetch=*/false, "JSR 奇数飛び先で脱出");
+
+    // メモリも世代も動いていない。
+    compareMemory(before, std::vector<std::uint16_t>(kGenPages, 0), "JSR 奇数飛び先で脱出");
+}
+
+TEST_CASE("JSR のスタックが窓の外なら降りる")
+{
+    struct Case
+    {
+        u32 a7;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        // A7 - 4 が奇数。write32 がアドレスエラーへ入る形。
+        {kStackAddr + 1u, "A7 - 4 が奇数"},
+        // A7 - 4 が窓の外 (0 からラップして $00FFFFFC になる)。
+        {0u, "A7 が 0 (ラップして窓の外)"},
+        // A7 - 4 + 3 が窓を跨ぐ。
+        {static_cast<u32>(x68k::kMainRamSize) + 2u, "A7 - 4 + 3 が窓の外"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        clearSeeds();
+        M68kState s = makeState(7);
+        s.a[7] = c.a7;
+        s.a[3] = kTargetAddr;
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan({jsr(kModeInd, 3)}, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        resetExecRam({jsr(kModeInd, 3)});
+        resetExecGen();
+        const std::vector<u8> before = execRam();
+        const NativeOutcome native = runEmitted(e, s);
+        INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+        REQUIRE(native.ok);
+
+        CHECK(native.guardExit);
+        CHECK_FALSE(native.dynamicBranch);
+        CHECK(native.ranOps == 0);
+
+        M68kState want = s;
+        want.pc = kEntry + 4u;
+        want.ir = jsr(kModeInd, 3);
+        want.irc = code.get16(kEntry + 2u);
+        compareStates(want, native.state, /*skipPrefetch=*/false, c.what);
+        compareMemory(before, std::vector<std::uint16_t>(kGenPages, 0), c.what);
+    }
+    clearSeeds();
+}
+
+TEST_CASE("JSR が自ページへ積むなら書く前に脱出する")
+{
+    // **G13。** 積み先が自ブロックのページなら、焼いた定数 (出口の ir/irc) が
+    // 実行中に古くなる。書く前に降りる。
+    //
+    // A7 をコードのすぐ後ろに置いて、-(A7) が kEntry のページへ掛かるようにする。
+    clearSeeds();
+    const u32 selfPageStack = kEntry + 0x40u;  // kEntry と同じ 1KB ページ
+    M68kState s = makeState(5);
+    s.a[7] = selfPageStack;
+    s.a[3] = kTargetAddr;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({jsr(kModeInd, 3)}, plan, code));
+    REQUIRE(plan.page == (kEntry >> x68k::CodeGenMap::kPageShift));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({jsr(kModeInd, 3)});
+    resetExecGen();
+    const std::vector<u8> before = execRam();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+
+    CHECK(native.guardExit);
+    // **自ページ脱出の印が立つ。** runner はこれを見て「世代不問」を焼く。
+    CHECK(native.selfPageExit);
+    CHECK_FALSE(native.dynamicBranch);
+    CHECK(native.ranOps == 0);
+
+    M68kState want = s;
+    want.pc = kEntry + 4u;
+    want.ir = jsr(kModeInd, 3);
+    want.irc = code.get16(kEntry + 2u);
+    compareStates(want, native.state, /*skipPrefetch=*/false, "JSR 自ページへ積む");
+    compareMemory(before, std::vector<std::uint16_t>(kGenPages, 0), "JSR 自ページへ積む");
+}
+
+TEST_CASE("動的分岐の手前の命令はちゃんと実行される")
+{
+    // **ブロック末尾の扱いが kBranch と同じであること。** 本体の命令を
+    // 落とす変異 (bodyCount を plan.count のままにする等) はここで落ちる。
+    for (u32 seed : {1u, 9u})
+    {
+        {
+            seedReturnAddress(kStackAddr, kTargetAddr);
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({moveq(0, 5), moveq(1, -3), kRtsOp}, s, "MOVEQ x2 + RTS");
+        }
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            s.a[3] = kTargetAddr;
+            checkEquivalence({moveq(2, 7), aluReg(0xD, 2, 2, 1), jsr(kModeInd, 3)}, s,
+                             "MOVEQ + ADD.l + JSR");
+        }
+        // 読み形 (Tier B) と混ぜる。
+        {
+            seedReturnAddress(kStackAddr, kTargetAddr);
+            guestSeeds().push_back(GuestSeed{kDataAddr, {0x11, 0x22, 0x33, 0x44}});
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            s.a[2] = kDataAddr;
+            checkEquivalence({moveMemToDn(0x2u, 1, kModeInd, 2), kRtsOp}, s,
+                             "MOVE.l (An),Dn + RTS");
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("動的分岐の手前でガードが不成立なら、その手前で降りる")
+{
+    // **島の出口が「その命令の直前の命令境界」であること** (G7)。
+    // 動的分岐そのものではなく、手前の読み形が降りる形を問う。
+    clearSeeds();
+    M68kState s = makeState(3);
+    s.a[7] = kStackAddr;
+    s.a[2] = static_cast<u32>(x68k::kMainRamSize);  // 窓の外
+
+    const std::vector<u16> words{moveq(0, 5), moveMemToDn(0x2u, 1, kModeInd, 2), kRtsOp};
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    REQUIRE(plan.count == 3);
+    REQUIRE(plan.end == BlockEnd::kDynamicBranch);
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+
+    CHECK(native.guardExit);
+    CHECK_FALSE(native.dynamicBranch);
+    // MOVEQ の 1 命令だけ実行して降りた。
+    CHECK(native.ranOps == 1);
+    CHECK(native.cycles == 4);
+    // 出口は 2 番目の命令の手前。
+    CHECK(native.state.pc == kEntry + 2u + 4u);
+    CHECK(native.state.ir == moveMemToDn(0x2u, 1, kModeInd, 2));
+}
+
+TEST_CASE("メールボックスが無い窓では動的分岐を発行しない")
+{
+    // **G21 の前提。** 飛び先の置き場が無いなら焼かない。焼くと
+    // 生成コードが 0 番地 (= 状態領域の d[0]) へ飛び先を書く。
+    //
+    // 落ちる変異: canEmitDynamicBranchIn を常に true にする
+    jit::EmitEnv env = fakeEnv();
+    env.mailboxAddr = 0;
+
+    FlatCode code;
+    BlockPlan plan{};
+    // 翻訳器には「入れてよい」と言わせたまま (既定の PlanCapabilities)
+    // 計画を作り、エミッタ単体が断ることを問う。
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    REQUIRE(plan.end == BlockEnd::kDynamicBranch);
+
+    CHECK(jit::requiredSize(plan, 0x4E71u, 0x4E71u, env) == 0u);
+    CHECK(jit::canEmitDynamicBranchIn(fakeEnv()));
+    CHECK_FALSE(jit::canEmitDynamicBranchIn(env));
+}
+
+TEST_CASE("窓が読めない写像では RTS を発行しない")
+{
+    // **RTS は eaMode を持たない** ので、eaMode だけを見る canEmitReads は
+    // RTS を「読まない形」と判定する。needsReadWindow / エミッタ側の
+    // canEmitDynamicBranchFor が別に見ないと、ROM 写像中に RTS を焼いて
+    // **窓の外のホストメモリを読む**。
+    //
+    // 落ちる変異: canEmitDynamicBranchFor から kRts の窓の判定を消す
+    jit::EmitEnv env = fakeEnv();
+    env.ramReadable = false;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    CHECK(jit::requiredSize(plan, 0x4E71u, 0x4E71u, env) == 0u);
+
+    // JSR は書き経路なので **ramReadable を要らない** (m68k.cpp:331-334)。
+    // ROM 写像中でも RAM へは書けるので、こちらは発行できる。
+    BlockPlan jsrPlan{};
+    FlatCode jsrCode;
+    REQUIRE(buildPlan({jsr(kModeInd, 3)}, jsrPlan, jsrCode));
+    CHECK(jit::requiredSize(jsrPlan, 0x4E71u, 0x4E71u, env) > 0u);
+}
+
+TEST_CASE("世代配列が無い窓では JSR を発行しない")
+{
+    // **JSR は -(A7) へ write32 する。** touch を再現できないと、
+    // 世代が JIT ON/OFF で割れる。
+    //
+    // 落ちる変異: canEmitDynamicBranchFor から kJsr の canEmitWritesIn を消す
+    jit::EmitEnv env = fakeEnv();
+    env.genBaseAddr = 0;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({jsr(kModeInd, 3)}, plan, code));
+    CHECK(jit::requiredSize(plan, 0x4E71u, 0x4E71u, env) == 0u);
+
+    // RTS は読むだけなので世代配列が無くても焼ける。
+    BlockPlan rtsPlan{};
+    FlatCode rtsCode;
+    REQUIRE(buildPlan({kRtsOp}, rtsPlan, rtsCode));
+    CHECK(jit::requiredSize(rtsPlan, 0x4E71u, 0x4E71u, env) > 0u);
+}
+
+TEST_CASE("動的分岐は必ずブロック末尾になる")
+{
+    // **I6 / G23。** RTS / JSR の後ろに命令があっても積まない。
+    // 積むと、飛んだ後に実行されないはずの命令が実行される。
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{kRtsOp, moveq(0, 1)}, "RTS の後ろ"},
+        {{jsr(kModeInd, 3), moveq(0, 1)}, "JSR の後ろ"},
+        {{moveq(0, 1), kRtsOp, moveq(1, 2)}, "MOVEQ + RTS の後ろ"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        CHECK(plan.end == BlockEnd::kDynamicBranch);
+        // 末尾が動的分岐で、それ以降が積まれていない。
+        CHECK(plan.count == c.words.size() - 1u);
+        const PlanKind lastKind = plan.ops[plan.count - 1u].kind;
+        const bool lastIsDynamic = lastKind == PlanKind::kRts || lastKind == PlanKind::kJsr;
+        CHECK(lastIsDynamic);
+    }
+}
+
+TEST_CASE("JSR の奇数な絶対飛び先は翻訳時に弾く")
+{
+    // **I7 の Tier D 版。** 翻訳時に分かる奇数は積まない。積むと
+    // 「毎周ガードを踏むだけのブロック」になる。
+    //
+    // 落ちる変異: plan() の isAbsoluteJumpTarget の判定を消す
+    // (xxx).L の下位語を奇数にする。**先頭に置くと 1 命令も積めない**ので
+    // plan() は false を返す (呼び出し側は kDeferToStep で step() へ落とす)。
+    {
+        FlatCode code;
+        BlockPlan plan{};
+        const std::vector<u16> words{jsr(kModeAbsL, 1), 0x0006u, 0x0001u};
+        CHECK_FALSE(buildPlan(words, plan, code));
+    }
+
+    // 手前に命令があれば、そこまでを積んで**奇数の JSR の手前で終端する**。
+    // これが「積まない」ことの本体で、上のケースは 0 命令になっただけ。
+    {
+        FlatCode code;
+        BlockPlan plan{};
+        const std::vector<u16> words{moveq(0, 1), jsr(kModeAbsL, 1), 0x0006u, 0x0001u};
+        REQUIRE(buildPlan(words, plan, code));
+        CHECK(plan.count == 1u);
+        CHECK(plan.end == BlockEnd::kUnsupported);
+    }
+
+    // 偶数なら積む。**弾く条件が「奇数」であって「絶対形」ではない**ことを
+    // 対で問う。片方だけだと、絶対形を丸ごと拒否する変異が通ってしまう。
+    {
+        FlatCode code;
+        BlockPlan plan{};
+        const std::vector<u16> words{jsr(kModeAbsL, 1), 0x0006u, 0x0000u};
+        REQUIRE(buildPlan(words, plan, code));
+        CHECK(plan.count == 1u);
+        CHECK(plan.end == BlockEnd::kDynamicBranch);
+    }
+}
+
+TEST_CASE("動的分岐を含むブロックが staging に収まる")
+{
+    // **BlockRunner::kStagingBytes (1536) に収まること。** 収まらないと
+    // 黙って諦める (素通りする) 形になるので、気づきにくい。
+    //
+    // 最悪ケース: 書き形 3 つ + JSR (xxx).L。書き形が一番長く、JSR は
+    // 「飛び先 + ガード 4 本 + touch 2 組 + store 4 本 + 島」を持つ。
+    constexpr std::size_t kStagingBytes = 1536;
+
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{kRtsOp}, "RTS 単体"},
+        {{jsr(kModeAbsL, 1), 0x0006u, 0x0000u}, "JSR (xxx).L 単体"},
+        {{moveDnToMem(0x2u, 0, kModeInd, 1), moveDnToMem(0x2u, 1, kModeInd, 2),
+          moveDnToMem(0x2u, 2, kModeInd, 3), kRtsOp},
+         "MOVE.l Dn,(An) x3 + RTS"},
+        {{clrMem(2u, kModeInd, 1), clrMem(2u, kModeInd, 2), clrMem(2u, kModeInd, 3),
+          jsr(kModeInd, 4)},
+         "CLR.l (An) x3 + JSR (An)"},
+    };
+
+    std::size_t worst = 0;
+    const char* worstWhat = "";
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        const u16 ir = code.get16(plan.fallThroughPc);
+        const u16 irc = code.get16(plan.fallThroughPc + 2);
+        const std::size_t need = jit::requiredSize(plan, ir, irc, fakeEnv());
+        // **0 なら発行できていない。** 諦めた形を「収まった」と読まない。
+        REQUIRE(need > 0u);
+        CHECK(need <= kStagingBytes);
+        if (need > worst)
+        {
+            worst = need;
+            worstWhat = c.what;
+        }
+    }
+    INFO("worst = ", worst, " (", std::string(worstWhat), ")");
+    // 余裕が 20% 以上あること。命令を 1 つ足しただけで超えるのは危うい。
+    CHECK(worst * 5u <= kStagingBytes * 4u);
+}
+
+TEST_CASE("動的分岐の出口が pc / ir / irc を書かない")
+{
+    // **分岐成立側 (Tier A) と同じ契約。** 飛び先のプリフェッチは
+    // ページの外を読みうるので、runner が branchTo で詰め直す。
+    // 生成コードが書くと、そこで書いた値が branchTo の結果と食い違う。
+    //
+    // 落ちる変異: emitDynamicBranchExit で emitBoundaryExit を呼ぶ
+    seedReturnAddress(kStackAddr, kTargetAddr);
+    M68kState initial = makeState(2);
+    initial.a[7] = kStackAddr;
+    // pc / ir / irc に見分けのつく値を入れておく。
+    initial.pc = 0x0BADF00Du;
+    initial.ir = 0xBEEFu;
+    initial.irc = 0xCAFEu;
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({kRtsOp}, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    resetExecRam({kRtsOp});
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, initial);
+    REQUIRE(native.ok);
+    REQUIRE(native.dynamicBranch);
+
+    CHECK(native.state.pc == initial.pc);
+    CHECK(native.state.ir == initial.ir);
+    CHECK(native.state.irc == initial.irc);
+    clearSeeds();
+}
+
+TEST_CASE("JSR は CCR を 1 bit も変えない")
+{
+    // **JSR はフラグを触らない** (m68k_ops_group4.cpp:354-371)。
+    // checkEquivalence の compareStates が sr を比べるので落ちるが、
+    // 「飛び先の置き場に kTmpCcr を使っている」という実装の都合が
+    // CCR を壊さないことを名指しで固定する。
+    for (u16 sr : {u16(0x2700u), u16(0x271Fu), u16(0xA715u), u16(0x0000u)})
+    {
+        clearSeeds();
+        M68kState s = makeState(1);
+        s.sr = sr;
+        s.a[7] = kStackAddr;
+        s.a[3] = kTargetAddr;
+        checkEquivalence({jsr(kModeInd, 3)}, s, "JSR は CCR を変えない");
+    }
+    clearSeeds();
+}
+
 TEST_CASE("負のキャッシュの kAnyGen は世代を問わず一致する")
 {
     // G18 の止血。自ページ脱出した番地は、そのあと step() が書いて
@@ -3256,6 +4158,7 @@ TEST_CASE("decodeBlockReturn が符号化を全数で解く")
             CHECK_FALSE(r.branchTaken);
             CHECK_FALSE(r.guardExit);
             CHECK_FALSE(r.selfPageExit);
+            CHECK_FALSE(r.dynamicBranch);
             CHECK(r.ranOps == 0);
         }
         {
@@ -3264,6 +4167,18 @@ TEST_CASE("decodeBlockReturn が符号化を全数で解く")
             CHECK(r.branchTaken);
             CHECK_FALSE(r.guardExit);
             CHECK_FALSE(r.selfPageExit);
+            CHECK_FALSE(r.dynamicBranch);
+        }
+        {
+            // 動的分岐 (Tier D)。**bit31 とは別のビット**で、
+            // runner は「メールボックスを読む」という別の動作をする。
+            const jit::BlockReturn r = jit::decodeBlockReturn(cycles | jit::kDynamicBranchFlag);
+            CHECK(r.cycles == cycles);
+            CHECK(r.dynamicBranch);
+            CHECK_FALSE(r.branchTaken);
+            CHECK_FALSE(r.guardExit);
+            CHECK_FALSE(r.selfPageExit);
+            CHECK(r.ranOps == 0);
         }
         for (std::uint32_t k = 0; k < x68k::kMaxOps; ++k)
         {
@@ -3273,6 +4188,7 @@ TEST_CASE("decodeBlockReturn が符号化を全数で解く")
             CHECK(r.guardExit);
             CHECK_FALSE(r.branchTaken);
             CHECK_FALSE(r.selfPageExit);
+            CHECK_FALSE(r.dynamicBranch);
             CHECK(r.ranOps == k);
             // 自ページ脱出 (G18): bit30 に**加えて** bit23 が立つ。
             const jit::BlockReturn sp = jit::decodeBlockReturn(ret | jit::kSelfPageExitFlag);
@@ -3280,9 +4196,36 @@ TEST_CASE("decodeBlockReturn が符号化を全数で解く")
             CHECK(sp.guardExit);
             CHECK(sp.selfPageExit);
             CHECK_FALSE(sp.branchTaken);
+            CHECK_FALSE(sp.dynamicBranch);
             CHECK(sp.ranOps == k);
+            // **ガード脱出と動的分岐は排他** (G21)。両方立った戻り値を
+            // 渡されても、復号側は「ガード脱出」だけを言う。
+            //
+            // 落ちる変異: r.dynamicBranch から !r.guardExit を外す
+            const jit::BlockReturn both = jit::decodeBlockReturn(ret | jit::kDynamicBranchFlag);
+            CHECK(both.guardExit);
+            CHECK_FALSE(both.dynamicBranch);
+            // **k はここで壊れてはいけない。** kGuardCountMask が
+            // kDynamicBranchFlag のビットまで含むと、動的分岐の印が
+            // 「k に 32 を足した」ものとして読める。
+            //
+            // 落ちる変異: kGuardCountMask を 0x3F へ戻す
+            CHECK(both.ranOps == k);
         }
     }
+
+    // --- ビットの重なりを名指しで問う ---
+    //
+    // **どれか 2 つが重なると、片方の意味がもう片方に化ける。**
+    // 位置を動かす変更は、必ずここを通ってから入る。
+    CHECK((jit::kDynamicBranchFlag & jit::kCycleMask) == 0u);
+    CHECK((jit::kDynamicBranchFlag & jit::kBranchTakenFlag) == 0u);
+    CHECK((jit::kDynamicBranchFlag & jit::kGuardExitFlag) == 0u);
+    CHECK((jit::kDynamicBranchFlag & jit::kSelfPageExitFlag) == 0u);
+    // **k の欄と重ならないこと。** ここが重なると M9 の変異が通る。
+    CHECK((jit::kDynamicBranchFlag & (jit::kGuardCountMask << jit::kGuardCountShift)) == 0u);
+    // k の欄が kMaxOps を表しきれること (0..kMaxOps が入る)。
+    CHECK(jit::kGuardCountMask >= x68k::kMaxOps);
 
     // **kSelfPageExitFlag はサイクルの外にある。** kCycleMask と重なると、
     // 自ページ脱出のたびにサイクルが 8,388,608 増えて時間が飛ぶ。
@@ -3314,8 +4257,11 @@ TEST_CASE("ガードより前に状態を書く命令が 1 つも無い")
             REQUIRE(e.ok);
 
             // 最初の bnez を探す。BRI12: op0=0x6 / t=0x5。
+            // **命令の切れ目に沿って歩く。** バイトごとに見ると、3 バイト
+            // 命令の途中が別の正当な命令に化けて偽の検出になる。
             std::size_t guardAt = e.buffer.size();
-            for (std::size_t i = e.info.entryOffset; i + 3 <= e.buffer.size(); ++i)
+            for (std::size_t i = e.info.entryOffset; i + 2 <= e.buffer.size();
+                 i += xtensaInsnLength(e.buffer[i]))
             {
                 const bool isBnez =
                     (e.buffer[i] & 0x0Fu) == 0x6u && ((e.buffer[i] >> 4) & 0x0Fu) == 0x5u;
@@ -3334,7 +4280,8 @@ TEST_CASE("ガードより前に状態を書く命令が 1 つも無い")
             // s16i at, a3, off = RRI8 op0=2 / r=5 / s=3
             // s32i.n at, a3, off = RRRN op0=9 / s=3
             bool wrote = false;
-            for (std::size_t i = e.info.entryOffset; i + 3 <= guardAt; ++i)
+            for (std::size_t i = e.info.entryOffset; i < guardAt;
+                 i += xtensaInsnLength(e.buffer[i]))
             {
                 const std::uint32_t op0 = e.buffer[i] & 0x0Fu;
                 const std::uint32_t s = e.buffer[i + 1] & 0x0Fu;
@@ -3349,6 +4296,122 @@ TEST_CASE("ガードより前に状態を書く命令が 1 つも無い")
             }
             CHECK_FALSE(wrote);
         }
+    }
+}
+
+TEST_CASE("動的分岐が最後のガードより前に状態もメモリも書かない")
+{
+    // **G3 の Tier D 版。** 同値テストは「ガードが不成立になった場合」に
+    // しか順序を問えないが、こちらは発行されたコードそのものを走査するので、
+    // 不成立を作りにくい形でも順序を固定できる。
+    //
+    // 動的分岐が守るべきものは 3 つあり、**どれも最後のガードより後**:
+    //   a[7] への s32i         RTS は +4、JSR は -4
+    //   ゲスト RAM への s8i    JSR が積む戻り先
+    //   世代配列への s16i      JSR の touch
+    //
+    // 落ちる変異:
+    //   RTS の戻り先の整列ガードを A7 の更新より後ろへ動かす
+    //   JSR の飛び先の整列ガードを積んだ後ろへ動かす
+    //   JSR の自ページガードを touch より後ろへ動かす
+    struct Case
+    {
+        std::vector<u16> words;
+        // ガードの本数。**この数だけ分岐を数えてから最後のものを取る。**
+        // 途中の分岐で切ると、後ろのガードより前の commit を見逃す。
+        std::size_t guardCount;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        // RTS: 範囲 (bnez) + 戻り先の整列 (bnez) の 2 本。
+        {{kRtsOp}, 2u, "RTS"},
+        // JSR: 飛び先の整列 (bnez) + 範囲 (bnez) + 自ページ x2 (beqz) の 4 本。
+        {{jsr(kModeInd, 3)}, 4u, "JSR (An)"},
+        {{jsr(kModeDisp, 4), 0x0100u}, 4u, "JSR (d16,An)"},
+        {{jsr(kModeAbsL, 1), 0x0006u, 0x0000u}, 4u, "JSR (xxx).L"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        REQUIRE(plan.end == BlockEnd::kDynamicBranch);
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        // ガードの分岐を順に数え、**最後の 1 本**の位置を取る。
+        //
+        // BRI12: op0 = 0x6。bnez は t = 0x5、beqz は t = 0x1。
+        // 出口の島も分岐を持たないので (retN で戻るだけ)、本体の分岐は
+        // ガードだけ。**数が合わないなら形が変わっている**ので REQUIRE で問う。
+        std::size_t lastGuardAt = e.buffer.size();
+        std::size_t seen = 0;
+        for (std::size_t i = e.info.entryOffset; i + 2 <= e.buffer.size();
+             i += xtensaInsnLength(e.buffer[i]))
+        {
+            const bool isBri12 = (e.buffer[i] & 0x0Fu) == 0x6u;
+            if (!isBri12)
+            {
+                continue;
+            }
+            const std::uint32_t t = (e.buffer[i] >> 4) & 0x0Fu;
+            const bool isGuardBranch = t == 0x5u || t == 0x1u;
+            if (!isGuardBranch)
+            {
+                continue;
+            }
+            ++seen;
+            lastGuardAt = i;
+            if (seen == c.guardCount)
+            {
+                break;
+            }
+        }
+        INFO("guards seen = ", seen);
+        REQUIRE(seen == c.guardCount);
+        REQUIRE(lastGuardAt < e.buffer.size());
+
+        // そこまでに commit が 1 つも無いこと。
+        //
+        // s32i  at, as, off = RRI8 op0=2 / r=6   (a[7] / メールボックス)
+        // s16i  at, as, off = RRI8 op0=2 / r=5   (世代配列)
+        // s8i   at, as, off = RRI8 op0=2 / r=4   (ゲスト RAM)
+        // s32i.n at, as, off = RRRN op0=9        (a[7] の短縮形)
+        //
+        // **基底レジスタを問わない。** Tier B/C の走査は kState (a3) 基底だけを
+        // 見ていたが、動的分岐はゲスト RAM と世代配列にも書くので、
+        // 基底で絞ると「窓へ書く命令」を見逃す。
+        const char* found = nullptr;
+        for (std::size_t i = e.info.entryOffset; i < lastGuardAt;
+             i += xtensaInsnLength(e.buffer[i]))
+        {
+            const std::uint32_t op0 = e.buffer[i] & 0x0Fu;
+            const std::uint32_t r = (e.buffer[i + 1] >> 4) & 0x0Fu;
+            if (op0 == 0x2u && r == 6u)
+            {
+                found = "s32i";
+                break;
+            }
+            if (op0 == 0x2u && r == 5u)
+            {
+                found = "s16i";
+                break;
+            }
+            if (op0 == 0x2u && r == 4u)
+            {
+                found = "s8i";
+                break;
+            }
+            if (op0 == 0x9u)
+            {
+                found = "s32i.n";
+                break;
+            }
+        }
+        INFO("store before last guard: ", std::string(found == nullptr ? "none" : found));
+        CHECK(found == nullptr);
     }
 }
 

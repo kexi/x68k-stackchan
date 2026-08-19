@@ -83,6 +83,15 @@ struct NativeStats
     u64 generationReset = 0;
     // 分岐で終端したブロックの実行回数 (direct chaining の的)。
     u64 endedWithBranch = 0;
+    // 動的分岐 (RTS / JSR) で終端したブロックの実行回数 (Tier D)。
+    u64 endedWithDynamicBranch = 0;
+    // そのうち実際に飛んだ回数。
+    //
+    // **endedWithDynamicBranch との差がガード脱出の回数。** 差が大きいなら
+    // RTS のスタックか JSR の飛び先が窓の外を指し続けている。その形は
+    // 翻訳に成功してしまうので負のキャッシュが効かず、毎周
+    // 「鍵照合 → 実行 → 不成立 → step()」を踏んで Tier C より遅くなりうる。
+    u64 dynamicBranch = 0;
     // 「翻訳できない」と覚えていたので再翻訳を省いた回数。
     u64 negativeHit = 0;  // 入口の命令からして翻訳できなかった
     // 読みガードが不成立でブロックを降りた回数 (Tier B)。

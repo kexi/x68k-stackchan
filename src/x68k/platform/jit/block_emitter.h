@@ -100,7 +100,29 @@ inline constexpr std::uint32_t kBranchTakenFlag = 0x80000000u;
 // 読み形は分岐ではないため (G11)。
 inline constexpr std::uint32_t kGuardExitFlag = 0x40000000u;
 inline constexpr std::uint32_t kGuardCountShift = 24;
-inline constexpr std::uint32_t kGuardCountMask = 0x3Fu;  // bit29-24
+
+// 戻り値の bit29。**動的な飛び先へ分岐した** (Tier D: RTS / JSR)。
+//
+// 飛び先そのものは 32bit あるので、戻り値の空きビットには入らない。
+// 生成コードは飛び先を **runner のメールボックス** (EmitEnv::mailboxAddr が
+// 指す u32) へ s32i で書き、このビットで「そこを見ろ」と伝える。
+// runner は M68k::branchTo(mailbox) を呼ぶ。
+//
+// **kBranchTakenFlag とは別のビットにする。** 静的分岐は飛び先が
+// BlockSlot::branchTarget にあり、翻訳時に奇数判定 (I7) 済み。動的分岐は
+// 実行時にしか飛び先が分からず、runner は「メールボックスを読む」という
+// 別の動作をする。1 つのビットに畳むと runner がどちらか分からない。
+//
+// **kGuardExitFlag とは同時に立たない。** 動的分岐はブロックの本体を
+// 走り切った出口で、ガード脱出は本体の途中で降りる出口。同じ命令が
+// 両方の出口を持つことはない (ガードが不成立なら飛び先を書かずに降りる)。
+inline constexpr std::uint32_t kDynamicBranchFlag = 0x20000000u;
+
+// **bit29 を kDynamicBranchFlag に譲ったので 6bit → 5bit。**
+// kMaxOps = 4 なので k は 0..4 しか入らず、5bit (0..31) で足りる。
+// 上限を 32 以上へ上げるときは、ここと kDynamicBranchFlag の位置を
+// 同時に見直すこと。**片方だけ動かすと k の上位が「動的分岐」に化ける。**
+inline constexpr std::uint32_t kGuardCountMask = 0x1Fu;  // bit28-24
 
 // 戻り値の bit23。**自ページ書き換えで降りた** (G13/G18)。
 //
@@ -129,6 +151,8 @@ struct BlockReturn
     bool guardExit = false;
     // 自ページ書き換えで降りたか (G13/G18)。**guardExit と同時にしか立たない。**
     bool selfPageExit = false;
+    // 動的な飛び先へ分岐したか (Tier D)。飛び先はメールボックスにある。
+    bool dynamicBranch = false;
 };
 
 constexpr BlockReturn decodeBlockReturn(std::uint32_t ret)
@@ -143,6 +167,9 @@ constexpr BlockReturn decodeBlockReturn(std::uint32_t ret)
     // サイクル数の一部ではないが (kCycleMask から外れている)、
     // 「自ページ脱出は必ずガード脱出でもある」を復号側でも保つ。
     r.selfPageExit = r.guardExit && (ret & kSelfPageExitFlag) != 0;
+    // **guardExit が立っていたら見ない。** 動的分岐はブロックを走り切った
+    // 出口なので、途中で降りるガード脱出とは排他。復号側でもその関係を保つ。
+    r.dynamicBranch = !r.guardExit && (ret & kDynamicBranchFlag) != 0;
     return r;
 }
 
@@ -185,6 +212,26 @@ struct EmitEnv
     // で、CodeGenMap::setStorage が bumpMappingEpoch を呼ぶ (G8)。
     std::uint32_t genBaseAddr = 0;  // 0 は「世代配列なし」
     std::uint32_t genPageCount = 0;
+
+    // --- Tier D: 動的分岐 (RTS / JSR) が飛び先を置く場所 ---
+    //
+    // runner が持つ u32 1 語のアドレス。生成コードは飛び先をここへ s32i で
+    // 書き、戻り値に kDynamicBranchFlag を立てる。runner はこの語を読んで
+    // M68k::branchTo を呼ぶ。**0 は「メールボックスなし」** で、そのときは
+    // 動的分岐を焼かない (canEmitDynamicBranchIn が断る)。
+    //
+    // Why not M68kState へ 1 語足さないか: 出口の契約 (§5.1) が
+    // 「M68kState は最後の命令をインタプリタで実行し終えた直後とビット単位で
+    // 同一」を言っている。飛び先を置く欄を足すと、その欄はインタプリタが
+    // 一度も書かない値になり、**同一性の比較から外さねばならなくなる**。
+    // 一度外した欄は、以後どんな書き漏らしも検出できない。状態の外へ出す。
+    //
+    // 焼いてよい根拠: メールボックスは BlockRunner のメンバで、runner 自身が
+    // 移動しない限り不変。setStorage / setNegativeStorage / reset はどれも
+    // runner のメンバを差し替えるだけで **this を動かさない**。
+    // ramBaseAddr のような epoch 連動の保護は要らない (窓と違って、
+    // 指す先が別のものへ張り替わることがない)。
+    std::uint32_t mailboxAddr = 0;
 };
 
 // 生成コードのシグネチャ。call0 で呼ぶので、呼び出し側は callx0 のゲートウェイを通す。
@@ -206,6 +253,11 @@ struct EmittedBlock
     std::uint32_t branchTarget = 0;
     // 分岐で終端したか。false なら戻り値の bit31 は決して立たない。
     bool endsWithBranch = false;
+    // 動的分岐で終端したか (Tier D)。false なら戻り値の bit29 は決して立たない。
+    //
+    // **endsWithBranch と同時には true にならない。** 1 つのブロックが
+    // 静的分岐と動的分岐の両方で終わることはない。
+    bool endsWithDynamicBranch = false;
 };
 
 // リテラルプールに入れられる語数の上限。
@@ -269,6 +321,21 @@ inline constexpr size_t kMaxLiterals = 56;
 // **ramReadable は課さない。** 書き経路は fastRamReadable_ を見ない
 // (m68k.cpp:331-334 — ROM 写像中も RAM へは書ける)。
 [[nodiscard]] bool canEmitWritesIn(const EmitEnv& env);
+
+// この窓で動的分岐 (Tier D の RTS / JSR) を焼いてよいか。
+//
+// **翻訳器へ教えるための口** (canEmitWritesIn と同じ役割)。満たさない env で
+// 積むと、エミッタがブロックを丸ごと拒否する。手前で終端させれば短くても
+// 翻訳できる。
+//
+// 条件:
+//   mailboxAddr != 0  — 飛び先の置き場がある
+//
+// RTS はスタックを読むので読みの条件も、JSR はスタックへ書くので書きの
+// 条件も要るが、それは kind ごとに違うので翻訳器が別に見る
+// (PlanCapabilities::canEmitReads / canEmitWrites)。ここは
+// **動的分岐そのものに固有の条件**だけを見る。
+[[nodiscard]] bool canEmitDynamicBranchIn(const EmitEnv& env);
 
 }  // namespace x68k::jit
 

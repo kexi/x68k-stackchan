@@ -80,6 +80,21 @@ enum class PlanKind : u8
     // eaRegOf() を通すこと (直書きすると読み形と書き形で静かに割れる)。
     kMoveDregToMem,  // MOVE.b/w/l Dn,<mem>。srcReg = Dn / dstReg = An 番号
     kClrMem,         // CLR.b/w/l <mem>。dstReg = An 番号
+
+    // --- Tier D: 動的な飛び先へ分岐する形 ---
+    //
+    // Tier B/C との違いは、**飛び先が実行時にしか分からない**こと。
+    // kBranch の飛び先は翻訳時に確定していて BlockPlan::branchTarget に
+    // 入るが、こちらは生成コードがメールボックスへ書いて runner へ渡す。
+    //
+    // **どちらもブロック末尾にしか置けない** (kBranch と同じ I6 の扱い)。
+    // 飛んだ先が翻訳済みかどうかはここでは分からないので、必ず切る。
+    //
+    // eaMode は kJsr だけが持つ (kEaIndirect / kEaDisp16 / kEaAbsShort /
+    // kEaAbsLong)。**kRts は eaMode を持たない** — スタックの読み先は
+    // A7 そのもので、EA の合成を通らない。
+    kRts,  // RTS。A7 から戻り先を読んで飛ぶ。レジスタ欄は使わない
+    kJsr,  // JSR <ea>。dstReg = An 番号 (書き形と同じ「転送先」の欄)
 };
 
 // PlannedOp::eaMode の値。
@@ -121,6 +136,9 @@ enum class BlockEnd : u8
     kCapacity,       // kMaxOps に達した
     kWindowExit,     // 命令語かプリフェッチ先が窓の外
     kPageBoundary,   // 1KB ページを跨ぐ手前で終端
+    // 動的分岐 (RTS / JSR) で終端。飛び先は実行時にしか分からないので、
+    // BlockPlan::branchTarget は使わない (生成コードがメールボックスへ書く)。
+    kDynamicBranch,
 };
 
 // ブロック内の 1 命令。命令語とデコード済みの意味を両方持つ (冒頭の理由)。
@@ -152,7 +170,52 @@ struct PlannedOp
 // **kind で判定する。** eaMode だけを見ると読み形と区別が付かない。
 constexpr bool isMemoryWriteKind(PlanKind kind)
 {
+    // **kJsr を入れない。** JSR も write32 でスタックへ積むので「メモリへ
+    // 書く形」ではあるが、この述語は eaRegOf() の欄の選び方と、翻訳器が
+    // canEmitWrites を問う対象を決めている。kJsr の EA は
+    // **書き先ではなく飛び先**で、積む先は常に -(A7) の A7 固定。
+    // ここへ入れると eaRegOf() が dstReg (= 飛び先の An) を「積む先の
+    // レジスタ」として返し、A7 以外が減る形になる。
+    //
+    // JSR がスタックへ書くことの取り扱いは needsWriteWindow() が別に持つ。
     return kind == PlanKind::kMoveDregToMem || kind == PlanKind::kClrMem;
+}
+
+// ゲスト RAM へ書く形か。**翻訳器が「書きの窓」を要求する対象。**
+//
+// isMemoryWriteKind との違いは kJsr を含むこと。JSR は -(A7) へ戻り先を
+// write32 するので、世代配列も窓も要る (Tier C と同じ理由) が、
+// eaRegOf() の欄の規約には従わない (上のコメント)。
+//
+// **2 つを 1 つにできない。** 片方は「欄の規約」、もう片方は「窓の要求」で、
+// たまたま Tier C では一致していただけ。畳むと JSR で A7 以外が減る。
+constexpr bool needsWriteWindow(PlanKind kind)
+{
+    return isMemoryWriteKind(kind) || kind == PlanKind::kJsr;
+}
+
+// ゲスト RAM を読む形か。**翻訳器が「読みの窓」を要求する対象。**
+//
+// eaMode を持つ読み形 (Tier B) に加えて kRts を含む。RTS は A7 から
+// read32 するが EA の合成を通らないので eaMode は kEaNone のまま。
+// eaMode だけで判定すると RTS が「読まない形」に見え、窓が読めない写像で
+// 焼いてしまう。
+constexpr bool needsReadWindow(PlanKind kind, u8 eaMode)
+{
+    if (kind == PlanKind::kRts)
+    {
+        return true;
+    }
+    return eaMode != kEaNone && !isMemoryWriteKind(kind) && kind != PlanKind::kJsr;
+}
+
+// ブロックの末尾にしか置けない形か (I6)。
+//
+// **分岐と動的分岐の両方。** 飛んだ先が翻訳済みかどうかは翻訳時に
+// 分からないので、飛ぶ形はどれも必ずそこで切る。
+constexpr bool isBlockTerminator(PlanKind kind)
+{
+    return kind == PlanKind::kBranch || kind == PlanKind::kRts || kind == PlanKind::kJsr;
 }
 
 // 実効アドレスの An 番号がどちらの欄に入っているか。

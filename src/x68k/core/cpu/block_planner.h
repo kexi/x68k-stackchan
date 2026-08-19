@@ -71,6 +71,14 @@ struct PlanCapabilities
     //
     // 既定 (nullptr) は canEmitReads と同じく「入れてよい」。
     bool (*canEmitWrites)(void* ctx);
+    // 動的分岐 (Tier D の RTS / JSR) をブロックへ入れてよいか。
+    //
+    // 読み・書きとは別の条件。**飛び先の置き場 (メールボックス) が要る。**
+    // 窓が全部そろっていてもメールボックスが未配線なら焼けないので、
+    // 教えてもらわないと「積んだ結果エミッタに丸ごと拒否される」形になる。
+    //
+    // 既定 (nullptr) は「入れてよい」。
+    bool (*canEmitDynamicBranch)(void* ctx);
     void* ctx;
 };
 

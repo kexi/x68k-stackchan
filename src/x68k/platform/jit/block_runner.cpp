@@ -101,6 +101,13 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
         env.genBaseAddr =
             static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(map.storage()));
         env.genPageCount = map.pageCount();
+        // 動的分岐 (Tier D) の飛び先を受け取る 1 語 (G21)。
+        //
+        // **epoch の保護が要らない唯一の焼き込み。** 窓や世代配列は
+        // 差し替わりうるので mappingEpoch を鍵に持つが、これは runner 自身の
+        // メンバで、runner が動かない限り不変 (block_runner.h の根拠)。
+        env.mailboxAddr =
+            static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(&branchMailbox_));
     }
 
     // **翻訳器にエミッタの都合を教える。**
@@ -126,6 +133,14 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
                                 {
                                     const EmitEnv& e = *static_cast<CapsCtx*>(c)->env;
                                     return canEmitWritesIn(e);
+                                },
+                                // 動的分岐の条件 (Tier D)。**飛び先の置き場**
+                                // だけを見る。RTS が要る読みの窓と JSR が要る
+                                // 書きの窓は、エミッタが kind ごとに別に見る。
+                                [](void* c) -> bool
+                                {
+                                    const EmitEnv& e = *static_cast<CapsCtx*>(c)->env;
+                                    return canEmitDynamicBranchIn(e);
                                 },
                                 &capsCtx};
 
@@ -243,6 +258,7 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     slot.count = plan.count;
     slot.code = buf + emitted.entryOffset;
     slot.endsWithBranch = emitted.endsWithBranch;
+    slot.endsWithDynamicBranch = emitted.endsWithDynamicBranch;
     slot.branchTarget = emitted.branchTarget;
     return &slot;
 }
@@ -326,6 +342,10 @@ NativeResult BlockRunner::run(M68k& cpu)
     {
         ++stats_.endedWithBranch;
     }
+    if (slot->endsWithDynamicBranch)
+    {
+        ++stats_.endedWithDynamicBranch;
+    }
 
     const BlockReturn decoded = decodeBlockReturn(ret);
     const u32 cycles = decoded.cycles;
@@ -382,6 +402,22 @@ NativeResult BlockRunner::run(M68k& cpu)
             // 起きたら branchTo が既にアドレスエラーへ入っている。
             return NativeResult{cycles, NativeExit::kRan};
         }
+        return NativeResult{cycles, NativeExit::kRan};
+    }
+
+    if (decoded.dynamicBranch)
+    {
+        // Tier D (G21): 飛び先はメールボックスにある。生成コードが
+        // 直前に書いているので、必ず今回の実行の値。
+        //
+        // **branchTarget は見ない。** 動的分岐のスロットではその欄は 0 のまま
+        // (翻訳時に飛び先が決まらないので、埋めると「確定した飛び先」と
+        // 読み違えられる)。
+        ++stats_.dynamicBranch;
+        // 飛び先の奇数は生成コードのガードが弾いている (G22) ので通常は
+        // 起きないが、branchTo の戻り値は無視しない。起きたなら branchTo が
+        // 既にアドレスエラーへ入っており、そのまま返してよい。
+        (void)cpu.branchTo(branchMailbox_);
     }
 
     return NativeResult{cycles, NativeExit::kRan};
