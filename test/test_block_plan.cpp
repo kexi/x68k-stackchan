@@ -363,10 +363,97 @@ bool specSafeBranch(x68k::u16 op)
     return disp8 != 0xFFu;
 }
 
+// --- Tier H: $0 の CMPI #imm,Dn と BTST #imm,Dn ---
+//
+// **符号化から直接組む。** $0 は 0000 ooo ss mmm rrr で、
+// opType (bit9-11) が命令を、bit8 が「静的/動的」を分ける。
+//
+//   bit8 == 1            動的ビット操作 (Dn をビット番号に使う) と MOVEP。
+//                        どちらも入れない (長さデコーダも諦めている)
+//   opType == 4          BTST/BCHG/BCLR/BSET #imm。**BTST だけ**が
+//                        読むだけで書き戻さない (bit6-7 == 0)
+//   opType == 6          CMPI。結果を書かずフラグだけ
+//   opType 0/1/2/3/5     ORI/ANDI/SUBI/ADDI/EORI。**書き戻しがある**ので
+//                        入れない (Dn 宛てでも d[] へ書く形は
+//                        kAluImmToDreg と同じで、符号だけが違う)
+//
+// どちらも **対象は Dn (mode 0) だけ**。メモリ対象は読みガードを背負う。
+bool specSafeImmediate(x68k::u16 op)
+{
+    if ((op >> 12) != 0x0u)
+    {
+        return false;
+    }
+    const bool isDynamicBitOpOrMovep = (op & 0x0100u) != 0;
+    if (isDynamicBitOpOrMovep)
+    {
+        return false;
+    }
+    const x68k::u32 opType = static_cast<x68k::u32>((op >> 9) & 7u);
+    const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
+    // 対象は Dn だけ。
+    if (mode != 0)
+    {
+        return false;
+    }
+
+    const bool isBitOp = opType == 4;
+    if (isBitOp)
+    {
+        // bit6-7 が 0 = BTST。1/2/3 は BCHG/BCLR/BSET で書き戻しがある。
+        return ((op >> 6) & 3u) == 0;
+    }
+
+    const bool isCmpi = opType == 6;
+    if (!isCmpi)
+    {
+        return false;
+    }
+    // ss == 11 はこの形に存在しない。
+    return ((op >> 6) & 3u) != 3;
+}
+
+// --- Tier H: $5 の ADDQ / SUBQ ---
+//
+// **符号化から直接組む。** 0101 ddd s ss mmm rrr。
+//   ss == 11              Scc (mode != 1) と DBcc (mode == 1)。
+//                         **どちらも入れない** — DBcc は終端し、
+//                         Scc は書き戻しがある
+//   mode 0 (Dn)           ADDQ/SUBQ #imm,Dn。フラグを変える
+//   mode 1 (An)           ADDQ/SUBQ #imm,An。**フラグ不変で常に 32bit**。
+//                         ただし .b (ss == 00) は 68000 に無い不当命令
+//   mode 2 以上           メモリ対象。読みと書きの両方のガードを背負う
+//                         (RMW) ので入れない
+bool specSafeQuickAlu(x68k::u16 op)
+{
+    if ((op >> 12) != 0x5u)
+    {
+        return false;
+    }
+    const x68k::u32 sizeBits = static_cast<x68k::u32>((op >> 6) & 3u);
+    const bool isSccOrDbcc = sizeBits == 3;
+    if (isSccOrDbcc)
+    {
+        return false;
+    }
+    const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
+    if (mode == 0)
+    {
+        return true;
+    }
+    const bool destIsAddressRegister = mode == 1;
+    if (destIsAddressRegister)
+    {
+        // byte で An に触る形は不当命令。
+        return sizeBits != 0;
+    }
+    return false;
+}
+
 bool specSafe(x68k::u16 op)
 {
     return specSafeMove(op) || specSafeMoveq(op) || specSafeAlu(op) || specSafeBranch(op) ||
-           specSafeMisc(op);
+           specSafeMisc(op) || specSafeImmediate(op) || specSafeQuickAlu(op);
 }
 
 // --- 実行して突き合わせるための Machine -------------------------------------

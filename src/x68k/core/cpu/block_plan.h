@@ -201,6 +201,60 @@ enum class PlanKind : u8
     // **サイクルは 6。** CMP の 4 でも ADDA の 8 でもない。
     kCmpaDregToAreg,  // srcReg = Dn 番号 / dstReg = An 番号
     kCmpaAregToAreg,  // srcReg = An 番号 / dstReg = An 番号
+
+    // --- Tier H: 命令長デコーダの拡張が解禁した形 (CMPI / ADDQ / BTST) ---
+    //
+    // **どれも非終端** (Tier G と同じ条件で選んである)。長さデコーダが
+    // $0 と $5 を返せるようになるまでは、許可リスト以前に積めなかった。
+    //
+    // Tier G と同じく、不変条件の軸では既存 Tier に収まる (全部 Tier A =
+    // ガード不要)。名前を分けたのは**選んだ理由**が違うから: Tier G は
+    // 「非終端の実測上位」、Tier H は「デコーダを直して初めて積めるように
+    // なった形」。次に的を選ぶ人が「デコーダを直せば何が開くか」を
+    // 逆引きできるようにしてある。
+    //
+    // **CMPI と ADDQ/SUBQ の Dn 宛ては新しい kind を持たない。**
+    // 意味が kAluImmToDreg (ALU <#imm>,Dn) とビット単位で同じで、
+    // 違うのはサイクルだけ (CMPI/ADDQ は 8、CMP/ADD #imm は 4)。
+    // サイクルは PlannedOp::cycles が命令ごとに持つ欄なので、
+    // kind を増やすとエミッタの switch とテストの網が二重になるだけで、
+    // 分岐は 1 本も増えない (block_plan.h の BSR .s/.w を分けない判断と
+    // 同じ理由)。**planner が cycles に何を入れるかだけが違う。**
+
+    // ADDQ / SUBQ #imm,An。**フラグを 1 bit も変えず、常に 32bit で作用する。**
+    //
+    // kAddaDregToAreg との違いは src の出どころだけ (レジスタではなく
+    // 翻訳時定数)。**サイズで結果を切らない**のも同じで、.w の ADDQ も
+    // a[] の 32bit 全体に効く (m68k_ops_misc.cpp の「An に対する ADDQ/SUBQ は
+    // フラグを変えず、常に 32bit で作用する」)。
+    //
+    // **エミッタは size 欄を読まない。** ADDQ.w #1,A0 と ADDQ.l #1,A0 は
+    // まったく同じ動作をする。
+    //
+    // **それでも符号化のサイズを入れる** (kLong で埋めない)。size を常に 4 に
+    // すると、エミッタが誤って結果を size で切っても**何も切られず、
+    // テストが 1 件も落ちない**。符号化の値が入っていれば .w で上位が
+    // 落ちて差分テストが落ちる。**欄が情報を持たないと、その欄を誤用する
+    // 変異を捕まえられない。**
+    //
+    // imm は 1-8 (符号化の 0 は 8 を意味する) を planner が畳んだ値。
+    // 加算か減算かは aluOp が持つ (kAdd / kSub)。
+    kAddqImmToAreg,  // dstReg = An 番号 / imm = 1-8 / aluOp = kAdd|kSub
+
+    // BTST #imm,Dn。**Z フラグだけを変える。** N/V/C/X は 1 bit も動かない。
+    //
+    // Why not kAluImmToDreg へ載せないか: ALU 群は N/Z/V/C を全部書く
+    // (emitLogicFlags / emitArithFlagsCore がまとめて立てる)。BTST は
+    // Z 以外を**保存する**ので、CCR の書き方が根本的に違う。
+    // 載せると N と V/C が黙って落ちる。
+    //
+    // 対象が Dn なので **32bit で回る** (ビット番号は 31 でマスク)。
+    // メモリ対象 (8bit で回る) は入れない — 読みガードを背負ううえに、
+    // ビット番号のマスクが 7 に変わる別の検証面になる。
+    //
+    // imm は planner が **31 でマスク済みのビット番号**。
+    // 生の即値ではないので、エミッタは 1u << imm をそのまま使ってよい。
+    kBtstImmToDreg,  // srcReg = 対象 Dn (読むだけ) / imm = ビット番号 0-31
 };
 
 // PlannedOp::eaMode の値。

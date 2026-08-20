@@ -1552,16 +1552,16 @@ TEST_SUITE("イベント駆動")
 
         std::size_t checked = 0;
         std::size_t mismatched = 0;
+        // **拒否された命令 (kUnknownLength) も実行して数える。** 諦めるのは
+        // 安全側なので「一致するか」のテストでは永遠に見えない。取りこぼしは
+        // 速度としてしか現れるので、ここで別のカウンタとして表に出す。
+        std::size_t rejectedButExecutable = 0;
         x68k::u16 firstBad = 0;
 
         for (x68k::u32 opv = 0; opv < 0x10000; ++opv)
         {
             const auto op = static_cast<x68k::u16>(opv);
             const x68k::u32 length = x68k::instructionLength(op);
-            if (length == x68k::kUnknownLength)
-            {
-                continue;
-            }
             // 分岐は成立すると PC が飛ぶので長さの検証にならない。
             // 実行時は「PC が想定と違えば抜ける」で守られる。
             if ((op >> 12) == 0x6)
@@ -1616,6 +1616,16 @@ TEST_SUITE("イベント駆動")
                 continue;  // 制御が飛んだ
             }
 
+            const bool decoderAccepted = length != x68k::kUnknownLength;
+            if (!decoderAccepted)
+            {
+                // ここへ来た命令は「実行すると素直に進むのに、デコーダが
+                // 諦めた」もの。正しさは損なわれないので落とさず数えるだけ
+                // にするが、下で総数を固定して**黙って増えない**ようにする。
+                ++rejectedButExecutable;
+                continue;
+            }
+
             ++checked;
             if (after - 0x1000 != length)
             {
@@ -1631,6 +1641,17 @@ TEST_SUITE("イベント駆動")
         CHECK(mismatched == 0);
         // 素通りしていないこと。対象の命令が実際に検査されている。
         CHECK(checked > 3000);
+
+        // 取りこぼしの総数を固定する。現在値は 9355 (残っているのは
+        // $E のシフト群と、$0/$4 の扱わない形)。
+        //
+        // **上限だけでなく下限も置く。** 上限だけだと、デコーダが壊れて
+        // 何でも受けるようになったときに 0 へ落ちて通ってしまう
+        // (そのときは mismatched が上がるはずだが、長さがたまたま合う
+        // 変異なら両方すり抜ける)。増えても減っても落ちる形にする。
+        CAPTURE(rejectedButExecutable);
+        CHECK(rejectedButExecutable > 9000);
+        CHECK(rejectedButExecutable < 9700);
     }
 
     // 分岐の命令長が実行と一致する。
@@ -1824,6 +1845,94 @@ TEST_SUITE("イベント駆動")
             {0x48E8, 6, "MOVEM.l regs,(d16,A0)"},
         };
         for (const auto& c : group4)
+        {
+            CAPTURE(c.name);
+            CAPTURE(c.op);
+            CHECK(x68k::instructionLength(c.op) == c.expected);
+        }
+
+        // $0 と $5 の命令長。**段 0-H で足した群。**
+        //
+        // ここは全数テストの「実行と一致する」で守られているが、
+        // 名指しでも固定する。理由は落ち方が違うこと: 全数テストは
+        // 「どれかが壊れた」としか言わないが、名前で書いておけば
+        // どのサイズ・どの形で壊れたかがその場で分かる。
+        //
+        // **即値語数の取り違えが最も危ない。** CMPI.l の即値は 2 語で、
+        // 1 語と読むと 2 バイト過小になり、即値の下位ワードが次の
+        // 命令語として実行される。
+        struct ImmediateCase
+        {
+            x68k::u16 op;
+            x68k::u32 expected;
+            const char* name;
+        };
+        const ImmediateCase immediateCases[] = {
+            // CMPI: 即値語数がサイズで変わる (.b/.w = 1 語、.l = 2 語)。
+            {0x0C00, 4, "CMPI.b #imm,D0"},
+            {0x0C40, 4, "CMPI.w #imm,D0"},
+            {0x0C80, 6, "CMPI.l #imm,D0"},
+            {0x0C50, 4, "CMPI.w #imm,(A0)"},
+            {0x0C68, 6, "CMPI.w #imm,(d16,A0)"},
+            {0x0C79, 8, "CMPI.w #imm,(xxx).L"},
+            {0x0CB9, 10, "CMPI.l #imm,(xxx).L"},
+            // 他の即値演算も同じ形。ADDI.l は即値 2 語。
+            {0x0640, 4, "ADDI.w #imm,D0"},
+            {0x0680, 6, "ADDI.l #imm,D0"},
+            {0x0440, 4, "SUBI.w #imm,D0"},
+            // **ビット操作の即値は常に 1 語。** 対象が Dn (32bit で回る)
+            // でも変わらない。ここを「Dn なら 2 語」と読むと 2 バイト過大。
+            {0x0800, 4, "BTST #imm,D0"},
+            {0x0810, 4, "BTST #imm,(A0)"},
+            {0x0840, 4, "BCHG #imm,D0"},
+            {0x0880, 4, "BCLR #imm,D0"},
+            {0x08C0, 4, "BSET #imm,D0"},
+            {0x0828, 6, "BTST #imm,(d16,A0)"},
+            // BTST は読むだけなので PC 相対も取れる。書き戻す方は取れない。
+            {0x083A, 6, "BTST #imm,(d16,PC)"},
+            {0x087A, x68k::kUnknownLength, "BCHG #imm,(d16,PC) は不正"},
+            // An 直接はビット操作にも即値演算にも無い。
+            {0x0848, x68k::kUnknownLength, "BTST #imm,A0 は不正"},
+            {0x0C48, x68k::kUnknownLength, "CMPI.w #imm,A0 は不正"},
+            // to CCR / to SR と MOVEP と動的ビット操作は扱わない。
+            {0x003C, x68k::kUnknownLength, "ORI to CCR は扱わない"},
+            {0x007C, x68k::kUnknownLength, "ORI to SR は扱わない"},
+            {0x0108, x68k::kUnknownLength, "MOVEP は扱わない"},
+            {0x0100, x68k::kUnknownLength, "BTST D0,D0 (動的) は扱わない"},
+
+            // ADDQ/SUBQ: **即値は命令語に埋まっている**ので拡張ワードは
+            // EA のぶんだけ。「即値 1 語」と数えると 2 バイト過大。
+            {0x5040, 2, "ADDQ.w #8,D0"},
+            {0x5240, 2, "ADDQ.w #1,D0"},
+            {0x5340, 2, "SUBQ.w #1,D0"},
+            {0x5080, 2, "ADDQ.l #8,D0"},
+            {0x5050, 2, "ADDQ.w #8,(A0)"},
+            {0x5068, 4, "ADDQ.w #8,(d16,A0)"},
+            {0x5079, 6, "ADDQ.w #8,(xxx).L"},
+            // An 宛ては .w/.l だけ。byte は不正命令。
+            {0x5048, 2, "ADDQ.w #8,A0"},
+            {0x5088, 2, "ADDQ.l #8,A0"},
+            {0x5008, x68k::kUnknownLength, "ADDQ.b #8,A0 は不正"},
+
+            // **DBcc は ADDQ と同じ $5 群。** ss == 11 かつ mode 1 で
+            // 判別する。落とすと変位ワードが次の命令語として実行される。
+            {0x50C8, 4, "DBT D0,<label>"},
+            {0x51C8, 4, "DBRA D0,<label>"},
+            {0x57CF, 4, "DBEQ D7,<label>"},
+            // ss == 11 で mode != 1 は Scc。変位ワードを持たない。
+            {0x50C0, 2, "ST D0"},
+            {0x57D0, 2, "SEQ (A0)"},
+            {0x57E8, 4, "SEQ (d16,A0)"},
+            {0x50FA, x68k::kUnknownLength, "ST (d16,PC) は不正"},
+
+            // TRAP は拡張ワード無し。番号は命令語の下位 4bit。
+            {0x4E40, 2, "TRAP #0"},
+            {0x4E4F, 2, "TRAP #15"},
+            // 隣の LINK ($4E50) は変位を持つ。TRAP のマスクが広すぎると
+            // ここが 2 に化ける。
+            {0x4E50, 4, "LINK A0,#d (TRAP の隣)"},
+        };
+        for (const auto& c : immediateCases)
         {
             CAPTURE(c.name);
             CAPTURE(c.op);

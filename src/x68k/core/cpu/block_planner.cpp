@@ -678,6 +678,180 @@ bool planAlu(u16 op, PlannedOp& out)
     return true;
 }
 
+// --- Tier H: $0 の即値演算とビット操作 ---
+//
+// **受けるのは CMPI #imm,Dn と BTST #imm,Dn の 2 つだけ。**
+//
+// Why not ORI/ANDI/SUBI/ADDI/EORI も入れないか: どれも **Dn 宛てでも
+// 書き戻しがある** (readEaForModify → writeEaToAddr)。mode 0 の書き戻しは
+// d[] へのストアなのでメモリには触らないが、それは kAluImmToDreg が
+// 既に持っている形と同じで、**符号だけが違う**。入れるなら
+// kAluImmToDreg へ載せるだけで済むので分岐は増えないが、
+// 実測でこの段の的として挙がっているのは CMPI と BTST の 2 つで、
+// 残りは別途頻度を測ってから開ける。
+//
+// **BCHG/BCLR/BSET は入れない。** 書き戻しがあるぶんサイクルが 8 で、
+// Z の立て方は BTST と同じだが「読んだ値を変えて書く」脚が増える。
+// BTST (読むだけ) とは別の検証面になる。
+bool planImmediate(u16 op, PlannedOp& out)
+{
+    const u32 mode = static_cast<u32>((op >> 3) & 7u);
+    const u32 reg = static_cast<u32>(op & 7u);
+    const u32 opType = static_cast<u32>((op >> 9) & 7u);
+
+    // 動的ビット操作 (bit8 == 1) と MOVEP。長さデコーダも諦めている。
+    const bool isDynamicBitOp = (op & 0x0100u) != 0;
+    if (isDynamicBitOp)
+    {
+        return false;
+    }
+
+    // BTST/BCHG/BCLR/BSET #imm : 0000 100 oo mmm rrr。
+    const bool isStaticBitOp = opType == 4;
+    if (isStaticBitOp)
+    {
+        // **BTST (bitOp == 0) だけ。** 残りは書き戻しがある。
+        const u32 bitOp = static_cast<u32>((op >> 6) & 3u);
+        if (bitOp != 0)
+        {
+            return false;
+        }
+        // **対象は Dn だけ。** メモリ対象は読みガードを背負ううえに、
+        // ビット番号のマスクが 31 から 7 へ変わる (block_plan.h)。
+        if (mode != 0)
+        {
+            return false;
+        }
+        out.kind = PlanKind::kBtstImmToDreg;
+        out.srcReg = static_cast<u8>(reg);
+        // 対象が Dn なので 32bit で回る (m68k_ops_misc.cpp の size = kLong)。
+        out.size = static_cast<u8>(kLong);
+        // **6 サイクル。** メモリ対象の 4 でも BCHG/BCLR/BSET の 8 でもない
+        // (m68k_ops_misc.cpp の `return targetIsRegister ? 6 : 4;`)。
+        out.cycles = 6;
+        // ビット番号は拡張ワードにあるので foldImmediate が入れる。
+        return true;
+    }
+
+    // CMPI : 0000 110 ss mmm rrr。
+    //
+    // **opType 6 だけ。** ORI/ANDI/SUBI/ADDI/EORI は書き戻しがあるので
+    // 入れない (この関数の冒頭のコメント)。
+    const bool isCmpi = opType == 6;
+    if (!isCmpi)
+    {
+        return false;
+    }
+    // **対象は Dn だけ。** メモリ対象は読みガードを背負う。
+    if (mode != 0)
+    {
+        return false;
+    }
+    const u32 sizeBits = static_cast<u32>((op >> 6) & 3u);
+    if (sizeBits == 3)
+    {
+        return false;
+    }
+
+    // **kAluImmToDreg へ載せる。** CMP #imm,Dn ($Bxxx の即値形) と
+    // 意味がビット単位で同じ (alu::sub → applyResultFlags(sr, r, false))。
+    // 違うのはサイクルだけなので、kind を増やさず cycles で分ける
+    // (block_plan.h の Tier H のコメント)。
+    out.kind = PlanKind::kAluImmToDreg;
+    out.aluOp = PlanAluOp::kCmp;
+    out.dstReg = static_cast<u8>(reg);
+    out.size = static_cast<u8>(sizeBits == 0 ? kByte : (sizeBits == 1 ? kWord : kLong));
+    // **8 サイクル。** CMP #imm,Dn の 4 ではない
+    // (m68k_ops_misc.cpp の CMPI が `return 8;`)。
+    out.cycles = 8;
+    // 即値は拡張ワードにあるので foldImmediate が入れる。
+    return true;
+}
+
+// --- Tier H: $5 の ADDQ / SUBQ ---
+//
+// **Scc と DBcc は入れない。**
+//   DBcc は終端する命令。段 0-F (BSR) で「終端はブロックを切る」ことが
+//     実測で出ているので、非終端の形を先に取る。
+//   Scc は書き戻しがある (mode 0 でも d[] へ byte を書く)。形としては
+//     入れられるが、実測の頻度が ADDQ/SUBQ に比べて小さい。
+bool planQuickAlu(u16 op, PlannedOp& out)
+{
+    const u32 sizeBits = static_cast<u32>((op >> 6) & 3u);
+    const u32 mode = static_cast<u32>((op >> 3) & 7u);
+    const u32 reg = static_cast<u32>(op & 7u);
+
+    // ss == 11 は Scc / DBcc。上のコメントの理由で入れない。
+    if (sizeBits == 3)
+    {
+        return false;
+    }
+
+    // データフィールドの 0 は 8 を意味する (m68k_ops_misc.cpp)。
+    u32 data = static_cast<u32>((op >> 9) & 7u);
+    if (data == 0)
+    {
+        data = 8;
+    }
+    const bool isSub = (op & 0x0100u) != 0;
+    const u32 size = sizeBits == 0 ? kByte : (sizeBits == 1 ? kWord : kLong);
+
+    // --- An 宛て。**フラグ不変で常に 32bit。** ---
+    const bool destIsAddressRegister = mode == 1;
+    if (destIsAddressRegister)
+    {
+        // **byte で An に触る形は不正命令。** 長さデコーダも弾いている。
+        if (size == kByte)
+        {
+            return false;
+        }
+        out.kind = PlanKind::kAddqImmToAreg;
+        out.aluOp = isSub ? PlanAluOp::kSub : PlanAluOp::kAdd;
+        out.dstReg = static_cast<u8>(reg);
+        // **符号化のサイズをそのまま入れる。** エミッタはこの欄を読まない
+        // (加減算は常に 32bit) が、**kLong を埋めてはいけない。**
+        //
+        // Why not kLong で「常に 32bit」を表さないか: そうすると size 欄が
+        // 常に 4 になり、エミッタが誤って emitTruncate(op.size) を挟んでも
+        // **何も切られないので、テストが 1 件も落ちない**。実際に変異を
+        // 注入して確かめた (kLong を入れた実装では truncate を足しても
+        // 751 件が全部通った)。符号化の値を入れておけば、.w の ADDQ で
+        // 上位 16bit が落ちて差分テストが落ちる。
+        //
+        // **欄が情報を持たないと、その欄を誤用する変異を捕まえられない。**
+        out.size = static_cast<u8>(size);
+        out.imm = data;
+        // m68k_ops_misc.cpp の An 経路は 8。
+        out.cycles = 8;
+        return true;
+    }
+
+    // --- Dn 宛て。**フラグを変える。** ---
+    //
+    // **kAluImmToDreg へ載せる。** ADD/SUB #imm,Dn と意味がビット単位で
+    // 同じ (alu::add/sub → applyResultFlags(sr, r, true))。違うのは
+    // 即値の出どころ (命令語の bit9-11) とサイクルだけ。
+    if (mode != 0)
+    {
+        // メモリ対象は読み書き両方のガードを背負う (RMW)。入れない。
+        return false;
+    }
+    out.kind = PlanKind::kAluImmToDreg;
+    out.aluOp = isSub ? PlanAluOp::kSub : PlanAluOp::kAdd;
+    out.dstReg = static_cast<u8>(reg);
+    out.size = static_cast<u8>(size);
+    // **即値は命令語に埋まっているので、ここで確定する。**
+    // 拡張ワードを持たないので foldImmediate は通らない。
+    //
+    // readEaSlow の 7.4 と同じく size でマスクする。data は 1-8 なので
+    // byte でも落ちないが、**マスクの形をそろえておく**。ここだけ
+    // 素通しにすると、後から即値の範囲が広がったときに気づけない。
+    out.imm = size == kByte ? (data & 0xFFu) : data;
+    // m68k_ops_misc.cpp の Dn 経路は 8。ADD/SUB #imm の 4 ではない。
+    out.cycles = 8;
+    return true;
+}
+
 // Bcc / BRA / BSR。
 bool planBranch(u16 op, u32 pc, PlannedOp& out)
 {
@@ -752,6 +926,10 @@ bool BlockPlanner::planOne(u16 op, u32 pc, PlannedOp& out)
     const u32 group = static_cast<u32>(op >> 12);
     switch (group)
     {
+        case 0x0u:
+            return planImmediate(op, out);
+        case 0x5u:
+            return planQuickAlu(op, out);
         case 0x1u:
         case 0x2u:
         case 0x3u:
@@ -769,8 +947,7 @@ bool BlockPlanner::planOne(u16 op, u32 pc, PlannedOp& out)
         case 0xDu:
             return planAlu(op, out);
         default:
-            // 許可リストに無い。$0 の即値演算も $4 (RTS/JSR/MOVEM/LEA) も
-            // $5 (ADDQ/Scc/DBcc) も $E (シフト) も、まだ入れない。
+            // 許可リストに無い。$A / $E (シフト) / $F は、まだ入れない。
             return false;
     }
 }
@@ -795,8 +972,46 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         // long は 2 語連結、byte は下位バイトだけ、word はそのまま。
         // MOVE #imm,Dn と同じ式なので、同じ枝に載せる。
         case PlanKind::kAluImmToDreg:
+        {
+            // **拡張ワードを持たない ADDQ/SUBQ #imm,Dn がこの枝を共有する。**
+            //
+            // Tier H の ADDQ は即値が命令語の bit9-11 に埋まっているので、
+            // planQuickAlu が既に imm を確定させている。ここで ext0 から
+            // 畳み直すと、拡張ワードを持たない (length == 2) ぶん ext0 は
+            // 0 のままで、**即値が黙って 0 になる** (ADDQ #1,D0 が
+            // ADD #0,D0 に化けて、フラグだけが正しく見える)。
+            //
+            // Why not kind を分けて枝を増やさないか: 分けるとエミッタ側の
+            // switch も二重になる。ここは「即値が拡張ワードにあるか」で
+            // 分かれるだけで、それは長さから一意に決まる。
+            const bool immediateIsInOpcodeWord = length == 2;
+            if (immediateIsInOpcodeWord)
+            {
+                break;
+            }
             // size でマスクする。byte は下位バイトだけ。
             p.imm = p.size == 4 ? longValue : (p.size == 1 ? (ext0 & 0xFFu) : ext0);
+            break;
+        }
+
+        // --- Tier H: BTST #imm,Dn のビット番号 ---
+        //
+        // **m68k_ops_misc.cpp と同じ 2 段のマスク。**
+        //   fetch() & 0xFF   拡張ワードの下位バイトだけを使う
+        //   & 31             対象が Dn なので 32bit で回る
+        //
+        // **どちらも要る。** 0xFF を落とすと拡張ワードの上位バイトが
+        // 混じり、31 を落とすとシフト量が 32 以上になって、生成コードの
+        // 「1 を imm ビット左へ寄せる」が Xtensa で未定義の量になる。
+        case PlanKind::kBtstImmToDreg:
+            p.imm = (ext0 & 0xFFu) & 31u;
+            break;
+
+        // --- Tier H: ADDQ/SUBQ #imm,An ---
+        //
+        // 即値は命令語の bit9-11 にあるので planQuickAlu が確定済み。
+        // **拡張ワードを持たないので、ここでは何もしない。**
+        case PlanKind::kAddqImmToAreg:
             break;
         case PlanKind::kMoveaImmToAreg:
             // MOVEA.w は符号拡張して 32bit 全体を書く。

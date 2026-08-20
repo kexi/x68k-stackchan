@@ -41,6 +41,7 @@
 #include "cpu/block_planner.h"
 #include "cpu/code_gen_map.h"
 #include "cpu/m68k_alu.h"
+#include "cpu/m68k_length.h"
 #include "cpu/m68k_types.h"
 #include "jit/block_emitter.h"
 #include "jit/block_runner.h"
@@ -2312,6 +2313,334 @@ TEST_CASE("Tier G の命令はブロックを終端しない")
     }
 }
 
+// --- Tier H: 命令長デコーダの拡張が解禁した形 -------------------------------
+
+// CMPI.<size> #imm,Dn : 0000 110 ss 000 rrr。
+constexpr u16 cmpiToDn(u32 dst, u32 sizeBits)
+{
+    return static_cast<u16>(0x0C00u | (sizeBits << 6) | dst);
+}
+// BTST #imm,Dn : 0000 100 00 000 rrr。
+constexpr u16 btstImmToDn(u32 dst)
+{
+    return static_cast<u16>(0x0800u | dst);
+}
+// ADDQ / SUBQ #data,<ea> : 0101 ddd s ss mmm rrr。
+// data は 1-8 (8 は符号化では 0)。isSub で bit8 が立つ。
+constexpr u16 addqTo(u32 data, bool isSub, u32 sizeBits, u32 mode, u32 reg)
+{
+    const u32 field = data == 8 ? 0u : data;
+    return static_cast<u16>(0x5000u | (field << 9) | (isSub ? 0x0100u : 0u) | (sizeBits << 6) |
+                            (mode << 3) | reg);
+}
+
+// CMPI #imm,Dn — 実測でこの段の最大の的。
+//
+// **CMP #imm,Dn ($Bxxx の即値形) と意味はビット単位で同じ。** 違うのは
+// 符号とサイクル (CMPI は 8、CMP #imm は 4) だけなので、planner は
+// kAluImmToDreg として積み、cycles だけを分ける。
+//
+// 落ちる変異:
+//   - planImmediate の cycles を 4 にする (CMP #imm と取り違え)
+//   - CMPI の即値語数を .l で 1 語にする (デコーダ側。上位が落ちる)
+//   - aluOp を kSub にする (結果が Dn へ書き戻され、d[] が壊れる)
+TEST_CASE("CMPI #imm,Dn がインタプリタと一致する")
+{
+    // 桁溢れと符号の境界。V と C はここでしか壊れない。
+    static constexpr u32 kDstValues[] = {
+        0x00000000u, 0x00000001u, 0x0000007Fu, 0x00000080u, 0x00007FFFu,
+        0x00008000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x12345678u,
+    };
+
+    for (u32 dv : kDstValues)
+    {
+        M68kState s = makeState(1);
+        s.d[2] = dv;
+        // **X が保存されることを問う。** CMPI は applyResultFlags(.., false)
+        // なので X を触らない。入口で立てておけば、触った変異で落ちる。
+        s.sr = static_cast<u16>(0x2700u | 0x10u);
+
+        // .b : 即値 1 語。**上位バイトは捨てられる** (readEaSlow の 7.4)。
+        checkEquivalence({cmpiToDn(2, 0u), 0xFF7Fu}, s, "CMPI.b #imm,Dn");
+        checkEquivalence({cmpiToDn(2, 0u), 0x0080u}, s, "CMPI.b #imm,Dn 符号");
+        checkEquivalence({cmpiToDn(2, 0u), 0x0000u}, s, "CMPI.b #imm,Dn ゼロ");
+        // .w : 即値 1 語。
+        checkEquivalence({cmpiToDn(2, 1u), 0x8000u}, s, "CMPI.w #imm,Dn");
+        checkEquivalence({cmpiToDn(2, 1u), 0x7FFFu}, s, "CMPI.w #imm,Dn 正の端");
+        checkEquivalence({cmpiToDn(2, 1u), 0x0000u}, s, "CMPI.w #imm,Dn ゼロ");
+        // .l : 即値 **2 語**。上位が落ちると必ず落ちる。
+        checkEquivalence({cmpiToDn(2, 2u), 0x8000u, 0x0000u}, s, "CMPI.l #imm,Dn");
+        checkEquivalence({cmpiToDn(2, 2u), 0x1234u, 0x5678u}, s, "CMPI.l #imm,Dn 任意");
+        checkEquivalence({cmpiToDn(2, 2u), 0xFFFFu, 0xFFFFu}, s, "CMPI.l #imm,Dn -1");
+    }
+}
+
+// ADDQ / SUBQ #imm,Dn — **フラグを変える。**
+//
+// **即値は命令語の bit9-11 に埋まっている。** 拡張ワードを持たないので、
+// foldImmediate が ext0 から畳み直すと即値が黙って 0 になる。
+//
+// 落ちる変異:
+//   - foldImmediate の kAluImmToDreg で length == 2 の枝を落とす
+//     (即値が 0 になり、ADDQ #1 が ADD #0 に化ける)
+//   - 符号化の data == 0 を 8 と読まない (ADDQ #8 が ADDQ #0 になる)
+//   - planQuickAlu の cycles を 4 にする (ADD #imm と取り違え)
+//   - applyResultFlags の X を落とす (ADDQ は X を書く)
+TEST_CASE("ADDQ / SUBQ #imm,Dn がインタプリタと一致する")
+{
+    static constexpr u32 kDstValues[] = {
+        0x00000000u, 0x00000001u, 0x0000007Fu, 0x00000080u, 0x000000FFu, 0x00007FFFu,
+        0x00008000u, 0x0000FFFFu, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x12345678u,
+    };
+
+    // **data は 1-8 を全部回す。** 8 は符号化で 0 なので、そこだけ
+    // 特別扱いする実装 (data == 0 なら 8) が要る。
+    for (u32 data = 1; data <= 8; ++data)
+    {
+        for (bool isSub : {false, true})
+        {
+            for (u32 dv : kDstValues)
+            {
+                for (u32 sizeBits : {0u, 1u, 2u})
+                {
+                    M68kState s = makeState(1);
+                    s.d[3] = dv;
+                    // X が上書きされること (ADDQ/SUBQ は書く) を問う。
+                    s.sr = static_cast<u16>(0x2700u | 0x10u);
+                    checkEquivalence({addqTo(data, isSub, sizeBits, 0u, 3u)}, s,
+                                     "ADDQ/SUBQ #imm,Dn");
+                }
+            }
+        }
+    }
+}
+
+// ADDQ / SUBQ #imm,An — **フラグを 1 bit も変えず、常に 32bit で作用する。**
+//
+// Dn 宛てと取り違えると CCR が動く。.w でも a[] の 32bit 全体に効くので、
+// size で結果を切ると .w が上位を落とす。
+//
+// 落ちる変異:
+//   - emitAddqImmToAreg で emitStoreCcr を呼ぶ (フラグが動く)
+//   - 転送先を aOffset ではなく dOffset にする (Dn 宛てとの取り違え)
+//   - op.size で結果を切る (.w が上位を落とす)
+//   - planQuickAlu が An 宛てを kAluImmToDreg として積む
+TEST_CASE("ADDQ / SUBQ #imm,An がインタプリタと一致する")
+{
+    // 32bit の折り返しと符号の境界。**フラグ不変なので、CCR が動いたら
+    // どの値でも落ちる。**
+    static constexpr u32 kDstValues[] = {
+        0x00000000u, 0x00000001u, 0x00007FFFu, 0x00008000u,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x00FFFFF8u,
+    };
+
+    for (u32 data = 1; data <= 8; ++data)
+    {
+        for (bool isSub : {false, true})
+        {
+            for (u32 dv : kDstValues)
+            {
+                // **.w と .l の両方。** どちらも 32bit で効くので、
+                // 同じ結果になることが主張。
+                for (u32 sizeBits : {1u, 2u})
+                {
+                    M68kState s = makeState(1);
+                    s.a[3] = dv;
+                    // **CCR を全部立てておく。** 1 bit でも落ちたら落ちる。
+                    s.sr = static_cast<u16>(0x2700u | 0x1Fu);
+                    checkEquivalence({addqTo(data, isSub, sizeBits, 1u, 3u)}, s,
+                                     "ADDQ/SUBQ #imm,An");
+                }
+            }
+        }
+    }
+
+    // **planner は符号化のサイズを size 欄へ入れる** (kLong で埋めない)。
+    //
+    // エミッタはこの欄を読まないが、**常に 4 にすると欄が情報を失い、
+    // エミッタが誤って結果を size で切っても何も切られない**。
+    // そうなると上の差分テストが 1 件も落ちない (実際に変異を注入して
+    // 確かめた: kLong を入れた実装では emitTruncate を足しても
+    // 751 件が全部通った)。欄の中身をここで名指しで固定する。
+    {
+        x68k::PlannedOp p{};
+        REQUIRE(x68k::BlockPlanner::planOne(addqTo(1, false, 1u, 1u, 3u), kEntry, p));
+        CHECK(p.kind == PlanKind::kAddqImmToAreg);
+        CHECK(p.size == 2);  // .w は 2。**4 ではない**
+        REQUIRE(x68k::BlockPlanner::planOne(addqTo(1, false, 2u, 1u, 3u), kEntry, p));
+        CHECK(p.size == 4);  // .l は 4
+    }
+
+    // **A7 でも同じ。** 特例 (byte の -(A7) が 2 進む) は ADDQ には
+    // 無いので、A7 だけ別扱いにした変異があれば落ちる。
+    for (u32 data : {1u, 8u})
+    {
+        M68kState s = makeState(1);
+        s.a[7] = 0x00001000u;
+        s.sr = static_cast<u16>(0x2700u | 0x1Fu);
+        checkEquivalence({addqTo(data, false, 2u, 1u, 7u)}, s, "ADDQ.l #imm,A7");
+        checkEquivalence({addqTo(data, true, 2u, 1u, 7u)}, s, "SUBQ.l #imm,A7");
+    }
+}
+
+// BTST #imm,Dn — **Z フラグだけを変える。** N/V/C/X は保存される。
+//
+// 対象が Dn なので 32bit で回り、ビット番号は 31 でマスクされる。
+// Z は「テストしたビットが **0 だったか**」なので論理が逆。
+//
+// 落ちる変異:
+//   - emitBtstImm の clearMask を kLogicClear にする (N/V/C が落ちる)
+//   - Z の論理を反転する (moveqz を movnez にする)
+//   - foldImmediate の & 31 を落とす (シフト量が 32 以上で未定義)
+//   - foldImmediate の & 0xFF を落とす (拡張ワードの上位が混じる)
+TEST_CASE("BTST #imm,Dn がインタプリタと一致する")
+{
+    // **ビット番号を 0-31 で全部回す。** 境界 (0 と 31) だけでなく
+    // 途中も見るのは、シフト量の取り違えがどこで出るか分からないため。
+    for (u32 bit = 0; bit < 32; ++bit)
+    {
+        for (u32 dv : {0x00000000u, 0xFFFFFFFFu, 0x80000001u, 0x12345678u, 0xAAAAAAAAu})
+        {
+            M68kState s = makeState(1);
+            s.d[4] = dv;
+            // **CCR を全部立てておく。** Z 以外が落ちたらそこで落ちる。
+            s.sr = static_cast<u16>(0x2700u | 0x1Fu);
+            checkEquivalence({btstImmToDn(4), static_cast<u16>(bit)}, s, "BTST #imm,Dn");
+
+            // **Z が 0 の入口からも問う。** 上の入口は Z が立っているので、
+            // 「Z を書かない」変異が「立てる」ケースで素通りする。
+            M68kState s2 = makeState(1);
+            s2.d[4] = dv;
+            s2.sr = static_cast<u16>(0x2700u);
+            checkEquivalence({btstImmToDn(4), static_cast<u16>(bit)}, s2, "BTST #imm,Dn (Z=0)");
+        }
+    }
+
+    // **ビット番号は 31 でマスクされる。** 拡張ワードに 32 以上を置くと、
+    // インタプリタは bitNumber &= 31 で折り返す。
+    for (u32 raw : {32u, 33u, 63u, 0xFFu, 0x1FFu})
+    {
+        M68kState s = makeState(1);
+        s.d[4] = 0x12345678u;
+        s.sr = static_cast<u16>(0x2700u | 0x1Fu);
+        checkEquivalence({btstImmToDn(4), static_cast<u16>(raw)}, s, "BTST #imm,Dn マスク");
+    }
+}
+
+// Tier H もブロックを終端しない。
+//
+// **これが段 0-H の要点。** 段 0-F (BSR) の教訓 (終端はブロックを切る) から、
+// 非終端の形だけを選んである。終端側に回ると被覆率は上がっても速度が
+// 付いてこない。
+//
+// 落ちる変異: isBlockTerminator に Tier H の kind を足す
+TEST_CASE("Tier H の命令はブロックを終端しない")
+{
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const Case cases[] = {
+        {{cmpiToDn(2, 1u), 0x1234u}, "CMPI.w #imm,Dn"},
+        {{cmpiToDn(2, 2u), 0x1234u, 0x5678u}, "CMPI.l #imm,Dn"},
+        {{btstImmToDn(4), 0x0005u}, "BTST #imm,Dn"},
+        {{addqTo(1, false, 1u, 0u, 3u)}, "ADDQ.w #1,Dn"},
+        {{addqTo(8, true, 2u, 0u, 3u)}, "SUBQ.l #8,Dn"},
+        {{addqTo(1, false, 2u, 1u, 3u)}, "ADDQ.l #1,An"},
+        {{addqTo(4, true, 1u, 1u, 3u)}, "SUBQ.w #4,An"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        std::vector<u16> words = c.words;
+        words.push_back(moveq(1, 7));
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        // **2 命令入ること**が主張。1 なら終端側に回っている。
+        CHECK(plan.count == 2);
+        CHECK(plan.end != BlockEnd::kBranch);
+        CHECK(plan.end != BlockEnd::kDynamicBranch);
+        for (std::uint32_t i = 0; i < plan.count; ++i)
+        {
+            CHECK_FALSE(x68k::isBlockTerminator(plan.ops[i].kind));
+            CHECK_FALSE(x68k::hasStaticBranchTarget(plan.ops[i].kind));
+        }
+    }
+
+    // **窓が一切使えなくても積まれること。** Tier H はどれもメモリに
+    // 触れないので、読み・書き・メールボックスのどれが未配線でも
+    // 落ちてはいけない。落ちたら被覆率が黙って減る。
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what), " / 窓もメールボックスも未配線");
+        std::vector<u16> words = c.words;
+        words.push_back(moveq(1, 7));
+
+        FlatCode code;
+        BlockPlan plan{};
+        x68k::PlanCapabilities caps{};
+        caps.canEmitReads = [](void*) { return false; };
+        caps.canEmitWrites = [](void*) { return false; };
+        caps.canEmitDynamicBranch = [](void*) { return false; };
+        REQUIRE(buildPlan(words, plan, code, caps));
+        CHECK(plan.count == 2);
+    }
+}
+
+// **DBcc と TRAP はデコーダが長さを返すが、翻訳対象には入らない。**
+//
+// これが段 0-H の切り分け。長さが分かると、planner は
+// 「未対応命令の手前で終端 (kUnsupported)」として数えられるようになる。
+// 長さ不明のままだと kUnknownLength に混ざり、どちらで落ちているかが
+// 統計で見えなくなる (block_plan.h の BlockEnd)。
+//
+// **手前までは積める。** DBcc / TRAP を含む区間でも、その手前の命令は
+// ブロックに入る。デコーダを直すこと自体が、翻訳対象に入れていない
+// 命令の周辺にも効く理由がこれ。
+//
+// 落ちる変異:
+//   - planQuickAlu が ss == 11 を弾かない (DBcc / Scc が入る)
+//   - planMisc が TRAP を受ける (例外に入る命令がブロックへ入る)
+TEST_CASE("DBcc と TRAP は長さが分かるが翻訳対象には入らない")
+{
+    struct Case
+    {
+        u16 op;
+        u32 length;
+        const char* what;
+    };
+    const Case cases[] = {
+        {0x51C8u, 4u, "DBRA D0,<label>"}, {0x57CFu, 4u, "DBEQ D7,<label>"},
+        {0x50C0u, 2u, "ST D0 (Scc)"},     {0x4E40u, 2u, "TRAP #0"},
+        {0x4E4Fu, 2u, "TRAP #15"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        // 長さは返る。
+        CHECK(x68k::instructionLength(c.op) == c.length);
+        // だが許可リストには入らない。
+        x68k::PlannedOp planned{};
+        CHECK_FALSE(x68k::BlockPlanner::planOne(c.op, kEntry, planned));
+
+        // **手前の命令は積める。** MOVEQ を 2 つ置いてから対象を置くと、
+        // ブロックは 2 命令ぶん積んで「未対応命令の手前」で切れる。
+        FlatCode code;
+        BlockPlan plan{};
+        const std::vector<u16> words = {moveq(1, 7), moveq(2, 3), c.op, 0x0000u};
+        REQUIRE(buildPlan(words, plan, code));
+        CHECK(plan.count == 2);
+        // **長さが分かっているので kUnsupported。** kUnknownLength ではない。
+        // ここが段 0-H でデコーダを直した効果そのもの。
+        CHECK(plan.end == BlockEnd::kUnsupported);
+    }
+}
+
 // MOVEA <mem>,An も窓ガードの外なら**状態を 1 bit も変えずに降りる** (G3/G7)。
 //
 // 読み形 (Tier B) と同じ島へ降りるが、**転送先が a[] になった**ので、
@@ -3590,7 +3919,7 @@ TEST_CASE("どの EA モードでも staging に収まる")
     CHECK(worst <= 1536 * 4 / 5);
 }
 
-// Tier G を**最も重い形で 4 つ並べた**ブロックが kMaxBlockBytes に収まる。
+// Tier G / H を**最も重い形で 4 つ並べた**ブロックが kMaxBlockBytes に収まる。
 //
 // 段 0-E で `requiredSize` が上限を超えると emitBlock が黙って false を返し、
 // **正しさは無傷のまま、その段が狙う形そのものを落とす**ことを踏んでいる
@@ -3599,7 +3928,7 @@ TEST_CASE("どの EA モードでも staging に収まる")
 // 「最悪ケースを実際に組んで測る」形でしか守れない。
 //
 // 落ちる変異: kMaxBlockBytes を 1024 へ下げる / emitAluImm を l32r 固定にする
-TEST_CASE("Tier G 4 つを並べたブロックが kMaxBlockBytes に収まる")
+TEST_CASE("Tier G / H を 4 つ並べたブロックが kMaxBlockBytes に収まる")
 {
     struct WorstCase
     {
@@ -3622,6 +3951,15 @@ TEST_CASE("Tier G 4 つを並べたブロックが kMaxBlockBytes に収まる")
         {PlanKind::kCmpaAregToAreg, x68k::kEaNone, 2, PlanAluOp::kCmp, "CMPA.w An,An"},
         {PlanKind::kAddaDregToAreg, x68k::kEaNone, 2, PlanAluOp::kAdd, "ADDA.w Dn,An"},
         {PlanKind::kAddaAregToAreg, x68k::kEaNone, 2, PlanAluOp::kSub, "SUBA.w An,An"},
+        // --- Tier H ---
+        //
+        // **CMPI と ADDQ の Dn 宛ては kAluImmToDreg** なので上の 2 つが
+        // 既に測っている。ここに足すのは Tier H 固有の 2 つ。
+        //   ADDQ #imm,An : 定数 1 本 + load/add/store
+        //   BTST #imm,Dn : 定数 2 本 (マスクと kCcrZ) + CCR の読み書き
+        {PlanKind::kAddqImmToAreg, x68k::kEaNone, 4, PlanAluOp::kAdd, "ADDQ.l #imm,An"},
+        {PlanKind::kAddqImmToAreg, x68k::kEaNone, 2, PlanAluOp::kSub, "SUBQ.w #imm,An"},
+        {PlanKind::kBtstImmToDreg, x68k::kEaNone, 4, PlanAluOp::kAdd, "BTST #imm,Dn"},
     };
 
     std::size_t worst = 0;
@@ -3648,7 +3986,14 @@ TEST_CASE("Tier G 4 つを並べたブロックが kMaxBlockBytes に収まる")
             op.dstReg = 2;
             // **リテラルを共有させない。** 命令ごとに違う定数にしておかないと、
             // literalIndex が畳んで最悪ケースにならない。
-            op.imm = 0x00123456u + i * 0x1111u;
+            //
+            // **BTST だけは imm がビット番号 (0-31)。** planner が 31 で
+            // マスクした値しか入らない欄なので、ここでも契約を守る。
+            // 大きい値を入れると 1u << imm が未定義になり、測っているのが
+            // 「起こりえない形」になる。ビット 24 以上ならマスク定数が
+            // 16bit に収まらないので、l32r へ落ちる側 (= 重い側) を選ぶ。
+            const bool immIsBitNumber = c.kind == PlanKind::kBtstImmToDreg;
+            op.imm = immIsBitNumber ? (24u + i) : (0x00123456u + i * 0x1111u);
         }
         const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
         INFO(std::string(c.name), " = ", need, " バイト");

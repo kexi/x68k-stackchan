@@ -715,6 +715,65 @@ void emitAluImm(Emitter& e, const PlannedOp& op)
     emitAluBody(e, op);
 }
 
+// --- Tier H: 命令長デコーダの拡張が解禁した形 -----------------------------
+
+// ADDQ / SUBQ #imm,An。**フラグを 1 bit も変えない** (Tier H)。
+//
+// emitAdda との違いは src の出どころだけ (a[]/d[] からの load ではなく
+// 翻訳時定数)。**フラグ不変も 32bit 固定も同じ**なので、形をそろえてある。
+//
+// emitStoreCcr を呼ばないことがそのまま「フラグ不変」の実装になっている。
+// ADDQ の Dn 宛て (kAluImmToDreg) と取り違えると CCR が動く。
+//
+// **加減算は必ず 32bit。** .w の ADDQ も a[] の 32bit 全体に効く
+// (m68k_ops_misc.cpp の「常に 32bit で作用する」)。
+//
+// **op.size を読まないことが実装そのもの。** planner は符号化のサイズを
+// 入れてある (kLong で埋めていない) ので、ここで emitTruncate(op.size) を
+// 挟むと .w の ADDQ が上位 16bit を落とし、差分テストが落ちる。
+void emitAddqImmToAreg(Emitter& e, const PlannedOp& op)
+{
+    emitConst(e, kTmpA, op.imm);
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    if (op.aluOp == PlanAluOp::kAdd)
+    {
+        addN(e.slot(kNarrowLen), kTmpC, kTmpB, kTmpA);
+    }
+    else
+    {
+        sub(e.slot(kWideLen), kTmpC, kTmpB, kTmpA);
+    }
+    s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
+}
+
+// BTST #imm,Dn。**Z フラグだけを変える** (Tier H)。
+//
+// N/V/C/X は 1 bit も動かない。**clearMask が kCcrZ だけ**であることが
+// そのまま「Z 以外を保存する」の実装になっている。kLogicClear を渡すと
+// N と V/C が黙って落ちる。
+//
+// Z は「テストしたビットが 0 だったか」。**論理が逆**なので、
+// emitLogicFlags の moveqz (値が 0 なら Z を立てる) がそのまま使える:
+// d[reg] & (1 << imm) が 0 のとき Z を立てる。
+//
+// ビット番号は planner が 31 でマスク済み (foldImmediate) なので、
+// 1u << imm は必ず 32bit に収まる。
+void emitBtstImm(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    // 対象は Dn なので 32bit で回る。切り出しは要らない。
+    emitConst(e, kTmpConst, 1u << op.imm);
+    and_(e.slot(kWideLen), kTmpC, kTmpA, kTmpConst);
+
+    // 結果が 0 なら Z を立てる。**分岐を使わない** (emitLogicFlags と同じ理由:
+    // 条件分岐を挟むと以降の命令の変位が発行順に依存する)。
+    movi(e.slot(kWideLen), kTmpCcr, 0);
+    movi(e.slot(kWideLen), kTmpConst, static_cast<std::int32_t>(kCcrZ));
+    moveqz(e.slot(kWideLen), kTmpCcr, kTmpConst, kTmpC);
+
+    emitStoreCcr(e, kTmpCcr, kCcrZ);
+}
+
 // --- Tier B: 読みガード ----------------------------------------------------
 //
 // ここから下の 4 つが「メモリを読む形」の全部。守る不変条件は 3 つ:
@@ -2373,6 +2432,17 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 break;
             case PlanKind::kCmpaAregToAreg:
                 emitCmpa(e, op, /*srcIsAddressRegister=*/true);
+                break;
+
+            // --- Tier H: デコーダ拡張が解禁した形 ---
+            //
+            // **CMPI と ADDQ/SUBQ の Dn 宛てはここに現れない。**
+            // kAluImmToDreg として積まれるので上の枝を通る (block_plan.h)。
+            case PlanKind::kAddqImmToAreg:
+                emitAddqImmToAreg(e, op);
+                break;
+            case PlanKind::kBtstImmToDreg:
+                emitBtstImm(e, op);
                 break;
 
             // --- Tier C: メモリへ書く形 ---

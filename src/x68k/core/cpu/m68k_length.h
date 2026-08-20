@@ -113,6 +113,178 @@ inline u32 instructionLength(u16 op)
 
     switch (group)
     {
+        case 0x0:
+        {
+            // $0 は「即値を取る演算」と「ビット操作」と MOVEP の寄せ集め。
+            // 判別の順序は m68k_ops_misc.cpp の groupImmediate に合わせてある
+            // (ずれると長さと実行が食い違う)。
+            //
+            // 実行頻度で測った内訳 (Human68k 稼働中、落とした命令のうち):
+            // CMPI と BTST #imm が大半を占める。ORI/ANDI/SUBI/ADDI/EORI は
+            // 符号が同じ形なので、判別を 1 本足すだけで一緒に取れる。
+            const u32 opType = static_cast<u32>((op >> 9) & 7u);
+            const bool isDynamicBitOp = (op & 0x0100u) != 0;
+
+            // MOVEP ($0xx1xx で mode 1) は動的ビット操作と同じ空間にいる。
+            //
+            // Why not 一緒に扱うか: MOVEP は effectiveAddress を通らず、
+            // 変位ワードを自前で fetch する形 (m68k_ops_misc.cpp)。
+            // 長さは常に 4 だが、実行頻度が実測でほぼ 0 なので、
+            // 判別を 1 本増やすだけの値打ちが無い。扱わずに諦める。
+            if (isDynamicBitOp)
+            {
+                return kUnknownLength;
+            }
+
+            // BTST/BCHG/BCLR/BSET #imm : 0000 100 oo mmm rrr。
+            //
+            // **即値は必ず 1 語。** ビット番号は 8bit しか使わないので、
+            // 対象が Dn (32bit で回る) でも即値語数は変わらない。
+            // ここを「対象が Dn なら 2 語」と読むと 2 バイト過大になる。
+            const bool isStaticBitOp = opType == 4;
+            if (isStaticBitOp)
+            {
+                const u32 bitOp = static_cast<u32>((op >> 6) & 3u);
+                const bool isBtst = bitOp == 0;
+                // BTST は読むだけなので即値と PC 相対も取れる。
+                // 書き戻す方 (BCHG/BCLR/BSET) は取れない。
+                const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+                if (!isBtst && isImmediateOrPcRelative)
+                {
+                    return kUnknownLength;
+                }
+                // **An 直接は取れない。** ビット操作は Dn かメモリだけ。
+                if (mode == 1)
+                {
+                    return kUnknownLength;
+                }
+                // 対象の EA が読むバイト数は Dn なら 4、メモリなら 1 だが、
+                // **拡張ワード数に効くのは即値 (mode 7.4) のときだけ**。
+                // BTST #imm,#imm は byte で読む (readEa の size は kByte)。
+                const u32 targetSize = mode == 0 ? 4u : 1u;
+                const u32 words = eaExtensionWords(mode, reg, targetSize);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                // 命令語 + 即値 1 語 + EA の拡張ワード。
+                return 4 + words * 2;
+            }
+
+            // ORI/ANDI/SUBI/ADDI/EORI/CMPI : 0000 ooo ss mmm rrr。
+            // opType 4 は上で捌いた。7 は 68020 以降 (CMP2/CHK2) なので扱わない。
+            const bool isImmediateAlu = opType <= 3 || opType == 5 || opType == 6;
+            if (!isImmediateAlu)
+            {
+                return kUnknownLength;
+            }
+            const u32 sizeBits = static_cast<u32>((op >> 6) & 3u);
+            // ss = 11 はこの形に存在しない。
+            if (sizeBits == 3)
+            {
+                return kUnknownLength;
+            }
+            const u32 size = sizeBits == 0 ? 1u : (sizeBits == 1 ? 2u : 4u);
+
+            // **即値語数はサイズで決まる。** .b/.w が 1 語、.l が 2 語。
+            // eaExtensionWords(7, 4, size) と同じ式だが、こちらは
+            // 「対象の EA」ではなく「先頭に置かれる即値」なので別に数える。
+            const u32 immediateWords = size == 4 ? 2u : 1u;
+
+            // ORI/ANDI/EORI to CCR/SR ($003C / $007C など) は対象が即値。
+            //
+            // **扱わない。** to SR は特権命令で例外に入りうるし、
+            // 対象が mode 7.4 なので下の eaExtensionWords が即値語数を
+            // もう 1 度数えてしまう (実際には即値は 1 つしかない)。
+            const bool isTargetImmediate = mode == 7 && reg == 4;
+            if (isTargetImmediate)
+            {
+                return kUnknownLength;
+            }
+            // **An 直接は取れない。** 即値演算は Dn かメモリだけ。
+            if (mode == 1)
+            {
+                return kUnknownLength;
+            }
+            // CMPI は読むだけなので PC 相対も取れる。書き戻す方は取れない。
+            //
+            // Why not CMPI にも PC 相対を許さないか: 許すと長さは正しく
+            // 返せるが、m68k.cpp の readEaForModify が mode 7.2/7.3 を
+            // どう扱うかに依存する。**インタプリタが受ける形だけを返す。**
+            const bool isCmpi = opType == 6;
+            const bool isPcRelative = mode == 7 && (reg == 2 || reg == 3);
+            if (!isCmpi && isPcRelative)
+            {
+                return kUnknownLength;
+            }
+            const u32 words = eaExtensionWords(mode, reg, size);
+            if (words == kUnknownExtensionWords)
+            {
+                return kUnknownLength;
+            }
+            return 2 + (immediateWords + words) * 2;
+        }
+
+        case 0x5:
+        {
+            // $5 は ADDQ/SUBQ と Scc/DBcc が同居する。**ss で分かれる。**
+            //   ss != 11 : ADDQ/SUBQ #imm,<ea>  (拡張ワードは EA のぶんだけ)
+            //   ss == 11 かつ mode 1 : DBcc Dn,<label> (変位 1 語)
+            //   ss == 11 かつ mode != 1 : Scc <ea>
+            //
+            // **DBcc と ADDQ の判別を落とすと静かに壊れる。** DBcc は
+            // 変位ワードを持つので長さ 4 だが、ADDQ として読むと 2 になり、
+            // 変位ワードが次の命令語として実行される。
+            const u32 sizeBits = static_cast<u32>((op >> 6) & 3u);
+
+            const bool isSccOrDbcc = sizeBits == 3;
+            if (isSccOrDbcc)
+            {
+                // DBcc Dn,<label> : 0101 cccc 11001 rrr。
+                // **mode 1 は An 直接ではなく DBcc の符号。**
+                const bool isDbcc = mode == 1;
+                if (isDbcc)
+                {
+                    return 4;  // 命令語 + 変位 1 語
+                }
+                // Scc <ea>。byte で読んで書き戻すので、即値と PC 相対は取れない。
+                const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+                if (isImmediateOrPcRelative)
+                {
+                    return kUnknownLength;
+                }
+                const u32 words = eaExtensionWords(mode, reg, 1);
+                if (words == kUnknownExtensionWords)
+                {
+                    return kUnknownLength;
+                }
+                return 2 + words * 2;
+            }
+
+            // ADDQ/SUBQ #imm,<ea>。**即値は命令語の bit9-11 に埋まっている**
+            // ので、拡張ワードは EA のぶんだけ。ここを「即値 1 語」と
+            // 数えると 2 バイト過大になる。
+            const u32 size = sizeBits == 0 ? 1u : (sizeBits == 1 ? 2u : 4u);
+            // 書き戻すので即値と PC 相対は取れない。
+            const bool isImmediateOrPcRelative = mode == 7 && reg >= 2;
+            if (isImmediateOrPcRelative)
+            {
+                return kUnknownLength;
+            }
+            // **byte で An に触る形は不正命令。** .w/.l の An 直接は正当で、
+            // フラグを変えずに 32bit で作用する (m68k_ops_misc.cpp)。
+            if (size == 1 && mode == 1)
+            {
+                return kUnknownLength;
+            }
+            const u32 words = eaExtensionWords(mode, reg, size);
+            if (words == kUnknownExtensionWords)
+            {
+                return kUnknownLength;
+            }
+            return 2 + words * 2;
+        }
+
         case 0x1:  // MOVE.b
         case 0x2:  // MOVE.l
         case 0x3:  // MOVE.w
@@ -186,7 +358,19 @@ inline u32 instructionLength(u16 op)
             const bool isSwap = (op & 0xFFF8u) == 0x4840u;
             const bool isUnlk = (op & 0xFFF8u) == 0x4E58u;
             const bool isExt = (op & 0xFFB8u) == 0x4880u;
-            if (isRts || isNop || isRte || isRtr || isSwap || isUnlk || isExt)
+            // TRAP #n : 0100 1110 0100 nnnn ($4E40-$4E4F)。**拡張ワード無し。**
+            //
+            // Why not 拡張ワードを持つことにしないか: TRAP の番号は命令語の
+            // 下位 4bit に埋まっている。1 語あることにすると長さが 2 バイト
+            // 過大になり、次の命令語を読み飛ばす。
+            //
+            // 長さは返すが**翻訳対象には入れない** (必ず例外に入るため)。
+            // 分けてある理由は planner の I1 と I2 の順序で、長さが分かれば
+            // 「未対応命令の手前で終端 (kUnsupported)」として数えられる。
+            // 長さ不明のままだと kUnknownLength に混ざり、どちらで落ちて
+            // いるかが統計で見えなくなる。
+            const bool isTrap = (op & 0xFFF0u) == 0x4E40u;
+            if (isRts || isNop || isRte || isRtr || isSwap || isUnlk || isExt || isTrap)
             {
                 return 2;
             }
