@@ -730,9 +730,23 @@ void emitEffectiveAddress(Emitter& e, const PlannedOp& op)
 //
 // **ここを通るまで状態を書かない** (G3)。分岐の変位は出口の島を吐いてから
 // パッチするので、ここでは場所だけ確保する。
-void emitReadGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
+//
+// extent は「kTmpA から連続して触るバイト数」。単一転送では op.size だが、
+// MOVEM は 4 * 本数 になる。**ここを引数にしてあるのが要点。**
+//
+// Why not MOVEM 用に別のガードを書かないか: 式が同じなら実装も同じにする、
+// という guestWriteFits が guestReadFits を呼ぶのと同じ流儀。別々に書くと、
+// 片方だけ直したときに「単一転送では弾くが MOVEM では通す」形ができ、
+// 失敗は窓の外のホストメモリを踏むという最も遠い形で出る。
+//
+// **範囲ガード 1 本で全アクセスを尽くせる根拠** (MOVEM の場合):
+// base <= limit - extent <= 2^24 - extent が成立するとき、i 番目の
+// アクセス先 base + 4i (i < extent/4) は bit24 へ繰り上がらないので、
+// マスク後の値と一致する。整列は stride 4 なので base と同じ parity。
+// よって「範囲 + 整列」の 1 本が、転送ごとの個別ガードと同値になる。
+void emitRangeGuard(Emitter& e, std::uint32_t extent, std::uint32_t opIndex)
 {
-    const std::uint32_t size = op.size;
+    const std::uint32_t size = extent;
 
     // 失敗ビットを kTmpD へ集める。
     const bool needsAlignment = size != 1;
@@ -764,6 +778,12 @@ void emitReadGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
     const size_t insnPc = e.codeBase + e.cursor;
     std::uint8_t* slot = e.slot(kWideLen);
     e.addGuard(slot, insnPc, opIndex, /*branchOnZero=*/false, kTmpD, /*extraRetFlags=*/0u);
+}
+
+// 単一転送のガード列。触る範囲は op.size バイトぶん。
+void emitReadGuard(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
+{
+    emitRangeGuard(e, op.size, opIndex);
 }
 
 // (An)+ / -(An) の An 更新を確定させる (G4)。**ガードが通ってから呼ぶ。**
@@ -1234,6 +1254,268 @@ void emitMemoryWrite(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std
     // **size で切り出してから渡す** (切り出していないと Z が立たない)。
     emitTruncate(e, kTmpC, kTmpC, size);
     emitLogicFlags(e, kTmpC, size);
+}
+
+// --- Tier E: MOVEM ----------------------------------------------------------
+//
+// 対象は 2 形だけ (翻訳器が符号で固定している):
+//
+//   MOVEM.L (An)+,<regs>   kMovemPostIncToRegs   ビット i ↔ D0..A7 (i 昇順)
+//   MOVEM.L <regs>,-(An)   kMovemRegsToPredec    ビット i ↔ A7..D0 (i 昇順、
+//                                                 アドレスは降順)
+//
+// **レジスタ順を間違えるとスタックフレームが壊れ、原因が非常に追いにくい**
+// (インタプリタ m68k_ops_group4.cpp:395-420 が唯一の正解。写してある)。
+//
+// ## 部分実行はしない (all-or-nothing)
+//
+// ガード不成立の回復経路は「runner が step() へ落とし、インタプリタが
+// **命令全体を**実行し直す」の 1 本しかない。転送を途中まで済ませて An を
+// 進めた状態から step() が走ると、済んだぶんがもう一度転送される。
+// G7 (降りる先はその命令の直前の命令境界) と、状態のビット単位同一性の
+// 両方が壊れる。
+//
+// **だから全アクセスを 1 本のガードで事前に検査する。** 対象が (An)+ /
+// -(An) の 2 形だけなので全転送のアドレスが連続し、
+// extent = 4 * popcount(mask) は翻訳時定数 (本数 <= 4 なので 16 以下)。
+// 範囲ガード 1 本が転送ごとの個別ガードと同値になる (emitRangeGuard の
+// コメントに根拠)。
+//
+// An < extent の予減ラップ (インタプリタはアクセス毎マスクでメモリ最上部へ
+// 回る) は、この式では範囲ガード不成立に落ちて step() が正しく再演する。
+// **保守的だが正しい。**
+
+// マスクの立っているビット数。extent と本数の計算に使う。
+constexpr std::uint32_t movemTransferCount(std::uint32_t mask)
+{
+    std::uint32_t count = 0;
+    for (std::uint32_t bit = 0; bit < 16; ++bit)
+    {
+        if (((mask >> bit) & 1u) != 0)
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// この命令が連続して触るバイト数。**単一転送は size、MOVEM は 4 * 本数。**
+//
+// 窓がその範囲を一度も許さないなら焼いても毎回ガードで降りるだけなので、
+// 翻訳時の受理判定 (canEmitReads / canEmitWritesFor) がこれを見る。
+// **op.size で見ると MOVEM が 4 バイトぶんしか検査されない。**
+constexpr std::uint32_t accessExtentOf(const PlannedOp& op)
+{
+    const bool isMovem =
+        op.kind == PlanKind::kMovemPostIncToRegs || op.kind == PlanKind::kMovemRegsToPredec;
+    return isMovem ? 4u * movemTransferCount(op.imm & 0xFFFFu) : op.size;
+}
+
+// 転送 1 本の転送先 / 転送元になる状態のバイトオフセット。
+//
+// regIndex は 0-7 が d[0..7]、8-15 が a[0..7]。インタプリタの
+// `regIndex < 8 ? st_.d[regIndex] : st_.a[regIndex - 8]` と同じ写像。
+constexpr std::uint32_t movemRegOffset(std::uint32_t regIndex)
+{
+    return regIndex < 8 ? dOffset(regIndex) : aOffset(regIndex - 8);
+}
+
+// MOVEM 1 命令。**ガード 1 本 → 転送を展開 → An commit、の順。**
+//
+// 順序が契約そのもの (G1/G3/G4):
+//
+//   [base 計算]    レジスタを読むだけ。状態は 1 bit も変えない
+//   [ガード 1 本]  整列 + 範囲 (extent ぶん)。不成立で島へ
+//   [自ページ x2]  書き形のみ。範囲の両端を見る (G13)
+//   --- ここから下はガードが全部通ったときだけ走る ---
+//   [転送 x count] 読みは load → s32i、書きは l32i → touch x2 → store
+//   [An commit]    **必ず最後。** 1 回だけ (G4)
+//
+// マスクは翻訳時定数なので、立っているビットを静的に列挙して転送ごとの
+// 直線コードを展開する。
+//
+// Why not 実行時にビットを走査するループを吐かないか: マスクが翻訳時に
+// 分かっているのに実行時へ持ち越すのは情報を捨てる行為で、走査の分岐と
+// カウンタが 1 転送ごとに乗る。本数は 4 以下と分かっているので、
+// 展開しても命令数は高が知れている。
+void emitMovem(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32_t page)
+{
+    const std::uint32_t mask = op.imm & 0xFFFFu;
+    const std::uint32_t count = movemTransferCount(mask);
+    const bool toRegisters = op.kind == PlanKind::kMovemPostIncToRegs;
+
+    // 本数の上限と 0 本は翻訳器が弾いている (BlockEnd::kMovemTooManyRegs)。
+    // **エミッタ単体でも断れるようにする** (テストが計画を直接渡す)。
+    if (count == 0 || count > kMovemMaxTransfers)
+    {
+        e.failed = true;
+        return;
+    }
+    // 対象は .L だけ。翻訳器が size を 4 に固定しているが、
+    // .W が来たら符号拡張が要るので黙って通してはいけない。
+    if (op.size != 4u)
+    {
+        e.failed = true;
+        return;
+    }
+
+    const std::uint32_t extent = 4u * count;
+
+    // 触る範囲の先頭 (マスク済み) を kTmpA へ、commit する値の基準を kTmpB へ。
+    //
+    // 読み形 (An)+ : base = a[An]、commit = a[An] + extent
+    // 書き形 -(An) : base = a[An] - extent、commit = base (減った値そのもの)
+    //
+    // **減算は 32bit 無マスクでやってからマスクする。** インタプリタも
+    // a[] には無マスクの値を書く (effectiveAddress / -(An) の環算)。
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
+    if (!toRegisters)
+    {
+        if (!canAddi(-static_cast<std::int32_t>(extent)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpB, kTmpB, -static_cast<std::int32_t>(extent));
+    }
+    emitConst(e, kTmpConst, kGuestAddrMask);
+    and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
+
+    // ガード。**extent ぶんを 1 本で見る** (部分実行しないための要)。
+    emitRangeGuard(e, extent, opIndex);
+
+    if (!toRegisters)
+    {
+        // G13: 書く範囲が自ページに掛かるなら、書く前に脱出する。
+        //
+        // **両端を見れば範囲全体が尽くせる。** extent <= 16 < 1KB なので、
+        // 範囲が跨げるページ境界は高々 1 つ。先頭と末尾が別ページなら
+        // その間にページは無い。
+        emitSelfPageGuard(e, opIndex, 0u, page);
+        emitSelfPageGuard(e, opIndex, extent - 1u, page);
+    }
+    if (e.failed)
+    {
+        return;
+    }
+
+    // --- ここから下はガードが全部通ったときだけ走る (G3) ---
+
+    // ホストアドレスを kTmpCcr へ作り、転送ごとに 4 ずつ歩く。
+    //
+    // **kTmpCcr と kTmpSr を転送の作業に使う。** MOVEM は CCR にも sr にも
+    // 触らない (インタプリタが sr を書かない) ので、どちらも空いている。
+    // kTmpB/kTmpD/kTmpE/kTmpConst は emitTouch が潰すので、転送を跨いで
+    // 値を保てない。
+    emitConst(e, kTmpConst, e.env.ramBaseAddr);
+    addN(e.slot(kNarrowLen), kTmpCcr, kTmpConst, kTmpA);
+
+    // commit する値 (無マスク) を、転送を跨いで生き残る側へ写しておく。
+    //
+    // **kTmpB のままでは駄目。** 書き形は転送ごとに emitTouch を呼び、
+    // emitTouch は世代の +1 を組むのに kTmpB を潰す。ここで写さないと、
+    // 最後の commit が「最後に触ったページの世代」を An へ書く。
+    movN(e.slot(kNarrowLen), kTmpSr, kTmpB);
+
+    // **アドレスは常に昇順に歩く。** 辿るビットの向きが 2 形で逆になる。
+    //
+    //   読み形 (An)+ : インタプリタもビット昇順でアドレスを増やす。
+    //                  ビット i ↔ D0 から数えて i 番目 (regIndex = i)。
+    //   書き形 -(An) : インタプリタは**ビット昇順でアドレスを減らす**ので、
+    //                  低いアドレスに載るのは**最後に転送したレジスタ**。
+    //                  昇順のアドレスへ写すには**ビットを降順に辿る**。
+    //                  ビット i ↔ A7 から数えて i 番目 (regIndex = 15 - i)。
+    //
+    // **ここを昇順のまま書くとレジスタの並びが丸ごと逆になり、
+    // スタックフレームが壊れる** (インタプリタが名指ししている失敗)。
+    // 実際にこの向きを取り違えて 1 度落とした。
+    std::uint32_t done = 0;
+    for (std::uint32_t step = 0; step < 16; ++step)
+    {
+        const std::uint32_t bit = toRegisters ? step : 15u - step;
+        if (((mask >> bit) & 1u) == 0)
+        {
+            continue;
+        }
+        const std::uint32_t regIndex = toRegisters ? bit : 15u - bit;
+        const std::uint32_t offset = movemRegOffset(regIndex);
+
+        if (toRegisters)
+        {
+            // ビッグエンディアンで組んで、そのままレジスタへ。
+            // **符号拡張は要らない** (.L は 32bit そのもの)。
+            l8ui(e.slot(kWideLen), kTmpC, kTmpCcr, 0u);
+            for (std::uint32_t byteAt = 1; byteAt < 4u; ++byteAt)
+            {
+                l8ui(e.slot(kWideLen), kTmpD, kTmpCcr, byteAt);
+                slli(e.slot(kWideLen), kTmpC, kTmpC, 8u);
+                or_(e.slot(kWideLen), kTmpC, kTmpC, kTmpD);
+            }
+            s32i(e.slot(kWideLen), kTmpC, kState, offset);
+        }
+        else
+        {
+            // 書く値を先に読む。**base の An がマスクに入っていても、
+            // 書かれるのは元の An** (インタプリタは a[] を書き換える前に
+            // 値を読む)。commit を最後に置いてあるので自然にそうなる。
+            l32i(e.slot(kWideLen), kTmpC, kState, offset);
+
+            // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
+            // kTmpA を転送先の先頭へ寄せてから呼ぶ (emitTouch は kTmpA を
+            // 見る)。飽和つきなので回数と引数が意味を持つ。
+            if (done != 0)
+            {
+                if (!canAddi(4))
+                {
+                    e.failed = true;
+                    return;
+                }
+                addi(e.slot(kWideLen), kTmpA, kTmpA, 4);
+            }
+            emitTouch(e, 0u, op);
+            if (e.failed)
+            {
+                return;
+            }
+            emitTouch(e, 3u, op);
+            if (e.failed)
+            {
+                return;
+            }
+
+            emitBigEndianStore(e, kTmpCcr, kTmpC, 4u);
+        }
+
+        ++done;
+        if (done != count)
+        {
+            if (!canAddi(4))
+            {
+                e.failed = true;
+                return;
+            }
+            addi(e.slot(kWideLen), kTmpCcr, kTmpCcr, 4);
+        }
+    }
+
+    // An commit (G4)。**必ず全転送の後に 1 回。**
+    //
+    // 読み形で base の An 自身がマスクに入っていると、ロードした値を
+    // ここが上書きする。インタプリタも同じ
+    // (m68k_ops_group4.cpp:476-479 がループ後に st_.a[reg] = addr)。
+    if (toRegisters)
+    {
+        if (!canAddi(static_cast<std::int32_t>(extent)))
+        {
+            e.failed = true;
+            return;
+        }
+        addi(e.slot(kWideLen), kTmpC, kTmpSr, static_cast<std::int32_t>(extent));
+        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(eaRegOf(op)));
+        return;
+    }
+    // 書き形は既に引いた値がそのまま最終値。
+    s32i(e.slot(kWideLen), kTmpSr, kState, aOffset(eaRegOf(op)));
 }
 
 // --- Tier D: 動的分岐 (RTS / JSR) --------------------------------------------
@@ -1811,14 +2093,10 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 e.failed = true;
                 break;
 
-            // --- 段 0-E: planner は積むが、エミッタはまだ吐けない ---
+            // --- Tier E: MOVEM ---
             case PlanKind::kMovemPostIncToRegs:
             case PlanKind::kMovemRegsToPredec:
-                // M1 で planner の受理率だけ先に測っている段階。
-                // **ここを黙って通してはいけない** ので明示的に断る。
-                // 断ればブロックが翻訳されず step() が担うだけで、
-                // 正しさは変わらない (許可リスト方式の性質)。
-                e.failed = true;
+                emitMovem(e, op, i, plan.page);
                 break;
 
             // --- Tier A: メモリに触れず例外も起きない形 ---
@@ -1915,8 +2193,9 @@ bool canEmitWritesFor(const BlockPlan& plan, const EmitEnv& env)
             return false;
         }
 
-        // 窓がこのサイズの書きを一度も許さないなら、ガードは常に不成立。
-        if (env.ramLimit < op.size)
+        // 窓がこの範囲の書きを一度も許さないなら、ガードは常に不成立。
+        // **op.size ではなく extent。** MOVEM は 4 * 本数を連続して書く。
+        if (env.ramLimit < accessExtentOf(op))
         {
             return false;
         }
@@ -2039,8 +2318,9 @@ bool canEmitReads(const BlockPlan& plan, const EmitEnv& env)
             return false;
         }
 
-        // 窓がこのサイズの読みを一度も許さないなら、ガードは常に不成立。
-        if (env.ramLimit < op.size)
+        // 窓がこの範囲の読みを一度も許さないなら、ガードは常に不成立。
+        // **op.size ではなく extent。** MOVEM は 4 * 本数を連続して読む。
+        if (env.ramLimit < accessExtentOf(op))
         {
             return false;
         }

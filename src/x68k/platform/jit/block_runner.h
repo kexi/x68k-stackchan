@@ -29,6 +29,7 @@
 #include "cpu/block_plan.h"
 #include "cpu/m68k.h"
 #include "cpu/native_exec.h"
+#include "jit/block_emitter.h"
 #include "jit/exec_memory.h"
 #include "jit/negative_cache.h"
 
@@ -174,7 +175,11 @@ private:
     // 書き 1 命令は「ガード 3 本 + touch 2 組 + バイト 4 本の store + 島 2 つ」
     // で読み形の 1.5 倍近くあり、命令を 1 つ足しただけで超える。
     // 超えたら黙って諦める (素通りする) 形なので、先に広げておく。
-    static constexpr std::size_t kStagingBytes = 1536;
+    //
+    // **値はエミッタ側の kMaxBlockBytes を使う。** ここに数字を書き写すと、
+    // 片方だけ広げたときに「エミッタは吐けるが runner が収まらないと言って
+    // 捨てる」形ができ、被覆が黙って減る (Tier E で実際に踏んだ)。
+    static constexpr std::size_t kStagingBytes = jit::kMaxBlockBytes;
     alignas(4) std::uint8_t staging_[kStagingBytes]{};
 
     BlockSlot* slots_ = nullptr;

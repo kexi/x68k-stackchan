@@ -3274,6 +3274,750 @@ TEST_CASE("書きガード脱出の irc が実メモリの mem16(opPc + 2) と�
     (void)selfPageAddr;
 }
 
+// --- Tier E: MOVEM ----------------------------------------------------------
+//
+// 対象は 2 形だけ:
+//
+//   MOVEM.L (An)+,<regs>   ビット i ↔ D0..A7 (i 昇順)
+//   MOVEM.L <regs>,-(An)   ビット i ↔ A7..D0 (i 昇順、アドレスは降順)
+//
+// 単一転送との決定的な違いは、**1 命令が最大 4 か所へ連続して触る**こと。
+// ガード不成立で降りる先はその命令の直前の命令境界しかない (G7) ので、
+// 転送を途中まで済ませて降りることは許されない。全事前検査が要る。
+
+namespace
+{
+
+// MOVEM.L (An)+,<regs> = $4CD8 | reg。拡張ワードにマスクが続く。
+constexpr u16 movemToRegs(u32 reg)
+{
+    return static_cast<u16>(0x4CD8u | reg);
+}
+
+// MOVEM.L <regs>,-(An) = $48E0 | reg。拡張ワードにマスクが続く。
+constexpr u16 movemToPreDec(u32 reg)
+{
+    return static_cast<u16>(0x48E0u | reg);
+}
+
+// MOVEM のテストで使うゲストアドレス。**自ブロックのページから遠く**、
+// かつ偶数。近いと G13 の脱出が混ざって比較の意味が変わる。
+constexpr u32 kMovemAddr = 0x00060000u;
+
+// 連続する len バイトを、**全部違う値**で埋める種を仕込む。
+//
+// seedData は 4 バイトしか置けない。MOVEM は最大 16 バイトを触るので、
+// バイトが 1 つでも入れ替わったら分かるだけの長さが要る。
+void seedRun(u32 addr, u32 len, u8 first)
+{
+    guestSeeds().clear();
+    GuestSeed seed;
+    seed.addr = addr;
+    for (u32 i = 0; i < len; ++i)
+    {
+        seed.bytes.push_back(static_cast<u8>(first + i * 7u));
+    }
+    guestSeeds().push_back(seed);
+}
+
+// マスクの立っているビット数。
+u32 popcount16(u32 mask)
+{
+    u32 n = 0;
+    for (u32 i = 0; i < 16; ++i)
+    {
+        n += (mask >> i) & 1u;
+    }
+    return n;
+}
+
+}  // namespace
+
+// --- T-E1: 差分テスト -------------------------------------------------------
+
+TEST_CASE("MOVEM.L (An)+,<regs> がインタプリタと一致する")
+{
+    // **本数もマスクの位置も散らす。** D だけ / A だけ / 混在 / 端 (D0, A7) を
+    // 含む形。ビット ↔ レジスタの写像を 1 つでも取り違えたら落ちる。
+    const u32 masks[] = {
+        0x0001u,  // D0 だけ (1 本、最下位ビット)
+        0x8000u,  // A7 だけ (1 本、最上位ビット)
+        0x0003u,  // D0,D1
+        0x000Fu,  // D0-D3 (4 本、上限)
+        0x0F00u,  // A0-A3
+        0x8001u,  // D0 と A7 (両端)
+        0x1248u,  // 散らばった 4 本
+        0xC000u,  // A6,A7
+    };
+
+    for (const u32 mask : masks)
+    {
+        for (const u32 seed : {1u, 3u, 7u})
+        {
+            const u32 count = popcount16(mask);
+            seedRun(kMovemAddr, count * 4u, static_cast<u8>(0x11u + seed));
+            M68kState s = makeState(seed);
+            s.a[2] = kMovemAddr;
+            checkEquivalence({movemToRegs(2), static_cast<u16>(mask)}, s, "MOVEM.L (An)+,<regs>");
+        }
+    }
+}
+
+TEST_CASE("MOVEM.L <regs>,-(An) がインタプリタと一致する")
+{
+    const u32 masks[] = {
+        0x0001u, 0x8000u, 0x0003u, 0x000Fu, 0x0F00u, 0x8001u, 0x1248u, 0xC000u,
+    };
+
+    for (const u32 mask : masks)
+    {
+        for (const u32 seed : {1u, 3u, 7u})
+        {
+            // 書き先に 0 でないバイトを置く。**書かない変異が緑で通らない**
+            // ようにするため。
+            const u32 count = popcount16(mask);
+            seedRun(kMovemAddr - 64u, 128u, static_cast<u8>(0xA5u + seed));
+            M68kState s = makeState(seed);
+            s.a[3] = kMovemAddr;
+            (void)count;
+            checkEquivalence({movemToPreDec(3), static_cast<u16>(mask)}, s, "MOVEM.L <regs>,-(An)");
+        }
+    }
+}
+
+TEST_CASE("MOVEM は CCR を 1 bit も変えない")
+{
+    // インタプリタの MOVEM は st_.sr にまったく触らない。**sr への任意の
+    // 書き込みを入れる変異が、ここで落ちる。**
+    //
+    // checkEquivalence が sr を含めて全状態を比べるので、CCR の初期値を
+    // 散らしておけば「どの向きに壊しても」検出できる。
+    for (const u32 seed : {0u, 1u, 2u, 15u, 31u})
+    {
+        seedRun(kMovemAddr, 16u, 0x31u);
+        M68kState s = makeState(4);
+        // 下位 5bit (CCR) を総当たりに近い形で散らす。
+        s.sr = static_cast<u16>(0x2700u | seed);
+        s.a[2] = kMovemAddr;
+        checkEquivalence({movemToRegs(2), 0x000Fu}, s, "MOVEM 読み CCR 不変");
+
+        M68kState w = makeState(4);
+        w.sr = static_cast<u16>(0x2700u | seed);
+        w.a[3] = kMovemAddr;
+        checkEquivalence({movemToPreDec(3), 0x000Fu}, w, "MOVEM 書き CCR 不変");
+    }
+}
+
+// --- T-E2: 書き形のレジスタ順 -----------------------------------------------
+
+TEST_CASE("MOVEM.L <regs>,-(An) のビット i は A7 から数えて i 番目")
+{
+    // **ここを昇順に取り違えるとスタックフレームが壊れる** (インタプリタの
+    // コメントが名指ししている失敗)。checkEquivalence でも捕まるが、
+    // メモリ像をバイトで直に照合して「どのレジスタがどこへ出たか」を固定する。
+    clearSeeds();
+
+    // 全 16 レジスタへ相異なる値を置く。**上位バイトまで違う**ので、
+    // 1 本でも入れ替わればバイト照合が落ちる。
+    M68kState s{};
+    for (u32 i = 0; i < 8; ++i)
+    {
+        s.d[i] = 0xD0000000u + i * 0x11111111u;
+        s.a[i] = 0xA0000000u + i * 0x11111111u;
+    }
+    s.sr = 0x2700u;
+    s.a[3] = kMovemAddr;
+
+    // **ビット i は A7 から数えて i 番目。** ビット 0,1,8,9 を立てると、
+    // 積まれるのは A7, A6, D7, D6 (D0,D1,A0,A1 では**ない**)。
+    // ここを取り違えるのがまさに防ぎたい失敗なので、期待値は
+    // インタプリタの式 (regIndex = 15 - i) から起こす。
+    const u32 mask = 0x0303u;
+    const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+    REQUIRE_FALSE(native.guardExit);
+
+    // インタプリタは**ビット昇順でアドレスを減らしながら**置く:
+    //   bit 0 (A7) → An-4、bit 1 (A6) → An-8、bit 8 (D7) → An-12、
+    //   bit 9 (D6) → An-16。
+    // つまり低いアドレスから並べると D6, D7, A6, A7。
+    const u32 base = kMovemAddr - 16u;
+    const u32 expect[4] = {s.d[6], s.d[7], s.a[6], s.a[7]};
+    for (u32 i = 0; i < 4; ++i)
+    {
+        const u32 at = base + i * 4u;
+        // ビッグエンディアンでバイト照合する。
+        for (u32 b = 0; b < 4; ++b)
+        {
+            const u8 want = static_cast<u8>((expect[i] >> ((3u - b) * 8u)) & 0xFFu);
+            INFO("i=", i, " b=", b);
+            CHECK(execRam()[at + b] == want);
+        }
+    }
+    // An は範囲の先頭まで下がる。
+    CHECK(native.state.a[3] == base);
+}
+
+TEST_CASE("MOVEM.L (An)+,<regs> のビット i は D0 から数えて i 番目")
+{
+    // 読み形の写像も同じ流儀で固定する。**降順への反転がここで落ちる。**
+    clearSeeds();
+
+    // 4 語ぶんの相異なるパターンを置く。
+    GuestSeed seed;
+    seed.addr = kMovemAddr;
+    const u32 values[4] = {0x11223344u, 0x55667788u, 0x99AABBCCu, 0xDDEEFF00u};
+    for (const u32 v : values)
+    {
+        for (u32 b = 0; b < 4; ++b)
+        {
+            seed.bytes.push_back(static_cast<u8>((v >> ((3u - b) * 8u)) & 0xFFu));
+        }
+    }
+    guestSeeds().clear();
+    guestSeeds().push_back(seed);
+
+    M68kState s = makeState(2);
+    s.a[2] = kMovemAddr;
+
+    // D1, D3, A0, A5 を読む。ビット: D1=1, D3=3, A0=8, A5=13。
+    const u32 mask = (1u << 1) | (1u << 3) | (1u << 8) | (1u << 13);
+    const std::vector<u16> words{movemToRegs(2), static_cast<u16>(mask)};
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    INFO(std::string(native.failure == nullptr ? "ok" : native.failure));
+    REQUIRE(native.ok);
+    REQUIRE_FALSE(native.guardExit);
+
+    // ビット昇順に、先頭から順に入る。
+    CHECK(native.state.d[1] == values[0]);
+    CHECK(native.state.d[3] == values[1]);
+    CHECK(native.state.a[0] == values[2]);
+    CHECK(native.state.a[5] == values[3]);
+    // 触っていないレジスタは元のまま。
+    CHECK(native.state.d[0] == s.d[0]);
+    CHECK(native.state.d[2] == s.d[2]);
+    CHECK(native.state.a[1] == s.a[1]);
+    // An は読み終わった位置まで進む。
+    CHECK(native.state.a[2] == kMovemAddr + 16u);
+}
+
+// --- T-E3: base がマスクに入っている形 --------------------------------------
+
+TEST_CASE("読み形は base の An にロードした値を commit が上書きする")
+{
+    // **G4 の要点。** インタプリタは (m68k_ops_group4.cpp) ループの後に
+    // st_.a[reg] = addr を無条件で書くので、マスクに base 自身が入っていても
+    // **最後に勝つのは commit の値**。
+    //
+    // commit を転送より前へ動かす変異は、ここで落ちる。
+    clearSeeds();
+    GuestSeed seed;
+    seed.addr = kMovemAddr;
+    for (u32 b = 0; b < 8; ++b)
+    {
+        seed.bytes.push_back(static_cast<u8>(0xE0u + b));
+    }
+    guestSeeds().clear();
+    guestSeeds().push_back(seed);
+
+    M68kState s = makeState(5);
+    s.a[2] = kMovemAddr;
+    // D0 と A2 (= base 自身) を読む。ビット: D0=0, A2=10。
+    const u32 mask = (1u << 0) | (1u << 10);
+    checkEquivalence({movemToRegs(2), static_cast<u16>(mask)}, s, "読み形 base がマスクに入る");
+
+    // 値も名指しで固定する。
+    const std::vector<u16> words{movemToRegs(2), static_cast<u16>(mask)};
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+    REQUIRE_FALSE(native.guardExit);
+    // **ロードした値 (0xE4E5E6E7) ではなく、commit の値。**
+    CHECK(native.state.a[2] == kMovemAddr + 8u);
+}
+
+TEST_CASE("書き形は base の An について元の値を書く")
+{
+    // -(An) 形で base 自身がマスクに入ると、書かれるのは**減らす前の An**。
+    // インタプリタは a[] を書き換える前に値を読むので、そうなる。
+    clearSeeds();
+    seedRun(kMovemAddr - 64u, 128u, 0x5Au);
+
+    M68kState s = makeState(6);
+    s.a[3] = kMovemAddr;
+    // D0 と A3 (= base 自身) を積む。**書き形のビットは A7 から数える**ので、
+    // A3 は regIndex 11 = ビット 4、D0 は regIndex 0 = ビット 15。
+    const u32 mask = (1u << 4) | (1u << 15);
+    checkEquivalence({movemToPreDec(3), static_cast<u16>(mask)}, s, "書き形 base がマスクに入る");
+
+    const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+    REQUIRE_FALSE(native.guardExit);
+
+    // 2 本ぶん (8 バイト) 下がる。低い方が D0、高い方が A3 (= base 自身)。
+    const u32 base = kMovemAddr - 8u;
+    CHECK(native.state.a[3] == base);
+    // 高い方の 4 バイトが**元の A3** であること (減らした後の値ではない)。
+    for (u32 b = 0; b < 4; ++b)
+    {
+        const u8 want = static_cast<u8>((kMovemAddr >> ((3u - b) * 8u)) & 0xFFu);
+        INFO("b=", b);
+        CHECK(execRam()[base + 4u + b] == want);
+    }
+}
+
+// --- T-E4: all-or-nothing ---------------------------------------------------
+
+TEST_CASE("MOVEM は範囲の一部でも窓を外れたら 1 bit も変えずに降りる")
+{
+    // **最重要。** ガードの bound を extent (= 4 * 本数) ではなく size (4) に
+    // 戻す変異は、ここでしか落ちない。
+    //
+    // 「1 本目は窓の中、3 本目で外れる」位置に base を置く。bound が 4 なら
+    // ガードは通ってしまい、2 本目以降が窓の外へ出る。extent なら降りる。
+    clearSeeds();
+    const u32 limit = static_cast<u32>(x68k::kMainRamSize);
+
+    for (const u32 count : {2u, 3u, 4u})
+    {
+        // 下位 count ビット = D0..D(count-1)。
+        const u32 mask = (1u << count) - 1u;
+        const u32 extent = count * 4u;
+
+        // 末尾 1 語だけが窓の外へ出る位置。
+        // base + extent - 4 == limit なので、最後の 1 本が外れる。
+        {
+            M68kState s = makeState(3);
+            s.a[2] = limit - extent + 4u;
+            checkEquivalence({movemToRegs(2), static_cast<u16>(mask)}, s, "読み 末尾が窓の外");
+
+            const std::vector<u16> words{movemToRegs(2), static_cast<u16>(mask)};
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            resetExecRam(words);
+            resetExecGen();
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("count=", count);
+            // **ガードで降りること。** bound を 4 に戻す変異はここで落ちる。
+            CHECK(native.guardExit);
+            // G7: 降りる先は MOVEM の直前の命令境界。手前に命令が無いので 0。
+            CHECK(native.ranOps == 0);
+            // 状態が 1 bit も変わっていないこと (An が進んでいない)。
+            CHECK(native.state.a[2] == s.a[2]);
+            for (u32 i = 0; i < 8; ++i)
+            {
+                CHECK(native.state.d[i] == s.d[i]);
+            }
+        }
+
+        // 書き形も同じ。-(An) は base = An - extent なので、
+        // An == limit + 4 に置くと先頭 1 語ぶんが窓の外へ出る。
+        {
+            M68kState s = makeState(3);
+            s.a[3] = limit + 4u;
+            const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+            checkEquivalence(words, s, "書き 先頭が窓の外");
+
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+            resetExecRam(words);
+            resetExecGen();
+            const std::vector<u8> before = execRam();
+            const std::vector<std::uint16_t> beforeGen = execGen();
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+            INFO("count=", count);
+            CHECK(native.guardExit);
+            CHECK(native.ranOps == 0);
+            CHECK(native.state.a[3] == s.a[3]);
+            // **メモリも世代も 1 bit も変わっていないこと** (G16: 降りる
+            // 経路では touch もしない)。
+            CHECK(execRam() == before);
+            CHECK(execGen() == beforeGen);
+        }
+    }
+}
+
+TEST_CASE("MOVEM は手前の命令ぶんだけ実行して命令境界で降りる")
+{
+    // G7 の本体。**手前に命令を置いて、ranOps がそこまでを指すこと。**
+    clearSeeds();
+    const u32 limit = static_cast<u32>(x68k::kMainRamSize);
+
+    M68kState s = makeState(4);
+    s.a[2] = limit - 8u;  // 4 本 (16 バイト) は入らない
+
+    // 手前に 2 命令 (どちらもメモリに触らない Tier A)。
+    const std::vector<u16> words{moveq(1, 7), moveq(2, -3), movemToRegs(2), 0x000Fu};
+    checkEquivalence(words, s, "手前 2 命令 + MOVEM で脱出");
+
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    resetExecRam(words);
+    resetExecGen();
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+    CHECK(native.guardExit);
+    // **手前の 2 命令ぶん。** MOVEM は 1 bit も実行していない。
+    CHECK(native.ranOps == 2);
+    CHECK(native.state.a[2] == s.a[2]);
+}
+
+// --- T-E5: 奇数 An と予減ラップ ---------------------------------------------
+
+TEST_CASE("奇数の An を持つ MOVEM は状態を変えずに降りる")
+{
+    // G7 / emitRts と同じ論法。**アドレスエラーは再現しない。** 降りて
+    // step() に再演させると、インタプリタがアドレスエラーへ入る。
+    clearSeeds();
+
+    for (const u32 mask : {0x0001u, 0x000Fu})
+    {
+        {
+            M68kState s = makeState(5);
+            s.a[2] = kMovemAddr + 1u;
+            checkEquivalence({movemToRegs(2), static_cast<u16>(mask)}, s, "読み 奇数 An");
+        }
+        {
+            M68kState s = makeState(5);
+            s.a[3] = kMovemAddr + 1u;
+            checkEquivalence({movemToPreDec(3), static_cast<u16>(mask)}, s, "書き 奇数 An");
+        }
+    }
+}
+
+TEST_CASE("予減が 0 からラップする MOVEM はガード不成立で降りる")
+{
+    // An < extent だと -(An) は 32bit で環算し、インタプリタはアクセス毎の
+    // マスクでメモリ最上部へ回る。生成コードの範囲ガードはこれを
+    // **不成立側**に落とす。保守的だが正しい (step() が再演する)。
+    clearSeeds();
+
+    for (const u32 count : {1u, 2u, 4u})
+    {
+        const u32 mask = (1u << count) - 1u;
+        M68kState s = makeState(2);
+        s.a[3] = count * 4u - 4u;  // extent より小さい
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+        checkEquivalence(words, s, "書き 予減ラップ");
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        resetExecRam(words);
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        INFO("count=", count);
+        CHECK(native.guardExit);
+        CHECK(native.ranOps == 0);
+        CHECK(native.state.a[3] == s.a[3]);
+    }
+}
+
+// --- T-E6: touch の回数 -----------------------------------------------------
+
+TEST_CASE("MOVEM の書きは転送ごとに touch を 2 回する")
+{
+    // G14/G16。**転送 1 回あたり 1 回へ畳む変異がここで落ちる。**
+    //
+    // 飽和つきなので回数が意味を持つ。世代が飽和の手前から始まる状況を
+    // 作って、インタプリタと同じ回数だけ上がることを問う。
+    clearSeeds();
+    seedRun(kMovemAddr - 64u, 128u, 0x77u);
+
+    for (const u32 count : {1u, 2u, 4u})
+    {
+        const u32 mask = (1u << count) - 1u;
+        M68kState s = makeState(3);
+        s.a[3] = kMovemAddr;
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+
+        // まず素の一致 (checkEquivalence が世代配列もバイト単位で比べる)。
+        checkEquivalence(words, s, "MOVEM 書き 世代");
+
+        // 回数を直に数える。全転送が同一ページに載る位置なので、
+        // そのページの世代が **2 * count** 上がるはず。
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        resetExecRam(words);
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        REQUIRE_FALSE(native.guardExit);
+
+        const u32 page = (kMovemAddr - count * 4u) >> 10;
+        INFO("count=", count, " page=", page);
+        // **転送ごとに 2 回。** 畳む変異なら count になる。
+        CHECK(execGen()[page] == static_cast<std::uint16_t>(2u * count));
+    }
+}
+
+TEST_CASE("MOVEM の書きの世代が飽和の境界でインタプリタと一致する")
+{
+    // 飽和つきの回数が意味を持つ形。0xFFFF で止まることと、
+    // そこへ至る回数がインタプリタと同じであること。
+    clearSeeds();
+    seedRun(kMovemAddr - 64u, 128u, 0x21u);
+
+    const u32 mask = 0x000Fu;  // 4 本 = touch 8 回
+    M68kState s = makeState(3);
+    s.a[3] = kMovemAddr;
+    const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+    const u32 page = (kMovemAddr - 16u) >> 10;
+
+    // 飽和の手前・ちょうど・跨ぐところを問う。
+    for (const std::uint16_t seedGen :
+         {static_cast<std::uint16_t>(0xFFF0u), static_cast<std::uint16_t>(0xFFF8u),
+          static_cast<std::uint16_t>(0xFFFEu), static_cast<std::uint16_t>(0xFFFFu)})
+    {
+        checkEquivalence(words, s, "MOVEM 書き 世代の飽和", fakeEnv(), page, seedGen);
+    }
+}
+
+// --- T-E7: 自ページへの書き -------------------------------------------------
+
+TEST_CASE("自ページに掛かる MOVEM の書きは書く前に脱出する")
+{
+    // G13。**範囲が plan.page に掛かったら 1 バイトも書かない。**
+    clearSeeds();
+    const u32 selfPageBase = kEntry & ~0x3FFu;
+
+    // (a) 範囲の末尾が自ページの先頭へ食い込む。
+    //     base は手前のページだが base + extent - 1 が自ページ。
+    {
+        const u32 mask = 0x0003u;  // 2 本 = 8 バイト
+        M68kState s = makeState(6);
+        s.a[3] = selfPageBase + 4u;  // base = selfPageBase - 4
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+        checkEquivalence(words, s, "MOVEM が自ページの先頭へ食い込む");
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        resetExecRam(words);
+        resetExecGen();
+        const std::vector<u8> before = execRam();
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        CHECK(native.guardExit);
+        // **bit23 が立つこと** (G18)。
+        CHECK(native.selfPageExit);
+        CHECK(native.ranOps == 0);
+        CHECK(execRam() == before);
+    }
+
+    // (b) 範囲がまるごと自ページに載る。
+    {
+        const u32 mask = 0x000Fu;
+        M68kState s = makeState(6);
+        s.a[3] = selfPageBase + 0x200u;
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+        checkEquivalence(words, s, "MOVEM がまるごと自ページ");
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        resetExecRam(words);
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        CHECK(native.guardExit);
+        CHECK(native.selfPageExit);
+        CHECK(native.ranOps == 0);
+    }
+
+    // (c) **対の成立側。** 両端が別ページで、範囲も自ページに掛からない
+    //     ところなら通ること。ここが無いと「常に脱出する」変異が緑で通る。
+    {
+        const u32 mask = 0x000Fu;
+        seedRun(kMovemAddr - 64u, 128u, 0x3Cu);
+        M68kState s = makeState(6);
+        s.a[3] = kMovemAddr;  // 自ページから遠い
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+        checkEquivalence(words, s, "MOVEM 自ページに掛からない (成立側)");
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+        resetExecRam(words);
+        resetExecGen();
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+        CHECK_FALSE(native.guardExit);
+    }
+
+    // (d) 範囲がページ境界を跨ぐが、どちらも自ページではない形も通ること。
+    {
+        const u32 mask = 0x000Fu;
+        const u32 crossing = (kMovemAddr & ~0x3FFu) + 8u;  // base = crossing - 16 で跨ぐ
+        seedRun(crossing - 64u, 128u, 0x4Du);
+        M68kState s = makeState(6);
+        s.a[3] = crossing;
+        const std::vector<u16> words{movemToPreDec(3), static_cast<u16>(mask)};
+        checkEquivalence(words, s, "MOVEM がページ境界を跨ぐ (成立側)");
+    }
+}
+
+// --- T-E8: requiredSize -----------------------------------------------------
+
+TEST_CASE("MOVEM 4 本を並べたブロックが staging に収まる")
+{
+    // **書き形 MOVEM ×4 が最悪。** 発行できるか、できないなら
+    // false で綺麗に断ること (黙って壊れた列を吐かないこと)。
+    BlockPlan plan{};
+    plan.entryPc = kEntry;
+    plan.count = static_cast<std::uint8_t>(x68k::kMaxOps);
+    plan.page = kEntry >> 10;
+    plan.end = BlockEnd::kUnsupported;
+    plan.fallThroughPc = kEntry + x68k::kMaxOps * 4u;
+    for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+    {
+        PlannedOp& op = plan.ops[i];
+        op.pc = kEntry + i * 4u;
+        op.length = 4;
+        op.kind = PlanKind::kMovemRegsToPredec;
+        op.size = 4;
+        op.cycles = static_cast<std::uint8_t>(8u + 4u * 8u);
+        op.eaMode = kModePreDec;
+        op.dstReg = 3;
+        op.imm = 0x000Fu;  // 4 本 (上限)
+    }
+
+    const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
+    INFO("MOVEM x4 で ", need, " バイト");
+    // 発行できること。**0 なら断っているので、そこで気づける。**
+    CHECK(need > 0);
+    // **書き形 MOVEM x4 が全 Tier を通じての最悪ケース。** 4 本 x 4 命令で
+    // 転送 16 回、touch 32 回ぶんの直線コードになる。runner の控えに
+    // 収まらないと、この形のブロックは黙って翻訳されない (= 素通りする)。
+    CHECK(need <= x68k::jit::kMaxBlockBytes);
+
+    // 読み形 4 つも同じく。
+    BlockPlan readPlan = plan;
+    for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+    {
+        readPlan.ops[i].kind = PlanKind::kMovemPostIncToRegs;
+        readPlan.ops[i].eaMode = kModePostInc;
+        readPlan.ops[i].srcReg = 2;
+        readPlan.ops[i].dstReg = 0;
+    }
+    const std::size_t readNeed = jit::requiredSize(readPlan, 0x4E71, 0x4E71, fakeEnv());
+    INFO("MOVEM 読み x4 で ", readNeed, " バイト");
+    CHECK(readNeed > 0);
+    CHECK(readNeed <= x68k::jit::kMaxBlockBytes);
+}
+
+TEST_CASE("窓が短すぎる MOVEM は発行しない")
+{
+    // **extent で見ていること。** op.size (4) で見る変異なら、
+    // 「4 本ぶんは入らないが 4 バイトなら入る」窓で発行してしまう。
+    BlockPlan plan{};
+    plan.entryPc = kEntry;
+    plan.count = 1;
+    plan.page = kEntry >> 10;
+    plan.end = BlockEnd::kUnsupported;
+    plan.fallThroughPc = kEntry + 4u;
+    PlannedOp& op = plan.ops[0];
+    op.pc = kEntry;
+    op.length = 4;
+    op.kind = PlanKind::kMovemPostIncToRegs;
+    op.size = 4;
+    op.cycles = 44;
+    op.eaMode = kModePostInc;
+    op.srcReg = 2;
+    op.imm = 0x000Fu;  // 4 本 = 16 バイト
+
+    // 16 バイトぶんを一度も許さない窓。**4 バイトなら許す**ので、
+    // size で見る変異はここで通ってしまう。
+    jit::EmitEnv tooSmall = fakeEnv();
+    tooSmall.ramLimit = 8;
+    CHECK(jit::requiredSize(plan, 0x4E71, 0x4E71, tooSmall) == 0);
+
+    // 足りる窓なら発行できること (対の成立側)。
+    CHECK(jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv()) > 0);
+}
+
+TEST_CASE("本数が上限を超える MOVEM はエミッタ単体でも断る")
+{
+    // 翻訳器が先に弾いているが、**エミッタ単体でも断れること。**
+    // 計画を直接組んで問う。
+    for (const u32 mask : {0x0000u, 0x001Fu, 0xFFFFu})
+    {
+        BlockPlan plan{};
+        plan.entryPc = kEntry;
+        plan.count = 1;
+        plan.page = kEntry >> 10;
+        plan.end = BlockEnd::kUnsupported;
+        plan.fallThroughPc = kEntry + 4u;
+        PlannedOp& op = plan.ops[0];
+        op.pc = kEntry;
+        op.length = 4;
+        op.kind = PlanKind::kMovemPostIncToRegs;
+        op.size = 4;
+        op.cycles = 44;
+        op.eaMode = kModePostInc;
+        op.srcReg = 2;
+        op.imm = mask;
+
+        INFO("mask=", mask);
+        CHECK(jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv()) == 0);
+    }
+}
+
 // --- Tier D: 動的分岐 (RTS / JSR) -------------------------------------------
 //
 // 静的分岐 (Tier A の Bcc) との違いは、飛び先が**実行時にしか分からない**こと。
