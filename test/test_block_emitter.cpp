@@ -3829,8 +3829,14 @@ TEST_CASE("書き形いっぱいのブロックがリテラルを使い切らな
     //
     // 溢れると発行を諦めるだけなので正しさは損なわれないが、
     // 諦めた分は素通りするので気づきにくい。
-    const std::vector<u16> words{clrMem(2u, kModeInd, 2), clrMem(2u, kModeInd, 3),
-                                 clrMem(2u, kModeInd, 4), clrMem(2u, kModeInd, 5)};
+    // **長さを kMaxOps から作る。** 4 個を直書きしていたが、kMaxOps を
+    // 伸ばすと「上限いっぱい」を問わなくなる。
+    std::vector<u16> words;
+    for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+    {
+        // An は 2 から回す。**A7 を避ける** (-(A7) の特例と混ざる)。
+        words.push_back(clrMem(2u, kModeInd, 2u + (i % 5u)));
+    }
     FlatCode code;
     BlockPlan plan{};
     REQUIRE(buildPlan(words, plan, code));
@@ -3839,17 +3845,22 @@ TEST_CASE("書き形いっぱいのブロックがリテラルを使い切らな
                                                code.get16(plan.fallThroughPc + 2), fakeEnv());
     INFO("need=", need);
     CHECK(need > 0);
-    // BlockRunner::kStagingBytes (1536) に収まること。**収まらないと
-    // translate が黙って諦める。**
-    CHECK(need <= 1536);
+    // **BlockRunner::kStagingBytes に収まること。** 収まらないと translate が
+    // 黙って諦める。
+    //
+    // **数値を写さない。** ここは 1536 と書いてあったが、staging は Tier E で
+    // 2560 へ広がっており、**上限が 1.7 倍ゆるいまま「収まる」と言っていた**。
+    // 実物の定数を読めば取り残されない (kCapacityResetThreshold を public に
+    // した判断と同じ理由)。
+    CHECK(need <= x68k::jit::kMaxBlockBytes);
 
     // 走らせても一致すること。
     M68kState s = makeState(2);
-    s.a[2] = kWriteAddr;
-    s.a[3] = kWriteAddr + 0x10u;
-    s.a[4] = kWriteAddr + 0x20u;
-    s.a[5] = kWriteAddr + 0x30u;
-    checkEquivalence(words, s, "CLR.l x 4");
+    for (std::uint32_t i = 0; i < 5u; ++i)
+    {
+        s.a[2u + i] = kWriteAddr + i * 0x10u;
+    }
+    checkEquivalence(words, s, "CLR.l x kMaxOps");
 }
 
 // staging に収まることを **全 EA モード** で問う。
@@ -3913,10 +3924,12 @@ TEST_CASE("どの EA モードでも staging に収まる")
 
     INFO("最悪 ", worst, " バイト (", worstName, ")");
     CHECK(worst > 0);
-    CHECK(worst <= 1536);
+    // **実物の定数を読む。** ここは 1536 と書いてあったが、staging は
+    // Tier E で 2560 へ広がっており、上限を写した側だけが取り残されていた。
+    CHECK(worst <= x68k::jit::kMaxBlockBytes);
     // **余裕が 20% を切ったら気づけるようにする。** 命令やガードを 1 つ
     // 足しただけで崖に戻るので、上限ぎりぎりで通っている状態を許さない。
-    CHECK(worst <= 1536 * 4 / 5);
+    CHECK(worst * 5u <= x68k::jit::kMaxBlockBytes * 4u);
 }
 
 // Tier G / H を**最も重い形で 4 つ並べた**ブロックが kMaxBlockBytes に収まる。
@@ -4767,10 +4780,28 @@ TEST_CASE("自ページに掛かる MOVEM の書きは書く前に脱出する")
 
 // --- T-E8: requiredSize -----------------------------------------------------
 
-TEST_CASE("MOVEM 4 本を並べたブロックが staging に収まる")
+TEST_CASE("MOVEM を並べたブロックは、収まらないなら綺麗に断る")
 {
-    // **書き形 MOVEM ×4 が最悪。** 発行できるか、できないなら
-    // false で綺麗に断ること (黙って壊れた列を吐かないこと)。
+    // **書き形 MOVEM が全 Tier を通じての最悪。** 4 本 x 1 命令で転送 4 回、
+    // touch 8 回ぶんの直線コードになり、1 命令で約 496 バイト。
+    //
+    // ## kMaxOps = 6 では**収まらない**。それでよい
+    //
+    // 律速は kMaxBlockBytes (2560) ではなく **Xtensa の条件分岐の到達距離**。
+    // ガードは前方の出口の島へ飛ぶが、B*I8/BRI12 系の変位は 12bit 符号付き
+    // (canBranch12: -2048..2047) しかない。書き形 MOVEM を 5 つ並べると、
+    // 先頭のガードから最後の島までが 2048 バイトを超え、**変位が届かない**。
+    //
+    // これは定数を広げれば済む話ではない (命令符号の幅なので動かせない)。
+    // 届かない形は emitBlock が false を返し、requiredSize が 0 を返して
+    // **その 1 本だけ翻訳を諦める**。諦めたブロックは素通りする =
+    // インタプリタが実行するので、**正しさは 1 mm も損なわれない**。
+    //
+    // ## だから「収まること」ではなく「断り方」を問う
+    //
+    // 危ないのは「収まらないこと」ではなく **黙って壊れた列を吐くこと**。
+    // requiredSize が 0 を返すか、emitBlock が false を返すかのどちらかで、
+    // **中途半端に成功しない**ことをここで問う。
     BlockPlan plan{};
     plan.entryPc = kEntry;
     plan.count = static_cast<std::uint8_t>(x68k::kMaxOps);
@@ -4790,16 +4821,36 @@ TEST_CASE("MOVEM 4 本を並べたブロックが staging に収まる")
         op.imm = 0x000Fu;  // 4 本 (上限)
     }
 
-    const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
-    INFO("MOVEM x4 で ", need, " バイト");
-    // 発行できること。**0 なら断っているので、そこで気づける。**
-    CHECK(need > 0);
-    // **書き形 MOVEM x4 が全 Tier を通じての最悪ケース。** 4 本 x 4 命令で
-    // 転送 16 回、touch 32 回ぶんの直線コードになる。runner の控えに
-    // 収まらないと、この形のブロックは黙って翻訳されない (= 素通りする)。
-    CHECK(need <= x68k::jit::kMaxBlockBytes);
+    // **断るか、収まるか。中間は無い。** これが問いたい不変条件。
+    auto checkCleanRefusalOrFit = [](const BlockPlan& p, const char* what)
+    {
+        INFO(std::string(what));
+        const std::size_t need = jit::requiredSize(p, 0x4E71, 0x4E71, fakeEnv());
+        INFO("need=", need);
 
-    // 読み形 4 つも同じく。
+        alignas(4) std::uint8_t buf[x68k::jit::kMaxBlockBytes] = {};
+        jit::EmittedBlock info{};
+        const bool emitted = jit::emitBlock(p, 0x4E71, 0x4E71, fakeEnv(), buf, sizeof(buf), info);
+
+        // **2 つの答えが一致すること。** requiredSize が「行ける」と言って
+        // emitBlock が落ちる (またはその逆) と、runner は要る大きさを
+        // 取り違えたまま確保する。
+        CHECK(emitted == (need > 0));
+
+        if (need == 0)
+        {
+            // 断った側。**staging より大きい数を返さない** (0 を返す)。
+            CHECK_FALSE(emitted);
+            return;
+        }
+        // 収まった側。**runner の控えに入ること。**
+        CHECK(need <= x68k::jit::kMaxBlockBytes);
+        CHECK(info.totalSize == need);
+    };
+
+    checkCleanRefusalOrFit(plan, "MOVEM 書き x kMaxOps");
+
+    // 読み形も同じく。**こちらはガードが 1 本なので収まる。**
     BlockPlan readPlan = plan;
     for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
     {
@@ -4808,10 +4859,18 @@ TEST_CASE("MOVEM 4 本を並べたブロックが staging に収まる")
         readPlan.ops[i].srcReg = 2;
         readPlan.ops[i].dstReg = 0;
     }
-    const std::size_t readNeed = jit::requiredSize(readPlan, 0x4E71, 0x4E71, fakeEnv());
-    INFO("MOVEM 読み x4 で ", readNeed, " バイト");
-    CHECK(readNeed > 0);
-    CHECK(readNeed <= x68k::jit::kMaxBlockBytes);
+    checkCleanRefusalOrFit(readPlan, "MOVEM 読み x kMaxOps");
+    // 読み形は**必ず収まる**ことまで問う。ここが 0 になったら、
+    // MOVEM がまるごと翻訳されなくなっている (被覆率が黙って落ちる)。
+    CHECK(jit::requiredSize(readPlan, 0x4E71, 0x4E71, fakeEnv()) > 0);
+
+    // **書き形 MOVEM が 2 つなら収まること。** 上限が届かないのは
+    // 「長すぎる並び」だけで、MOVEM の書き形そのものが翻訳できなく
+    // なったわけではないことを示す。ここが落ちたら Tier E が死んでいる。
+    BlockPlan shortWrite = plan;
+    shortWrite.count = 2;
+    shortWrite.fallThroughPc = kEntry + 2u * 4u;
+    CHECK(jit::requiredSize(shortWrite, 0x4E71, 0x4E71, fakeEnv()) > 0);
 }
 
 TEST_CASE("窓が短すぎる MOVEM は発行しない")
@@ -6964,16 +7023,38 @@ TEST_CASE("kMaxOps いっぱいのブロックがリテラルを使い切らな�
         std::vector<u16> words;
         const char* what;
     };
+    // **kMaxOps ちょうどの長さを組み立てる。** 4 個を直書きしていたが、
+    // kMaxOps を 4 から伸ばした瞬間に「上限いっぱい」を問わなくなり、
+    // テースト名だけが正しいまま中身が緩む。長さを kMaxOps から作る。
+    auto repeat = [](auto make)
+    {
+        std::vector<u16> words;
+        for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+        {
+            words.push_back(make(i));
+        }
+        return words;
+    };
     const std::vector<Case> cases = {
-        // 最も定数を食う形: ADD.b x4 (サイズマスク + CCR マスク + 上位保存マスク)。
-        {{aluReg(0xDu, 0, 0, 1), aluReg(0xDu, 2, 0, 3), aluReg(0xDu, 4, 0, 5),
-          aluReg(0xDu, 6, 0, 7)},
-         "ADD.b x4"},
-        {{aluReg(0x9u, 0, 1, 1), aluReg(0xBu, 2, 1, 3), aluReg(0xCu, 4, 1, 5),
-          aluReg(0x8u, 6, 1, 7)},
-         "SUB/CMP/AND/OR .w x4"},
-        {{moveReg(0x1u, 0, 1), moveReg(0x3u, 2, 3), moveReg(0x1u, 4, 5), moveReg(0x3u, 6, 7)},
-         "MOVE.b/.w x4"},
+        // 最も定数を食う形: ADD.b (サイズマスク + CCR マスク + 上位保存マスク)。
+        // **レジスタ番号を回す。** 同じ Dn を並べると、リテラル共有が効きすぎて
+        // 「共有をやめる」変異が捕まらない。
+        {repeat([](std::uint32_t i)
+                { return aluReg(0xDu, (i * 2u) & 7u, 0, ((i * 2u) + 1u) & 7u); }),
+         "ADD.b x kMaxOps"},
+        {repeat(
+             [](std::uint32_t i)
+             {
+                 constexpr u32 kOps[4] = {0x9u, 0xBu, 0xCu, 0x8u};
+                 return aluReg(kOps[i & 3u], (i * 2u) & 7u, 1, ((i * 2u) + 1u) & 7u);
+             }),
+         "SUB/CMP/AND/OR .w x kMaxOps"},
+        {repeat(
+             [](std::uint32_t i)
+             {
+                 return moveReg((i & 1u) != 0u ? 0x3u : 0x1u, (i * 2u) & 7u, ((i * 2u) + 1u) & 7u);
+             }),
+         "MOVE.b/.w x kMaxOps"},
     };
 
     for (const Case& c : cases)
@@ -7797,3 +7878,157 @@ TEST_CASE("空きスロットを引いたらコールドミスとして数える
 
     checkDeferAccounting(h.stats(), "コールドミス");
 }
+
+// --- 割り込み受理点がブロック長に依らないこと (kMaxOps を伸ばす前提) ---
+//
+// **kMaxOps を 4 から 6 へ伸ばすときに block_plan.h が要求したテスト。**
+// 伸ばすと「ブロック実行中はデバイスに時間を渡さない」区間が長くなるので、
+// 受理が遅れる上限が伸びる。伸びてよいのは**上限だけ**で、
+//   受理が命令境界で起きること
+//   受理する前に状態を 1 ビットも動かさないこと
+//   遅れが kMaxOps 命令ぶんを超えないこと
+// の 3 つは kMaxOps に依らず不変でなければならない。
+//
+// Why not インタプリタ側の受理テスト (test_scheduler.cpp) で足りるか:
+// あちらは BlockRunner を一切通らない。**ネイティブ実行が成功し続ける限り
+// step() が呼ばれない**経路こそがこの不変条件の危ないところ (m68k.h:120-133
+// が名指しで警告している失敗) なので、runner を通した形でしか問えない。
+//
+// **翻訳は失敗させたままでよい。** 割り込みの検査は run() の最初の文で、
+// スロット索引よりも翻訳よりも手前にある。ホストで runBlock が
+// std::abort() する制約 (上の節) と両立する。
+
+namespace irq_acceptance
+{
+
+// What: 保留中の割り込みがあるとき、runner はブロックへ入らず、
+// **翻訳すら試みずに** kDeferToStep を返す。受理はインタプリタの命令境界。
+TEST_CASE("割り込みが保留なら runner はブロックへ入らない")
+{
+    runner_accounting::Harness h;
+    // **翻訳を必ず失敗させる。** ホストでは runBlock が std::abort() する
+    // ので、翻訳が成功すると run() がそこで落ちる (上の節)。問いたい
+    // 割り込みの検査は翻訳より手前にあるので、失敗させたままで通る。
+    h.makeTranslationImpossible();
+
+    // まず「割り込みが無ければ翻訳まで進む」ことを示す。
+    // **これが無いと、次の CHECK が「そもそも何もしない」でも通ってしまい、
+    // 割り込みを問うたことにならない。**
+    const x68k::NativeResult warm = h.runAt(kEntry);
+    REQUIRE(warm.exit == x68k::NativeExit::kDeferToStep);
+    const std::uint64_t translatedBefore = h.stats().translated + h.stats().translateFail;
+    REQUIRE(translatedBefore > 0);
+    const std::uint64_t deferIrqBefore = h.stats().deferInterrupt;
+
+    // 割り込みを立てる。**マスクより上のレベル**を使う。
+    h.cpu().requestInterrupt(7);
+
+    const x68k::M68kState before = h.cpu().state();
+    const x68k::NativeResult r = h.runAt(kEntry);
+
+    CHECK(r.exit == x68k::NativeExit::kDeferToStep);
+    CHECK(r.cycles == 0);
+    // **割り込みぶんとして数える。** 未対応 (deferUnsupported) に化けると、
+    // 「なぜ降りたか」が統計から消える。
+    CHECK(h.stats().deferInterrupt == deferIrqBefore + 1);
+
+    // **翻訳を 1 度も試みない。** 検査が翻訳より後ろへ動く変異
+    // (= 割り込み保留中でも翻訳の費用を払う) をここで捕まえる。
+    CHECK(h.stats().translated + h.stats().translateFail == translatedBefore);
+
+    // **状態を 1 ビットも動かさない。** cycles == 0 だけだと
+    // 「走ったがサイクルを返さない」変異が素通りする。
+    const x68k::M68kState after = h.cpu().state();
+    CHECK(std::memcmp(&before, &after, sizeof(x68k::M68kState)) == 0);
+}
+
+// What: 受理は「入口で 1 度」ではなく**毎回**問われる。
+// 一度ネイティブが成功した後も、割り込みが立てば次の呼び出しで必ず降りる。
+//
+// **これが「検査をブロック入口だけにする」変異を捕まえる本体。**
+TEST_CASE("割り込みは呼び出しのたびに問われる")
+{
+    runner_accounting::Harness h;
+    h.makeTranslationImpossible();
+
+    // 割り込みが無い状態で何度か回す。どれも降りない理由は「未対応」。
+    for (int i = 0; i < 3; ++i)
+    {
+        const x68k::NativeResult r = h.runAt(kEntry);
+        REQUIRE(r.exit == x68k::NativeExit::kDeferToStep);
+    }
+    REQUIRE(h.stats().deferInterrupt == 0);
+
+    // ここで立てる。**以後は毎回、割り込みぶんとして降りる。**
+    h.cpu().requestInterrupt(7);
+    for (int i = 1; i <= 3; ++i)
+    {
+        const x68k::NativeResult r = h.runAt(kEntry);
+        CHECK(r.exit == x68k::NativeExit::kDeferToStep);
+        CHECK(r.cycles == 0);
+        CHECK(h.stats().deferInterrupt == static_cast<std::uint64_t>(i));
+    }
+}
+
+// What: halted / stopped も割り込みと同じ扱いで降りる (m68k.h:134)。
+// **3 つのどれか 1 つだけを見る変異**を捕まえる。
+TEST_CASE("halted と stopped も runner を降ろす")
+{
+    SUBCASE("stopped")
+    {
+        runner_accounting::Harness h;
+        h.makeTranslationImpossible();
+        REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+        const std::uint64_t before = h.stats().deferInterrupt;
+        x68k::M68kState st = h.cpu().state();
+        st.stopped = true;
+        h.cpu().loadStateForTest(st);
+        CHECK(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+        CHECK(h.stats().deferInterrupt == before + 1);
+    }
+    SUBCASE("halted")
+    {
+        runner_accounting::Harness h;
+        h.makeTranslationImpossible();
+        REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+        const std::uint64_t before = h.stats().deferInterrupt;
+        x68k::M68kState st = h.cpu().state();
+        st.halted = true;
+        h.cpu().loadStateForTest(st);
+        CHECK(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+        CHECK(h.stats().deferInterrupt == before + 1);
+    }
+}
+
+// What: 受理の遅れの上限 = 1 ブロックが進める命令数が kMaxOps を超えないこと。
+//
+// **kMaxOps を伸ばす変更が最初に壊すのはここ。** 計画が上限より長い
+// ブロックを作れてしまうと、受理の遅れが設計の保証を超える。
+TEST_CASE("計画は kMaxOps を超える命令を積まない")
+{
+    // 連続する MOVEQ を kMaxOps + 4 個ぶん置く。**終端しない形**なので、
+    // 切れる理由は kCapacity しかない。
+    std::vector<u16> words;
+    for (std::uint32_t i = 0; i < x68k::kMaxOps + 4u; ++i)
+    {
+        words.push_back(0x7000u);  // MOVEQ #0,D0
+    }
+
+    BlockPlan plan{};
+    FlatCode code;
+    REQUIRE(buildPlan(words, plan, code));
+
+    // **上限ちょうどで切れる。** kCapacity 以外の理由で切れていたら
+    // 「上限を問うた」ことにならないので、理由まで問う。
+    CHECK(plan.count == x68k::kMaxOps);
+    CHECK(plan.end == BlockEnd::kCapacity);
+
+    // 受理の遅れの上限 = このブロックが進めるバイト数。MOVEQ は 2 バイト。
+    CHECK(plan.fallThroughPc == kEntry + x68k::kMaxOps * 2u);
+
+    // **サイクルでも上限を問う。** 命令数だけだと、1 命令が長い形
+    // (MOVEM) で遅れが伸びることを見落とす。
+    CHECK(plan.cyclesNotTaken == x68k::kMaxOps * 4u);  // MOVEQ は 4 サイクル
+}
+
+}  // namespace irq_acceptance

@@ -2078,11 +2078,27 @@ TEST_SUITE("BlockPlanner")
         CHECK_FALSE(accepts(0x48F8u));  // MOVEM.L <regs>,(xxx).W
     }
 
+    // What: BlockPlan の大きさが「PlannedOp 20 バイト x kMaxOps + 鍵と出口 32」で、
+    // 256 本ぶんと世代配列が内部 SRAM の実測空きに収まること。
     TEST_CASE("BlockPlan の大きさが見積もりどおり")
     {
-        CHECK(x68k::kMaxOps == 4);
+        CHECK(x68k::kMaxOps == 6);
+        // **PlannedOp は kMaxOps と独立に 20 バイト。** ここが太ると
+        // kMaxOps を 1 増やす費用が 20 バイトより大きくなる。
         CHECK(sizeof(x68k::PlannedOp) == 20);
-        CHECK(sizeof(x68k::BlockPlan) == 112);
+        CHECK(sizeof(x68k::BlockPlan) == 152);
+
+        // **式で問う。** 数値だけを写すと、PlannedOp に欄を足したときに
+        // 「152 のまま通る」ことがありえない一方で、なぜ 152 なのかが
+        // 読めなくなる。両方を問えば、どちらが動いたかが分かる。
+        CHECK(sizeof(x68k::BlockPlan) == sizeof(x68k::PlannedOp) * x68k::kMaxOps + 32);
+
+        // What: 256 本 + 世代配列 4,096 バイトが内部 SRAM の実測空き
+        // 48,351 バイトに収まること。**kMaxOps を伸ばす人が最初に踏む天井。**
+        constexpr std::size_t kBlocks = 256;
+        constexpr std::size_t kGenBytes = 4096;
+        constexpr std::size_t kMeasuredFreeSram = 48351;
+        CHECK(sizeof(x68k::BlockPlan) * kBlocks + kGenBytes <= kMeasuredFreeSram);
     }
 
     // 番地 0 からは翻訳しない (空きスロットの番兵と衝突するため)。
