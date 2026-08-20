@@ -318,16 +318,10 @@ NativeResult BlockRunner::run(M68k& cpu)
 
     BlockSlot* slot = &slots_[slotIndex(entryPc)];
 
-    // 設計 §5.5 の順で照合する。**順序が意味を持つ。**
+    // 設計 §5.5 の順で照合する。**順序が意味を持つ** (keyMatches)。
     CodeGenMap& map = cpu.codeGenMap();
     const std::uint16_t nowGen = map.generation(slot->page << CodeGenMap::kPageShift);
-    const bool hit = slot->code != nullptr &&                     // 翻訳済み
-                     slot->entryPc != 0 &&                        // 空きの番兵
-                     slot->entryPc == entryPc &&                  // タグ
-                     slot->count <= kMaxOps &&                    // ゴミ検査
-                     slot->mappingEpoch == map.mappingEpoch() &&  // 写像
-                     nowGen != CodeGenMap::kAlwaysStale &&        // **先に見る**
-                     nowGen == slot->pageGen;                     // 世代の一致
+    const bool hit = keyMatches(*slot, entryPc, nowGen, map.mappingEpoch());
 
     if (!hit)
     {
@@ -341,7 +335,7 @@ NativeResult BlockRunner::run(M68k& cpu)
         {
             // 鍵が外れた理由を分けて数える。段 3 の判断材料になる。
             //
-            // **判定 (hit) の順序と帰属の順序は別物。** hit は
+            // **判定 (keyMatches) の順序と帰属の順序は別物。** keyMatches は
             // kAlwaysStale を世代一致より先に見る (§5.5 の正しさの根拠) が、
             // ここでタグより先に見ると、居座りブロックのページが飽和して
             // いるだけでスロット衝突が「飽和」に化ける。実機ではページ 0

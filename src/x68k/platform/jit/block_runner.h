@@ -132,6 +132,32 @@ public:
 private:
     NativeResult run(M68k& cpu);
     void rememberFailure(std::uint32_t entryPc, std::uint16_t gen);
+    // 設計 §5.5 の鍵照合 7 項。**唯一の実装。**
+    //
+    // Why not 呼ぶ側それぞれに書かないか: 段 D-0 の計測は「チェーンの hop が
+    // 踏む判定と同一の判定を、飛ばずに数える」形なので、実物と計測が同じ式で
+    // なければ意味を持たない。切り出す前は計測側が 7 項を**写していて**、
+    // **実物だけ直せば計測が古い判定を測り続ける**構造だった。索引式を写して
+    // 変異が素通りした前例と同じ形 (test_block_emitter.cpp の runnerSlotIndex)。
+    //
+    // **順序が意味を持つ。** kAlwaysStale の検査を世代の一致より先に置く
+    // (このヘッダ冒頭の理由)。
+    //
+    // nowGen と nowMappingEpoch は呼ぶ側が渡す。鍵外れの帰属
+    // (keyMissStale か keyMissGen か) が同じ値を要るので、ここで読み直すと
+    // 2 回引くことになる。
+    [[nodiscard]] static bool keyMatches(const BlockSlot& slot, std::uint32_t entryPc,
+                                         std::uint16_t nowGen, std::uint32_t nowMappingEpoch)
+    {
+        return slot.code != nullptr &&                  // 翻訳済み
+               slot.entryPc != 0 &&                     // 空きの番兵
+               slot.entryPc == entryPc &&               // タグ
+               slot.count <= kMaxOps &&                 // ゴミ検査
+               slot.mappingEpoch == nowMappingEpoch &&  // 写像
+               nowGen != CodeGenMap::kAlwaysStale &&    // **先に見る**
+               nowGen == slot.pageGen;                  // 世代の一致
+    }
+
     // 翻訳して置く。置けたらスロットを返す。
     BlockSlot* translate(M68k& cpu, std::uint32_t entryPc);
     [[nodiscard]] std::uint32_t slotIndex(std::uint32_t pc) const
