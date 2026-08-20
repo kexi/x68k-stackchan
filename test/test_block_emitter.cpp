@@ -635,7 +635,8 @@ PlanGenSource makeGen()
 // 命令語を並べて計画を組む。entryPc は 1KB ページの先頭から少し内側。
 constexpr u32 kEntry = 0x2000;
 
-bool buildPlan(const std::vector<u16>& words, BlockPlan& plan, FlatCode& code)
+bool buildPlan(const std::vector<u16>& words, BlockPlan& plan, FlatCode& code,
+               const x68k::PlanCapabilities& caps)
 {
     code.reset(0x1000, 0x3000);
     u32 at = kEntry;
@@ -644,7 +645,13 @@ bool buildPlan(const std::vector<u16>& words, BlockPlan& plan, FlatCode& code)
         code.put16(at, w);
         at += 2;
     }
-    return BlockPlanner::plan(makeSource(code), makeGen(), kEntry, plan);
+    return BlockPlanner::plan(makeSource(code), makeGen(), kEntry, plan, caps);
+}
+
+// 既定の能力 (何も制限しない) で組む。**大半のテストはこちらを呼ぶ。**
+bool buildPlan(const std::vector<u16>& words, BlockPlan& plan, FlatCode& code)
+{
+    return buildPlan(words, plan, code, x68k::PlanCapabilities{});
 }
 
 // --- 発行と実行 -------------------------------------------------------------
@@ -1562,8 +1569,23 @@ TEST_CASE("MOVE #imm,Dn がインタプリタと一致する")
         std::vector<u16> ext;
     };
     const Case cases[] = {
-        {0x3u, {0x0000}},         {0x3u, {0x8000}}, {0x3u, {0x7FFF}}, {0x2u, {0x1234, 0x5678}},
-        {0x2u, {0x8000, 0x0000}}, {0x1u, {0x0042}}, {0x1u, {0x0080}},
+        {0x3u, {0x0000}},
+        {0x3u, {0x8000}},
+        {0x3u, {0x7FFF}},
+        {0x2u, {0x1234, 0x5678}},
+        {0x2u, {0x8000, 0x0000}},
+        {0x1u, {0x0042}},
+        {0x1u, {0x0080}},
+        // **上位バイトが 0 でない byte 即値。** 68000 の .b 即値は拡張ワードの
+        // 下位バイトだけを使い、上位は無視される (readEaSlow / m68k.cpp)。
+        // foldImmediate の `& 0xFF` を外すと、emitMoveImmToDreg が畳む
+        // N / Z がその上位バイトを拾って壊れる。
+        //
+        // **上位バイトが 0 のケースだけでは、この変異が捕まらない**
+        // (実際に注入して確かめた)。0x0042 / 0x0080 しか通していなかった。
+        {0x1u, {0xFF7F}},
+        {0x1u, {0xAB00}},
+        {0x1u, {0x7F80}},
     };
     for (const Case& c : cases)
     {
@@ -1953,6 +1975,385 @@ TEST_CASE("ALU <mem>,Dn がインタプリタと一致する")
         }
     }
     clearSeeds();
+}
+
+// --- Tier G: 非終端の高頻度形 ------------------------------------------------
+//
+// 3 系統とも「隣の命令とフラグの扱いが正反対」なのが要点。
+//   CMP #imm / CMPA : フラグを**全部**変える (X 以外)
+//   MOVEA <mem>     : フラグを **1 bit も**変えない
+//   ADDA / SUBA     : フラグを **1 bit も**変えない
+// checkEquivalence は sr を丸ごと比べるので、どちらへ間違えても落ちる。
+
+// ALU.<size> #imm,Dd (拡張ワードは呼び出し側が words に続けて置く)
+constexpr u16 aluImmToDn(u32 group, u32 dst, u32 opmode)
+{
+    return static_cast<u16>((group << 12) | (dst << 9) | (opmode << 6) | (7u << 3) | 4u);
+}
+// MOVEA.<size> <ea>,Ad。sizeGroup は $2 = long / $3 = word。
+constexpr u16 moveaMemToAn(u32 sizeGroup, u32 dstAn, u32 mode, u32 reg)
+{
+    return static_cast<u16>((sizeGroup << 12) | (dstAn << 9) | (1u << 6) | (mode << 3) | reg);
+}
+// ADDA / SUBA / CMPA <src>,Ad。group は $D / $9 / $B、opmode は 3 (.w) / 7 (.l)。
+// srcMode は 0 (Dn) か 1 (An)。
+constexpr u16 aluaReg(u32 group, u32 dstAn, u32 opmode, u32 srcMode, u32 srcReg)
+{
+    return static_cast<u16>((group << 12) | (dstAn << 9) | (opmode << 6) | (srcMode << 3) | srcReg);
+}
+
+// CMP.w #imm,Dn — 実測で単独 7.3% を落としていた最軽量の的。
+//
+// **フラグを全部変える** (N/Z/V/C。X は保存)。V と C は桁溢れの境界でしか
+// 壊れないので、即値と Dn の両方に符号の境界を通す。
+//
+// 落ちる変異:
+//   - emitAluImm が emitConst を落とす (kTmpA が前の命令の値のまま)
+//   - foldImmediate の byte マスクを外す (上位バイトが混ざる)
+//   - planAlu の即値経路で size を取り違える (.w と .l が入れ替わる)
+//   - CMP でフラグを書かない (emitStoreCcr を消す)
+TEST_CASE("ALU #imm,Dn がインタプリタと一致する")
+{
+    // group: $8 = OR / $9 = SUB / $B = CMP / $C = AND / $D = ADD
+    static constexpr u32 kGroups[] = {0x8u, 0x9u, 0xBu, 0xCu, 0xDu};
+    // 桁溢れと符号の境界。V と C はここでしか壊れない。
+    static constexpr u32 kDstValues[] = {
+        0x00000000u, 0x00000001u, 0x0000007Fu, 0x00000080u, 0x00007FFFu,
+        0x00008000u, 0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x12345678u,
+    };
+
+    for (u32 group : kGroups)
+    {
+        for (u32 dv : kDstValues)
+        {
+            M68kState s = makeState(1);
+            s.d[2] = dv;
+            // X が保存される (CMP / AND / OR) / 上書きされる (ADD / SUB)
+            // 両方を見るため、入口で X を立てておく。
+            s.sr = static_cast<u16>(0x2700u | 0x10u);
+
+            // .b : 拡張ワード 1 語。**上位バイトは捨てられる** (readEaSlow)。
+            checkEquivalence({aluImmToDn(group, 2, 0u), 0xFF7Fu}, s, "ALU.b #imm,Dn");
+            checkEquivalence({aluImmToDn(group, 2, 0u), 0x0080u}, s, "ALU.b #imm,Dn 符号");
+            // .w : 拡張ワード 1 語。
+            checkEquivalence({aluImmToDn(group, 2, 1u), 0x8000u}, s, "ALU.w #imm,Dn");
+            checkEquivalence({aluImmToDn(group, 2, 1u), 0x7FFFu}, s, "ALU.w #imm,Dn 正の端");
+            checkEquivalence({aluImmToDn(group, 2, 1u), 0x0000u}, s, "ALU.w #imm,Dn ゼロ");
+            // .l : 拡張ワード 2 語。**上位が落ちると必ず落ちる。**
+            checkEquivalence({aluImmToDn(group, 2, 2u), 0x8000u, 0x0000u}, s, "ALU.l #imm,Dn");
+            checkEquivalence({aluImmToDn(group, 2, 2u), 0x1234u, 0x5678u}, s, "ALU.l #imm,Dn 任意");
+        }
+    }
+}
+
+// MOVEA.l <mem>,An — 実測で (d16,An) 5.5% / (An) 5.4% / (xxx).L 3.6%。
+//
+// **フラグを 1 bit も変えない** ← MOVE との決定的な違い。
+// **.w は符号拡張して 32bit 全体を書く** ← 読んだ 16bit をそのまま
+// 書くと上位が 0 になる。
+//
+// 落ちる変異:
+//   - emitMemoryRead の kMoveaMemToAreg で emitLogicFlags を呼ぶ (sr が動く)
+//   - emitMemoryRead の kMoveaMemToAreg で emitSext16 を落とす (.w の上位)
+//   - 転送先を aOffset ではなく dOffset にする (MOVE との取り違え)
+//   - planMove が kMoveaMemToAreg ではなく kMoveMemToDreg を積む
+TEST_CASE("MOVEA <mem>,An がインタプリタと一致する")
+{
+    // sizeGroup: $2 = long / $3 = word。**$1 (byte) は 68000 に無い。**
+    for (u32 group : {0x2u, 0x3u})
+    {
+        for (u32 seed : {1u, 7u, 21u})
+        {
+            // 符号拡張を問う値。上位バイトが 0x80 なら .w で負になる。
+            seedData(kDataAddr, 0x80, 0x00, 0x12, 0x34);
+            M68kState s = makeState(seed);
+            s.a[2] = kDataAddr;
+            checkEquivalence({moveaMemToAn(group, 5, kModeInd, 2)}, s, "MOVEA (An),An");
+
+            seedData(kDataAddr, 0x7F, 0xFF, 0xFF, 0xFFu);
+            s = makeState(seed);
+            s.a[2] = kDataAddr;
+            checkEquivalence({moveaMemToAn(group, 5, kModeInd, 2)}, s, "MOVEA (An),An 正の端");
+
+            seedData(kDataAddr, 0x00, 0x00, 0x00, 0x00);
+            s = makeState(seed);
+            s.a[2] = kDataAddr;
+            // **ゼロでも Z が立たないこと。** MOVE と取り違えたらここで落ちる。
+            checkEquivalence({moveaMemToAn(group, 5, kModeInd, 2)}, s, "MOVEA (An),An ゼロ");
+
+            // (An)+ / -(An) は An を動かす。commit の順序も同時に問う。
+            seedData(kDataAddr, 0xDE, 0xAD, 0xBE, 0xEF);
+            s = makeState(seed);
+            s.a[3] = kDataAddr;
+            checkEquivalence({moveaMemToAn(group, 5, kModePostInc, 3)}, s, "MOVEA (An)+,An");
+            s = makeState(seed);
+            s.a[4] = kDataAddr + 4u;
+            checkEquivalence({moveaMemToAn(group, 5, kModePreDec, 4)}, s, "MOVEA -(An),An");
+
+            // (d16,An) は正負の変位。
+            s = makeState(seed);
+            s.a[3] = kDataAddr - 0x10u;
+            checkEquivalence({moveaMemToAn(group, 5, kModeDisp, 3), 0x0010u}, s,
+                             "MOVEA (d16,An),An");
+            s = makeState(seed);
+            s.a[3] = kDataAddr + 0x10u;
+            checkEquivalence({moveaMemToAn(group, 5, kModeDisp, 3), 0xFFF0u}, s,
+                             "MOVEA (負変位,An),An");
+
+            // (xxx).L / (xxx).W は実効アドレスが翻訳時定数。ガードが畳まれる。
+            s = makeState(seed);
+            checkEquivalence({moveaMemToAn(group, 5, kModeAbsL, 1),
+                              static_cast<u16>(kDataAddr >> 16), static_cast<u16>(kDataAddr)},
+                             s, "MOVEA (xxx).L,An");
+        }
+    }
+    clearSeeds();
+}
+
+// **転送先の An が EA の An と同じとき**、commit と本体の順序で結果が割れる。
+//
+// MOVEA.l (A3)+,A3 は「読んで A3 を進めてから A3 へ読んだ値を書く」ので、
+// 最後に残るのは読んだ値。commit を本体の後に置くと進んだ値が残る。
+//
+// 落ちる変異: emitMemoryRead で commit を本体の後ろへ動かす
+TEST_CASE("MOVEA の転送先が EA と同じ An でもインタプリタと一致する")
+{
+    for (u32 group : {0x2u, 0x3u})
+    {
+        seedData(kDataAddr, 0x00, 0x11, 0x22, 0x33);
+        M68kState s = makeState(3);
+        s.a[3] = kDataAddr;
+        checkEquivalence({moveaMemToAn(group, 3, kModePostInc, 3)}, s, "MOVEA (A3)+,A3");
+        s = makeState(3);
+        s.a[3] = kDataAddr + 4u;
+        checkEquivalence({moveaMemToAn(group, 3, kModePreDec, 3)}, s, "MOVEA -(A3),A3");
+        s = makeState(3);
+        s.a[3] = kDataAddr;
+        checkEquivalence({moveaMemToAn(group, 3, kModeInd, 3)}, s, "MOVEA (A3),A3");
+    }
+    clearSeeds();
+}
+
+// ADDA / SUBA — 実測で ADDA.l Dn,An 3.7% / ADDA.l An,An 3.6%。
+//
+// **フラグを 1 bit も変えない** ← ADD / SUB との決定的な違い。
+// **.w は符号拡張してから 32bit で足す** ← サイズで結果を切ると上位が消える。
+//
+// 落ちる変異:
+//   - emitAdda が emitStoreCcr を呼ぶ (フラグが動く)
+//   - emitAdda が emitSext16 を落とす (.w が上位を拾う / 落とす)
+//   - emitAdda が結果を emitTruncate する (.w で An の上位 16bit が消える)
+//   - planAlu が kAdd と kSub を取り違える ($9 と $D)
+//   - サイクルを 4 にする (実測 8)
+TEST_CASE("ADDA / SUBA がインタプリタと一致する")
+{
+    // opmode: 3 = .w / 7 = .l。group: $D = ADDA / $9 = SUBA。
+    static constexpr u32 kValues[] = {
+        0x00000000u, 0x00000001u, 0x00007FFFu, 0x00008000u, 0x0000FFFFu,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x00123456u,
+    };
+    for (u32 group : {0x9u, 0xDu})
+    {
+        for (u32 opmode : {3u, 7u})
+        {
+            for (u32 sv : kValues)
+            {
+                for (u32 dv : {0x00000000u, 0x0000FFFFu, 0x7FFFFFFFu, 0x80000000u})
+                {
+                    M68kState s = makeState(1);
+                    s.d[4] = sv;
+                    s.a[4] = sv;
+                    s.a[5] = dv;
+                    // X が保存されることを見るため、入口で立てておく。
+                    s.sr = static_cast<u16>(0x2700u | 0x1Fu);
+                    checkEquivalence({aluaReg(group, 5, opmode, 0u, 4u)}, s, "ADDA/SUBA Dn,An");
+                    checkEquivalence({aluaReg(group, 5, opmode, 1u, 4u)}, s, "ADDA/SUBA An,An");
+                }
+            }
+        }
+    }
+}
+
+// **転送元と転送先が同じ An** のとき、読む順序で結果が割れる。
+// ADDA.l A5,A5 は A5 = A5 + A5。
+TEST_CASE("同じ An どうしの ADDA / SUBA も一致する")
+{
+    for (u32 group : {0x9u, 0xDu})
+    {
+        for (u32 opmode : {3u, 7u})
+        {
+            for (u32 v : {0x00008000u, 0xFFFF8000u, 0x12345678u})
+            {
+                M68kState s = makeState(2);
+                s.a[5] = v;
+                checkEquivalence({aluaReg(group, 5, opmode, 1u, 5u)}, s, "ADDA/SUBA A5,A5");
+            }
+        }
+    }
+}
+
+// CMPA — ADDA / SUBA の隣にいて、**フラグの扱いが正反対**。
+//
+// **比較は必ず 32bit** (m68k_ops_alu.cpp:281)。.w でも src を符号拡張して
+// から引くので、size 欄でフラグ幅を決めると .w が壊れる。
+//
+// 落ちる変異:
+//   - emitCmpa が emitArithFlagsCore に size = 4 ではなく op.size を渡す
+//   - emitCmpa が emitStoreCcr を呼ばない (フラグが動かない)
+//   - emitCmpa が X を書く (CMP は X を保存する)
+//   - emitCmpa が a[dstReg] へ結果を書き戻す (CMP は書かない)
+//   - サイクルを 4 や 8 にする (実測 6)
+TEST_CASE("CMPA がインタプリタと一致する")
+{
+    static constexpr u32 kValues[] = {
+        0x00000000u, 0x00000001u, 0x00007FFFu, 0x00008000u, 0x0000FFFFu,
+        0x7FFFFFFFu, 0x80000000u, 0xFFFFFFFFu, 0x00123456u, 0xFFFF8000u,
+    };
+    for (u32 opmode : {3u, 7u})
+    {
+        for (u32 sv : kValues)
+        {
+            for (u32 dv : kValues)
+            {
+                M68kState s = makeState(1);
+                s.d[4] = sv;
+                s.a[4] = sv;
+                s.a[5] = dv;
+                // **X が保存されること**を見るため、入口で立てておく。
+                s.sr = static_cast<u16>(0x2700u | 0x10u);
+                checkEquivalence({aluaReg(0xBu, 5, opmode, 0u, 4u)}, s, "CMPA Dn,An");
+                checkEquivalence({aluaReg(0xBu, 5, opmode, 1u, 4u)}, s, "CMPA An,An");
+            }
+        }
+    }
+}
+
+TEST_CASE("同じ An どうしの CMPA も一致する")
+{
+    // A5 と A5 の比較は必ず Z が立ち、V / C は倒れる。
+    for (u32 opmode : {3u, 7u})
+    {
+        for (u32 v : {0x00000000u, 0x00008000u, 0xFFFF8000u, 0x80000000u})
+        {
+            M68kState s = makeState(2);
+            s.a[5] = v;
+            checkEquivalence({aluaReg(0xBu, 5, opmode, 1u, 5u)}, s, "CMPA A5,A5");
+        }
+    }
+}
+
+// **Tier G はどれもブロックを終端しない。** 段 0-F (BSR) は被覆率を
+// 伸ばしたのにブロックを短くして速度が付いてこなかった。ここに入れた形が
+// 終端側に回ったら、その効果を丸ごと失う。
+//
+// 落ちる変異: isBlockTerminator へ Tier G のどれかを足す
+TEST_CASE("Tier G の命令はブロックを終端しない")
+{
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const Case cases[] = {
+        {{aluImmToDn(0xBu, 2, 1u), 0x1234u}, "CMP.w #imm,Dn"},
+        {{moveaMemToAn(0x2u, 5, kModeInd, 2)}, "MOVEA.l (An),An"},
+        {{moveaMemToAn(0x2u, 5, kModeDisp, 2), 0x0010u}, "MOVEA.l (d16,An),An"},
+        {{aluaReg(0xDu, 5, 7u, 0u, 4u)}, "ADDA.l Dn,An"},
+        {{aluaReg(0xDu, 5, 7u, 1u, 4u)}, "ADDA.l An,An"},
+        {{aluaReg(0xBu, 5, 7u, 0u, 4u)}, "CMPA.l Dn,An"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        // 後ろへ MOVEQ を積む。終端していれば count == 1 で止まる。
+        std::vector<u16> words = c.words;
+        words.push_back(moveq(1, 7));
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        // **2 命令入ること**が主張。1 なら終端側に回っている。
+        CHECK(plan.count == 2);
+        CHECK(plan.end != BlockEnd::kBranch);
+        CHECK(plan.end != BlockEnd::kDynamicBranch);
+        // **述語そのものも名指しで固定する。** 上の count == 2 だけでは
+        // 足りない: plan() が isBlockTerminator を見るのは
+        // 「静的な飛び先を持たず、かつメールボックスが未配線」のときだけ
+        // なので、既定の caps (dynamicBranchAllowed = true) では
+        // 述語を書き換えても count は 2 のまま通る。**実際に変異を注入して
+        // 確かめた** — 述語へ Tier G を足しても 745 件が全部通った。
+        // 述語が真になると、メールボックス未配線の実機で Tier G が
+        // 丸ごと積まれなくなる (被覆率にしか現れない)。
+        for (std::uint32_t i = 0; i < plan.count; ++i)
+        {
+            CHECK_FALSE(x68k::isBlockTerminator(plan.ops[i].kind));
+            CHECK_FALSE(x68k::hasStaticBranchTarget(plan.ops[i].kind));
+        }
+    }
+
+    // メールボックスが未配線でも Tier G は積まれること。
+    //
+    // 上の述語検査と同じことを、**翻訳器の側から**も問う。
+    // canEmitDynamicBranch が false を返す env は実機で実際に起きる
+    // (mailboxAddr == 0)。そこで Tier G が落ちたら被覆率が黙って減る。
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what), " / メールボックス未配線");
+        std::vector<u16> words = c.words;
+        words.push_back(moveq(1, 7));
+
+        FlatCode code;
+        BlockPlan plan{};
+        x68k::PlanCapabilities caps{};
+        caps.canEmitDynamicBranch = [](void*) { return false; };
+        REQUIRE(buildPlan(words, plan, code, caps));
+        CHECK(plan.count == 2);
+    }
+}
+
+// MOVEA <mem>,An も窓ガードの外なら**状態を 1 bit も変えずに降りる** (G3/G7)。
+//
+// 読み形 (Tier B) と同じ島へ降りるが、**転送先が a[] になった**ので、
+// ガードを消した変異は「An が書き換わる」形で出る。
+//
+// 落ちる変異:
+//   - emitReadGuard を消す (窓の外を読み、An が壊れる)
+//   - bound を limit にする (窓の末尾で範囲外を読む)
+//   - commit をガードより前へ動かす (An が進んだまま降りる)
+TEST_CASE("MOVEA の窓ガードが不成立なら状態が 1 bit も変わらない")
+{
+    const u32 outside = static_cast<u32>(x68k::kMainRamSize) + 0x1000u;
+    for (u32 group : {0x2u, 0x3u})
+    {
+        for (u32 mode : {kModeInd, kModePostInc, kModePreDec})
+        {
+            M68kState s = makeState(5);
+            s.a[2] = outside;
+            // 手前に 1 命令置いて、**その命令ぶんだけ実行して降りる**ことも問う。
+            checkEquivalence({moveq(0, 3), moveaMemToAn(group, 5, mode, 2)}, s, "MOVEA 窓の外");
+        }
+    }
+}
+
+// 窓の端ちょうど。**a == limit - size は成立、その先は不成立。**
+// MOVEA.w は 2 バイト、MOVEA.l は 4 バイト。size 欄を 4 に固定すると
+// .w の端 2 バイトを落とす。
+//
+// 落ちる変異: planMove の MOVEA 読み形で size を常に kLong にする
+TEST_CASE("MOVEA の窓の境界がインタプリタと一致する")
+{
+    const u32 limit = static_cast<u32>(x68k::kMainRamSize);
+    for (u32 group : {0x2u, 0x3u})
+    {
+        const u32 size = group == 0x2u ? 4u : 2u;
+        for (u32 addr : {limit - size, limit - size + 2u, limit - 2u, limit})
+        {
+            M68kState s = makeState(6);
+            s.a[2] = addr;
+            checkEquivalence({moveaMemToAn(group, 5, kModeInd, 2)}, s, "MOVEA 窓の端");
+        }
+    }
 }
 
 TEST_CASE("読みガードの境界がインタプリタと一致する")
@@ -3187,6 +3588,113 @@ TEST_CASE("どの EA モードでも staging に収まる")
     // **余裕が 20% を切ったら気づけるようにする。** 命令やガードを 1 つ
     // 足しただけで崖に戻るので、上限ぎりぎりで通っている状態を許さない。
     CHECK(worst <= 1536 * 4 / 5);
+}
+
+// Tier G を**最も重い形で 4 つ並べた**ブロックが kMaxBlockBytes に収まる。
+//
+// 段 0-E で `requiredSize` が上限を超えると emitBlock が黙って false を返し、
+// **正しさは無傷のまま、その段が狙う形そのものを落とす**ことを踏んでいる
+// (docs/knowledge/event-driven-implementation.md「staging が黙って翻訳を
+// 落としていた」)。落ちたことは被覆率にしか現れないので、上限は
+// 「最悪ケースを実際に組んで測る」形でしか守れない。
+//
+// 落ちる変異: kMaxBlockBytes を 1024 へ下げる / emitAluImm を l32r 固定にする
+TEST_CASE("Tier G 4 つを並べたブロックが kMaxBlockBytes に収まる")
+{
+    struct WorstCase
+    {
+        PlanKind kind;
+        std::uint8_t eaMode;
+        std::uint8_t size;
+        PlanAluOp aluOp;
+        const char* name;
+    };
+    // 定数を最も食う形を選ぶ。
+    //   ALU #imm : .l の CMP (即値が l32r へ落ちる + フラグ 5 本ぶん)
+    //   MOVEA    : (d16,An) の .l (EA 定数 + ガード + commit)
+    //   CMPA     : .w (符号拡張 4 命令 + フラグ全部)
+    const WorstCase cases[] = {
+        {PlanKind::kAluImmToDreg, x68k::kEaNone, 4, PlanAluOp::kCmp, "CMP.l #imm,Dn"},
+        {PlanKind::kAluImmToDreg, x68k::kEaNone, 4, PlanAluOp::kAdd, "ADD.l #imm,Dn"},
+        {PlanKind::kMoveaMemToAreg, x68k::kEaDisp16, 4, PlanAluOp::kAdd, "MOVEA.l (d16,An),An"},
+        {PlanKind::kMoveaMemToAreg, x68k::kEaDisp16, 2, PlanAluOp::kAdd, "MOVEA.w (d16,An),An"},
+        {PlanKind::kCmpaDregToAreg, x68k::kEaNone, 2, PlanAluOp::kCmp, "CMPA.w Dn,An"},
+        {PlanKind::kCmpaAregToAreg, x68k::kEaNone, 2, PlanAluOp::kCmp, "CMPA.w An,An"},
+        {PlanKind::kAddaDregToAreg, x68k::kEaNone, 2, PlanAluOp::kAdd, "ADDA.w Dn,An"},
+        {PlanKind::kAddaAregToAreg, x68k::kEaNone, 2, PlanAluOp::kSub, "SUBA.w An,An"},
+    };
+
+    std::size_t worst = 0;
+    const char* worstName = "";
+    for (const WorstCase& c : cases)
+    {
+        BlockPlan plan{};
+        plan.entryPc = kEntry;
+        plan.count = static_cast<std::uint8_t>(x68k::kMaxOps);
+        plan.page = kEntry >> 10;
+        plan.end = BlockEnd::kUnsupported;
+        plan.fallThroughPc = kEntry + x68k::kMaxOps * 8u;
+        for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+        {
+            PlannedOp& op = plan.ops[i];
+            op.pc = kEntry + i * 8u;
+            op.length = 6;
+            op.kind = c.kind;
+            op.eaMode = c.eaMode;
+            op.size = c.size;
+            op.aluOp = c.aluOp;
+            op.cycles = 8;
+            op.srcReg = 1;
+            op.dstReg = 2;
+            // **リテラルを共有させない。** 命令ごとに違う定数にしておかないと、
+            // literalIndex が畳んで最悪ケースにならない。
+            op.imm = 0x00123456u + i * 0x1111u;
+        }
+        const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
+        INFO(std::string(c.name), " = ", need, " バイト");
+        CHECK(need > 0);
+        CHECK(need <= x68k::jit::kMaxBlockBytes);
+        if (need > worst)
+        {
+            worst = need;
+            worstName = c.name;
+        }
+    }
+
+    INFO("最悪 ", worst, " バイト (", std::string(worstName), ")");
+    // **余裕が 20% を切ったら気づけるようにする。** 命令やガードを 1 つ
+    // 足しただけで崖に戻るので、上限ぎりぎりで通っている状態を許さない。
+    CHECK(worst * 5u <= x68k::jit::kMaxBlockBytes * 4u);
+
+    // **系統を混ぜた形も測る。** リテラルは種類ごとに違う定数を食うので、
+    // 同じ形を 4 つ並べるより混ぜた方が l32r の共有が効かず重くなりうる。
+    {
+        BlockPlan plan{};
+        plan.entryPc = kEntry;
+        plan.count = static_cast<std::uint8_t>(x68k::kMaxOps);
+        plan.page = kEntry >> 10;
+        plan.end = BlockEnd::kUnsupported;
+        plan.fallThroughPc = kEntry + x68k::kMaxOps * 8u;
+        const WorstCase mix[] = {cases[2], cases[0], cases[4], cases[3]};
+        for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
+        {
+            PlannedOp& op = plan.ops[i];
+            op.pc = kEntry + i * 8u;
+            op.length = 6;
+            op.kind = mix[i].kind;
+            op.eaMode = mix[i].eaMode;
+            op.size = mix[i].size;
+            op.aluOp = mix[i].aluOp;
+            op.cycles = 8;
+            op.srcReg = 1;
+            op.dstReg = 2;
+            op.imm = 0x00654321u + i * 0x2222u;
+        }
+        const std::size_t need = jit::requiredSize(plan, 0x4E71, 0x4E71, fakeEnv());
+        INFO("混成 = ", need, " バイト");
+        CHECK(need > 0);
+        CHECK(need * 5u <= x68k::jit::kMaxBlockBytes * 4u);
+    }
 }
 
 TEST_CASE("書きガード脱出の irc が実メモリの mem16(opPc + 2) と一致する")

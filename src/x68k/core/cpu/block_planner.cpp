@@ -177,21 +177,36 @@ bool planMove(u16 op, PlannedOp& out)
         return false;
     }
 
-    // メモリ読み形は Dn 宛てだけ。**MOVEA (dstMode == 1) は入れない。**
+    // メモリ読み形。**転送先が Dn (MOVE) か An (MOVEA) かで別の kind。**
     //
-    // Why not 一緒に入れないか: MOVEA.w は符号拡張して 32bit を書くので、
-    // ガードの後ろに繋ぐ本体が MOVE とは別物になる。入れるなら別の kind と
-    // 別のテストが要る。読み形の被覆はまず Dn 宛てで測る。
+    // MOVEA は .w が符号拡張して 32bit 全体を書き、しかも**フラグを
+    // 1 bit も変えない**。取り違えると CCR が動いて静かに壊れるので、
+    // 種別で分けてエミッタが 1 箇所で判断できるようにする。
+    //
+    // **byte の MOVEA は 68000 に無い** (dstMode == 1 かつ group $1)。
+    // この下の touchesAddressRegisterAsByte が弾いているが、
+    // 読み形はそこへ到達する前に return するので、ここでも見る。
+    //
+    // Why not `dstMode > 1` (転送先がメモリ = MOVE <mem>,<mem>) もここで
+    // 弾かないか: **上の書き形の分岐が既に return している**ので、ここは
+    // dstMode <= 1 でしか到達しない。置いても一度も真にならない死んだ枝で、
+    // 変異を注入して確かめた (弾く行を消しても 745 件が全部通った)。
+    // 死んだ枝はテストが緑のまま「守っているつもり」を作る。
     if (srcIsMemory)
     {
-        if (dstMode != 0)
+        const bool destIsAddressRegister = dstMode == 1;
+        const bool isIllegalByteMovea = destIsAddressRegister && size == kByte;
+        if (isIllegalByteMovea)
         {
             return false;
         }
-        out.kind = PlanKind::kMoveMemToDreg;
+        out.kind = destIsAddressRegister ? PlanKind::kMoveaMemToAreg : PlanKind::kMoveMemToDreg;
         out.eaMode = srcEa;
         out.srcReg = static_cast<u8>(srcReg);
         out.dstReg = static_cast<u8>(dstReg);
+        // **size は「メモリから何バイト読むか」。** MOVEA.w は 2 バイト
+        // 読んでから符号拡張して 32bit 書く。ここを 4 にすると
+        // 読みガードの extent がずれ、窓の端で範囲外を読む。
         out.size = static_cast<u8>(size);
         // groupMove は EA の形によらず 4 を返す (m68k_ops_move.cpp:68)。
         out.cycles = 4;
@@ -483,23 +498,113 @@ bool planAlu(u16 op, PlannedOp& out)
     const u32 opmode = static_cast<u32>((op >> 6) & 7u);
     const u32 mode = static_cast<u32>((op >> 3) & 7u);
 
-    // opmode 3/7 は ADDA/SUBA/CMPA と MULU/MULS/DIVU/DIVS。
-    // A レジスタを書く形と、除算でゼロ除算例外に入りうる形。どちらも入れない。
+    const u32 group = static_cast<u32>(op >> 12);
+    const u32 reg = static_cast<u32>(op & 7u);
+
+    // --- Tier G: opmode 3/7 のうち ADDA / SUBA / CMPA (mode 0/1) ---
+    //
+    // **受けるのは mode 0 (Dn) と mode 1 (An) だけ。** メモリ形
+    // (ADDA.l (An),An など) は読みガードの後ろに繋ぐ本体が別物になるので、
+    // 実測で最も重い形 (ADDA.l Dn,An 3.7% / ADDA.l An,An 3.6%) から入れる。
+    //
+    // どの群を受けるかは下の switch が 1 か所で決める (理由もそこに書く)。
     const bool isAddressOrMulDiv = opmode == 3 || opmode == 7;
     if (isAddressOrMulDiv)
+    {
+        // mode 0/1 以外は入れない (メモリ形と PC 相対と即値)。
+        const bool srcIsRegisterDirect = mode == 0 || mode == 1;
+        if (!srcIsRegisterDirect)
+        {
+            return false;
+        }
+        const bool srcIsAddressRegister = mode == 1;
+        // opmode 3 が .w、7 が .l (m68k_ops_alu.cpp:78 / 181 / 279)。
+        const u32 addrSize = opmode == 3 ? kWord : kLong;
+        // **$8 と $C はここへ列挙しない。** そちらの opmode 3/7 は
+        // MULU/MULS/DIVU/DIVS で、除算はゼロ除算例外に入りうる
+        // (§5.3 の「例外が起きない」に反する)。乗算も可変サイクルなので、
+        // サイクルの同値を別の検証面として背負う。
+        //
+        // Why not `group == 0x8 || group == 0xC` の明示的な検査を先に置くか:
+        // **この switch が既に落としている**ので、置いても一度も真にならない
+        // 死んだ枝になる。実際にそう書いてから変異を注入して気づいた
+        // (検査を `false` へ潰しても 745 件が全部通った)。
+        // 死んだ枝はテストが緑のまま「守っているつもり」を作るので、
+        // 落とせる場所を 1 つにする。
+        switch (group)
+        {
+            case 0xDu:  // ADDA
+                out.kind =
+                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.aluOp = PlanAluOp::kAdd;
+                // **8 サイクル。** ADD / SUB の 4 ではない (m68k_ops_alu.cpp:81)。
+                out.cycles = 8;
+                break;
+            case 0x9u:  // SUBA
+                out.kind =
+                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.aluOp = PlanAluOp::kSub;
+                out.cycles = 8;
+                break;
+            case 0xBu:  // CMPA
+                out.kind =
+                    srcIsAddressRegister ? PlanKind::kCmpaAregToAreg : PlanKind::kCmpaDregToAreg;
+                out.aluOp = PlanAluOp::kCmp;
+                // **6 サイクル。** CMP の 4 でも ADDA の 8 でもない
+                // (m68k_ops_alu.cpp:283)。
+                out.cycles = 6;
+                break;
+            default:
+                // MULU / MULS / DIVU / DIVS ($8 / $C)。上のコメントの理由。
+                return false;
+        }
+        out.srcReg = static_cast<u8>(reg);
+        out.dstReg = static_cast<u8>((op >> 9) & 7u);
+        // size は「src をどう読むか」だけを決める。CMPA の比較幅は
+        // 常に kLong で、size 欄とは無関係 (block_plan.h)。
+        out.size = static_cast<u8>(addrSize);
+        return true;
+    }
+
+    // mode 0 (Dn) と、Tier B の読み形メモリ EA、そして Tier G の即値を受ける。
+    //
+    // **読み方向 (opmode < 4) だけ。** メモリ方向はこの下で弾く。
+    const bool srcIsImmediate = mode == 7 && reg == 4;
+    u8 ea = kEaNone;
+    const bool isMemoryRead = !srcIsImmediate && mode != 0 && readEaMode(mode, reg, ea);
+    if (mode != 0 && !srcIsImmediate && !isMemoryRead)
     {
         return false;
     }
 
-    // mode 0 (Dn) と、Tier B の読み形メモリ EA を受ける。
+    // --- Tier G: ALU <#imm>,Dn ---
     //
-    // **読み方向 (opmode < 4) だけ。** メモリ方向はこの下で弾く。
-    const u32 reg = static_cast<u32>(op & 7u);
-    u8 ea = kEaNone;
-    const bool isMemoryRead = mode != 0 && readEaMode(mode, reg, ea);
-    if (mode != 0 && !isMemoryRead)
+    // **メモリに触れず例外も起きない** (即値は拡張ワードにあり、
+    // plan() が窓の中であることを既に確かめている)。CMP.w #imm,Dn は
+    // 実測で単独 7.3% を落としていた。
+    //
+    // **メモリ方向より先に見ない。** 即値は転送先になれないので、
+    // opmode 4-6 の即値形は 68000 に存在しない。長さデコーダも
+    // `toMemory && mode == 7 && reg >= 2` で弾いている。
+    if (srcIsImmediate)
     {
-        return false;
+        if ((opmode & 4u) != 0)
+        {
+            return false;
+        }
+        PlanAluOp immAluOp = PlanAluOp::kAdd;
+        if (!aluOpFromGroupRead(group, immAluOp))
+        {
+            return false;
+        }
+        out.kind = PlanKind::kAluImmToDreg;
+        out.aluOp = immAluOp;
+        out.dstReg = static_cast<u8>((op >> 9) & 7u);
+        out.size = static_cast<u8>(aluSizeFromOpmode(opmode));
+        // 読み方向は EA の形によらず 4 (m68k_ops_alu.cpp の各 return)。
+        out.cycles = 4;
+        // **srcReg は使わない。** 即値は imm 欄に入る (foldImmediate)。
+        return true;
     }
 
     if (isMemoryRead)
@@ -512,8 +617,7 @@ bool planAlu(u16 op, PlannedOp& out)
             return false;
         }
         PlanAluOp memAluOp = PlanAluOp::kAdd;
-        const u32 memGroup = static_cast<u32>(op >> 12);
-        if (!aluOpFromGroupRead(memGroup, memAluOp))
+        if (!aluOpFromGroupRead(group, memAluOp))
         {
             return false;
         }
@@ -558,7 +662,6 @@ bool planAlu(u16 op, PlannedOp& out)
 
     // <ea>,Dn 方向。mode 0 なので Dn,Dn。
     PlanAluOp aluOp = PlanAluOp::kAdd;
-    const u32 group = static_cast<u32>(op >> 12);
     if (!aluOpFromGroupRead(group, aluOp))
     {
         return false;
@@ -686,6 +789,12 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
     switch (p.kind)
     {
         case PlanKind::kMoveImmToDreg:
+        // --- Tier G: ALU <#imm>,Dn ---
+        //
+        // **readEaSlow の 7.4 とまったく同じ合成** (m68k.cpp)。
+        // long は 2 語連結、byte は下位バイトだけ、word はそのまま。
+        // MOVE #imm,Dn と同じ式なので、同じ枝に載せる。
+        case PlanKind::kAluImmToDreg:
             // size でマスクする。byte は下位バイトだけ。
             p.imm = p.size == 4 ? longValue : (p.size == 1 ? (ext0 & 0xFFu) : ext0);
             break;
@@ -714,6 +823,9 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         // 実効アドレスの合成は読み形とまったく同じ (effectiveAddressSlow を
         // 通るのが読み書きどちらでも同じ関数なので、分ける理由が無い)。
         case PlanKind::kMoveMemToDreg:
+        // **kMoveaMemToAreg も同じ枝。** 実効アドレスの合成は転送先が
+        // d[] か a[] かに依存しない。分けると片方だけ直す事故の面が増える。
+        case PlanKind::kMoveaMemToAreg:
         case PlanKind::kTstMem:
         case PlanKind::kAluMemToDreg:
         case PlanKind::kMoveDregToMem:
@@ -771,7 +883,38 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
             p.cycles = static_cast<u8>(base + count * 8u);
             break;
         }
-        default:
+
+        // --- 拡張ワードを持たない種別 ---
+        //
+        // **`default:` を置かずに全部列挙する。** 許可リスト方式の要点は
+        // 「新しい種別を足した人が必ずここへ来る」ことで、`default: break;`
+        // があると**来ないまま通ってしまう**。そのとき p.imm は 0 のまま
+        // 残り、即値や変位を 0 として焼いた生成コードができる。
+        //
+        // 落ち方が最も遠い形になる: 翻訳は成功し、テストも「その種別で
+        // 即値が非ゼロの例」を書いていなければ緑のまま通り、実機で
+        // その命令を踏んだときだけゲストの状態が静かにずれる。
+        //
+        // 列挙しておけば `-Wswitch` が足し忘れをその場で落とす。
+        // エミッタの emitAll が同じ理由で default を持たないのと揃えてある
+        // (docs「エミッタ未対応の種別は明示的に拒否する」)。
+        case PlanKind::kMoveRegToReg:
+        case PlanKind::kMoveq:
+        case PlanKind::kAluRegToReg:
+        case PlanKind::kBranch:
+        case PlanKind::kMoveAregToDreg:
+        case PlanKind::kMoveaDregToAreg:
+        case PlanKind::kMoveaAregToAreg:
+        case PlanKind::kTstDreg:
+        case PlanKind::kClrDreg:
+        case PlanKind::kRts:
+        case PlanKind::kBsr:
+        case PlanKind::kAddaDregToAreg:
+        case PlanKind::kAddaAregToAreg:
+        case PlanKind::kCmpaDregToAreg:
+        case PlanKind::kCmpaAregToAreg:
+            // どれも拡張ワードを持たないか (kMoveq / kBranch の 8bit 変位形は
+            // planOne が既に畳んでいる)、レジスタだけで閉じている。
             break;
     }
 }

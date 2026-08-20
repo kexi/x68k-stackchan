@@ -162,13 +162,22 @@ bool specSafeMove(x68k::u16 op)
     }
     // 転送元は Dn / An / 即値 / 読み形メモリ (Tier B)。
     //
-    // 読み形は Dn 宛てだけ。An 宛て (MOVEA) は .w の符号拡張で本体が
-    // 別物になるので、Tier B の初回スコープには入っていない。
+    // **転送先は Dn (MOVE) と An (MOVEA) の両方 (Tier G)。**
+    // MOVEA は .w が符号拡張して 32bit 全体を書き、フラグを 1 bit も
+    // 変えない。MOVE とは別の命令なので、planner が種別で分ける。
+    //
+    // **byte の MOVEA は 68000 に無い** (dstMode == 1 かつ group $1)。
+    // レジスタ間形と同じく不当命令なので、読み形でも外す。
     const bool srcIsImmediate = srcMode == 7 && srcReg == 4;
     const bool srcIsReadMemory = !srcIsImmediate && srcMode > 1 && specReadEa(srcMode, srcReg);
     if (srcIsReadMemory)
     {
-        return dstMode == 0;
+        if (dstMode > 1)
+        {
+            return false;
+        }
+        const bool isIllegalByteMovea = dstMode == 1 && size == 1;
+        return !isIllegalByteMovea;
     }
     if (srcMode > 1 && !srcIsImmediate)
     {
@@ -294,14 +303,44 @@ bool specSafeAlu(x68k::u16 op)
     const x68k::u32 opmode = static_cast<x68k::u32>((op >> 6) & 7u);
     const x68k::u32 mode = static_cast<x68k::u32>((op >> 3) & 7u);
     const x68k::u32 reg = static_cast<x68k::u32>(op & 7u);
+    // --- Tier G: ADDA / SUBA / CMPA (opmode 3/7) ---
+    //
+    // **符号化から直接組む。** opmode 3 が .w、7 が .l で、転送先は必ず An。
+    //   $D : ADDA  フラグ不変
+    //   $9 : SUBA  フラグ不変
+    //   $B : CMPA  フラグを全部変える (X 以外)
+    //   $8/$C : DIVU/DIVS/MULU/MULS — **ゼロ除算例外**に入りうるので入れない
+    //
+    // 受けるのは mode 0 (Dn) と mode 1 (An) だけ。メモリ形は読みガードの
+    // 後ろに繋ぐ本体が別物になるので、この段では入れない。
+    const bool isAddressOrMulDiv = opmode == 3 || opmode == 7;
+    if (isAddressOrMulDiv)
+    {
+        const bool isMulDiv = group == 0x8u || group == 0xCu;
+        if (isMulDiv)
+        {
+            return false;
+        }
+        return mode == 0 || mode == 1;
+    }
+
+    // --- Tier G: ALU <#imm>,Dn ---
+    //
+    // 即値はメモリを読まない (拡張ワードから来る) ので Tier A。
+    // **メモリ方向 (opmode 4-6) の即値形は 68000 に無い** — 即値は
+    // 転送先になれないので、そこは不当命令。
+    const bool srcIsImmediate = mode == 7 && reg == 4;
+    if (srcIsImmediate)
+    {
+        return opmode <= 2;
+    }
+
     if (mode != 0)
     {
-        // <mem>,Dn の読み方向だけ (Tier B)。opmode 3/7 は ADDA/SUBA/CMPA と
-        // MULU/MULS/DIVU/DIVS、opmode 4-6 はメモリへ書く方向。
+        // <mem>,Dn の読み方向だけ (Tier B)。opmode 4-6 はメモリへ書く方向。
         return opmode <= 2 && specReadEa(mode, reg);
     }
-    // opmode 3/7 は ADDA/SUBA/CMPA (A レジスタ) と MULU/MULS/DIVU/DIVS
-    // (ゼロ除算)。opmode 4-6 は ADDX/SUBX/ABCD/SBCD/EOR/CMPM の特殊形。
+    // opmode 4-6 は ADDX/SUBX/ABCD/SBCD/EOR/CMPM の特殊形。
     return opmode <= 2;
 }
 
@@ -416,8 +455,12 @@ TEST_SUITE("BlockPlanner")
     //   - planMove の mode 検査を落とす (MOVE.b An,Dn が入り、不当命令例外)
     //   - planBranch の disp8 == 0xFF 検査を落とす (BSR.l / Bcc.l が入る)
     //   - planBranch へ cond == 1 の拒否を戻す (BSR が落ちる)
-    //   - planAlu の opmode 3/7 検査を落とす (DIVU が入り、ゼロ除算例外)
+    //   - planAlu の $8/$C 検査を落とす (DIVU が入り、ゼロ除算例外)
     //   - planAlu の mode 検査を落とす (ADD (An),Dn が入り、バスを読む)
+    //   - planAlu の opmode 3/7 で mode 0/1 の制限を外す
+    //     (ADDA.l (An),An が入り、読みガード無しでメモリを読む)
+    //   - planMove の読み形で dstMode > 1 を弾かない (MOVE <mem>,<mem> が入る)
+    //   - planMove の読み形で byte の MOVEA を弾かない (不当命令が入る)
     TEST_CASE("planOne の許可リストが符号化から組んだ安全な集合と一致する")
     {
         std::size_t accepted = 0;

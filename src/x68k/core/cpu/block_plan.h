@@ -134,6 +134,73 @@ enum class PlanKind : u8
     //
     // レジスタ欄は使わない。積む先は常に -(A7) 固定。
     kBsr,
+
+    // --- Tier G: 非終端の高頻度形 (CMP #imm / MOVEA <mem> / ADDA・CMPA) ---
+    //
+    // **どれもブロックを切らない。** 段 0-F (BSR) は被覆率を +5.95 ポイント
+    // 伸ばしたのに速度が +1.7% しか出なかった。BSR が必ずブロックを終端し、
+    // 1 ブロックあたりの命令数が 1.562 → 1.534 へ下がったため。
+    // ここに入れる形はどれも終端しないので、被覆率とブロック長の
+    // **両方**が改善する。
+    //
+    // Why not 系統ごとに別の Tier へ分けないか: Tier A-F は「翻訳器が
+    // 背負う不変条件」で切ってある (A = ガード不要 / B = 読みガード /
+    // C = 書きガードと世代 / D = 動的な飛び先 / E = 複数転送 / F = 分岐と
+    // スタック)。**Tier G の 3 系統はその軸では既存 Tier に収まる**
+    // (CMP #imm と ADDA/CMPA は A、MOVEA <mem> は B) ので、不変条件では
+    // 分ける理由が無い。
+    //
+    // それでも 1 つの名前を付けたのは、**選んだ理由が共通だから**:
+    // 段 0-F (BSR) で「被覆率が伸びてもブロックを切ると速度が付いてこない」
+    // ことが実測で出たあと、**非終端であること**を条件に実測上位から
+    // 選び直した集合がこの 3 系統になった。次に的を選ぶ人が見るべきは
+    // 「ガードを何本背負うか」ではなく「ブロックを切るか」なので、
+    // その判断の単位で名前を付けてある。
+    //
+    // 3 系統ある。増えた検証面は系統ごとに違う。
+
+    // ALU <#imm>,Dn (Tier A)。**メモリに触れず例外も起きない。**
+    //
+    // kAluRegToReg / kAluMemToDreg と本体は同じ (emitAluBody) で、
+    // src の出どころだけが違う。CMP.w #imm,Dn は実測で単独 7.3% を落として
+    // いた最軽量の的。
+    //
+    // imm は foldImmediate が **size でマスク済み** の値を入れる。
+    // readEaSlow の 7.4 (即値) が byte で `value & 0xFF` を返すのと同じ形。
+    kAluImmToDreg,
+
+    // MOVEA.w/l <mem>,An (Tier B)。**フラグを 1 bit も変えない。**
+    //
+    // kMoveMemToDreg との違いは 2 つで、どちらも間違えると静かに壊れる:
+    //   転送先が a[] (d[] ではない)
+    //   **emitLogicFlags を呼ばない** — MOVE と取り違えると CCR が動く
+    //
+    // .w は符号拡張して 32bit 全体を書く (writeEa mode 1 / m68k.h:552)。
+    // 読んだ値は 16bit なので、**読んだ後に符号拡張する**。
+    kMoveaMemToAreg,
+
+    // ADDA / SUBA .w/l <src>,An (Tier A)。**フラグを 1 bit も変えない。**
+    //
+    // ADD / SUB と取り違えると CCR が動く。aluOp が kAdd か kSub を持つ。
+    // .w は src を符号拡張してから **32bit 加減算** する
+    // (m68k_ops_alu.cpp:78-82)。サイズで結果を切らない。
+    //
+    // **サイクルは 8。** ADD / SUB の 4 ではない (m68k_ops_alu.cpp:81)。
+    kAddaDregToAreg,  // srcReg = Dn 番号 / dstReg = An 番号
+    kAddaAregToAreg,  // srcReg = An 番号 / dstReg = An 番号
+
+    // CMPA .w/l <src>,An (Tier A)。**フラグは全部変える。**
+    //
+    // ADDA / SUBA と反対で、こちらは N/Z/V/C を立てる (X は保存)。
+    // 同じ opmode 3/7 の隣にいる形なので、分けておかないと取り違える。
+    //
+    // **比較は必ず kLong で行う** (m68k_ops_alu.cpp:281)。.w でも
+    // src を符号拡張してから 32bit で引くので、size 欄は
+    // 「src をどう読むか」だけを決め、フラグの幅は決めない。
+    //
+    // **サイクルは 6。** CMP の 4 でも ADDA の 8 でもない。
+    kCmpaDregToAreg,  // srcReg = Dn 番号 / dstReg = An 番号
+    kCmpaAregToAreg,  // srcReg = An 番号 / dstReg = An 番号
 };
 
 // PlannedOp::eaMode の値。

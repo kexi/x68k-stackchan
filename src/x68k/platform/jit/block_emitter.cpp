@@ -185,9 +185,15 @@ struct Emitter
 // 定数をレジスタへ置く。範囲に収まれば movi、収まらなければ l32r。
 //
 // Why not 常に l32r にしないか: movi は 3 バイトで済むのは同じだが、
-// l32r はリテラルを 4 バイト消費する。kMaxLiterals は 24 しかないので、
+// l32r はリテラルを **kMaxLiterals 本の枠**から 1 本消費する。
 // -2048..2047 に収まる定数 (CCR のマスク、MOVEQ の即値、小さい pc) を
-// movi へ逃がさないとすぐ溢れる。
+// movi へ逃がさないと、その枠がすぐ尽きる。
+//
+// **本数をここへ書き写さない。** かつて「24 しかない」と書いてあったが、
+// Tier C で 56 へ広げたときにこちらが取り残された (実際に 2 倍以上ずれた
+// まま残っていた)。同じ数を 2 か所に置くと、片方だけ直したことに
+// 気づけない — kMaxBlockBytes を 1 か所に寄せたのと同じ理由
+// (block_emitter.h)。
 void emitConst(Emitter& e, XReg reg, std::uint32_t value)
 {
     const std::int32_t s = static_cast<std::int32_t>(value);
@@ -499,12 +505,18 @@ void emitLogicAlu(Emitter& e, const PlannedOp& op)
 // CMP は値を書かず X も触らない (applyFlags(sr, r, false))。
 // ADD / SUB は X に C と同じ値を書く。
 // **src は kTmpA に載っている前提。**
-void emitArithAluCore(Emitter& e, const PlannedOp& op)
+// 算術フラグの本体。**s が kTmpA、d が kTmpB に載っている前提。**
+//
+// 結果 r は kTmpC に残す (呼び出し側が書き戻すかどうかを決める)。
+// CMP / CMPA は書かないので、ここでは CCR しか触らない。
+//
+// **切り出しもここでやる。** 呼び出し側に出すと、レジスタ間形と
+// CMPA で切り出し幅がずれても式は同じに見え、V / C だけが静かに割れる。
+void emitArithFlagsCore(Emitter& e, PlanAluOp aluOp, std::uint32_t size)
 {
-    const std::uint32_t size = op.size;
     const std::uint32_t bits = sizeBits(size);
-    const bool isAdd = op.aluOp == PlanAluOp::kAdd;
-    const bool isCmp = op.aluOp == PlanAluOp::kCmp;
+    const bool isAdd = aluOp == PlanAluOp::kAdd;
+    const bool isCmp = aluOp == PlanAluOp::kCmp;
 
     // d と s を切り出す。
     //
@@ -515,7 +527,6 @@ void emitArithAluCore(Emitter& e, const PlannedOp& op)
     // 依存しているから。段 3 でレジスタに値を寝かせる最適化を入れて r の
     // 切り詰めを出口へ移した瞬間、V と C が上位の桁を拾い始める。
     // **等価性が別の場所の実装に依存している形は、崩れたことに気づけない。**
-    l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
     emitTruncate(e, kTmpA, kTmpA, size);  // s
     emitTruncate(e, kTmpB, kTmpB, size);  // d
 
@@ -590,11 +601,18 @@ void emitArithAluCore(Emitter& e, const PlannedOp& op)
     moveqz(e.slot(kWideLen), kTmpCcr, kTmpD, kTmpC);
 
     emitStoreCcr(e, kTmpCcr, isCmp ? kLogicClear : kArithClear);
+}
 
+// ADD / SUB / CMP のうち、転送先が d[] の形。**src は kTmpA に載っている前提。**
+void emitArithAluCore(Emitter& e, const PlannedOp& op)
+{
+    l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
+    emitArithFlagsCore(e, op.aluOp, op.size);
     // CMP は結果を書かない。
+    const bool isCmp = op.aluOp == PlanAluOp::kCmp;
     if (!isCmp)
     {
-        emitWriteDataRegister(e, op.dstReg, kTmpC, size);
+        emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
     }
 }
 
@@ -603,6 +621,65 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
 {
     l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
     emitArithAluCore(e, op);
+}
+
+// ADDA / SUBA .w/l <src>,An。**フラグを 1 bit も変えない** (Tier G)。
+//
+// emitStoreCcr を呼ばないことがそのまま「フラグ不変」の実装になっている。
+// ADD / SUB と同じだろうと思って emitArithAluCore へ載せると CCR が動く。
+//
+// **加減算は必ず 32bit。** .w は src を符号拡張してから 32bit で足す
+// (m68k_ops_alu.cpp:78-82)。size で結果を切ると .w が上位を落とす。
+void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
+{
+    const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
+    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    if (op.size == 2)
+    {
+        // interpreter は readEa mode 0 で **下位 16bit に切ってから**
+        // 符号拡張し、mode 1 では An をそのまま符号拡張する (m68k.h:513-524)。
+        // どちらも「下位 16bit を符号拡張」と同じ値になるので 1 本で済む。
+        emitSext16(e, kTmpA, kTmpA);
+    }
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    if (op.aluOp == PlanAluOp::kAdd)
+    {
+        addN(e.slot(kNarrowLen), kTmpC, kTmpB, kTmpA);
+    }
+    else
+    {
+        sub(e.slot(kWideLen), kTmpC, kTmpB, kTmpA);
+    }
+    s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
+}
+
+// CMPA .w/l <src>,An。**フラグは全部変える** (X 以外)。Tier G。
+//
+// ADDA / SUBA と符号が隣り合うのに、フラグの扱いが正反対。
+// **比較は必ず kLong で行う** (m68k_ops_alu.cpp:281) ので、
+// emitArithAluCore を size = 4 の CMP として呼ぶ。size 欄は
+// 「src をどう読むか」だけを決める。
+//
+// **dst が a[] なので emitArithAluCore は使えない。** あちらは dst を
+// d[] から読み、CMP でなければ d[] へ書き戻す。ここは a[] を読むだけ。
+// 差し替えるのは「d を載せるところ」だけなので、フラグの式が割れないよう
+// 本体側に「d が既にレジスタに載っている」入口を作って共有する。
+void emitCmpa(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
+{
+    const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
+    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    if (op.size == 2)
+    {
+        emitSext16(e, kTmpA, kTmpA);
+    }
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    // **比較幅は op.size ではなく常に 4。** インタプリタは .w でも
+    // src を符号拡張してから alu::sub(a[reg], value, kLong) を呼ぶ
+    // (m68k_ops_alu.cpp:281)。op.size は「src をどう読むか」だけを決める欄で、
+    // フラグの幅とは別物なので、ここへ渡すと .w の N/Z/V/C が 16bit 幅で
+    // 立ってしまう。
+    constexpr std::uint32_t kCmpaCompareSize = 4u;
+    emitArithFlagsCore(e, PlanAluOp::kCmp, kCmpaCompareSize);
 }
 
 // 演算種別で本体を選ぶ。**レジスタ間形とメモリ読み形で同じ関数を通す。**
@@ -624,6 +701,18 @@ void emitAluBody(Emitter& e, const PlannedOp& op)
     }
     // kEor は翻訳器が積まない。積まれたなら対応範囲がずれているので諦める。
     e.failed = true;
+}
+
+// ALU <#imm>,Dn。**即値は翻訳時定数**なので kTmpA へ置くだけ (Tier G)。
+//
+// planner が size でマスク済みの値を imm に入れてある (readEaSlow の 7.4 と
+// 同じ合成) ので、emitArithAluCore / emitLogicAluCore が先頭で行う
+// emitTruncate は何も変えない。**それでも本体を共有する**のが要点で、
+// フラグの式をレジスタ間形と 1 mm もずらさない。
+void emitAluImm(Emitter& e, const PlannedOp& op)
+{
+    emitConst(e, kTmpA, op.imm);
+    emitAluBody(e, op);
 }
 
 // --- Tier B: 読みガード ----------------------------------------------------
@@ -910,6 +999,18 @@ void emitMemoryRead(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
         case PlanKind::kMoveMemToDreg:
             emitWriteDataRegister(e, op.dstReg, kTmpC, size);
             emitLogicFlags(e, kTmpC, size);
+            return;
+        case PlanKind::kMoveaMemToAreg:
+            // **フラグを 1 bit も変えない。** emitLogicFlags を呼ばない
+            // ことがそのまま実装になっている (MOVEA の全形で同じ規約)。
+            //
+            // .w は符号拡張して 32bit 全体を書く (writeEa mode 1 /
+            // m68k.h:552)。読んだ値は上位が 0 なので、**書く前に**拡張する。
+            if (size == 2)
+            {
+                emitSext16(e, kTmpC, kTmpC);
+            }
+            s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
             return;
         case PlanKind::kTstMem:
             // **読むだけで書かない。**
@@ -2251,7 +2352,27 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
             case PlanKind::kMoveMemToDreg:
             case PlanKind::kTstMem:
             case PlanKind::kAluMemToDreg:
+            // **kMoveaMemToAreg も同じ経路 (Tier G)。** ガード → commit →
+            // 読み、までが同じで、読めた値の使い先だけが違う。
+            case PlanKind::kMoveaMemToAreg:
                 emitMemoryRead(e, op, i);
+                break;
+
+            // --- Tier G: 非終端の高頻度形 ---
+            case PlanKind::kAluImmToDreg:
+                emitAluImm(e, op);
+                break;
+            case PlanKind::kAddaDregToAreg:
+                emitAdda(e, op, /*srcIsAddressRegister=*/false);
+                break;
+            case PlanKind::kAddaAregToAreg:
+                emitAdda(e, op, /*srcIsAddressRegister=*/true);
+                break;
+            case PlanKind::kCmpaDregToAreg:
+                emitCmpa(e, op, /*srcIsAddressRegister=*/false);
+                break;
+            case PlanKind::kCmpaAregToAreg:
+                emitCmpa(e, op, /*srcIsAddressRegister=*/true);
                 break;
 
             // --- Tier C: メモリへ書く形 ---
