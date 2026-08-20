@@ -93,6 +93,16 @@ struct NativeStats
     u64 keyMissCold = 0;
     // 満杯から回復するために全部捨てた回数。
     u64 capacityReset = 0;
+    // **翻訳に成功した回数と、そのバイト数の合計。**
+    //
+    // 商が平均ブロックサイズで、これが無いと「16KB に何本入るか」を
+    // 推定でしか言えない (arena の適正値も admission の閾値も、
+    // 常駐本数を根拠にしか決められない)。
+    //
+    // 再翻訳率も出る: translated が blocksRun に対して大きいなら、
+    // 同じ番地を何度も翻訳し直している (チャーンの浪費)。
+    u64 translated = 0;
+    u64 translatedBytes = 0;
     // 世代が飽和して翻訳できなくなり、全部捨てて数え直した回数。
     u64 generationReset = 0;
     // 分岐で終端したブロックの実行回数 (direct chaining の的)。

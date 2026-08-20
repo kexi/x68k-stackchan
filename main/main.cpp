@@ -1859,6 +1859,15 @@ private:
                      (unsigned long long)st->keyMissCold);
             // **収支が閉じているかを出す。** 諦めた回数と理由の合計が
             // 合わないなら、無勘定の早期 return がある (実際に踏んだ)。
+            // 平均ブロックサイズ。**arena に何本入るかの唯一の根拠。**
+            if (st->translated != 0)
+            {
+                ESP_LOGI(
+                    kTag, "[jit] 翻訳 %llu 本 / %llu バイト (平均 %llu バイト、%llu 本入る)",
+                    (unsigned long long)st->translated, (unsigned long long)st->translatedBytes,
+                    (unsigned long long)(st->translatedBytes / st->translated),
+                    (unsigned long long)(kJitCodeBytes / (st->translatedBytes / st->translated)));
+            }
             ESP_LOGI(kTag, "[jit] 満杯で諦めた %llu / 満杯で捨てた %llu (収支 %lld)",
                      (unsigned long long)st->fullDeferred, (unsigned long long)st->capacityReset,
                      (long long)st->deferUnsupported - (long long)st->negativeHit -

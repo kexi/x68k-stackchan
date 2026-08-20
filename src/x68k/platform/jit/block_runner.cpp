@@ -272,6 +272,11 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     // 書く前の中身を拾いうる (1 回目だけ壊れる形で出る)。
     code_->commit();
 
+    // 平均ブロックサイズの材料。**翻訳が確定した後に数える** (途中で
+    // 諦めた分を混ぜると、arena に実際に載った量と合わなくなる)。
+    ++stats_.translated;
+    stats_.translatedBytes += need;
+
     BlockSlot& slot = here;
     // **鍵だけを写す。** ops[] は翻訳の途中でしか要らない。
     slot.entryPc = plan.entryPc;
