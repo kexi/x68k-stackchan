@@ -575,21 +575,17 @@ bool planAlu(u16 op, PlannedOp& out)
     return true;
 }
 
-// Bcc / BRA。BSR は入れない (I8)。
+// Bcc / BRA / BSR。
 bool planBranch(u16 op, u32 pc, PlannedOp& out)
 {
     const u32 cond = static_cast<u32>((op >> 8) & 0xFu);
     const u32 disp8 = static_cast<u32>(op & 0xFFu);
 
-    // I8: BSR は a[7] を減らして write32 する。メモリを触るので
-    // codeGen_.touch とアドレスエラーを同時に背負うことになる。
-    if (cond == 1)
-    {
-        return false;
-    }
-
     // 32bit 変位 ($FF) は 68020 以降。instructionLength も
     // kUnknownLength を返すので I1 が先に弾くが、単体でも落とす。
+    //
+    // **BSR.l ($61FF) もここで落ちる。** cond == 1 の判定より先に置いてある
+    // ので、BSR を受けるようにしても $61FF は入らない。
     if (disp8 == 0xFFu)
     {
         return false;
@@ -600,21 +596,35 @@ bool planBranch(u16 op, u32 pc, PlannedOp& out)
     // pc は 命令語 + 6 なので、pc - 4 が 命令語 + 2)。
     const u32 base = pc + 2;
 
+    // Tier F: BSR (cond == 1)。**Bcc と飛び先の作り方は完全に同じ**なので、
+    // kind と cycles だけを分ける。
+    //
+    // **cond 欄は埋めない。** BSR は条件を持たない (必ず飛ぶ) ので、
+    // 0 のままにしておく。1 を入れると emitCondition が「cond == 1」を
+    // 評価しようとする形が生まれる。エミッタは kBsr で条件を一切見ないが、
+    // 意味の無い値を置かないでおけば、後から誰かが読んでも迷わない。
+    const bool isBsr = cond == 1;
+
     if (disp8 == 0)
     {
         // 16bit 変位。拡張ワードの中身は plan() が読んで埋める。
-        out.kind = PlanKind::kBranch;
-        out.cond = static_cast<u8>(cond);
-        // groupBranch の不成立側は disp8 == 0 で 12。
-        out.cycles = 12;
+        out.kind = isBsr ? PlanKind::kBsr : PlanKind::kBranch;
+        out.cond = isBsr ? 0u : static_cast<u8>(cond);
+        // groupBranch: BSR は形によらず 18、Bcc の不成立側は disp8 == 0 で 12。
+        out.cycles = isBsr ? 18u : 12u;
+        // **BSR は A7 から 4 バイトぶん read/write する。** エミッタの
+        // 範囲ガードは op.size から「窓の上限 - size」を作るので、
+        // 0 のままだと窓の末尾 3 バイトで範囲外を書く (RTS と同じ理由)。
+        out.size = isBsr ? static_cast<u8>(kLong) : 0u;
         out.imm = base;
         return true;
     }
 
-    out.kind = PlanKind::kBranch;
-    out.cond = static_cast<u8>(cond);
-    // 8bit 変位の不成立側は 8。
-    out.cycles = 8;
+    out.kind = isBsr ? PlanKind::kBsr : PlanKind::kBranch;
+    out.cond = isBsr ? 0u : static_cast<u8>(cond);
+    // BSR は 18、Bcc の 8bit 変位の不成立側は 8。
+    out.cycles = isBsr ? 18u : 8u;
+    out.size = isBsr ? static_cast<u8>(kLong) : 0u;
     out.imm = base + static_cast<u32>(static_cast<s32>(static_cast<s8>(disp8)));
     return true;
 }
@@ -878,7 +888,12 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
         //
         // **読み・書きの許可とは別の条件。** 窓が全部そろっていても
         // メールボックスが未配線なら焼けないので、そこで終端する。
-        if (isBlockTerminator(planned.kind) && planned.kind != PlanKind::kBranch &&
+        //
+        // **静的な飛び先を持つ終端 (Bcc / BRA / BSR) は除く。** 飛び先が
+        // BlockPlan::branchTarget に入るので、メールボックスが未配線でも
+        // 焼ける。`kind != kBranch` と直に書くと、後から静的な終端を
+        // 足した人 (= BSR) が黙ってこのゲートに掛かる。
+        if (isBlockTerminator(planned.kind) && !hasStaticBranchTarget(planned.kind) &&
             !dynamicBranchAllowed)
         {
             out.end = BlockEnd::kUnsupported;
@@ -1068,7 +1083,9 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
             break;
         }
 
-        const bool isBranch = planned.kind == PlanKind::kBranch;
+        // 静的分岐 (Bcc / BRA / BSR)。飛び先が翻訳時に決まるので
+        // BlockPlan::branchTarget へ入れる。
+        const bool isBranch = hasStaticBranchTarget(planned.kind);
         if (isBranch)
         {
             // 16bit 変位形は、planBranch が imm に基準アドレスだけを
@@ -1097,9 +1114,17 @@ bool BlockPlanner::plan(const PlanSource& src, const PlanGenSource& gen, u32 ent
             out.fallThroughPc = nextPc;
             out.branchTarget = target;
             out.cyclesNotTaken += planned.cycles;
-            // 成立側は形によらず 10 (groupBranch)。BRA も testCondition(0) が
-            // 常に真なのでここを通り、cyclesNotTaken は参照されない。
-            out.cyclesTaken += 10;
+            // 成立側は Bcc / BRA なら形によらず 10 (groupBranch)。BRA も
+            // testCondition(0) が常に真なのでここを通り、cyclesNotTaken は
+            // 参照されない。
+            //
+            // **BSR は 18 で、しかも .s と .w で同じ。** groupBranch の
+            // BSR 経路は disp8 を見ずに 18 を返す (m68k_ops_move.cpp:126)
+            // ので、planned.cycles をそのまま使う。BSR は必ず飛ぶので
+            // cyclesNotTaken も同じ値になるが、**そちらも埋めておく**:
+            // ガード不成立で降りると島が「その命令の手前まで」を返すため、
+            // 未定義のままだと出口のサイクルが壊れる (Tier D と同じ)。
+            out.cyclesTaken += planned.kind == PlanKind::kBsr ? planned.cycles : 10u;
             // I6: 分岐はブロックの最後にしか置けない。飛んだ先が翻訳済みか
             // どうかはここでは分からないので、必ず切る。
             break;

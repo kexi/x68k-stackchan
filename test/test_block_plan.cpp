@@ -104,7 +104,8 @@ struct FakeGen
 //
 // ここに入れてよいのは、次を全部満たす形だけ:
 //   - 不当命令・特権違反・トラップ・ゼロ除算に入らない
-//   - A レジスタもスタックも触らない (BSR / MOVEA / ADDA)
+//   - スタックへ積むなら **積む先が -(A7) 固定**で、実行時ガードが
+//     窓の中かを確かめられる (BSR / JSR)。任意の An へ書く形は入らない
 //   - メモリに触るなら **読むだけ** で、実効アドレスが Tier B の
 //     許可 EA に入っている (下の specReadEa)
 //
@@ -304,17 +305,23 @@ bool specSafeAlu(x68k::u16 op)
     return opmode <= 2;
 }
 
-// Bcc / BRA。BSR (cond 1) は a[7] へ write32 するので入れない。
-// 変位 $FF は 68020 以降の 32bit 変位。
+// Bcc / BRA / BSR。
+//
+// **BSR (cond 1) が入った (Tier F)。** 戻り先を -(A7) へ write32 するが、
+// 書き形 (Tier C) や JSR (Tier D) と同じく、実効アドレスが窓の中かは
+// 生成コードのガードが実行時に確かめて、外れたら 1 bit も状態を変えずに
+// step() へ降りる。**静的に禁じる理由が無くなった形。**
+//
+// 変位 $FF は 68020 以降の 32bit 変位。BSR.l ($61FF) もここで外れる。
+// 変位 $00 は 16bit 変位形で、拡張ワードが 1 語続く。
 bool specSafeBranch(x68k::u16 op)
 {
     if ((op >> 12) != 0x6u)
     {
         return false;
     }
-    const x68k::u32 cond = static_cast<x68k::u32>((op >> 8) & 0xFu);
     const x68k::u32 disp8 = static_cast<x68k::u32>(op & 0xFFu);
-    return cond != 1 && disp8 != 0xFFu;
+    return disp8 != 0xFFu;
 }
 
 bool specSafe(x68k::u16 op)
@@ -407,7 +414,8 @@ TEST_SUITE("BlockPlanner")
     //
     // 落ちる変異:
     //   - planMove の mode 検査を落とす (MOVE.b An,Dn が入り、不当命令例外)
-    //   - planBranch の cond == 1 検査を落とす (BSR が入り、スタックへ書く)
+    //   - planBranch の disp8 == 0xFF 検査を落とす (BSR.l / Bcc.l が入る)
+    //   - planBranch へ cond == 1 の拒否を戻す (BSR が落ちる)
     //   - planAlu の opmode 3/7 検査を落とす (DIVU が入り、ゼロ除算例外)
     //   - planAlu の mode 検査を落とす (ADD (An),Dn が入り、バスを読む)
     TEST_CASE("planOne の許可リストが符号化から組んだ安全な集合と一致する")
@@ -981,43 +989,146 @@ TEST_SUITE("BlockPlanner")
         }
     }
 
-    // I8: BSR はブロックへ入れない。
+    // Tier F: BSR はブロックへ**入る**。飛び先が翻訳時に決まる終端。
     //
-    // BSR は復帰アドレスを a[7] へ write32 する。メモリを触るので、
-    // 「メモリを触らない」契約が破れるだけでなく、a[7] が奇数のときに
-    // アドレスエラーへ入る。**instructionLength は BSR にも長さを返す**ので、
-    // I1 は守ってくれない。planOne が手で弾くしかない。
+    // **段 0-F まで I8 で除外していた形。** 除外の理由は「a[7] へ write32
+    // するので、世代の更新とアドレスエラーを背負う」だった。Tier C/D で
+    // 書き形と JSR のスタック積みが入り、どちらも実行時ガードで閉じたので、
+    // BSR だけを外し続ける理由が無くなった。
     //
-    // 落ちる変異: planBranch の cond == 1 の検査を消す
-    TEST_CASE("BSR はブロックに入らない")
+    // 落ちる変異:
+    //   - planBranch へ cond == 1 の拒否を戻す (BSR が入らなくなる)
+    //   - kBsr の cycles を 10 / 12 / 8 にする (インタプリタは形によらず 18)
+    //   - 飛び先の基準を pc + 4 にする
+    //   - hasStaticBranchTarget から kBsr を外す (branchTarget が 0 のまま)
+    TEST_CASE("BSR はブロックの終端として入る")
     {
-        // 単体で見ても弾かれること。
-        for (x68k::u32 disp = 0; disp < 0x100; ++disp)
+        // BSR.s: 8bit 変位 ($00 と $FF を除く全部) を受けること。
+        for (x68k::u32 disp = 1; disp < 0xFF; ++disp)
         {
             const auto op = static_cast<x68k::u16>(0x6100u | disp);
             CAPTURE(op);
             x68k::PlannedOp planned{};
-            CHECK_FALSE(x68k::BlockPlanner::planOne(op, kEntry, planned));
+            REQUIRE(x68k::BlockPlanner::planOne(op, kEntry, planned));
+            CHECK(planned.kind == x68k::PlanKind::kBsr);
+            // **インタプリタは BSR に形によらず 18 を返す** (groupBranch)。
+            CHECK(planned.cycles == 18);
+            // A7 から 4 バイトぶん動かすので、範囲ガードの基準に 4 が要る。
+            CHECK(planned.size == 4);
+            // **条件を持たない。** cond 欄に 1 を残すと、読んだ人が
+            // 「条件コード 1 を評価する形」と読み違える。
+            CHECK(planned.cond == 0);
+            // 飛び先の基準は「命令語の次のワード」= pc + 2。
+            const auto want = kEntry + 2u +
+                              static_cast<x68k::u32>(static_cast<x68k::s32>(
+                                  static_cast<x68k::s8>(static_cast<x68k::u8>(disp))));
+            CHECK(planned.imm == want);
         }
-        // 命令長デコーダは BSR に長さを返す。つまり I1 では守れない。
-        CHECK(x68k::instructionLength(0x6102) == 2);
-        CHECK(x68k::instructionLength(0x6100) == 4);
 
-        FlatCode code;
-        FakeGen gen;
-        const auto gsrc = gen.source();
+        // BSR.w ($6100): 変位は拡張ワードにあるので imm は基準だけ。
+        {
+            x68k::PlannedOp planned{};
+            REQUIRE(x68k::BlockPlanner::planOne(0x6100u, kEntry, planned));
+            CHECK(planned.kind == x68k::PlanKind::kBsr);
+            CHECK(planned.cycles == 18);
+            CHECK(planned.imm == kEntry + 2u);
+        }
 
-        code.reset(0x0800, 0x1800);
-        code.poke16(kEntry, 0x7000);      // MOVEQ #0,D0
-        code.poke16(kEntry + 2, 0x6102);  // BSR.s
-        code.poke16(kEntry + 4, 0x4E71);
-        const auto src = code.source();
+        // BSR.l ($61FF) は 68020 以降。**拒否すること。**
+        // instructionLength も kUnknownLength を返すので I1 が先に弾くが、
+        // planOne 単体でも落とす (二重に閉じる)。
+        {
+            x68k::PlannedOp planned{};
+            CHECK_FALSE(x68k::BlockPlanner::planOne(0x61FFu, kEntry, planned));
+            CHECK(x68k::instructionLength(0x61FF) == x68k::kUnknownLength);
+        }
 
-        x68k::BlockPlan plan{};
-        REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
-        CHECK(plan.count == 1);
-        CHECK(plan.end == x68k::BlockEnd::kUnsupported);
-        CHECK(plan.fallThroughPc == kEntry + 2);
+        // Bcc ($62xx-$6Fxx) は kBsr にならないこと。**cond == 1 だけが BSR。**
+        for (x68k::u32 cond = 2; cond < 16; ++cond)
+        {
+            const auto op = static_cast<x68k::u16>(0x6000u | (cond << 8) | 0x02u);
+            CAPTURE(op);
+            x68k::PlannedOp planned{};
+            REQUIRE(x68k::BlockPlanner::planOne(op, kEntry, planned));
+            CHECK(planned.kind == x68k::PlanKind::kBranch);
+        }
+        // BRA ($60xx) も kBranch。
+        {
+            x68k::PlannedOp planned{};
+            REQUIRE(x68k::BlockPlanner::planOne(0x6002u, kEntry, planned));
+            CHECK(planned.kind == x68k::PlanKind::kBranch);
+        }
+
+        // 計画に組んだとき、**終端になって飛び先が branchTarget へ入る**こと。
+        {
+            FlatCode code;
+            FakeGen gen;
+            const auto gsrc = gen.source();
+
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x7000);      // MOVEQ #0,D0
+            code.poke16(kEntry + 2, 0x6102);  // BSR.s +2 → 0x1006
+            code.poke16(kEntry + 4, 0x4E71);
+            code.poke16(kEntry + 6, 0x4E71);
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            // MOVEQ と BSR の 2 命令。**BSR で切れる。**
+            CHECK(plan.count == 2);
+            CHECK(plan.end == x68k::BlockEnd::kBranch);
+            CHECK(plan.ops[1].kind == x68k::PlanKind::kBsr);
+            // 飛び先 = (kEntry + 2) + 2 + 2 = kEntry + 6。
+            CHECK(plan.branchTarget == kEntry + 6);
+            // **メールボックス経由ではない。** kDynamicBranch にならないこと。
+            CHECK(plan.end != x68k::BlockEnd::kDynamicBranch);
+            // BSR は必ず飛ぶので、成立側と不成立側のサイクルが同じ。
+            // MOVEQ (4) + BSR (18) = 22。
+            CHECK(plan.cyclesTaken == 22);
+            CHECK(plan.cyclesNotTaken == 22);
+            // MOVEQ (2) + BSR.s (2)。
+            CHECK(plan.fallThroughPc == kEntry + 4);
+        }
+
+        // BSR.w の飛び先が拡張ワードから畳まれること。
+        {
+            FlatCode code;
+            FakeGen gen;
+            const auto gsrc = gen.source();
+
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x6100);      // BSR.w
+            code.poke16(kEntry + 2, 0x0010);  // 変位 +16
+            code.poke16(kEntry + 4, 0x4E71);
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            CHECK(plan.count == 1);
+            CHECK(plan.end == x68k::BlockEnd::kBranch);
+            // 飛び先 = (kEntry + 2) + 16。
+            CHECK(plan.branchTarget == kEntry + 2 + 16);
+            CHECK(plan.cyclesTaken == 18);
+            CHECK(plan.fallThroughPc == kEntry + 4);
+        }
+
+        // 奇数の飛び先は I7 が積まずに弾くこと (Bcc と同じ)。
+        {
+            FlatCode code;
+            FakeGen gen;
+            const auto gsrc = gen.source();
+
+            code.reset(0x0800, 0x1800);
+            code.poke16(kEntry, 0x7000);      // MOVEQ
+            code.poke16(kEntry + 2, 0x6103);  // BSR.s +3 → 奇数
+            code.poke16(kEntry + 4, 0x4E71);
+            const auto src = code.source();
+
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan));
+            CHECK(plan.count == 1);
+            CHECK(plan.end == x68k::BlockEnd::kUnsupported);
+        }
     }
 
     // MOVE.b で An を触る形をブロックへ入れないこと。
@@ -1230,6 +1341,10 @@ TEST_SUITE("BlockPlanner")
         {
             std::vector<x68k::u16> words;  // kEntry から並べる語
             Caps caps;
+            // 禁止を解いたときの終端理由。**BSR は静的分岐なので
+            // kDynamicBranch にならない。** 一律に kDynamicBranch を
+            // 期待すると、BSR をメールボックス経由にする実装が通ってしまう。
+            x68k::BlockEnd allowedEnd;
             const char* what;
         };
 
@@ -1241,17 +1356,41 @@ TEST_SUITE("BlockPlanner")
             // eaMode で判定する実装はここを通してしまう。**
             //
             // 落ちる変異: needsReadWindow から kRts を外す
-            {{0x7000u, 0x4E75u}, Caps{false, true, true}, "RTS と読み禁止"},
+            {{0x7000u, 0x4E75u},
+             Caps{false, true, true},
+             x68k::BlockEnd::kDynamicBranch,
+             "RTS と読み禁止"},
             // JSR: 書きの窓が要る。**isMemoryWriteKind は kJsr を含まない**
             // ので、そちらで判定する実装はここを通してしまう。
             //
             // 落ちる変異: needsWriteWindow から kJsr を外す
-            {{0x7000u, 0x4E93u}, Caps{true, false, true}, "JSR (A3) と書き禁止"},
+            {{0x7000u, 0x4E93u},
+             Caps{true, false, true},
+             x68k::BlockEnd::kDynamicBranch,
+             "JSR (A3) と書き禁止"},
+            // BSR: 書きの窓が要る。**eaMode を持たず isMemoryWriteKind にも
+            // 入らない**ので、そのどちらで判定する実装もここを通してしまう。
+            //
+            // 落ちる変異: needsWriteWindow から kBsr を外す
+            {{0x7000u, 0x6102u},
+             Caps{true, false, true},
+             x68k::BlockEnd::kBranch,
+             "BSR.s と書き禁止"},
+            {{0x7000u, 0x6100u, 0x0004u},
+             Caps{true, false, true},
+             x68k::BlockEnd::kBranch,
+             "BSR.w と書き禁止"},
             // どちらもメールボックスが要る。
             //
             // 落ちる変異: dynamicBranchAllowed の判定を消す
-            {{0x7000u, 0x4E75u}, Caps{true, true, false}, "RTS と動的分岐禁止"},
-            {{0x7000u, 0x4E93u}, Caps{true, true, false}, "JSR と動的分岐禁止"},
+            {{0x7000u, 0x4E75u},
+             Caps{true, true, false},
+             x68k::BlockEnd::kDynamicBranch,
+             "RTS と動的分岐禁止"},
+            {{0x7000u, 0x4E93u},
+             Caps{true, true, false},
+             x68k::BlockEnd::kDynamicBranch,
+             "JSR と動的分岐禁止"},
         };
 
         for (const Case& c : cases)
@@ -1278,7 +1417,32 @@ TEST_SUITE("BlockPlanner")
             x68k::BlockPlan allowedPlan{};
             REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, allowedPlan, makeCaps(allowed)));
             CHECK(allowedPlan.count == 2u);
-            CHECK(allowedPlan.end == x68k::BlockEnd::kDynamicBranch);
+            CHECK(allowedPlan.end == c.allowedEnd);
+        }
+
+        // **BSR はメールボックスを要らない。** 動的分岐が禁止でも積めること
+        // を、上の表とは逆向き (禁止しても通る) に問う。
+        //
+        // 落ちる変異: plan() の動的分岐ゲートを hasStaticBranchTarget では
+        //             なく kBranch だけで除外する
+        for (const std::vector<x68k::u16>& words :
+             {std::vector<x68k::u16>{0x7000u, 0x6102u},
+              std::vector<x68k::u16>{0x7000u, 0x6100u, 0x0004u}})
+        {
+            code.reset(0x0800, 0x1800);
+            x68k::u32 at = kEntry;
+            for (const x68k::u16 w : words)
+            {
+                code.poke16(at, w);
+                at += 2;
+            }
+            const auto src = code.source();
+
+            Caps noDynamic{true, true, false};
+            x68k::BlockPlan plan{};
+            REQUIRE(x68k::BlockPlanner::plan(src, gsrc, kEntry, plan, makeCaps(noDynamic)));
+            CHECK(plan.count == 2u);
+            CHECK(plan.end == x68k::BlockEnd::kBranch);
         }
     }
 

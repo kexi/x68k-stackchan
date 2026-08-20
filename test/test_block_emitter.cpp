@@ -4816,6 +4816,536 @@ TEST_CASE("JSR は CCR を 1 bit も変えない")
     clearSeeds();
 }
 
+// --- Tier F: BSR -------------------------------------------------------------
+//
+// **JSR のスタック操作 + Bcc の静的な飛び先。** ここで問うのは 4 つ:
+//
+//   飛び先が BlockSlot::branchTarget から来ること (メールボックスではない)
+//   積む戻り先が「次の命令のアドレス」であること
+//   ガードが all-or-nothing であること (A7 も pc も動かさずに降りる)
+//   サイクルが .s / .w とも 18 であること
+//
+// checkEquivalence が「参照側の pc == branchTarget + 4」と
+// 「kBranchTakenFlag が立ち kDynamicBranchFlag が立たない」を問うので、
+// 飛び先を取り違える変異と出口のビットを取り違える変異は必ず落ちる。
+
+namespace
+{
+
+// BSR.s。disp8 は $00 / $FF を除く。
+constexpr u16 bsrShort(int disp8)
+{
+    return static_cast<u16>(0x6100u | (static_cast<u32>(disp8) & 0xFFu));
+}
+constexpr u16 kBsrWordOp = 0x6100u;
+
+}  // namespace
+
+TEST_CASE("BSR がインタプリタと一致する")
+{
+    for (u32 seed : {1u, 3u, 7u})
+    {
+        // BSR.s。前方へ飛ぶ。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({bsrShort(4)}, s, "BSR.s 前方");
+        }
+        // BSR.s。**後方へ飛ぶ (負の変位)。** 符号拡張を間違えると落ちる。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({bsrShort(-0x40)}, s, "BSR.s 後方");
+        }
+        // BSR.w。拡張ワードの変位。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kBsrWordOp, 0x0010u}, s, "BSR.w 前方");
+        }
+        // BSR.w。負の 16bit 変位。
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({kBsrWordOp, 0xFF00u}, s, "BSR.w 後方");
+        }
+        // 手前に命令があるブロック。**BSR が末尾でも前の命令の結果が残る。**
+        {
+            clearSeeds();
+            M68kState s = makeState(seed);
+            s.a[7] = kStackAddr;
+            checkEquivalence({moveq(1, 0x42), bsrShort(6)}, s, "MOVEQ + BSR.s");
+        }
+    }
+    clearSeeds();
+}
+
+TEST_CASE("BSR が積む戻り先が次の命令のアドレス")
+{
+    // **インタプリタの returnAddr は .s で base、.w で base + 2**
+    // (base = 命令語 + 2)。どちらも「命令語 + 命令長」に等しい。
+    //
+    // 落ちる変異:
+    //   - 戻り先を op.pc + op.length ± 2 にする
+    //   - .s と .w で同じ定数 (op.pc + 2 など) を使う
+    struct Case
+    {
+        std::vector<u16> words;
+        u32 length;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{bsrShort(4)}, 2u, "BSR.s"},
+        {{kBsrWordOp, 0x0010u}, 4u, "BSR.w"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        clearSeeds();
+        M68kState s = makeState(2);
+        s.a[7] = kStackAddr;
+
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        REQUIRE(plan.end == BlockEnd::kBranch);
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        resetExecRam(c.words);
+        resetExecGen(0xFFFFFFFFu, 0);
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+
+        // A7 は 4 減っている。
+        CHECK(native.state.a[7] == kStackAddr - 4u);
+        // 積まれた 4 バイトがビッグエンディアンで kEntry + length。
+        const u32 want = kEntry + c.length;
+        const u32 sp = kStackAddr - 4u;
+        const u32 got =
+            (static_cast<u32>(execRam()[sp]) << 24) | (static_cast<u32>(execRam()[sp + 1]) << 16) |
+            (static_cast<u32>(execRam()[sp + 2]) << 8) | static_cast<u32>(execRam()[sp + 3]);
+        INFO("return address");
+        CHECK(got == want);
+    }
+    clearSeeds();
+}
+
+TEST_CASE("BSR の飛び先は静的で、メールボックスを使わない")
+{
+    // **kBranchTakenFlag を立てて BlockSlot::branchTarget から飛ぶ。**
+    // kDynamicBranchFlag を立てる実装だと、runner が前のブロックが残した
+    // メールボックスの値へ飛ぶ (= 原因から最も遠い暴走)。
+    //
+    // 落ちる変異:
+    //   - emitBsr の出口を emitDynamicBranchExit にする
+    //   - hasStaticBranchTarget から kBsr を外す (branchTarget が 0 になる)
+    clearSeeds();
+    const std::vector<u16> words{bsrShort(4)};
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    REQUIRE(plan.end == BlockEnd::kBranch);
+    // 飛び先 = (kEntry + 2) + 4。
+    REQUIRE(plan.branchTarget == kEntry + 6u);
+
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+    CHECK(e.info.endsWithBranch);
+    CHECK_FALSE(e.info.endsWithDynamicBranch);
+    CHECK(e.info.branchTarget == plan.branchTarget);
+
+    M68kState s = makeState(4);
+    s.a[7] = kStackAddr;
+    resetExecRam(words);
+    resetExecGen(0xFFFFFFFFu, 0);
+    const NativeOutcome native = runEmitted(e, s);
+    REQUIRE(native.ok);
+
+    CHECK(native.branchTaken);
+    CHECK_FALSE(native.dynamicBranch);
+    CHECK_FALSE(native.guardExit);
+    // **メールボックスは runEmitted が走らせる前に 0xDEADBEEF で潰している。**
+    // 生成コードが 1 語も書かないこと = 潰した値がそのまま残ること。
+    INFO("mailbox untouched");
+    CHECK(native.mailbox == 0xDEADBEEFu);
+
+    // runner のディスパッチが静的な飛び先を選ぶこと。
+    // **メールボックスの値を渡しても、そちらを採らない。**
+    jit::BlockReturn decoded{};
+    decoded.branchTaken = native.branchTaken;
+    decoded.dynamicBranch = native.dynamicBranch;
+    decoded.guardExit = native.guardExit;
+    const jit::BranchDecision decision =
+        jit::nextBranch(decoded, plan.branchTarget, native.mailbox);
+    CHECK(decision.source == jit::BranchSource::kStaticTarget);
+    CHECK(decision.target == plan.branchTarget);
+    clearSeeds();
+}
+
+TEST_CASE("BSR のサイクルは .s も .w も 18")
+{
+    // **groupBranch の BSR 経路は disp8 を見ずに 18 を返す**
+    // (m68k_ops_move.cpp:126)。Bcc のように形で分かれると思って
+    // 12 / 8 を入れると、rasterNumber の 317 サイクル粒度が数万命令後に割れる。
+    //
+    // 落ちる変異: kBsr の cyclesTaken を 10 (Bcc の成立側) にする
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    for (const Case& c :
+         std::vector<Case>{{{bsrShort(4)}, "BSR.s"}, {{kBsrWordOp, 0x0010u}, "BSR.w"}})
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        CHECK(plan.cyclesTaken == 18u);
+        CHECK(plan.cyclesNotTaken == 18u);
+    }
+    // 手前に MOVEQ (4) が付けば 22。**足し込まれていること**を問う。
+    {
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan({moveq(1, 3), bsrShort(6)}, plan, code));
+        CHECK(plan.cyclesTaken == 22u);
+    }
+}
+
+TEST_CASE("BSR のスタックが窓の外なら 1 bit も動かさずに降りる")
+{
+    // **all-or-nothing (G3 / G7)。** A7 - 4 が窓の外なら、A7 も pc も
+    // ゲスト RAM も世代配列も動かない。
+    //
+    // 落ちる変異:
+    //   - emitBsr の s32i (A7 の更新) をガードより前へ移す
+    //   - emitTouch をガードより前へ移す
+    //   - 範囲ガードそのものを消す
+    struct Case
+    {
+        u32 sp;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        // 窓の外 (上)。
+        {static_cast<u32>(x68k::kMainRamSize) + 0x100u, "窓の外"},
+        // 窓の先頭 (A7 - 4 が下へ回り込む)。
+        {0u, "A7 = 0 で A7-4 が回り込む"},
+        // **奇数。** write32 はアドレスエラーへ入る。
+        {kStackAddr + 1u, "A7-4 が奇数"},
+        // **窓の末尾ちょうど。** A7-4 == limit なので 4 バイトぶん外へ出る。
+        //
+        // ここが op.size を埋めているかどうかを問う唯一の点。範囲ガードは
+        // 「a <= limit - size」を作るので、size が 0 のままだと
+        // 「a <= limit」になり、**窓の末尾 4 バイトが素通りする**
+        // (RTS が size を埋めている理由と同じ)。
+        {static_cast<u32>(x68k::kMainRamSize) + 4u, "A7-4 が窓の末尾ちょうど"},
+        // A7-4 が窓の末尾から 2 バイト手前。**4 バイト書くと 2 バイトはみ出す。**
+        {static_cast<u32>(x68k::kMainRamSize) + 2u, "A7-4 が窓の末尾 -2"},
+    };
+
+    // **.s と .w の両方で回す。** planBranch は 2 つの経路で別々に size を
+    // 埋めるので、片方だけ試すともう片方の埋め忘れが素通りする
+    // (実際に .w だけ生き残る変異があった)。
+    const std::vector<std::vector<u16>> forms = {{bsrShort(4)}, {kBsrWordOp, 0x0010u}};
+
+    for (const Case& c : cases)
+        for (const std::vector<u16>& words : forms)
+        {
+            INFO(std::string(c.what));
+            INFO(std::string(words.size() == 1u ? "BSR.s" : "BSR.w"));
+            clearSeeds();
+            FlatCode code;
+            BlockPlan plan{};
+            REQUIRE(buildPlan(words, plan, code));
+            const EmitResult e = emit(plan, code);
+            REQUIRE(e.ok);
+
+            M68kState s = makeState(5);
+            s.a[7] = c.sp;
+            resetExecRam(words);
+            resetExecGen(0xFFFFFFFFu, 0);
+            const std::vector<u8> before = execRam();
+
+            const NativeOutcome native = runEmitted(e, s);
+            REQUIRE(native.ok);
+
+            CHECK(native.guardExit);
+            CHECK_FALSE(native.branchTaken);
+            CHECK_FALSE(native.dynamicBranch);
+            // 0 命令ぶんしか進んでいない (BSR はブロックの唯一の命令)。
+            CHECK(native.ranOps == 0u);
+            // **アーキテクチャ状態は 1 bit も動いていない** (G3)。
+            // pc / ir / irc だけは島が「その命令の直前の命令境界」を書く (G7)。
+            M68kState want = s;
+            want.pc = kEntry + 4u;
+            want.ir = words[0];
+            want.irc = code.get16(kEntry + 2u);
+            compareStates(want, native.state, /*skipPrefetch=*/false, c.what);
+            // **A7 は動いていない。** 名指しで固定する (compareStates が
+            // 全レジスタを見るが、ここが G3 の本体)。
+            CHECK(native.state.a[7] == c.sp);
+            compareMemory(before, std::vector<std::uint16_t>(kGenPages, 0), c.what);
+        }
+    clearSeeds();
+}
+
+TEST_CASE("BSR が自ページへ積むなら書く前に脱出する")
+{
+    // G13: 積む先が plan.page に掛かると、焼いた定数 (出口の ir / irc) が
+    // 実行中に古くなる。**書く前に降りる。**
+    //
+    // 落ちる変異:
+    //   - emitBsr から emitSelfPageGuard を消す
+    //   - byteOffset 3 のほう (`.l` の後端) だけを消す
+    clearSeeds();
+    const u32 selfPageBase = kEntry & ~0x3FFu;
+    const std::vector<u16> words{bsrShort(4)};
+
+    struct Case
+    {
+        u32 sp;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        // A7 - 4 がちょうど自ページの中。
+        {selfPageBase + 0x104u, "自ページの中へ積む"},
+        // A7 - 4 が手前のページだが、a + 3 が自ページの先頭へ食い込む。
+        // **byteOffset 3 のガードでしか捕まらない。**
+        {selfPageBase + 2u, "a+3 が自ページへ食い込む"},
+        // A7 - 4 が自ページの末尾で、a + 3 は**次のページ**。
+        // **byteOffset 0 のガードでしか捕まらない。** 上のケースと対にして
+        // 置かないと、2 本のうち片方を消す変異がもう片方に拾われて通る。
+        {selfPageBase + 0x402u, "a が自ページの末尾 / a+3 は次ページ"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(words, plan, code));
+        const EmitResult e = emit(plan, code);
+        REQUIRE(e.ok);
+
+        M68kState s = makeState(6);
+        s.a[7] = c.sp;
+        resetExecRam(words);
+        resetExecGen(0xFFFFFFFFu, 0);
+        const std::vector<u8> before = execRam();
+
+        const NativeOutcome native = runEmitted(e, s);
+        REQUIRE(native.ok);
+
+        CHECK(native.guardExit);
+        CHECK(native.selfPageExit);
+        CHECK(native.ranOps == 0u);
+        M68kState want = s;
+        want.pc = kEntry + 4u;
+        want.ir = words[0];
+        want.irc = code.get16(kEntry + 2u);
+        compareStates(want, native.state, /*skipPrefetch=*/false, c.what);
+        CHECK(native.state.a[7] == c.sp);
+        compareMemory(before, std::vector<std::uint16_t>(kGenPages, 0), c.what);
+    }
+    clearSeeds();
+}
+
+TEST_CASE("BSR は書きの窓と世代配列が無いと発行しない")
+{
+    // **BSR は -(A7) へ write32 する。** eaMode を持たず
+    // isMemoryWriteKind にも入らないので、canEmitWritesFor は見ていない。
+    // canEmitBsrFor が別に見ないと、世代配列の外へ s16i する形で焼ける。
+    //
+    // 落ちる変異:
+    //   - measure() から canEmitBsrFor の呼び出しを消す
+    //   - canEmitBsrFor の canEmitWritesIn を消す
+    clearSeeds();
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan({bsrShort(4)}, plan, code));
+    const u16 ir = code.get16(plan.fallThroughPc);
+    const u16 irc = code.get16(plan.fallThroughPc + 2);
+
+    CHECK(jit::requiredSize(plan, ir, irc, fakeEnv()) > 0u);
+
+    // 世代配列が無い。
+    jit::EmitEnv noGen = fakeEnv();
+    noGen.genBaseAddr = 0;
+    CHECK(jit::requiredSize(plan, ir, irc, noGen) == 0u);
+
+    // ページ数が足りない。
+    jit::EmitEnv shortGen = fakeEnv();
+    shortGen.genPageCount = kGenPages - 1;
+    CHECK(jit::requiredSize(plan, ir, irc, shortGen) == 0u);
+
+    // 窓が無い。
+    jit::EmitEnv noWindow = fakeEnv();
+    noWindow.ramBaseAddr = 0;
+    CHECK(jit::requiredSize(plan, ir, irc, noWindow) == 0u);
+
+    // 窓が 4 バイトの書きを一度も許さない。
+    jit::EmitEnv tiny = fakeEnv();
+    tiny.ramLimit = 2;
+    CHECK(jit::requiredSize(plan, ir, irc, tiny) == 0u);
+
+    // **窓が読めなくても焼ける。** BSR は書き経路だけで、
+    // 書き経路は fastRamReadable_ を見ない (m68k.cpp:331-334)。
+    jit::EmitEnv unreadable = fakeEnv();
+    unreadable.ramReadable = false;
+    CHECK(jit::requiredSize(plan, ir, irc, unreadable) > 0u);
+
+    // **メールボックスが無くても焼ける。** BSR は飛び先を静的に持つ。
+    //
+    // 落ちる変異: canEmitBsrFor で canEmitDynamicBranchIn も問う
+    jit::EmitEnv noMailbox = fakeEnv();
+    noMailbox.mailboxAddr = 0;
+    CHECK(jit::requiredSize(plan, ir, irc, noMailbox) > 0u);
+}
+
+TEST_CASE("BSR は必ずブロック末尾になる")
+{
+    // **I6 / G23。** BSR の後ろに命令があっても積まない。
+    // 積むと、飛んだ後に実行されないはずの命令が実行される。
+    //
+    // 落ちる変異: plan() の静的分岐の break を消す
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{bsrShort(4), moveq(0, 1)}, "BSR.s の後ろ"},
+        {{kBsrWordOp, 0x0010u, moveq(0, 1)}, "BSR.w の後ろ"},
+        {{moveq(0, 1), bsrShort(4), moveq(1, 2)}, "MOVEQ + BSR + MOVEQ"},
+    };
+
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        REQUIRE(plan.count >= 1u);
+        // 末尾が BSR で、そこで切れていること。
+        CHECK(plan.ops[plan.count - 1u].kind == PlanKind::kBsr);
+        CHECK(plan.end == BlockEnd::kBranch);
+        // **述語そのものも問う。** plan() は hasStaticBranchTarget で
+        // 切っているので、isBlockTerminator に kBsr が入っていなくても
+        // 上の CHECK は通ってしまう。契約 (「末尾にしか置けない形」) を
+        // 名指しで固定しないと、後から誰かが isBlockTerminator を根拠に
+        // 判断を書いたときに黙って外れる。
+        //
+        // 落ちる変異: isBlockTerminator から kBsr を外す
+        CHECK(x68k::isBlockTerminator(PlanKind::kBsr));
+        // 静的な飛び先を持つ側でもあること。**両方に入るのは Bcc と BSR だけ。**
+        CHECK(x68k::hasStaticBranchTarget(PlanKind::kBsr));
+        CHECK_FALSE(x68k::hasStaticBranchTarget(PlanKind::kJsr));
+        CHECK_FALSE(x68k::hasStaticBranchTarget(PlanKind::kRts));
+    }
+}
+
+TEST_CASE("BSR は CCR を 1 bit も変えない")
+{
+    // **groupBranch の BSR 経路は setLogicFlags も testCondition も通らない**
+    // (m68k_ops_move.cpp:119-127)。
+    for (u16 sr : {u16(0x2700u), u16(0x271Fu), u16(0xA715u), u16(0x0000u)})
+    {
+        clearSeeds();
+        M68kState s = makeState(1);
+        s.sr = sr;
+        s.a[7] = kStackAddr;
+        checkEquivalence({bsrShort(4)}, s, "BSR は CCR を変えない");
+    }
+    clearSeeds();
+}
+
+TEST_CASE("BSR の世代の動きがインタプリタと一致する")
+{
+    // **write32 は page(a) と page(a+3) の 2 回 touch する** (m68k.cpp:377-378)。
+    // 同一ページでも 2 回。畳むと飽和のタイミングが JIT ON/OFF で割れる。
+    //
+    // 落ちる変異: emitTouch の 2 回目 (byteOffset 3) を消す
+    clearSeeds();
+    const u32 page = (kStackAddr - 4u) >> 10;
+    for (const std::uint16_t before :
+         {std::uint16_t(0u), std::uint16_t(5u), std::uint16_t(0xFFFDu), std::uint16_t(0xFFFFu)})
+    {
+        M68kState s = makeState(3);
+        s.a[7] = kStackAddr;
+        checkEquivalence({bsrShort(4)}, s, "BSR の世代", fakeEnv(), page, before);
+    }
+
+    // ページ境界を跨いで積む形。**2 ページぶん上がること。**
+    {
+        const u32 crossing = ((kStackAddr >> 10) << 10) + 2u;  // A7-4 = page 先頭 - 2
+        M68kState s = makeState(3);
+        s.a[7] = crossing;
+        checkEquivalence({bsrShort(4)}, s, "BSR がページ境界を跨ぐ");
+    }
+    clearSeeds();
+}
+
+TEST_CASE("BSR を含むブロックが staging に収まる")
+{
+    // **kMaxBlockBytes (2560) に収まること。** 収まらないと translate が
+    // 黙って諦める (素通りする) 形になるので、気づきにくい。
+    //
+    // 最悪ケース: 一番長い形を 3 つ並べたうえで BSR で終端する。
+    // BSR は「ガード 3 本 + touch 2 組 + store 4 本 + 島」を持つ。
+    struct Case
+    {
+        std::vector<u16> words;
+        const char* what;
+    };
+    const std::vector<Case> cases = {
+        {{bsrShort(4)}, "BSR.s 単体"},
+        {{kBsrWordOp, 0x0010u}, "BSR.w 単体"},
+        {{moveDnToMem(0x2u, 0, kModeInd, 1), moveDnToMem(0x2u, 1, kModeInd, 2),
+          moveDnToMem(0x2u, 2, kModeInd, 3), bsrShort(4)},
+         "MOVE.l Dn,(An) x3 + BSR.s"},
+        {{clrMem(2u, kModeInd, 1), clrMem(2u, kModeInd, 2), clrMem(2u, kModeInd, 3), bsrShort(4)},
+         "CLR.l (An) x3 + BSR.s"},
+        // **MOVEM の書きが全 Tier で一番長い。** 3 つ並べて BSR で締める。
+        {{movemToPreDec(1), 0x000Fu, movemToPreDec(2), 0x000Fu, movemToPreDec(3), 0x000Fu,
+          bsrShort(4)},
+         "MOVEM.l <4regs>,-(An) x3 + BSR.s"},
+    };
+
+    std::size_t worst = 0;
+    const char* worstWhat = "";
+    for (const Case& c : cases)
+    {
+        INFO(std::string(c.what));
+        FlatCode code;
+        BlockPlan plan{};
+        REQUIRE(buildPlan(c.words, plan, code));
+        // 末尾が BSR であること。**そうでないと最悪ケースを測っていない。**
+        REQUIRE(plan.ops[plan.count - 1u].kind == PlanKind::kBsr);
+        const u16 ir = code.get16(plan.fallThroughPc);
+        const u16 irc = code.get16(plan.fallThroughPc + 2);
+        const std::size_t need = jit::requiredSize(plan, ir, irc, fakeEnv());
+        // **0 なら発行できていない。** 諦めた形を「収まった」と読まない。
+        REQUIRE(need > 0u);
+        CHECK(need <= x68k::jit::kMaxBlockBytes);
+        if (need > worst)
+        {
+            worst = need;
+            worstWhat = c.what;
+        }
+    }
+    INFO("worst = ", worst, " (", std::string(worstWhat), ")");
+    // 余裕が 20% 以上あること。命令を 1 つ足しただけで超えるのは危うい。
+    CHECK(worst * 5u <= x68k::jit::kMaxBlockBytes * 4u);
+}
+
 TEST_CASE("負のキャッシュの kAnyGen は世代を問わず一致する")
 {
     // G18 の止血。自ページ脱出した番地は、そのあと step() が書いて

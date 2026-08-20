@@ -1732,6 +1732,100 @@ void emitJsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     emitDynamicBranchExit(e, kTmpCcr, cycles);
 }
 
+// --- Tier F: BSR --------------------------------------------------------------
+//
+// **JSR のスタック操作 + Bcc の静的な飛び先。** 新しい機構は 1 つも要らない。
+//
+//   [A7 - 4 を作る]  積む先。まだ書かない
+//   [ガード 1]       整列 + 範囲 (write32 の fast path に入るか)
+//   [ガード 2,3]     自ページ (beqz)。`.l` なので 2 本
+//   --- ここから下が commit ---
+//   [A7 -= 4]
+//   [touch x2]       write32 は page(a) と page(a+3) の 2 回。**畳まない**
+//   [RAM store]      戻り先を 4 バイト、ビッグエンディアンで
+//   [出口]           kBranchTakenFlag を立てて戻る。**メールボックスは書かない**
+//
+// JSR に対して欠けるのは飛び先の計算と G22 (飛び先の整列ガード) の 2 つ。
+// 飛び先は翻訳時に BlockPlan::branchTarget へ入っていて、奇数は I7 が
+// 積まずに弾いている。**実行時に変わる余地が無いので、実行時ガードを
+// 吐く意味が無い。**
+//
+// Why not JSR と同じく実行時ガードも吐いて二重に閉じないか: G17 (b) の
+// 二重防御は「翻訳時定数の畳み間違いがヒープ破壊として現れる」書き先に
+// 対する網で、そこは畳み間違えると窓の外のホストメモリを書く。BSR の
+// 飛び先はホストメモリを 1 バイトも触らず、間違えても branchTo の引数が
+// 変わるだけ。**害の大きさが違うので、同じ網を張る理由が無い。**
+// 飛び先の正しさは checkEquivalence が参照側の pc と突き合わせて問う。
+//
+// 戻り先は翻訳時定数。BSR が番地 X で長さ L なら、インタプリタの
+// returnAddr は .s (L=2) で base = X + 2、.w (L=4) で base + 2 = X + 4
+// (m68k_ops_move.cpp:100-117)。**どちらも X + L**、つまり次の命令の
+// アドレスで、JSR とまったく同じ式になる。
+void emitBsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32_t page,
+             std::uint32_t cycles)
+{
+    // --- 積む先 (A7 - 4) を kTmpB (無マスク) と kTmpA (マスク済み) へ ---
+    //
+    // **まだ a[7] へ書かない。** ガードが全部通ってから commit する (G3)。
+    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    addi(e.slot(kWideLen), kTmpB, kTmpB, -4);
+    emitConst(e, kTmpConst, kGuestAddrMask);
+    and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
+
+    // ガード 1: write32 の fast path に入るか (G19)。**読み形と同一実装**
+    // (emitReadGuard = emitWriteGuard)。op.size は 4。
+    emitReadGuard(e, op, opIndex);
+
+    // ガード 2/3: 自ページ (G13)。`.l` なので両端を見る。
+    emitSelfPageGuard(e, opIndex, 0u, page);
+    emitSelfPageGuard(e, opIndex, 3u, page);
+    if (e.failed)
+    {
+        return;
+    }
+
+    // --- ここから下はガードが全部通ったときだけ走る (G3) ---
+
+    // A7 -= 4。**無マスクの値** (インタプリタも a[7] にはマスクしない値を書く)。
+    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+
+    // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
+    emitTouch(e, 0u, op);
+    if (e.failed)
+    {
+        return;
+    }
+    emitTouch(e, 3u, op);
+    if (e.failed)
+    {
+        return;
+    }
+
+    // 戻り先 (翻訳時定数) をホストへ書く。
+    //
+    // **kTmpC へ置く。** emitTouch が kTmpB / kTmpD / kTmpE / kTmpConst を
+    // 潰しているので、touch より後に作る。
+    emitConst(e, kTmpC, op.pc + op.length);
+    emitConst(e, kTmpConst, e.env.ramBaseAddr);
+    addN(e.slot(kNarrowLen), kTmpE, kTmpConst, kTmpA);
+    emitBigEndianStore(e, kTmpE, kTmpC, 4u);
+
+    // **CCR は触らない。** BSR はフラグを 1 bit も変えない (groupBranch は
+    // BSR 経路で setLogicFlags も testCondition も通らない)。
+
+    // --- 出口 ---
+    //
+    // **pc / ir / irc を書かない。** 静的分岐の成立側 (emitBranchExit) と
+    // 同じ理由で、飛び先のプリフェッチはページの外を読みうる。
+    // runner が BlockSlot::branchTarget を見て branchTo で詰め直す。
+    //
+    // **kBranchTakenFlag を立てる。** kDynamicBranchFlag ではない
+    // (メールボックスに飛び先を書いていないので、runner がそちらを見ると
+    // 前のブロックが残した値へ飛ぶ)。
+    emitConst(e, kRet, cycles | kBranchTakenFlag);
+    retN(e.slot(kNarrowLen));
+}
+
 // ガード脱出の出口で irc に入る語 = mem16(opPc + 2) を求める (I11)。
 //
 // **導出はここ 1 箇所だけに置く。** 出どころが 3 つに分かれるので、
@@ -1761,6 +1855,31 @@ bool guardExitIrc(const BlockPlan& plan, std::uint32_t k, std::uint16_t fallThro
     {
         const bool isLast = k + 1 >= plan.count;
         out = isLast ? fallThroughIr : plan.ops[k + 1].op;
+        return true;
+    }
+    // **BSR.w だけ imm の意味が違う。** ほかの長さ 4 の形は imm に
+    // 拡張ワード由来の値 (符号拡張した変位 / 絶対アドレス) を持つが、
+    // BSR は planBranch が **飛び先の基準** (= opPc + 2) を置き、plan() が
+    // 拡張ワードを足して BlockPlan::branchTarget を作る。imm はその途中の
+    // 値なので、下位 16bit は拡張ワードの原文ではない。
+    //
+    // 原文は「飛び先 - 基準」で戻せる: target = (opPc + 2) + sext16(ext) なので
+    // ext == (target - (opPc + 2)) の下位 16bit。**ここを op.imm & 0xFFFF の
+    // まま通すと、ガード脱出の irc が別の値になる**ぶんだけ、降りた先の
+    // プリフェッチが壊れる (step() が違う命令を実行する)。
+    //
+    // **kBsr の判定を長さより先に置く。** 長さで分けてから中で kind を
+    // 見る形にすると、`.s` (長さ 2) が上の分岐で先に返るので条件が
+    // 二重になり、片方だけ直したときに割れる。
+    if (op.kind == PlanKind::kBsr)
+    {
+        if (op.length == 2)
+        {
+            // ここへは来ない (上の length == 2 が先に返す) が、
+            // 長さの前提を式に書いておく。
+            return false;
+        }
+        out = static_cast<std::uint16_t>((plan.branchTarget - (op.pc + 2u)) & 0xFFFFu);
         return true;
     }
     if (op.length == 4)
@@ -2088,6 +2207,7 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
             case PlanKind::kBranch:
             case PlanKind::kRts:
             case PlanKind::kJsr:
+            case PlanKind::kBsr:
                 // I6 / G23 が「飛ぶ形は末尾のみ」を保証しているので、
                 // 本体には来ない。
                 e.failed = true;
@@ -2149,7 +2269,19 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
 
     if (endsWithBranch)
     {
-        emitBranchExit(e, plan, ir, irc);
+        // **BSR は条件を持たない静的分岐。** emitBranchExit は条件を
+        // 評価して 2 つの出口を作る形なので通さない (cond == 0 の
+        // 「常に真」経路に載せると、不成立側の到達不能コードが残り、
+        // スタックへ積む脚を置く場所も無い)。
+        const PlannedOp& last = plan.ops[plan.count - 1u];
+        if (last.kind == PlanKind::kBsr)
+        {
+            emitBsr(e, last, plan.count - 1u, plan.page, plan.cyclesTaken);
+        }
+        else
+        {
+            emitBranchExit(e, plan, ir, irc);
+        }
     }
     else if (endsWithDynamicBranch)
     {
@@ -2285,6 +2417,37 @@ bool canEmitDynamicBranchFor(const BlockPlan& plan, const EmitEnv& env)
     return true;
 }
 
+// BSR を含む計画を、この窓で発行してよいか (Tier F)。
+//
+// **JSR の窓の条件だけを取り出した形。** BSR も -(A7) へ write32 するので
+// 書き形と同じ窓と世代配列が要るが、isMemoryWriteKind が kBsr を含まない
+// (EA 欄の規約に従わない) ので canEmitWritesFor は見ていない。
+//
+// **メールボックスは要らない。** 飛び先は BlockSlot::branchTarget から
+// runner へ渡る。ここで canEmitDynamicBranchIn を問うと、メールボックスが
+// 未配線の env で BSR まで断ることになる。
+bool canEmitBsrFor(const BlockPlan& plan, const EmitEnv& env)
+{
+    for (std::uint32_t i = 0; i < plan.count; ++i)
+    {
+        if (plan.ops[i].kind != PlanKind::kBsr)
+        {
+            continue;
+        }
+        // G19: 窓と世代配列がそろっていないと、スタックへ積めない。
+        if (!canEmitWritesIn(env))
+        {
+            return false;
+        }
+        // 窓が 4 バイトの書きを一度も許さないなら、ガードは常に不成立。
+        if (env.ramLimit < 4u)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 // 読み形を含む計画を、この窓で発行してよいか (G6 / G12)。
 //
 // **翻訳時に決められることは翻訳時に決める。** 走らせてから諦める形にすると、
@@ -2351,6 +2514,10 @@ bool measure(const BlockPlan& plan, std::uint16_t ir, std::uint16_t irc, const E
         return false;
     }
     if (!canEmitDynamicBranchFor(plan, env))
+    {
+        return false;
+    }
+    if (!canEmitBsrFor(plan, env))
     {
         return false;
     }

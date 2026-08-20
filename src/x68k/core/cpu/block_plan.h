@@ -115,6 +115,25 @@ enum class PlanKind : u8
     // kEaNone のままだと「EA を持たない形」として読まれる。
     kMovemPostIncToRegs,  // MOVEM.L (An)+,<regs>。srcReg = An (読み形の欄)
     kMovemRegsToPredec,   // MOVEM.L <regs>,-(An)。dstReg = An (書き形の欄)
+
+    // --- Tier F: BSR ---
+    //
+    // **kBranch のスタック操作つき。** 「戻り先を -(A7) へ積んで、翻訳時に
+    // 決まった飛び先へ飛ぶ」。kJsr との違いは飛び先だけで、JSR が
+    // <ea> から実行時に求めるのに対し、BSR は変位が命令語 (と拡張ワード) に
+    // 埋まっている。
+    //
+    // だから **飛び先は BlockPlan::branchTarget に入り、メールボックスは
+    // 使わない。** 戻り値も kBranchTakenFlag (静的分岐) で、
+    // kDynamicBranchFlag ではない。runner から見れば「必ず成立する Bcc」。
+    //
+    // **`.s` と `.w` を分けない。** 違うのは変位の幅と命令長だけで、
+    // 変位は plan() が branchTarget へ畳み、長さは length 欄が持つ。
+    // 分けると「同じ形が 2 つの kind に散る」ぶんだけエミッタの switch と
+    // テストの網が二重になり、片方だけ直す事故の面が増える。
+    //
+    // レジスタ欄は使わない。積む先は常に -(A7) 固定。
+    kBsr,
 };
 
 // PlannedOp::eaMode の値。
@@ -222,9 +241,13 @@ constexpr bool isMemoryWriteKind(PlanKind kind)
 //
 // **2 つを 1 つにできない。** 片方は「欄の規約」、もう片方は「窓の要求」で、
 // たまたま Tier C では一致していただけ。畳むと JSR で A7 以外が減る。
+//
+// **kBsr も kJsr と同じ理由で入る。** BSR は -(A7) へ戻り先を write32 する
+// (m68k_ops_move.cpp:121-125) ので世代も窓も要るが、EA 欄の規約には従わない
+// (そもそも EA を持たない)。
 constexpr bool needsWriteWindow(PlanKind kind)
 {
-    return isMemoryWriteKind(kind) || kind == PlanKind::kJsr;
+    return isMemoryWriteKind(kind) || kind == PlanKind::kJsr || kind == PlanKind::kBsr;
 }
 
 // ゲスト RAM を読む形か。**翻訳器が「読みの窓」を要求する対象。**
@@ -246,9 +269,24 @@ constexpr bool needsReadWindow(PlanKind kind, u8 eaMode)
 //
 // **分岐と動的分岐の両方。** 飛んだ先が翻訳済みかどうかは翻訳時に
 // 分からないので、飛ぶ形はどれも必ずそこで切る。
+//
+// kBsr は飛び先が翻訳時に決まる (kBranch と同じ) が、それでも切る理由は
+// 同じ: 飛んだ先が翻訳済みかは分からない。
 constexpr bool isBlockTerminator(PlanKind kind)
 {
-    return kind == PlanKind::kBranch || kind == PlanKind::kRts || kind == PlanKind::kJsr;
+    return kind == PlanKind::kBranch || kind == PlanKind::kRts || kind == PlanKind::kJsr ||
+           kind == PlanKind::kBsr;
+}
+
+// 飛び先が BlockPlan::branchTarget に入る形か (静的分岐)。
+//
+// **kBsr と kBranch の 2 つ。** 動的分岐 (kRts / kJsr) はメールボックス
+// 経由なので入らない。翻訳器が「どちらの出口の欄を埋めるか」を、
+// エミッタが「kBranchTakenFlag と kDynamicBranchFlag のどちらを立てるか」を
+// この述語 1 つで決める。**2 箇所で別々に条件を書くと割れる。**
+constexpr bool hasStaticBranchTarget(PlanKind kind)
+{
+    return kind == PlanKind::kBranch || kind == PlanKind::kBsr;
 }
 
 // 実効アドレスの An 番号がどちらの欄に入っているか。
