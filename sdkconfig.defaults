@@ -106,3 +106,16 @@ CONFIG_BT_ENABLED=n
 # ESP32-S3 内蔵の USB-Serial/JTAG をログ出力に使う。
 #
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# JIT の生成コードは MALLOC_CAP_EXEC から取る。**memprot が有効だと
+# IRAM が heap に登録されず、EXEC の空きが 0 になって JIT が丸ごと死ぬ。**
+#
+# sdkconfig は .gitignore で追跡外なので、新しい worktree や clone では
+# IDF 既定の y が拾われる。実際に隔離 worktree で JIT が無効になり
+# (9074 → 5400 kHz)、原因の特定に数時間かかった。**ここに書いておかないと
+# 「同じコミットなのに速度が 1.7 倍違う」が再発する。**
+#
+# Why not memprot を有効のままにするか: 生成コードを実行する JIT とは
+# 原理的に両立しない。IRAM を書いて実行することが機能の本体なので、
+# 「書けない・実行できない」保護と取引にならない。
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n

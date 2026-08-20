@@ -968,7 +968,12 @@ bool reserveMemory()
     // **希少な順に取る**のが確保順の原則。
     if (!g_jitCode.acquire(kJitCodeBytes))
     {
-        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)");
+        // **EXEC の残量を必ず一緒に出す。** 空きが 0 なら断片化ではなく
+        // 「IRAM が heap に登録されていない」= memprot が有効になっている。
+        // これを出さなかったせいで、原因の特定に実機を何度も焼き直した。
+        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)。EXEC 空き=%u 最大連続=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_EXEC)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC)));
     }
     g_jitSlots = static_cast<x68k::jit::BlockSlot*>(heap_caps_calloc(
         kJitSlots, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
