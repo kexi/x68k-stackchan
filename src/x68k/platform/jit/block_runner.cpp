@@ -281,14 +281,80 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     // **鍵だけを写す。** ops[] は翻訳の途中でしか要らない。
     slot.entryPc = plan.entryPc;
     slot.mappingEpoch = plan.mappingEpoch;
-    slot.page = plan.page;
     slot.pageGen = plan.pageGen;
     slot.count = plan.count;
     slot.code = buf + emitted.entryOffset;
     slot.endsWithBranch = emitted.endsWithBranch;
     slot.endsWithDynamicBranch = emitted.endsWithDynamicBranch;
     slot.branchTarget = emitted.branchTarget;
+
+    // **照合用の控えを取る (段 F)。**
+    //
+    // 範囲は entryPc から fallThroughPc + 4 まで。ブロックが前提にしている
+    // バイト列そのもので、出口の ir (fallThroughPc) と irc
+    // (fallThroughPc + 2) を含む。**この 2 語は生成コードへ定数として
+    // 焼いてある**ので、変わったら翻訳し直さなければならない。
+    //
+    // I4 が fallThroughPc + 2 までを同一ページに閉じているので範囲は連続。
+    //
+    // 上限を超えたら控えを持たない (verifyWords = 0)。世代が動いたときに
+    // 照合できず翻訳し直すだけで、**保守的な側へ倒れる**。
+    const u32 verifyBytes = plan.fallThroughPc + 4u - plan.entryPc;
+    const u32 verifyWords = verifyBytes / 2u;
+    slot.verifyWords = 0;
+    if (verifyWords <= kMaxVerifyWords)
+    {
+        bool readable = true;
+        for (u32 i = 0; i < verifyWords; ++i)
+        {
+            u16 word = 0;
+            if (!cpu.peekCodeWord(plan.entryPc + i * 2u, word))
+            {
+                // 読めない語が混ざったら控えを持たない。**部分的に控えると
+                // 「控えた範囲は同じだが読めなかった語が変わっている」
+                // ブロックを同一と判定する。**
+                readable = false;
+                break;
+            }
+            slot.verify[i] = word;
+        }
+        if (readable)
+        {
+            slot.verifyWords = static_cast<std::uint8_t>(verifyWords);
+        }
+    }
+    if (slot.verifyWords == 0)
+    {
+        ++stats_.verifyTooLong;
+    }
     return &slot;
+}
+
+bool BlockRunner::verifyMatches(const BlockSlot& slot, M68k& cpu)
+{
+    // **控えが無ければ照合しない。** 範囲が kMaxVerifyWords を超えたブロックは
+    // 語を持っていないので、同じかどうかを言えない。言えないなら翻訳し直す
+    // (保守的な側)。
+    if (slot.verifyWords == 0)
+    {
+        return false;
+    }
+
+    // **窓の中からだけ読む。** バスを叩くと照合しただけで MFP の割り込み
+    // 要因レジスタが動く (readCodeWord と同じ理由)。
+    for (std::uint32_t i = 0; i < slot.verifyWords; ++i)
+    {
+        u16 word = 0;
+        if (!cpu.peekCodeWord(slot.entryPc + i * 2u, word))
+        {
+            return false;
+        }
+        if (word != slot.verify[i])
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
 NativeResult BlockRunner::run(M68k& cpu)
@@ -319,12 +385,17 @@ NativeResult BlockRunner::run(M68k& cpu)
     BlockSlot* slot = &slots_[slotIndex(entryPc)];
 
     // 設計 §5.5 の順で照合する。**順序が意味を持つ** (keyMatches)。
+    //
+    // 世代を引く番地は entryPc から導く。I4 がブロック全体を 1 ページに
+    // 閉じているので、先頭バイトのページがそのままブロックのページになる。
     CodeGenMap& map = cpu.codeGenMap();
-    const std::uint16_t nowGen = map.generation(slot->page << CodeGenMap::kPageShift);
+    const std::uint16_t nowGen = map.generation(entryPc);
     const bool hit = keyMatches(*slot, entryPc, nowGen, map.mappingEpoch());
 
     if (!hit)
     {
+        // 照合で救えたか。救えたブロックは翻訳し直さずそのまま実行する。
+        bool verified = false;
         if (slot->code == nullptr)
         {
             // 空きスロット (コールドミス)。**ここを数えていなかったので、
@@ -359,13 +430,40 @@ NativeResult BlockRunner::run(M68k& cpu)
             else
             {
                 ++stats_.keyMissGen;
+
+                // **世代だけが外れた。翻訳し直す前にバイト列を照合する。**
+                //
+                // ここへ来る条件はタグも写像も合っていて、飽和でもないこと。
+                // つまり「同じ番地の同じブロックだが、そのページに何か
+                // 書かれた」状態で、実測ではその **100.00% が偽共有**
+                // (コードは 1 バイトも変わらず、同居するデータが書かれただけ)
+                // だった。
+                //
+                // 照合が通ったら世代を控え直してそのまま実行する。**通らな
+                // ければ必ず翻訳し直す** (下の translate へ落ちる) ので、
+                // 照合は「捨てる前の確認」にしかならず、pull 型を緩めない。
+                if (verifyMatches(*slot, cpu))
+                {
+                    ++stats_.verifyHit;
+                    // **控え直す。** これをしないと次回も世代が外れ、毎周
+                    // 照合を走らせることになる (正しさは無傷で、遅いだけ)。
+                    slot->pageGen = nowGen;
+                    verified = true;
+                }
+                else
+                {
+                    ++stats_.verifyMiss;
+                }
             }
         }
-        slot = translate(cpu, entryPc);
-        if (slot == nullptr)
+        if (!verified)
         {
-            ++stats_.deferUnsupported;
-            return NativeResult{0, NativeExit::kDeferToStep};
+            slot = translate(cpu, entryPc);
+            if (slot == nullptr)
+            {
+                ++stats_.deferUnsupported;
+                return NativeResult{0, NativeExit::kDeferToStep};
+            }
         }
     }
 

@@ -114,6 +114,14 @@ void ExecMemory::syncInstructionCache()
 #endif
 }
 
+#if !defined(ESP_PLATFORM) || !defined(__XTENSA__)
+namespace
+{
+// ホストのテストが差し替える生成コードの代役。**実機のビルドには無い。**
+RunBlockHook g_runBlockHook = nullptr;
+}  // namespace
+#endif
+
 X68K_JIT_IRAM std::uint32_t runBlock(void* state, const void* code)
 {
 #if defined(ESP_PLATFORM) && defined(__XTENSA__)
@@ -170,12 +178,25 @@ X68K_JIT_IRAM std::uint32_t runBlock(void* state, const void* code)
     __asm__ __volatile__("" : "+r"(arg));
     return arg;
 #else
-    // ホストでは呼べない。**黙って 0 を返さない** — 0 は「実行できなかった」の
-    // 意味を持ちうるので、呼ばれたこと自体を見えるようにする。
+    // ホストではテストが差し替えた関数があればそれを呼ぶ。
+    if (g_runBlockHook != nullptr)
+    {
+        return g_runBlockHook(state, code);
+    }
+    // 差し替えが無ければ呼べない。**黙って 0 を返さない** — 0 は
+    // 「実行できなかった」の意味を持ちうるので、呼ばれたこと自体を
+    // 見えるようにする。
     (void)code;
     (void)state;
     std::abort();
 #endif
 }
+
+#if !defined(ESP_PLATFORM) || !defined(__XTENSA__)
+void setRunBlockHookForTest(RunBlockHook hook)
+{
+    g_runBlockHook = hook;
+}
+#endif
 
 }  // namespace x68k::jit

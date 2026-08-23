@@ -78,6 +78,18 @@ struct NativeStats
     u64 keyMissEpoch = 0;  // 写像 epoch 不一致
     u64 keyMissGen = 0;    // ページ世代不一致
     u64 keyMissStale = 0;  // kAlwaysStale で捨てた
+    // **世代が外れた後のバイト照合の結果** (段 F)。keyMissGen の内訳で、
+    // verifyHit + verifyMiss == keyMissGen が常に成り立つ。
+    //
+    // verifyHit は偽共有 (同じページのデータが書かれただけで、命令語は
+    // 変わっていない) を弾いた回数。翻訳し直さずに実行した。
+    // verifyMiss は本当に書き換わったか、控えを持たなかった回数。
+    u64 verifyHit = 0;
+    u64 verifyMiss = 0;
+    // 照合の控えを持てなかった翻訳の本数。範囲が kMaxVerifyWords を超えたか、
+    // 読めない語が混ざった。**黙って被覆が減る形を作らないために数える**
+    // (この数が多ければ控えの語数を増やす判断材料になる)。
+    u64 verifyTooLong = 0;
     u64 translateFail = 0;
     // **コード領域が満杯で翻訳を試みもしなかった回数。**
     //

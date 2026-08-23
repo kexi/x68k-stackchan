@@ -7386,7 +7386,6 @@ struct Harness
             }
             slots[i].entryPc = pc ^ 0x2u;  // pc とは必ず違う値
             slots[i].mappingEpoch = cpu().codeGenMap().mappingEpoch();
-            slots[i].page = pc >> x68k::CodeGenMap::kPageShift;
             slots[i].pageGen = cpu().codeGenMap().generation(pc);
             slots[i].count = 1;
             slots[i].code = probeCode;
@@ -7766,14 +7765,20 @@ TEST_CASE("スロット衝突は居座りブロックのページが飽和して
 {
     // **欠陥 3 の回帰テスト。**
     //
-    // 鍵照合は世代を `slot->page` (= そのスロットの**先客**のページ) から
-    // 引く。空きスロットなら 0 で、ページ 0 は例外ベクタ表と Human68k の
-    // ワーク領域なので起動後すぐ 65,536 回書かれて飽和する。
+    // かつて鍵照合は世代を `slot->page` (= そのスロットの**先客**のページ)
+    // から引いていた。空きスロットなら 0 で、ページ 0 は例外ベクタ表と
+    // Human68k のワーク領域なので起動後すぐ 65,536 回書かれて飽和する。
     //
     // 飽和すると `nowGen == kAlwaysStale` が**どのスロットのどの取りこぼしでも**
     // 成立する。帰属の if-else が kAlwaysStale をタグより先に見ていたため、
     // 本来「スロット衝突」であるものが**まとめて「飽和」に化けた**。
     // 実機ではこれで衝突 151 万件が誤帰属され、対策の方向を丸ごと見誤った。
+    //
+    // **段 F で世代は entryPc (訪問者のページ) から引くようになった**ので、
+    // 先客の飽和が訪問者の判定へ漏れる経路自体が消えた。それでも帰属の
+    // 順序は依然として意味を持つ (訪問者自身のページが飽和していれば
+    // 両方成立する) ため、このテストは残す。先客 pc1 と訪問者 pc2 が
+    // 別ページであることを下で明示して、先客の飽和が効かないことも固定する。
     //
     // **判定 (hit) の順序は変えていない。** kAlwaysStale を世代一致より先に
     // 見るのは正しさの根拠がある (§5.5)。変えたのは帰属の順序だけで、
@@ -7804,13 +7809,15 @@ TEST_CASE("スロット衝突は居座りブロックのページが飽和して
     REQUIRE(pc2 != 0u);
     REQUIRE(foldedIndex(pc1, kSlots) == foldedIndex(pc2, kSlots));
     REQUIRE(pc1 != pc2);
+    // **別ページであること。** 同じページだと下で飽和させたときに訪問者の
+    // 世代まで飽和し、「タグに数える」ことを問えなくなる。
+    REQUIRE((pc1 >> x68k::CodeGenMap::kPageShift) != (pc2 >> x68k::CodeGenMap::kPageShift));
 
     // pc1 をスロットへ居座らせる。**翻訳は成功しないので、居座らせるには
     // スロットを直接書く** (テスト対象を経由せず状態を作る)。
     x68k::jit::BlockSlot& slot = h.slots[foldedIndex(pc1, kSlots)];
     slot.entryPc = pc1;
     slot.mappingEpoch = h.cpu().codeGenMap().mappingEpoch();
-    slot.page = pc1 >> x68k::CodeGenMap::kPageShift;
     slot.pageGen = h.cpu().codeGenMap().generation(pc1);
     slot.count = 1;
     // code != nullptr でないと帰属の if-else へ入らない (空きは keyMissCold)。
@@ -7838,6 +7845,498 @@ TEST_CASE("スロット衝突は居座りブロックのページが飽和して
     CHECK(h.stats().keyMissStale == staleBefore);
 
     checkDeferAccounting(h.stats(), "帰属の排他性");
+}
+
+// --- T7: バイト照合 (段 F) --------------------------------------------------
+
+namespace verify_stage_f
+{
+
+using namespace runner_accounting;
+
+// **翻訳を成功させ、生成コードの代わりにフックを呼ぶ台。**
+//
+// runBlock は Xtensa の callx0 でホストでは abort するので、既定の Harness は
+// 「翻訳を失敗させる」ことで runBlock を避けている。ところが段 F の照合は
+// **「照合が通ったら翻訳し直さずに実行する」**機構なので、実行まで届かないと
+// 「翻訳し直さなかった」ことを翻訳回数で問えない。
+//
+// setRunBlockHookForTest でホストのビルドだけ差し替える (実機には無い口)。
+struct VerifyHarness
+{
+    Harness h;
+    // フックが呼ばれた回数 = 生成コードを実行した回数。
+    static inline int ran = 0;
+
+    VerifyHarness()
+    {
+        ran = 0;
+        // 生成コードの代役。**0 を返す** = 分岐せず、サイクル 0 で戻る。
+        // 状態を 1 ビットも変えないので、run() の後段 (飛び先の決定) が
+        // 何をしても観測に混ざらない。
+        x68k::jit::setRunBlockHookForTest(
+            [](void*, const void*) -> std::uint32_t
+            {
+                ++ran;
+                return 0;
+            });
+    }
+
+    ~VerifyHarness()
+    {
+        // **必ず外す。** 残すと後続のテストで生成コードの呼び出しが
+        // 差し替わったままになる。
+        x68k::jit::setRunBlockHookForTest(nullptr);
+    }
+
+    VerifyHarness(const VerifyHarness&) = delete;
+    VerifyHarness& operator=(const VerifyHarness&) = delete;
+};
+
+// kEntry のページの世代を 1 つ進める。**命令語は 1 バイトも変えない。**
+// これが偽共有 (同じ 1KB ページに同居するデータが書かれた状態) そのもの。
+void bumpPageOnly(Harness& h, u32 pc)
+{
+    h.cpu().codeGenMap().touch(pc);
+}
+
+}  // namespace verify_stage_f
+
+TEST_CASE("偽共有では翻訳し直さない")
+{
+    // **What: 同じページのデータが書かれただけ (命令語は不変) なら、世代が
+    // 動いてもブロックを翻訳し直さず、そのまま実行すること。**
+    //
+    // 実測で世代が動いたブロックの 100.00% がこれだった (1,153,764 件中
+    // 1,153,764 件で命令語が 1 バイトも変わっていない)。翻訳し直すのは
+    // まるごと無駄で、再翻訳率 944 倍の主因のひとつ。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    // 1 回目: 空きスロットなので翻訳する。
+    h.runAt(kEntry);
+    const std::uint64_t translatedAfterFirst = h.stats().translated;
+    REQUIRE(translatedAfterFirst == 1u);
+    REQUIRE(VerifyHarness::ran == 1);
+
+    // **命令語は変えず、ページの世代だけ上げる。**
+    bumpPageOnly(h, kEntry);
+
+    // 2 回目: 世代が外れるが、照合が通るので翻訳し直さない。
+    h.runAt(kEntry);
+
+    INFO("translated ", translatedAfterFirst, " -> ", h.stats().translated);
+    INFO("verifyHit=", h.stats().verifyHit, " verifyMiss=", h.stats().verifyMiss);
+    // **翻訳回数が増えないこと。** ここが本体。
+    CHECK(h.stats().translated == translatedAfterFirst);
+    // 照合が通ったこと。
+    CHECK(h.stats().verifyHit == 1u);
+    CHECK(h.stats().verifyMiss == 0u);
+    // **そして実行されたこと。** 翻訳しないだけで実行もしないなら、
+    // それは「諦めた」であって「救った」ではない。
+    CHECK(VerifyHarness::ran == 2);
+}
+
+TEST_CASE("本物の書き換えでは翻訳し直す")
+{
+    // **What: 命令語が実際に変わったら、必ず翻訳し直すこと。**
+    //
+    // **これが pull 型の核心。** 照合が「同じ」と誤って答えると、
+    // 書き換えられた番地で**古いコードを静かに実行し続ける**。
+    // code_gen_map.h が push 型を棄却した理由 (「症状が原因から遠い」) が
+    // そのまま当てはまる失敗形なので、ここは名指しで固定する。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    h.runAt(kEntry);
+    const std::uint64_t translatedAfterFirst = h.stats().translated;
+    REQUIRE(translatedAfterFirst == 1u);
+
+    // **命令語を実際に書き換える。** MOVEQ #0,D0 ($7000) → MOVEQ #1,D0 ($7001)。
+    // 世代も一緒に上げる (実機なら書き込みが touch を呼ぶ)。
+    REQUIRE(h.ram[kEntry] == 0x70);
+    REQUIRE(h.ram[kEntry + 1] == 0x00);
+    h.ram[kEntry + 1] = 0x01;
+    bumpPageOnly(h, kEntry);
+
+    h.runAt(kEntry);
+
+    INFO("translated ", translatedAfterFirst, " -> ", h.stats().translated);
+    INFO("verifyHit=", h.stats().verifyHit, " verifyMiss=", h.stats().verifyMiss);
+    // **翻訳し直したこと。**
+    CHECK(h.stats().translated == translatedAfterFirst + 1u);
+    // 照合は「違う」と答えたこと。
+    CHECK(h.stats().verifyHit == 0u);
+    CHECK(h.stats().verifyMiss == 1u);
+}
+
+TEST_CASE("照合が通ったら世代を控え直す")
+{
+    // **What: 照合が通ったスロットの pageGen が現在の世代になること。**
+    //
+    // 控え直さなくても**正しさは 1 ビットも壊れない** (次回また照合が走って
+    // 通るだけ)。壊れるのは速度だけなので、状態を比べるテストには映らない。
+    // したがって **照合の回数**で問う: 控え直していれば 2 回目以降は鍵が
+    // そのまま当たり、照合は 1 度しか走らない。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    h.runAt(kEntry);
+    REQUIRE(h.stats().translated == 1u);
+
+    bumpPageOnly(h, kEntry);
+
+    // 2 回目: 世代が外れて照合が走り、通る。
+    h.runAt(kEntry);
+    REQUIRE(h.stats().verifyHit == 1u);
+    const std::uint64_t genMissAfterVerify = h.stats().keyMissGen;
+
+    // 3 回目・4 回目: **世代はもう動かしていない。** 控え直していれば
+    // 鍵がそのまま当たり、世代外れも照合も 1 度も増えない。
+    h.runAt(kEntry);
+    h.runAt(kEntry);
+
+    INFO("keyMissGen ", genMissAfterVerify, " -> ", h.stats().keyMissGen);
+    INFO("verifyHit=", h.stats().verifyHit);
+    // **控え直していれば、以後は照合すら走らない。**
+    CHECK(h.stats().keyMissGen == genMissAfterVerify);
+    CHECK(h.stats().verifyHit == 1u);
+    // 翻訳も増えないこと (照合の有無にかかわらず)。
+    CHECK(h.stats().translated == 1u);
+    // 4 回とも実行されたこと。
+    CHECK(VerifyHarness::ran == 4);
+}
+
+TEST_CASE("飽和したページでは照合しない")
+{
+    // **What: kAlwaysStale のページでは照合を試みず、必ず翻訳し直すこと。**
+    //
+    // kAlwaysStale は「常に古い」を意味する番兵で、実際の世代ではない。
+    // 照合しても意味が無い (世代を控え直しても次回また外れる) うえ、
+    // **控え直した瞬間に pageGen == kAlwaysStale が鍵の一致を作りかねない**。
+    // keyMatches が kAlwaysStale を世代一致より先に見ているのはそのためで、
+    // 照合をその手前に置いてはいけない。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    h.runAt(kEntry);
+    REQUIRE(h.stats().translated == 1u);
+    const std::uint64_t verifyBefore = h.stats().verifyHit + h.stats().verifyMiss;
+
+    // **ページを飽和させる。** 命令語は 1 バイトも変えない。
+    h.saturatePage(kEntry);
+    REQUIRE(h.cpu().codeGenMap().generation(kEntry) == x68k::CodeGenMap::kAlwaysStale);
+
+    h.runAt(kEntry);
+
+    INFO("keyMissStale=", h.stats().keyMissStale, " verifyHit=", h.stats().verifyHit,
+         " verifyMiss=", h.stats().verifyMiss);
+    // **飽和として数え、照合は 1 度も走らないこと。**
+    CHECK(h.stats().keyMissStale >= 1u);
+    CHECK(h.stats().verifyHit + h.stats().verifyMiss == verifyBefore);
+}
+
+TEST_CASE("出口の ir / irc が書き換わったら翻訳し直す")
+{
+    // **What: ブロック本体の手前だけでなく、出口の ir / irc
+    // (fallThroughPc と fallThroughPc + 2) が変わっても翻訳し直すこと。**
+    //
+    // この 2 語は**生成コードへ定数として焼いてある** (requiredSize /
+    // emitBlock が引数に取る)。焼いた値と実メモリが食い違うと、出口の
+    // CPU 状態 (ir / irc) が実メモリと違うまま次の命令へ進む —— つまり
+    // **古い前提のコードを静かに実行し続ける**。
+    //
+    // 照合の範囲を fallThroughPc までで切ると、ここが素通りする。
+    // I4 の +2 が「出口で irc に入るワード」を守っているのと同じ理由で、
+    // 照合の範囲も +4 まで要る。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    h.runAt(kEntry);
+    const std::uint64_t translatedAfterFirst = h.stats().translated;
+    REQUIRE(translatedAfterFirst == 1u);
+
+    // **本体の外 (出口の ir / irc が読まれる位置) を書き換える。**
+    //
+    // 位置は**スロットの控えた語数からは求めない**。控えの長さは
+    // まさにこのテストが問うている当のもので、そこから位置を導くと
+    // **範囲を縮める変異に合わせて書き込み先まで縮み**、変異が素通りする
+    // (実際に踏んだ)。ブロックの形から独立に求める。
+    //
+    // 本体は MOVEQ (2 バイト) が count 本。fallThroughPc はその直後で、
+    // irc はさらに +2。
+    const x68k::jit::BlockSlot& placed = h.slots[foldedIndex(kEntry, Harness::kSlots)];
+    const u32 fallThroughPc = kEntry + static_cast<u32>(placed.count) * 2u;
+    const u32 ircAddr = fallThroughPc + 2u;
+    // **本体の命令語より後ろであること** (本体を書き換えたのでは、
+    // 範囲を縮める変異を問うたことにならない)。
+    REQUIRE(ircAddr >= fallThroughPc);
+    REQUIRE(h.ram[ircAddr + 1] == 0x00);
+    h.ram[ircAddr + 1] = 0x01;
+    bumpPageOnly(h, kEntry);
+
+    h.runAt(kEntry);
+
+    INFO("count=", (unsigned)placed.count, " fallThroughPc=", fallThroughPc, " ircAddr=", ircAddr,
+         " translated ", translatedAfterFirst, " -> ", h.stats().translated);
+    // **翻訳し直したこと。** 照合の範囲が短いとここが増えない。
+    CHECK(h.stats().translated == translatedAfterFirst + 1u);
+    CHECK(h.stats().verifyMiss == 1u);
+    CHECK(h.stats().verifyHit == 0u);
+}
+
+TEST_CASE("照合の内訳は世代外れの総数と一致する")
+{
+    // **What: verifyHit + verifyMiss == keyMissGen が常に成り立つこと。**
+    //
+    // 保存則。破れることは「世代が外れたのに照合もせず翻訳もしない経路が
+    // ある」か「世代外れ以外から照合へ入る経路がある」ことと同値で、
+    // どちらも pull 型の穴になる。T1 の勘定の保存と同じ形の網。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    // 偽共有と本物の書き換えを混ぜて回す。
+    for (int i = 0; i < 8; ++i)
+    {
+        h.runAt(kEntry);
+        bumpPageOnly(h, kEntry);
+        if (i % 3 == 0)
+        {
+            // ときどき本当に書き換える (照合が「違う」と答える側も通す)。
+            h.ram[kEntry + 1] = static_cast<x68k::u8>(h.ram[kEntry + 1] + 1u);
+        }
+    }
+    h.runAt(kEntry);
+
+    INFO("verifyHit=", h.stats().verifyHit, " verifyMiss=", h.stats().verifyMiss,
+         " keyMissGen=", h.stats().keyMissGen);
+    // 両側を実際に通っていること (通っていなければ以下は空虚)。
+    CHECK(h.stats().verifyHit > 0u);
+    CHECK(h.stats().verifyMiss > 0u);
+    CHECK(h.stats().verifyHit + h.stats().verifyMiss == h.stats().keyMissGen);
+}
+
+// --- T8: スロット増 (段 F) --------------------------------------------------
+
+TEST_CASE("2048 スロットでも 1KB / 2KB / 4KB 周期が別スロットへ散る")
+{
+    // **What: マスクが 0x7FF (11 ビット) に広がっても、畳み込みが周期性を
+    // 潰さないこと。**
+    //
+    // **段 0-D の前例がここに直接効く。** 索引を (pc >> 11) にしたとき、
+    // 512 スロット (マスク 0x1FF) では pc のビット 10 が索引から完全に消え、
+    // **直そうとした当の 1KB 周期がそのまま残った**。マスク幅を変えるのは
+    // まさにこの罠を再び踏みうる変更なので、幅を広げた側でも名指しで問う。
+    //
+    // 2048 スロット (マスク 0x7FF = ビット 0-10) では、(pc >> 1) がビット
+    // 1-11 を、(pc >> 10) がビット 10-20 を索引へ運ぶ。ビット 10 は
+    // (pc >> 1) 側でビット 9 に、(pc >> 10) 側でビット 0 に乗るので、
+    // どちらからも消えない。
+    using namespace runner_accounting;
+
+    constexpr std::uint32_t kWide = 2048;
+    constexpr int kCount = 16;
+
+    // 1KB / 2KB / 4KB の 3 周期すべてを問う。**1 つでも通ればよいのではない**
+    // — 実機の常駐部とサブルーチン群はこの 3 つの周期で並んでいる。
+    const struct
+    {
+        u32 stride;
+        const char* name;
+    } kCases[] = {{1024u, "1KB"}, {2048u, "2KB"}, {4096u, "4KB"}};
+
+    for (const auto& c : kCases)
+    {
+        std::vector<std::uint32_t> seen;
+        for (int i = 0; i < kCount; ++i)
+        {
+            seen.push_back(foldedIndex(kEntry + static_cast<u32>(i) * c.stride, kWide));
+        }
+        std::sort(seen.begin(), seen.end());
+        seen.erase(std::unique(seen.begin(), seen.end()), seen.end());
+        INFO(c.name, " 周期: distinct = ", seen.size(), " / ", kCount);
+        // **全部散ること。** 畳み込みを外すと 1KB 周期が 1 個へ潰れ、
+        // シフト量をずらすとどれかの周期が半分になる。
+        CHECK(seen.size() == static_cast<std::size_t>(kCount));
+    }
+
+    SUBCASE("ちょうど 1KB 離れた番地が別のスロットへ写る")
+    {
+        // ビット 10 だけが違う組。**索引からビット 10 が消えていないこと**を
+        // 名指しで問う (段 0-D が残した周期そのもの)。
+        for (u32 pc = kEntry; pc < kEntry + 0x8000u; pc += 2u)
+        {
+            REQUIRE(foldedIndex(pc, kWide) != foldedIndex(pc ^ 0x400u, kWide));
+        }
+    }
+}
+
+TEST_CASE("スロット数が変わっても実装の索引はテストの再現式と一致する")
+{
+    // **What: 実装の slotIndex が、テストが再現している式と同じ幅で畳むこと。**
+    //
+    // 上の SUBCASE は foldedIndex (テスト側の写し) だけを問うており、
+    // **実装を 1 行も通っていない**。畳み込みを外す変異はテスト側の式を
+    // 変えないので素通りする (T4 が同じ理由で実装の振る舞いへ裏を取っている)。
+    //
+    // ここでは実装に「この pc をどのスロットへ写すか」を訊いて突き合わせる。
+    // Harness は 512 スロットなので幅は 512 で問う。**幅そのものではなく
+    // 「実装とテストの式が一致していること」**を固定する網で、これが緑なら
+    // 上の 2048 幅の SUBCASE も実装の式について語れる。
+    using namespace runner_accounting;
+
+    Harness h;
+    h.makeTranslationImpossible();
+    h.disableNegativeCache();
+
+    // 1KB 周期に並ぶ番地を実装に写させる。
+    for (int i = 0; i < 4; ++i)
+    {
+        const u32 pc = kEntry + static_cast<u32>(i) * 1024u;
+        const std::uint32_t fromImpl = h.runnerSlotIndex(pc);
+        INFO("pc=", pc, " impl=", fromImpl, " test=", foldedIndex(pc, Harness::kSlots));
+        REQUIRE(fromImpl < Harness::kSlots);
+        CHECK(fromImpl == foldedIndex(pc, Harness::kSlots));
+    }
+}
+
+TEST_CASE("スロット数が 512 でも 2048 でも同じように動く")
+{
+    // **What: 確保に失敗して 512 へ落ちた構成でも、ランナーが正しく動くこと。**
+    //
+    // 2048 スロット (80KB) は内部 SRAM の largest free block (実測 90KB) に
+    // 対して余裕が 10KB しかない。断片化で取れなければ 512 へ落とす
+    // (**JIT ごと死なせない** — 段 0-I で 8192 エントリの確保に失敗した
+    // 前例があり、フォールバックは設計どおり働いた)。
+    //
+    // 落ちた側が壊れていたら、確保に失敗した実機だけが静かに誤動作する。
+    // **両方の幅で同じ不変条件を問う。**
+    //
+    // 幅は setStorage が受け取るので、ランナーの側は 2 の冪であること
+    // (slotIndex がマスクで畳む) しか仮定していない。
+    using namespace verify_stage_f;
+
+    // Harness は 512 スロットを確保しているので、その一部だけを使わせて
+    // 「小さい表」を作る。**2 の冪であること**が唯一の前提。
+    for (std::uint32_t width : {std::uint32_t{64}, std::uint32_t{512}})
+    {
+        VerifyHarness v;
+        Harness& h = v.h;
+        h.runner.setStorage(h.slots.data(), width, &h.code);
+        h.runner.reset();
+        REQUIRE(h.runner.isReady());
+
+        // 翻訳 → 偽共有 → 照合で救う、という段 F の筋がそのまま通ること。
+        h.runAt(kEntry);
+        INFO("width=", width, " translated=", h.stats().translated);
+        REQUIRE(h.stats().translated == 1u);
+
+        bumpPageOnly(h, kEntry);
+        h.runAt(kEntry);
+
+        INFO("width=", width, " verifyHit=", h.stats().verifyHit,
+             " translated=", h.stats().translated);
+        // **どちらの幅でも翻訳し直さないこと。**
+        CHECK(h.stats().translated == 1u);
+        CHECK(h.stats().verifyHit == 1u);
+
+        // 本物の書き換えなら、どちらの幅でも翻訳し直すこと。
+        h.ram[kEntry + 1] = 0x03;
+        bumpPageOnly(h, kEntry);
+        h.runAt(kEntry);
+        INFO("width=", width, " 書き換え後 translated=", h.stats().translated);
+        CHECK(h.stats().translated == 2u);
+    }
+}
+
+TEST_CASE("世代を引く番地は entryPc のページから来る")
+{
+    // **What: page 欄を落とした後も、世代は「訪問者 (entryPc) のページ」から
+    // 引くこと。**
+    //
+    // かつては slot->page (= **先客**のページ) から引いていた。欄を落として
+    // entryPc から導くようになったので、**先客が別ページでも訪問者自身の
+    // ページの世代で判定される**。
+    //
+    // これを取り違えると、先客のページが飽和・書き換えされただけで訪問者の
+    // ブロックが捨てられる (遅くなるだけ) か、逆に訪問者のページが
+    // 書き換わったのに先客のページが静かなので**古いコードを実行し続ける**。
+    // 後者は pull 型の失敗形なので、名指しで固定する。
+    using namespace verify_stage_f;
+
+    VerifyHarness v;
+    Harness& h = v.h;
+
+    h.runAt(kEntry);
+    REQUIRE(h.stats().translated == 1u);
+
+    // **entryPc とは別のページを飽和させる。** ここから世代を引いていたら
+    // 鍵が飽和で外れる。
+    const u32 otherPage = kEntry + 0x800u;
+    REQUIRE((otherPage >> x68k::CodeGenMap::kPageShift) !=
+            (kEntry >> x68k::CodeGenMap::kPageShift));
+    h.saturatePage(otherPage);
+
+    const std::uint64_t staleBefore = h.stats().keyMissStale;
+    const std::uint64_t translatedBefore = h.stats().translated;
+    h.runAt(kEntry);
+
+    INFO("keyMissStale ", staleBefore, " -> ", h.stats().keyMissStale);
+    // **別ページの飽和は 1 ビットも効かないこと。** 鍵はそのまま当たる。
+    CHECK(h.stats().keyMissStale == staleBefore);
+    CHECK(h.stats().translated == translatedBefore);
+
+    // 逆側: **自分のページ**が書き換われば、ちゃんと外れること。
+    h.ram[kEntry + 1] = 0x02;
+    bumpPageOnly(h, kEntry);
+    h.runAt(kEntry);
+    INFO("自ページ書き換え後 translated=", h.stats().translated);
+    CHECK(h.stats().translated == translatedBefore + 1u);
+
+    SUBCASE("先客が別番地でも訪問者のページで判定する")
+    {
+        // **スロットが空き、または別番地の先客に占められている場合が本番。**
+        //
+        // 鍵が当たっている間は slot->entryPc == entryPc なので、先客から
+        // 引いても訪問者から引いても同じ値になり、**取り違えを問えない**。
+        // 差が出るのは衝突したときだけ。
+        //
+        // 空きスロットの entryPc は 0 で、ページ 0 は例外ベクタ表と
+        // Human68k のワーク領域なので実機では真っ先に飽和する。先客から
+        // 引いていると、**まったく無関係な訪問者までページ 0 の飽和に
+        // 巻き込まれる**。
+        VerifyHarness v2;
+        Harness& h2 = v2.h;
+
+        // ページ 0 を飽和させる (空きスロットの entryPc = 0 が指す先)。
+        h2.saturatePage(0);
+        REQUIRE(h2.cpu().codeGenMap().generation(0) == x68k::CodeGenMap::kAlwaysStale);
+        // 訪問者のページは静かなまま。
+        REQUIRE(h2.cpu().codeGenMap().generation(kEntry) != x68k::CodeGenMap::kAlwaysStale);
+
+        // **空きスロットを訪ねる。** 訪問者のページから引いていれば飽和は
+        // 無関係で、コールドミスとして普通に翻訳できる。
+        h2.runAt(kEntry);
+
+        INFO("keyMissStale=", h2.stats().keyMissStale, " translated=", h2.stats().translated,
+             " keyMissCold=", h2.stats().keyMissCold);
+        // **翻訳できること。** 先客 (= 空き = ページ 0) から引いていると
+        // kAlwaysStale になり、翻訳器の I9 が拒否して 1 本も置けない。
+        CHECK(h2.stats().translated == 1u);
+        CHECK(h2.stats().keyMissCold == 1u);
+    }
 }
 
 // --- T6: コールドミスが数えられている ---------------------------------------

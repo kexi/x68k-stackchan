@@ -898,14 +898,23 @@ std::uint16_t* g_codeGen = nullptr;
 
 // JIT のブロックキャッシュ。
 //
-// スロット数は 2 の冪 (slotIndex がマスクで畳む)。256 スロット x 112 バイト
-// = 28,672 バイト。実測の内部 SRAM 空き 48KB に対して、世代配列 4KB と
-// 合わせて 32KB。**PSRAM には置かない** (散らばったアクセスで実機が止まる)。
-// **2 の冪でなければならない** (slotIndex がマスクで畳む)。
+// スロット数は 2 の冪 (slotIndex がマスクで畳む)。**PSRAM には置かない**
+// (散らばったアクセスで実機が止まる)。
 //
-// 1 スロット 40 バイトなので 512 で 20,480 バイト。実測の最大ブロックが
-// 31,744 なので連続で取れる。1024 は 40,960 で取れない。
-constexpr x68k::u32 kJitSlots = 512;
+// **512 → 2048 へ増やした (段 F)。** 容量無制限のハーネスで焼き直しの
+// 原因を数えたところ、空きスロット 47.09% + スロット衝突 36.99% で
+// 8 割超がスロット不足だった。
+//
+// **バイト照合と同時でなければ効かない。** 片方だけでは再翻訳率が
+// 944.0x → 600.8x (スロットのみ) / 521.1x (照合のみ) で 2 倍未満に
+// とどまるのに、両方だと 9.1x (104 倍) になる。一方の churn がもう一方を
+// 再点火し続けるので、片方を潰しても意味が薄い。
+//
+// 取れなければ 512 へ落とす。**JIT ごと死なせない** (段 0-I で 8192
+// エントリの確保に失敗した前例があり、フォールバックは設計どおり働いた)。
+constexpr x68k::u32 kJitSlotsWanted = 2048;
+constexpr x68k::u32 kJitSlotsFallback = 512;
+x68k::u32 g_jitSlotCount = 0;
 
 // 「翻訳できない」を覚える表。**成功ブロックとは別に持つ。**
 // 1024 件 x 8 バイト = 8,192 バイト。2 の冪でなければならない。
@@ -975,11 +984,39 @@ bool reserveMemory()
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_EXEC)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC)));
     }
+    // **最大連続空きを先に出す。** 確保が通ったか落ちたかだけでは、
+    // 落ちた理由が「足りない」のか「断片化」なのか分からない (段 0-I で
+    // 確保失敗の原因特定に実機を何度も焼き直した)。
+    ESP_LOGI(kTag, "JIT スロット確保前: 内部 SRAM 空き=%u 最大連続=%u (要求=%u バイト)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(kJitSlotsWanted * sizeof(x68k::jit::BlockSlot)));
+
+    g_jitSlotCount = kJitSlotsWanted;
     g_jitSlots = static_cast<x68k::jit::BlockSlot*>(heap_caps_calloc(
-        kJitSlots, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        kJitSlotsWanted, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     if (g_jitSlots == nullptr)
     {
+        // **取れなければ半分以下へ落とす。** ここで諦めると JIT がまるごと
+        // 無効になり、インタプリタ単体より遅い状態で起動する。
+        g_jitSlotCount = kJitSlotsFallback;
+        g_jitSlots = static_cast<x68k::jit::BlockSlot*>(
+            heap_caps_calloc(kJitSlotsFallback, sizeof(x68k::jit::BlockSlot),
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_LOGW(kTag, "JIT スロット %u 個を置けません。%u 個へ落とします",
+                 static_cast<unsigned>(kJitSlotsWanted), static_cast<unsigned>(kJitSlotsFallback));
+    }
+    if (g_jitSlots == nullptr)
+    {
+        g_jitSlotCount = 0;
         ESP_LOGW(kTag, "JIT のスロットを内部 SRAM に置けません (JIT は無効)");
+    }
+    else
+    {
+        ESP_LOGI(kTag, "JIT スロット %u 個 (%u バイト) を確保しました",
+                 static_cast<unsigned>(g_jitSlotCount),
+                 static_cast<unsigned>(g_jitSlotCount * sizeof(x68k::jit::BlockSlot)));
     }
     g_jitNeg = static_cast<x68k::jit::NegEntry*>(heap_caps_calloc(
         kJitNegEntries, sizeof(x68k::jit::NegEntry), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
@@ -1810,7 +1847,7 @@ private:
                     ESP_LOGW(kTag, "JIT: 置き場が無いので有効にできません");
                     return;
                 }
-                g_jitRunner.setStorage(g_jitSlots, kJitSlots, &g_jitCode);
+                g_jitRunner.setStorage(g_jitSlots, g_jitSlotCount, &g_jitCode);
                 g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
                 g_jitRunner.reset();
                 g_machine.cpu().setNativeExec(g_jitRunner.exec());
@@ -1862,6 +1899,15 @@ private:
                      (unsigned long long)st->keyMissTag, (unsigned long long)st->keyMissEpoch,
                      (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale,
                      (unsigned long long)st->keyMissCold);
+            // **照合の内訳 (段 F)。** verifyHit が偽共有を弾いた回数で、
+            // これが keyMissGen の大半を占めるなら狙いどおり効いている。
+            ESP_LOGI(
+                kTag,
+                "[jit] 照合: 一致 %llu / 不一致 %llu (世代外れ %llu の %.1f%%) / 控え無し %llu 本",
+                (unsigned long long)st->verifyHit, (unsigned long long)st->verifyMiss,
+                (unsigned long long)st->keyMissGen,
+                st->keyMissGen != 0 ? 100.0 * (double)st->verifyHit / (double)st->keyMissGen : 0.0,
+                (unsigned long long)st->verifyTooLong);
             // **収支が閉じているかを出す。** 諦めた回数と理由の合計が
             // 合わないなら、無勘定の早期 return がある (実際に踏んだ)。
             // 平均ブロックサイズ。**arena に何本入るかの唯一の根拠。**

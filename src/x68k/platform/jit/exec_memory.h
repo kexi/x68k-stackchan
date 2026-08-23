@@ -144,6 +144,27 @@ private:
 // callx0 を書くと通るのに、関数にすると落ちるのが手がかりだった。
 std::uint32_t runBlock(void* state, const void* code) X68K_JIT_IRAM;
 
+#if !defined(ESP_PLATFORM) || !defined(__XTENSA__)
+// **ホストのビルドにだけ存在する差し替え口。**
+//
+// runBlock は Xtensa の callx0 なのでホストでは呼べず、既定では
+// std::abort() する。そのため「翻訳が成功して、実際に生成コードを呼ぶ」
+// 経路がホストのテストから**一切踏めない**。
+//
+// 段 F のバイト照合は「照合が通ったら翻訳し直さずに実行する」機構なので、
+// **実行まで届かないと『翻訳し直さなかったこと』を確かめられない**
+// (翻訳回数を数えるには translate を通らない側を通す必要がある)。
+//
+// Why not 実機だけで確かめるか: 実機で確かめられるのは速度だけで、
+// 「本物の書き換えでは翻訳し直す」という**正しさ**の側は変異を入れて
+// 落ちることを見なければ意味がない。段 D-1 でも同じ口を作っている。
+//
+// **実機のビルドには存在しない** (#if で消える) ので、生成コードの呼び出しが
+// テスト用の関数へ差し替わったまま実機が動く形にはならない。
+using RunBlockHook = std::uint32_t (*)(void* state, const void* code);
+void setRunBlockHookForTest(RunBlockHook hook);
+#endif
+
 }  // namespace x68k::jit
 
 #endif  // X68K_PLATFORM_JIT_EXEC_MEMORY_H
