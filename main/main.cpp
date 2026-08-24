@@ -1903,9 +1903,10 @@ private:
             // これが keyMissGen の大半を占めるなら狙いどおり効いている。
             ESP_LOGI(
                 kTag,
-                "[jit] 照合: 一致 %llu / 不一致 %llu (世代外れ %llu の %.1f%%) / 控え無し %llu 本",
+                "[jit] 照合: 一致 %llu / 実差 %llu / 控え無し %llu (世代外れ %llu の %.1f%%) / "
+                "控えを持てず %llu 本",
                 (unsigned long long)st->verifyHit, (unsigned long long)st->verifyMiss,
-                (unsigned long long)st->keyMissGen,
+                (unsigned long long)st->verifyNoSnapshot, (unsigned long long)st->keyMissGen,
                 st->keyMissGen != 0 ? 100.0 * (double)st->verifyHit / (double)st->keyMissGen : 0.0,
                 (unsigned long long)st->verifyTooLong);
             // **収支が閉じているかを出す。** 諦めた回数と理由の合計が

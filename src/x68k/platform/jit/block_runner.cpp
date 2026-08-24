@@ -450,6 +450,13 @@ NativeResult BlockRunner::run(M68k& cpu)
                     slot->pageGen = nowGen;
                     verified = true;
                 }
+                else if (slot->verifyWords == 0)
+                {
+                    // 控えが無いので照合を試みてすらいない。**本物の
+                    // 書き換えと混ぜない。** 混ぜたせいで実機の 26.7% を
+                    // 「命令語が書き換わっている」と読み違えた。
+                    ++stats_.verifyNoSnapshot;
+                }
                 else
                 {
                     ++stats_.verifyMiss;
