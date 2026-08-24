@@ -733,6 +733,43 @@ EmitResult emit(const BlockPlan& plan, const FlatCode& code)
     return emit(plan, code, fakeEnv());
 }
 
+// 生成コードが「M68kState の off へ 32bit ストアする命令」を含むか。
+//
+// **通常形 (s32i) と短縮形 (s32i.n) の両方を見る。** どちらで書くかは
+// エミッタの符号化の都合で、保証したいのは「書き戻す」ことそのもの。
+// 片方だけ見ると、エミッタが短縮形へ寄せた瞬間に「書き戻しが消えた」と
+// 誤って落ちる — 実際にそう落ちた。
+//
+// 書く値のレジスタ (at) は都合で変わりうるので比べない。基底が kState
+// (a3) で、オフセットが off であることだけを問う。
+bool containsStateStore32(const std::vector<std::uint8_t>& buf, std::uint32_t off)
+{
+    // 短縮形: s32i.n at, a3, off  — RRRN op0=9 / r=off/4 / s=3
+    if (jit::canNarrowOffset(off))
+    {
+        std::uint8_t want[2];
+        jit::s32iN(want, /*at=*/4, /*as=*/3, off);
+        for (std::size_t i = 0; i + 2 <= buf.size(); ++i)
+        {
+            if ((buf[i] & 0x0Fu) == (want[0] & 0x0Fu) && buf[i + 1] == want[1])
+            {
+                return true;
+            }
+        }
+    }
+    // 通常形: s32i at, a3, off — RRI8 op0=2 / r=6 / s=3 / imm8=off/4
+    std::uint8_t want[3];
+    jit::s32i(want, /*at=*/4, /*as=*/3, off);
+    for (std::size_t i = 0; i + 3 <= buf.size(); ++i)
+    {
+        if ((buf[i] & 0x0Fu) == (want[0] & 0x0Fu) && buf[i + 1] == want[1] && buf[i + 2] == want[2])
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 // M68kState を、生成コードから見えるのと同じ平坦なメモリに置いて走らせる。
 //
 // 生成コードは a2 に渡されたアドレスからの相対でしか触らないので、
@@ -1377,24 +1414,14 @@ TEST_CASE("出口で書き戻すレジスタが 1 つも漏れていない")
         const EmitResult e = emit(plan, code);
         REQUIRE(e.ok);
 
-        // d[reg] への s32i (offset = reg*4) が含まれること。
-        // s32i at, a3, off は RRI8 op0=2 / r=6 / s=3 / imm8=off/4。
-        std::uint8_t want[3];
-        jit::s32i(want, /*at=*/4, /*as=*/3, jit::kStateDOffset + reg * 4u);
-        // at (書く値のレジスタ) は発行器の都合で変わりうるので、
-        // 「s と r と imm8 が一致する 3 バイト」を探す。
-        bool found = false;
-        for (std::size_t i = 0; i + 3 <= e.buffer.size(); ++i)
-        {
-            if ((e.buffer[i] & 0x0Fu) == (want[0] & 0x0Fu) && e.buffer[i + 1] == want[1] &&
-                e.buffer[i + 2] == want[2])
-            {
-                found = true;
-                break;
-            }
-        }
-        INFO("d[", reg, "] への s32i");
-        CHECK(found);
+        // d[reg] への 32bit ストア (offset = reg*4) が含まれること。
+        //
+        // **通常形と短縮形の両方を許す。** 問うているのは「触った Dn が
+        // 書き戻される」ことであって、どの符号化で書くかではない。
+        // 符号化を 1 つに固定すると、エミッタが s32i.n を選んだだけで
+        // 落ちる (実際に落ちた) — 保証している What は変わっていないのに。
+        INFO("d[", reg, "] への 32bit ストア");
+        CHECK(containsStateStore32(e.buffer, jit::kStateDOffset + reg * 4u));
     }
 
     // pc / ir / irc も同じく。非分岐終端のブロックで問う。
@@ -1418,9 +1445,8 @@ TEST_CASE("出口で書き戻すレジスタが 1 つも漏れていない")
         return false;
     };
     std::uint8_t pat[3];
-    jit::s32i(pat, 4, 3, jit::kStatePcOffset);
-    INFO("pc への s32i");
-    CHECK(contains(pat));
+    INFO("pc への 32bit ストア");
+    CHECK(containsStateStore32(e.buffer, jit::kStatePcOffset));
     jit::s16i(pat, 4, 3, jit::kStateIrOffset);
     INFO("ir への s16i");
     CHECK(contains(pat));
@@ -1430,6 +1456,77 @@ TEST_CASE("出口で書き戻すレジスタが 1 つも漏れていない")
     jit::s16i(pat, 4, 3, jit::kStateSrOffset);
     INFO("sr への s16i");
     CHECK(contains(pat));
+}
+
+TEST_CASE("短縮形の 32bit アクセスは d[] / a[] だけに使う")
+{
+    // s32i.n / l32i.n のオフセット欄は 4bit しかないので、届くのは
+    // 0..60 の 4 の倍数だけ。**範囲外を渡すと別のオフセットの正当な命令に
+    // 化ける** — 64 を渡せば r = 16 が 4bit で切れて 0 になり、d[0] を潰す。
+    //
+    // エミッタが短縮形を選ぶ判定は canNarrowOffset ただ 1 つで、
+    // ここはその判定が d[] / a[] を覆い、pc から先を覆わないことを問う。
+    // **判定の式を書き写さない。** 写すと片方だけ直したときに気づけない。
+    for (u32 reg = 0; reg < 8; ++reg)
+    {
+        INFO("d[", reg, "]");
+        CHECK(jit::canNarrowOffset(jit::kStateDOffset + reg * 4u));
+        INFO("a[", reg, "]");
+        CHECK(jit::canNarrowOffset(jit::kStateAOffset + reg * 4u));
+    }
+
+    // pc から先は短縮形で書いてはいけない。usp / ssp は生成コードが
+    // そもそも触らない契約 (§5.1) だが、**触らないことを短縮形の
+    // 到達距離に頼らない**ため、届かないこと自体をここで固定する。
+    CHECK_FALSE(jit::canNarrowOffset(jit::kStatePcOffset));
+    CHECK_FALSE(jit::canNarrowOffset(offsetof(M68kState, usp)));
+    CHECK_FALSE(jit::canNarrowOffset(offsetof(M68kState, ssp)));
+}
+
+TEST_CASE("d[] / a[] のアクセスに通常形の s32i / l32i を残さない")
+{
+    // **「短縮形が使えるのに使わない」は正しさを 1 mm も損なわない。**
+    // だから正しさのテストでは永遠に落ちない (実際に、短縮形の選択を
+    // 丸ごと殺す変異は 766 件すべてを素通りした)。arena は 16KB 固定で
+    // 鍵外れの 42.9% がコールドミスなので、**1 命令 1 バイトが常駐本数に
+    // 直結する**。落ちる形にしておかないと、次に触る人が黙って戻せる。
+    //
+    // 問い方: d[] / a[] を読み書きする計画を発行し、バイト列の中に
+    // 「基底が kState (a3) で、オフセットが d[] / a[] の範囲の通常形」が
+    // 1 つも無いことを確かめる。
+    const std::vector<u16> words{moveq(0, 0x12), aluReg(0xD, 1, 2, 0)};  // MOVEQ; ADD.b D1,D2
+    FlatCode code;
+    BlockPlan plan{};
+    REQUIRE(buildPlan(words, plan, code));
+    const EmitResult e = emit(plan, code);
+    REQUIRE(e.ok);
+
+    for (std::size_t i = e.info.entryOffset; i + 3 <= e.buffer.size(); ++i)
+    {
+        const std::uint32_t w = static_cast<std::uint32_t>(e.buffer[i]) |
+                                (static_cast<std::uint32_t>(e.buffer[i + 1]) << 8) |
+                                (static_cast<std::uint32_t>(e.buffer[i + 2]) << 16);
+        const bool isRri8 = (w & 0xFu) == 0x2u;
+        if (!isRri8)
+        {
+            continue;
+        }
+        const std::uint32_t r = (w >> 12) & 0xFu;
+        const bool isWord32 = r == 0x2u || r == 0x6u;  // l32i / s32i
+        if (!isWord32)
+        {
+            continue;
+        }
+        const std::uint32_t s = (w >> 8) & 0xFu;
+        const bool basedOnState = s == 3u;  // kState = a3
+        if (!basedOnState)
+        {
+            continue;
+        }
+        const std::uint32_t off = ((w >> 16) & 0xFFu) * 4u;
+        INFO("通常形の 32bit アクセスが offset ", off, " に残っている");
+        CHECK_FALSE(jit::canNarrowOffset(off));
+    }
 }
 
 TEST_CASE("usp / ssp / stopped / halted を触る命令を発行しない")
@@ -1442,6 +1539,27 @@ TEST_CASE("usp / ssp / stopped / halted を触る命令を発行しない")
     REQUIRE(buildPlan(words, plan, code));
     const EmitResult e = emit(plan, code);
     REQUIRE(e.ok);
+
+    // **短縮形も走査する。** usp (64) / ssp (68) は canNarrowOffset の 0..60 を
+    // 超えるので s32i.n では届かない。だがその事実に網羅性を委ねると、
+    // M68kState のレイアウトが動いた瞬間にこの走査が黙って死角になる。
+    // 届かないことを式で固定したうえで、短縮形も実際に見る。
+    static_assert(offsetof(M68kState, usp) > 60u, "usp が短縮形の届く範囲に入った");
+    static_assert(offsetof(M68kState, ssp) > 60u, "ssp が短縮形の届く範囲に入った");
+    for (std::size_t i = e.info.entryOffset; i + 2 <= e.buffer.size(); ++i)
+    {
+        const std::uint32_t n = static_cast<std::uint32_t>(e.buffer[i]) |
+                                (static_cast<std::uint32_t>(e.buffer[i + 1]) << 8);
+        const bool isNarrowStore32 = (n & 0xFu) == 0x9u;
+        if (!isNarrowStore32)
+        {
+            continue;
+        }
+        const std::uint32_t off = ((n >> 12) & 0xFu) * 4u;
+        INFO("s32i.n offset ", off);
+        CHECK(off != offsetof(M68kState, usp));
+        CHECK(off != offsetof(M68kState, ssp));
+    }
 
     for (std::size_t i = e.info.entryOffset; i + 3 <= e.buffer.size(); ++i)
     {

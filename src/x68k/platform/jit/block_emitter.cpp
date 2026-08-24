@@ -227,6 +227,37 @@ void emitConst(Emitter& e, XReg reg, std::uint32_t value)
     l32r(at, reg, off);
 }
 
+// M68kState の語アクセス。**短縮形が使えるなら使う** (3 バイト → 2 バイト)。
+//
+// l32i.n / s32i.n はオフセット 0..60 の 4 の倍数だけを取る。d[0..7] は 0..28、
+// a[0..7] は 32..60 なので**汎用レジスタは全部この範囲に入る**。範囲外
+// (pc は 72) は通常形へ落ちる。canNarrowOffset が唯一の判定で、範囲を
+// 手で書き写さない — 写すと encoder 側を広げたときに置き去りになる。
+//
+// Why not 常に通常形を使わないか: 1 命令 1 バイトの差だが、生成コードは
+// レジスタの読み書きが本体の大半を占める。arena は 16KB 固定で
+// コールドミスが鍵外れの 42.9% を占めるので、**同じ 16KB に入る本数**が
+// そのまま当たりに効く。
+void emitLoadState(Emitter& e, XReg dst, std::uint32_t off)
+{
+    if (canNarrowOffset(off))
+    {
+        l32iN(e.slot(kNarrowLen), dst, kState, off);
+        return;
+    }
+    l32i(e.slot(kWideLen), dst, kState, off);
+}
+
+void emitStoreState(Emitter& e, XReg src, std::uint32_t off)
+{
+    if (canNarrowOffset(off))
+    {
+        s32iN(e.slot(kNarrowLen), src, kState, off);
+        return;
+    }
+    s32i(e.slot(kWideLen), src, kState, off);
+}
+
 // d[reg] / a[reg] のバイトオフセット。
 constexpr std::uint32_t dOffset(std::uint32_t reg)
 {
@@ -298,15 +329,15 @@ void emitWriteDataRegister(Emitter& e, std::uint32_t reg, XReg valueReg, std::ui
 {
     if (size == 4)
     {
-        s32i(e.slot(kWideLen), valueReg, kState, dOffset(reg));
+        emitStoreState(e, valueReg, dOffset(reg));
         return;
     }
     const std::uint32_t keepMask = size == 1 ? 0xFFFFFF00u : 0xFFFF0000u;
-    l32i(e.slot(kWideLen), kTmpE, kState, dOffset(reg));
+    emitLoadState(e, kTmpE, dOffset(reg));
     emitConst(e, kTmpConst, keepMask);
     and_(e.slot(kWideLen), kTmpE, kTmpE, kTmpConst);
     or_(e.slot(kWideLen), kTmpE, kTmpE, valueReg);
-    s32i(e.slot(kWideLen), kTmpE, kState, dOffset(reg));
+    emitStoreState(e, kTmpE, dOffset(reg));
 }
 
 // レジスタの下位 size バイトを取り出す (上位をゼロにする)。
@@ -347,7 +378,7 @@ void emitTruncate(Emitter& e, XReg dstReg, XReg srcReg, std::uint32_t size)
 void emitMoveq(Emitter& e, const PlannedOp& op)
 {
     emitConst(e, kTmpA, op.imm);
-    s32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.dstReg));
+    emitStoreState(e, kTmpA, dOffset(op.dstReg));
 
     std::uint32_t ccr = 0;
     if (op.imm == 0)
@@ -365,7 +396,7 @@ void emitMoveq(Emitter& e, const PlannedOp& op)
 // MOVE.b/w/l Dn,Dm。src / dst とも mode 0。
 void emitMove(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLoadState(e, kTmpA, dOffset(op.srcReg));
     emitTruncate(e, kTmpC, kTmpA, op.size);
     emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
     emitLogicFlags(e, kTmpC, op.size);
@@ -377,7 +408,7 @@ void emitMove(Emitter& e, const PlannedOp& op)
 // 渡すが、どちらも内部で size にマスクするので、切り詰めた値で等価。
 void emitMoveAregToDreg(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.srcReg));
+    emitLoadState(e, kTmpA, aOffset(op.srcReg));
     emitTruncate(e, kTmpC, kTmpA, op.size);
     emitWriteDataRegister(e, op.dstReg, kTmpC, op.size);
     emitLogicFlags(e, kTmpC, op.size);
@@ -414,12 +445,12 @@ void emitMoveImmToDreg(Emitter& e, const PlannedOp& op)
 void emitMovea(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
     const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
-    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    emitLoadState(e, kTmpA, src);
     if (op.size == 2)
     {
         emitSext16(e, kTmpA, kTmpA);
     }
-    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+    emitStoreState(e, kTmpA, aOffset(op.dstReg));
 }
 
 // MOVEA #imm,An と LEA (xxx).W/L,An。どちらも「定数を a[] へ入れる」だけ。
@@ -427,28 +458,28 @@ void emitMovea(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 void emitLoadAregConst(Emitter& e, const PlannedOp& op)
 {
     emitConst(e, kTmpA, op.imm);
-    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+    emitStoreState(e, kTmpA, aOffset(op.dstReg));
 }
 
 // LEA (An),An / (d16,An),An。**アドレスを求めるだけで読まない。**
 // フラグは変えない。
 void emitLeaDisp(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.srcReg));
+    emitLoadState(e, kTmpA, aOffset(op.srcReg));
     if (op.imm != 0)
     {
         // 変位が 0 かどうかは翻訳時に決まるので、生成コードは決定的。
         emitConst(e, kTmpB, op.imm);
         addN(e.slot(kNarrowLen), kTmpA, kTmpA, kTmpB);
     }
-    s32i(e.slot(kWideLen), kTmpA, kState, aOffset(op.dstReg));
+    emitStoreState(e, kTmpA, aOffset(op.dstReg));
 }
 
 // TST.b/w/l Dn。**読むだけで d[] には書かない。**
 // N/Z を立て V/C をクリア。X は保存 (kLogicClear に X が無い)。
 void emitTstDreg(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLoadState(e, kTmpA, dOffset(op.srcReg));
     emitTruncate(e, kTmpC, kTmpA, op.size);
     emitLogicFlags(e, kTmpC, op.size);
 }
@@ -472,7 +503,7 @@ void emitClrDreg(Emitter& e, const PlannedOp& op)
 // 出して本体を 1 本にする。
 void emitLogicAluCore(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
+    emitLoadState(e, kTmpB, dOffset(op.dstReg));
     if (op.aluOp == PlanAluOp::kAnd)
     {
         and_(e.slot(kWideLen), kTmpC, kTmpB, kTmpA);
@@ -489,7 +520,7 @@ void emitLogicAluCore(Emitter& e, const PlannedOp& op)
 // AND / OR のレジスタ間形。
 void emitLogicAlu(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLoadState(e, kTmpA, dOffset(op.srcReg));
     emitLogicAluCore(e, op);
 }
 
@@ -611,7 +642,7 @@ void emitArithFlagsCore(Emitter& e, PlanAluOp aluOp, std::uint32_t size)
 // ADD / SUB / CMP のうち、転送先が d[] の形。**src は kTmpA に載っている前提。**
 void emitArithAluCore(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpB, kState, dOffset(op.dstReg));
+    emitLoadState(e, kTmpB, dOffset(op.dstReg));
     emitArithFlagsCore(e, op.aluOp, op.size);
     // CMP は結果を書かない。
     const bool isCmp = op.aluOp == PlanAluOp::kCmp;
@@ -624,7 +655,7 @@ void emitArithAluCore(Emitter& e, const PlannedOp& op)
 // ADD / SUB / CMP のレジスタ間形。
 void emitArithAlu(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLoadState(e, kTmpA, dOffset(op.srcReg));
     emitArithAluCore(e, op);
 }
 
@@ -638,7 +669,7 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
 void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
     const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
-    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    emitLoadState(e, kTmpA, src);
     if (op.size == 2)
     {
         // interpreter は readEa mode 0 で **下位 16bit に切ってから**
@@ -646,7 +677,7 @@ void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
         // どちらも「下位 16bit を符号拡張」と同じ値になるので 1 本で済む。
         emitSext16(e, kTmpA, kTmpA);
     }
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    emitLoadState(e, kTmpB, aOffset(op.dstReg));
     if (op.aluOp == PlanAluOp::kAdd)
     {
         addN(e.slot(kNarrowLen), kTmpC, kTmpB, kTmpA);
@@ -655,7 +686,7 @@ void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
     {
         sub(e.slot(kWideLen), kTmpC, kTmpB, kTmpA);
     }
-    s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
+    emitStoreState(e, kTmpC, aOffset(op.dstReg));
 }
 
 // CMPA .w/l <src>,An。**フラグは全部変える** (X 以外)。Tier G。
@@ -672,12 +703,12 @@ void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 void emitCmpa(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
     const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
-    l32i(e.slot(kWideLen), kTmpA, kState, src);
+    emitLoadState(e, kTmpA, src);
     if (op.size == 2)
     {
         emitSext16(e, kTmpA, kTmpA);
     }
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    emitLoadState(e, kTmpB, aOffset(op.dstReg));
     // **比較幅は op.size ではなく常に 4。** インタプリタは .w でも
     // src を符号拡張してから alu::sub(a[reg], value, kLong) を呼ぶ
     // (m68k_ops_alu.cpp:281)。op.size は「src をどう読むか」だけを決める欄で、
@@ -739,7 +770,7 @@ void emitAluImm(Emitter& e, const PlannedOp& op)
 void emitAddqImmToAreg(Emitter& e, const PlannedOp& op)
 {
     emitConst(e, kTmpA, op.imm);
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(op.dstReg));
+    emitLoadState(e, kTmpB, aOffset(op.dstReg));
     if (op.aluOp == PlanAluOp::kAdd)
     {
         addN(e.slot(kNarrowLen), kTmpC, kTmpB, kTmpA);
@@ -748,7 +779,7 @@ void emitAddqImmToAreg(Emitter& e, const PlannedOp& op)
     {
         sub(e.slot(kWideLen), kTmpC, kTmpB, kTmpA);
     }
-    s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
+    emitStoreState(e, kTmpC, aOffset(op.dstReg));
 }
 
 // BTST #imm,Dn。**Z フラグだけを変える** (Tier H)。
@@ -765,7 +796,7 @@ void emitAddqImmToAreg(Emitter& e, const PlannedOp& op)
 // 1u << imm は必ず 32bit に収まる。
 void emitBtstImm(Emitter& e, const PlannedOp& op)
 {
-    l32i(e.slot(kWideLen), kTmpA, kState, dOffset(op.srcReg));
+    emitLoadState(e, kTmpA, dOffset(op.srcReg));
     // 対象は Dn なので 32bit で回る。切り出しは要らない。
     emitConst(e, kTmpConst, 1u << op.imm);
     and_(e.slot(kWideLen), kTmpC, kTmpA, kTmpConst);
@@ -851,7 +882,7 @@ void emitEffectiveAddress(Emitter& e, const PlannedOp& op)
 {
     const std::uint32_t step = eaStep(op);
 
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
+    emitLoadState(e, kTmpB, aOffset(eaRegOf(op)));
     if (op.eaMode == kEaPreDec)
     {
         // -(An) は**引いてから**アクセスする (m68k.h:454-457)。
@@ -955,13 +986,13 @@ void emitCommitAddressRegister(Emitter& e, const PlannedOp& op)
             return;
         }
         addi(e.slot(kWideLen), kTmpC, kTmpB, static_cast<std::int32_t>(step));
-        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(eaRegOf(op)));
+        emitStoreState(e, kTmpC, aOffset(eaRegOf(op)));
         return;
     }
     if (op.eaMode == kEaPreDec)
     {
         // -(An) は既に引いた値がアクセス先そのもの。
-        s32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
+        emitStoreState(e, kTmpB, aOffset(eaRegOf(op)));
     }
 }
 
@@ -1074,7 +1105,7 @@ void emitMemoryRead(Emitter& e, const PlannedOp& op, std::uint32_t opIndex)
             {
                 emitSext16(e, kTmpC, kTmpC);
             }
-            s32i(e.slot(kWideLen), kTmpC, kState, aOffset(op.dstReg));
+            emitStoreState(e, kTmpC, aOffset(op.dstReg));
             return;
         case PlanKind::kTstMem:
             // **読むだけで書かない。**
@@ -1375,7 +1406,7 @@ void emitMemoryWrite(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std
     }
     else
     {
-        l32i(e.slot(kWideLen), kTmpC, kState, dOffset(op.srcReg));
+        emitLoadState(e, kTmpC, dOffset(op.srcReg));
     }
 
     // touch (G14/G16)。**ゲスト RAM の store より前。**
@@ -1533,7 +1564,7 @@ void emitMovem(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint
     //
     // **減算は 32bit 無マスクでやってからマスクする。** インタプリタも
     // a[] には無マスクの値を書く (effectiveAddress / -(An) の環算)。
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(eaRegOf(op)));
+    emitLoadState(e, kTmpB, aOffset(eaRegOf(op)));
     if (!toRegisters)
     {
         if (!canAddi(-static_cast<std::int32_t>(extent)))
@@ -1616,14 +1647,14 @@ void emitMovem(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint
                 slli(e.slot(kWideLen), kTmpC, kTmpC, 8u);
                 or_(e.slot(kWideLen), kTmpC, kTmpC, kTmpD);
             }
-            s32i(e.slot(kWideLen), kTmpC, kState, offset);
+            emitStoreState(e, kTmpC, offset);
         }
         else
         {
             // 書く値を先に読む。**base の An がマスクに入っていても、
             // 書かれるのは元の An** (インタプリタは a[] を書き換える前に
             // 値を読む)。commit を最後に置いてあるので自然にそうなる。
-            l32i(e.slot(kWideLen), kTmpC, kState, offset);
+            emitLoadState(e, kTmpC, offset);
 
             // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
             // kTmpA を転送先の先頭へ寄せてから呼ぶ (emitTouch は kTmpA を
@@ -1676,11 +1707,11 @@ void emitMovem(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint
             return;
         }
         addi(e.slot(kWideLen), kTmpC, kTmpSr, static_cast<std::int32_t>(extent));
-        s32i(e.slot(kWideLen), kTmpC, kState, aOffset(eaRegOf(op)));
+        emitStoreState(e, kTmpC, aOffset(eaRegOf(op)));
         return;
     }
     // 書き形は既に引いた値がそのまま最終値。
-    s32i(e.slot(kWideLen), kTmpSr, kState, aOffset(eaRegOf(op)));
+    emitStoreState(e, kTmpSr, aOffset(eaRegOf(op)));
 }
 
 // --- Tier D: 動的分岐 (RTS / JSR) --------------------------------------------
@@ -1758,7 +1789,7 @@ void emitRts(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // **emitEffectiveAddress は通さない。** あれは eaMode で分岐する形で、
     // RTS は eaMode を持たない (kEaNone)。通すと (An) 扱いで
     // eaRegOf(op) = srcReg = 0 になり、**A0 をスタックポインタとして読む**。
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitLoadState(e, kTmpB, aOffset(7));
     emitConst(e, kTmpConst, kGuestAddrMask);
     and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
 
@@ -1780,7 +1811,7 @@ void emitRts(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // A7 += 4。**無マスクの値に足す** (インタプリタも a[7] には
     // マスクしない値を書く: st_.a[7] = st_.a[7] + 4)。
     addi(e.slot(kWideLen), kTmpB, kTmpB, 4);
-    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitStoreState(e, kTmpB, aOffset(7));
 
     emitDynamicBranchExit(e, kTmpC, cycles);
 }
@@ -1835,7 +1866,7 @@ void emitJsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
         // mode 3/4 の commit のために kTmpB を残す約束になっている。
         // JSR の EA は「積む先」ではないので、その約束を持ち込むと
         // 下の A7 の計算と kTmpB を取り合う。飛び先だけを直に組む。
-        l32i(e.slot(kWideLen), kTmpCcr, kState, aOffset(op.dstReg));
+        emitLoadState(e, kTmpCcr, aOffset(op.dstReg));
         const bool hasDisplacement = op.eaMode == kEaDisp16 && op.imm != 0;
         if (hasDisplacement)
         {
@@ -1850,7 +1881,7 @@ void emitJsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // --- 積む先 (A7 - 4) を kTmpB (無マスク) と kTmpA (マスク済み) へ ---
     //
     // **まだ a[7] へ書かない。** ガードが全部通ってから commit する (G3)。
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitLoadState(e, kTmpB, aOffset(7));
     addi(e.slot(kWideLen), kTmpB, kTmpB, -4);
     emitConst(e, kTmpConst, kGuestAddrMask);
     and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
@@ -1870,7 +1901,7 @@ void emitJsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // --- ここから下はガードが全部通ったときだけ走る (G3) ---
 
     // A7 -= 4。**無マスクの値** (インタプリタも a[7] にはマスクしない値を書く)。
-    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitStoreState(e, kTmpB, aOffset(7));
 
     // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
     emitTouch(e, 0u, op);
@@ -1932,7 +1963,7 @@ void emitBsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // --- 積む先 (A7 - 4) を kTmpB (無マスク) と kTmpA (マスク済み) へ ---
     //
     // **まだ a[7] へ書かない。** ガードが全部通ってから commit する (G3)。
-    l32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitLoadState(e, kTmpB, aOffset(7));
     addi(e.slot(kWideLen), kTmpB, kTmpB, -4);
     emitConst(e, kTmpConst, kGuestAddrMask);
     and_(e.slot(kWideLen), kTmpA, kTmpB, kTmpConst);
@@ -1952,7 +1983,7 @@ void emitBsr(Emitter& e, const PlannedOp& op, std::uint32_t opIndex, std::uint32
     // --- ここから下はガードが全部通ったときだけ走る (G3) ---
 
     // A7 -= 4。**無マスクの値** (インタプリタも a[7] にはマスクしない値を書く)。
-    s32i(e.slot(kWideLen), kTmpB, kState, aOffset(7));
+    emitStoreState(e, kTmpB, aOffset(7));
 
     // touch (G14/G16)。**ゲスト RAM の store より前。畳まない。**
     emitTouch(e, 0u, op);
@@ -2078,7 +2109,7 @@ void emitBoundaryExit(Emitter& e, std::uint32_t nextInsnPc, std::uint16_t ir, st
                       std::uint32_t retConst)
 {
     emitConst(e, kTmpA, nextInsnPc + 4u);
-    s32i(e.slot(kWideLen), kTmpA, kState, kStatePcOffset);
+    emitStoreState(e, kTmpA, kStatePcOffset);
     emitConst(e, kTmpA, ir);
     s16i(e.slot(kWideLen), kTmpA, kState, kStateIrOffset);
     emitConst(e, kTmpA, irc);
