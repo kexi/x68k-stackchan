@@ -1,13 +1,13 @@
 ---
-title: イベント駆動デバイス — 実装確定版
-description: 命令ごとの tickDevices / serviceInterrupts をやめ、次に状態が変わる時点まで飛ばす設計の確定版。複数の敵対的レビューで壊しにいった結果を反映してある。実装済みで、実機で +51.9% (4991 -> 7579 kHz、実機比 76%) を実測した。
+title: イベント駆動デバイスと JIT — 実機 10MHz までの記録
+description: 命令ごとの tickDevices をやめる設計から始め、JIT (動的再コンパイル) で実機 10MHz (10063 kHz、実機比 100.6%) に到達するまでの実測の記録。効かなかった手 (admission ゲート / direct chaining / eviction) と、その見誤りの構造も残してある。
 type: reference
-tags: [x68k, emulator, esp32s3, performance, event-driven, mfp, crtc, rtc, interrupt]
+tags: [x68k, emulator, esp32s3, performance, event-driven, jit, dynarec, xtensa, mfp, crtc, rtc, interrupt]
 verified: measured
 sources:
-  - 実測（M5Stack CoreS3、ESP-IDF v5.5.2、Human68k 3.02 稼働中、2026-08-17）
+  - 実測（M5Stack CoreS3、ESP-IDF v5.5.2、Human68k 3.02 稼働中、2026-08-17 〜 2026-08-24）
   - 多エージェントによる設計と敵対的検証（調査 3 / 設計 3 / 攻撃 9 / 統合 1）
-updated: 2026-08-17
+updated: 2026-08-24
 ---
 
 # イベント駆動デバイス — 実装確定版
