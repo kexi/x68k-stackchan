@@ -15,6 +15,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_alu.cpp"
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_misc.cpp"
         "${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_group4.cpp"
+        "${X68K_ROOT}/src/x68k/core/cpu/block_planner.cpp"
         "${X68K_ROOT}/src/x68k/core/bus.cpp"
         "${X68K_ROOT}/src/x68k/core/machine.cpp"
         "${X68K_ROOT}/src/x68k/core/dev/sram.cpp"
@@ -48,6 +49,13 @@ idf_component_register(
         # 実体を共有する)。顔は RGB565 の配列へ画素を置くだけで、LCD へ送るのは
         # DisplayLcd::pushFrame (avatar.h の冒頭を見よ)。
         # servo.cpp だけが ESP-IDF (LEDC) を必要とする。
+        # --- JIT: BlockPlan を Xtensa の機械語へ落とす ---
+        # block_emitter.cpp は ESP-IDF に触らない (吐くのは Xtensa のバイト列で、
+        # 実行するのは exec_memory.cpp の側)。ホストのテストと実体を共有する。
+        # exec_memory.cpp だけが MALLOC_CAP_EXEC と callx0 のゲートウェイを持つ。
+        "${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp"
+        "${X68K_ROOT}/src/x68k/platform/jit/block_runner.cpp"
+        "${X68K_ROOT}/src/x68k/platform/jit/exec_memory.cpp"
         "${X68K_ROOT}/src/x68k/platform/app_mode.cpp"
         "${X68K_ROOT}/src/x68k/platform/avatar.cpp"
         "${X68K_ROOT}/src/x68k/platform/servo.cpp"
@@ -68,3 +76,12 @@ idf_component_register(
         esp_driver_ledc
         esp_driver_gpio
 )
+
+# ディスク読み出しの実時間を測る計測 (storage_sd.cpp)。
+# 既定は 0。just measure-disk が -DX68K_MEASURE_DISK=1 で有効にする。
+# 判断が済んだら消す。
+if(DEFINED X68K_MEASURE_DISK)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_MEASURE_DISK=${X68K_MEASURE_DISK})
+else()
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_MEASURE_DISK=0)
+endif()

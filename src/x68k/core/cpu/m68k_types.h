@@ -133,9 +133,6 @@ struct M68kState
     // エミュレータの開発用フラグ。
     bool halted = false;
 
-    // 実行したサイクル数の累計。デバイスを進める量の基準に使う。
-    u64 cycles = 0;
-
     [[nodiscard]] bool isSupervisor() const
     {
         return (sr & sr_bit::kSupervisor) != 0;

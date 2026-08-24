@@ -21,6 +21,8 @@
 #ifndef X68K_CORE_CPU_M68K_H
 #define X68K_CORE_CPU_M68K_H
 
+#include "code_gen_map.h"
+#include "native_exec.h"
 #include "m68k_types.h"
 
 // ホットパスを内部 SRAM (IRAM) へ置くための印。
@@ -66,6 +68,11 @@ public:
     // halted または stopped の場合は何もせず 0 を返す。
     X68K_HOT_PATH u32 step();
 
+#if X68K_COUNT_JIT_COVERAGE
+    // JIT の被覆率を数える (計測用。恒久的な機能ではない)。
+    bool countJitCoverage(u16 op);
+#endif
+
     // 割り込みを要求する。level は 1-7 (7 はマスク不可)。
     // 実際に受け付けられるかは SR の割り込みマスクによる。
     //
@@ -73,6 +80,111 @@ public:
     // その番号のベクタを使う。X68000 の MFP は自分のベクタ番号を返す
     // デバイスなので、これを使わないと未定義割り込みのハンドラへ飛んでしまう。
     void requestInterrupt(u32 level, u32 vectorNumber = 0);
+
+    // 受理待ちの割り込みレベル (0 = なし)。
+    //
+    // イベント駆動の STOP 一括飛び越しがこれを見る。STOP 中に割り込みを
+    // 要求されても st_.stopped が下りるのは次の step() なので、これを
+    // 見ないと「もう起きることが決まっている」CPU を期限まで眠らせて
+    // しまい、割り込みの受理が期限ぶん遅れる (実際に踏んだ)。
+    [[nodiscard]] u32 pendingInterruptLevel() const
+    {
+        return pendingIrq_;
+    }
+
+    // ネイティブ実行器を教わる。setFastRam と同じ「外から教わる」流儀。
+    //
+    // 教わっていない間は run が nullptr なので、Machine の分岐塔が
+    // UseNative=false の実体化しか選ばない。**既定で挙動が 1 ビットも
+    // 変わらない**のはこれが根拠。
+    void setNativeExec(const NativeExec& e)
+    {
+        nativeExec_ = e;
+    }
+
+    [[nodiscard]] bool hasNativeExec() const
+    {
+        return nativeExec_.isReady();
+    }
+
+    [[nodiscard]] const NativeStats* nativeStats() const
+    {
+        return nativeExec_.stats != nullptr ? nativeExec_.stats(nativeExec_.context) : nullptr;
+    }
+
+    // ブロックを 1 本走らせる。走らなければ kDeferToStep。
+    //
+    // **呼び出し側は kDeferToStep なら step() を 1 回回す。**
+    // 未対応命令 / halted / stopped / 割り込み保留の 3 つを区別しないのは、
+    // step() が 3 つとも正しく処理するから (native_exec.h の NativeExit 参照)。
+    NativeResult tryNative()
+    {
+        return nativeExec_.run(nativeExec_.context, *this);
+    }
+
+    // ブロックへ入る前に「インタプリタへ落とすべきか」を問う。
+    //
+    // **ネイティブ実行器は必ず入口でこれを見る。** これが無いと、
+    // reachSlow で pendingIrq_ が立った後、ネイティブが成功し続ける限り
+    // step() が呼ばれず、**次に reachSlow へ落ちるまでの最大 80,000
+    // サイクル割り込みが受理されない**。
+    //
+    // halted / stopped も同じ扱いにする。step() が既に 3 つとも正しく
+    // 処理するので、実行器側は理由を区別しなくてよい。
+    [[nodiscard]] bool mustDeferToStep() const
+    {
+        return st_.halted || st_.stopped || pendingIrq_ != 0;
+    }
+
+    // 命令語を「窓の中からだけ」読む。**副作用を持たない。**
+    //
+    // 翻訳器がバスを叩くと、**翻訳しただけで MFP の割り込み要因レジスタが
+    // 動く**。窓に当たらなければ false を返し、呼び出し側はそこで翻訳を
+    // 打ち切る。
+    //
+    // Why not 窓のポインタを外へ出さないか: 生ポインタを渡すと
+    // setFastRam / setFastRamReadable / setFastRom で窓が変わったことを
+    // 受け取り側が知る手段が無い。命令フェッチの窓をポインタでキャッシュ
+    // して捨て損ねた失敗を一度している (code_gen_map.h の冒頭)。
+    [[nodiscard]] bool peekCodeWord(u32 addr, u16& out) const
+    {
+        const u32 a = addr & M68k::kAddrMask;
+        if ((a & 1) != 0)
+        {
+            return false;
+        }
+        if (fastRamReadable_ && fastRamHasWord(a))
+        {
+            out = static_cast<u16>((fastRam_[a] << 8) | fastRam_[a + 1]);
+            return true;
+        }
+        if (u32 off = 0; fastRomHas(a, 2, off))
+        {
+            out = static_cast<u16>((fastRom_[off] << 8) | fastRom_[off + 1]);
+            return true;
+        }
+        return false;
+    }
+
+    // 分岐成立時にプリフェッチを詰め直す。
+    //
+    // **成立側でしか呼ばない。** 非分岐終端で呼ぶと、インタプリタが
+    // 読まないワード (fallThroughPc + 2) を余分に読む。それが I/O なら
+    // 副作用が起き、窓の外なら faulted_ が立って**インタプリタでは一度も
+    // 起きなかったバスエラー例外**が発生する。
+    //
+    // 戻り値: 奇数番地なら false (アドレスエラーに入っている)。
+    // 翻訳時に I7 が弾いているので通常は起きないが、段 2 以降で I7 を
+    // 緩めたときに呼び出し側が必ず書き換わるように返す。
+    bool branchTo(u32 target)
+    {
+        if ((target & 1) != 0)
+        {
+            return false;
+        }
+        refillPrefetch(target);
+        return true;
+    }
 
     // RESET 命令が実行されたときに呼ばれる。
     //
@@ -128,8 +240,37 @@ public:
     //
     // romAtZero は「$000000 に IPL-ROM が写像されている」間 true。写像中は
     // 窓の読み出しが RAM ではなく ROM 側に当たるので、fast path を止める。
+    // デコード済みブロックの世代表 (code_gen_map.h)。
+    // 書き込みのたびに触るので、CPU が直接持つ。
+    // テストからプリフェッチを張り直す。命令長デコーダの検証に使う。
+    void refillPrefetchForTest(u32 pc)
+    {
+        refillPrefetch(pc);
+    }
+
+    // テストから CPU の書き込み経路を直接叩く。
+    //
+    // Why 要るか: 「CPU の直行路 (fastRam) が世代を上げるか」は、
+    // バス経由と区別して確かめないと意味が無い。命令を組んで走らせると
+    // どちらを通ったか分からない。
+    void writeForTest(u32 addr, u16 value)
+    {
+        write16(addr, value);
+    }
+
+    [[nodiscard]] CodeGenMap& codeGenMap()
+    {
+        return codeGen_;
+    }
+
     void setFastRam(u8* base, u32 length)
     {
+        // 実体が差し替わったら、控えている世代は全部当てにならない。
+        // 個別に消して回るより 1 つ進める方が漏れようがない。
+        codeGen_.touchAll();
+        // 見え方そのものが変わる。ページの世代では表現できないので、
+        // 写像の世代も進める (CodeGenMap::mappingEpoch のコメント参照)。
+        codeGen_.bumpMappingEpoch();
         fastRam_ = base;
         fastRamLimit_ = base != nullptr ? length : 0;
     }
@@ -140,7 +281,39 @@ public:
     // SystemBus::setRomMappedAtZero と必ず対で呼ぶ。
     void setFastRamReadable(bool readable)
     {
+        // **ゲスト RAM は 1 バイトも変わらないのに、見える中身が変わる。**
+        // ページの世代は書き込みしか数えないのでここを取りこぼす。
+        // 取りこぼすと、$000000 の ROM 写像が外れた前後で古い前提の
+        // まま実行することになる。
+        if (fastRamReadable_ != readable)
+        {
+            codeGen_.bumpMappingEpoch();
+        }
         fastRamReadable_ = readable;
+    }
+
+    // 翻訳器 (JIT) が窓を生成コードへ焼くための読み取り口。
+    //
+    // **mappingEpoch を鍵に持つブロックへ焼く以外の用途に使ってはいけない。**
+    // 保持した瞬間から setFastRam / setFastRamReadable / setFastRom / reset /
+    // loadStateForTest で古くなり、それを知る手段は epoch の照合しかない。
+    // 上の 5 経路はすべて bumpMappingEpoch を呼ぶので、焼いた値が古いまま
+    // 実行されることは原理的に無い (実行前の鍵照合が epoch を見る)。
+    //
+    // Why not 「無効化を知れないから public にしない」を貫かないか: それが
+    // 却下理由だったのは、受け取り側が古さを検出できなかったから。ここでは
+    // 受け取り側が epoch を鍵に持ち、走る前に必ず照合する。**却下理由が
+    // 消えている前提でだけ開ける。**
+    struct CodeWindow
+    {
+        const u8* ramBase = nullptr;
+        u32 ramLimit = 0;
+        bool ramReadable = false;
+    };
+
+    [[nodiscard]] CodeWindow codeWindowForJit() const
+    {
+        return CodeWindow{fastRam_, fastRamLimit_, fastRamReadable_};
     }
 
     // 仮想関数を通さずに読んでよい IPL-ROM の窓を教える。
@@ -158,6 +331,8 @@ public:
     // Bus を挟んでいる理由。窓の位置は必ず SystemBus から教わる。
     void setFastRom(const u8* base, u32 busBase, u32 length)
     {
+        // ROM の窓が動くのも写像の変化。setFastRam と同じ扱いにする。
+        codeGen_.bumpMappingEpoch();
         fastRom_ = base;
         fastRomBase_ = busBase;
         fastRomLength_ = base != nullptr ? length : 0;
@@ -521,7 +696,11 @@ private:
     u32 fastRomLength_ = 0;
     // $000000 の ROM 写像が外れているか。写像中は読み出しを bus_ に任せる。
     bool fastRamReadable_ = false;
+    // ネイティブ実行器。既定は run == nullptr で、教わるまで使われない。
+    NativeExec nativeExec_{};
     M68kState st_;
+    // ゲスト RAM の書き換えを世代で追う (code_gen_map.h)。
+    CodeGenMap codeGen_;
     // 保留中の割り込みレベル (0 = なし)。
     u32 pendingIrq_ = 0;
     // 保留中の割り込みが使うベクタ番号 (0 = 自動ベクタ)。

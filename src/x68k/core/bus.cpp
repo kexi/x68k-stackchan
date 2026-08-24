@@ -70,6 +70,15 @@ void SystemBus::publishFastRam()
     // ウォッチは書き込みだけを見張る仕組みなので、読み出し専用のこの窓には
     // 関係しない。止める必要が無い。
     fastPathCpu_->setFastRom(mem_.iplRom, kIplromBase, kIplromSize);
+
+    // **ROM は書き換わらないので、世代を固定値で返してよい。**
+    //
+    // 世代配列はメインメモリぶんしか無いため、$FE0000 は範囲外として
+    // kAlwaysStale になり、翻訳器の I9 が「常に古い」と見て拒否していた。
+    // 実測で**実行の 23% が ROM から**なので、まるごと捨てていた。
+    //
+    // 窓と同じ場所で教えるので、片方だけ更新して食い違うことがない。
+    fastPathCpu_->codeGenMap().setImmutableRange(kIplromBase, kIplromSize);
 }
 
 SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
@@ -311,6 +320,12 @@ void SystemBus::write8(u32 addr, u8 value)
         // ROM が写像されている間の書き込みは RAM 側へ行く (ROM は書けない)。
         if (mem_.mainRam != nullptr)
         {
+            // ここは CPU の遅い経路と **DMA** の両方が通る。デコード済み
+            // ブロックの前提が崩れたことを世代で伝える (code_gen_map.h)。
+            if (codeGen_ != nullptr)
+            {
+                codeGen_->touch(a);
+            }
             mem_.mainRam[a] = value;
         }
         return;
@@ -370,6 +385,10 @@ void SystemBus::write16(u32 addr, u16 value)
     const bool fitsInMainRam = a + 1 < kMainRamSize;
     if (fitsInMainRam && mem_.mainRam != nullptr)
     {
+        if (codeGen_ != nullptr)
+        {
+            codeGen_->touch(a);
+        }
         mem_.mainRam[a] = static_cast<u8>(value >> 8);
         mem_.mainRam[a + 1] = static_cast<u8>(value & 0xFFu);
         return;

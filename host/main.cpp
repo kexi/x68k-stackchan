@@ -11,6 +11,7 @@
 //   x68k-run --iplrom rom/iplrom.dat [--hdd rom/hdd0.hdf] [--fd0 disk.xdf]
 //            [--ppm out.ppm] [--trace] [--cycles N]
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,28 @@
 #include "io/ascii_keymap.h"
 #include "gui_demo.h"
 #include "machine.h"
+
+#if X68K_COUNT_JIT_COVERAGE
+extern unsigned long g_jitTotal;
+extern unsigned long g_jitDecodable;
+extern unsigned long g_jitByGroup[16];
+extern unsigned long g_jitDecodableByGroup[16];
+extern unsigned long g_jitRunLen[33];
+extern unsigned long g_group4[64];
+extern unsigned long g_g4Named[12];
+extern unsigned long long g_jitCyclesDecodable;
+extern unsigned long long g_jitCyclesOther;
+extern unsigned long g_cutBranch;
+extern unsigned long g_cutCall;
+extern unsigned long g_cutStore;
+extern unsigned long g_cutIrq;
+extern unsigned long g_nativeRunLen[33];
+#endif
+#if X68K_COUNT_FETCH_ORIGIN
+extern unsigned long g_refillFromRom;
+extern unsigned long g_refillFromRam;
+extern unsigned long g_blockHits[65536];
+#endif
 #include "video/cgrom_fallback.h"
 #include "video/graphic_raster.h"
 #include "video/text_raster.h"
@@ -418,6 +441,13 @@ void printUsage()
         "  --trace-from A  指定アドレスに到達してからトレースを始める\n"
         "  --trace-last N  停止直前の N 命令だけを出す (既定 0 = 出さない)\n"
         "  --stats         実行した命令の内訳を最後に出す\n"
+        "  --no-fast-tick  毎命令通る経路の最適化を切って走らせる\n"
+        "                  付けた側と付けない側で最終状態が一致するはず\n"
+        "  --event-driven  次にデバイスの状態が変わる時点まで飛ばす\n"
+        "                  (docs/knowledge/event-driven-implementation.md)\n"
+        "                  付けた側と付けない側で最終状態が一致するはず\n"
+        "  --shadow-verify 期限を計算するが飛ばさず、予測と実際を突き合わせる\n"
+        "                  段 1 の検証。最後に不一致の件数を出す\n"
         "\n"
         "ROM はライセンス上リポジトリに含まれない。NOTICE.md を参照。\n");
 }
@@ -598,6 +628,9 @@ int main(int argc, char** argv)
     bool hasTraceFrom = false;
     std::size_t traceLast = 0;
     bool showStats = false;
+    bool noFastTick = false;
+    bool eventDriven = false;
+    bool shadowVerify = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -691,6 +724,27 @@ int main(int argc, char** argv)
         else if (arg == "--stats")
         {
             showStats = true;
+        }
+        // 毎命令通る経路の最適化を切って走らせる。実機では 1 文字で
+        // 切り替えるが (main/main.cpp の 'p')、ホストでは
+        // 「切った側と入れた側で最終状態が一致するか」を機械的に
+        // 確かめるのに使う。一致しなければ最適化が状態を変えている。
+        else if (arg == "--no-fast-tick")
+        {
+            noFastTick = true;
+        }
+        // イベント駆動 (docs/knowledge/event-driven-implementation.md)。
+        // 実機では速度を測るために切り替えるが、ホストでは
+        // 「飛ばした側と毎命令 tick 側で最終状態が一致するか」を
+        // 実物の IPL-ROM と Human68k で確かめるのに使う。
+        else if (arg == "--event-driven")
+        {
+            eventDriven = true;
+        }
+        // 段 1 の shadow 検証。飛ばさずに期限の予測だけを突き合わせる。
+        else if (arg == "--shadow-verify")
+        {
+            shadowVerify = true;
         }
         else if (arg == "--help" || arg == "-h")
         {
@@ -834,6 +888,12 @@ int main(int argc, char** argv)
     std::vector<x68k::u8> sasiBuffer(x68k::Machine::kSasiBufferBytes, 0);
     machine.setSasiBuffer(sasiBuffer.data());
 
+    // コードページの世代を配線する。**未配線だと「常に古い」が
+    // 「常に有効」に化ける** (pageCount_ = 0 で generation() が全アドレスに
+    // kAlwaysStale を返し、素朴な照合が通ってしまう)。
+    static std::vector<std::uint16_t> codeGen(x68k::kMainRamSize / x68k::CodeGenMap::kPageSize, 0);
+    machine.cpu().codeGenMap().setStorage(codeGen.data(), static_cast<x68k::u32>(codeGen.size()));
+
     disk.setTrace(traceDisk);
     machine.setDisk(&disk);
 
@@ -845,6 +905,28 @@ int main(int argc, char** argv)
             continue;
         }
         machine.setFloppyDisk(d, &floppy[d]);
+    }
+
+    if (noFastTick)
+    {
+        x68k::PerfSwitch off;
+        off.inlineRtcTick = false;
+        off.inlineCrtcTick = false;
+        off.inlineMfpTimer = false;
+        machine.setPerfSwitch(off);
+        std::printf("[perf] 毎命令通る経路の最適化を切って走らせる\n");
+    }
+
+    if (eventDriven)
+    {
+        machine.setEventDriven(true);
+        std::printf("[perf] イベント駆動で走らせる (次に状態が変わる時点まで飛ばす)\n");
+    }
+
+    if (shadowVerify)
+    {
+        machine.setShadowVerify(true);
+        std::printf("[perf] shadow 検証: 期限を計算するが飛ばさない\n");
     }
 
     machine.reset();
@@ -884,16 +966,30 @@ int main(int argc, char** argv)
     //  tickDevices が 8 倍重く見えていた。quantum は観測可能なずれを作ると
     //  分かって撤廃したので、今は両経路の tick 粒度は同じ。それでも
     //  「実機と同じ関数を回す」という原則は変わらない。)
+    // キー入力があっても run() 経路を使う。
+    //
+    // Why これを許すか: run() と step() は別の関数で、イベント駆動
+    // (--event-driven) が乗っているのは run() だけ。キーを打つ検証を
+    // step() 経路へ落とすと、**「A> まで起動して dir が動く」を
+    // イベント駆動で一度も確かめないまま通ってしまう**。
+    // キーは「次に打つサイクル」までで run() を刻めば送れる。
     const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
-                               keys.empty() && mouseScript.empty() && watchAddr == 0;
+                               mouseScript.empty() && watchAddr == 0;
     if (canUseFastRun)
     {
         while (spent < cycleLimit)
         {
             // 1 回の run() で回す量。大きすぎると停止の検出が遅れる。
             constexpr x68k::u32 kFastRunChunk = 100000;
-            const x68k::u32 chunk =
-                static_cast<x68k::u32>(std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent));
+            x68k::u64 limit = std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent);
+            // 次にキーを打つ時刻を跨がない。跨ぐと、打つべき時刻から
+            // 最大 1 スライスぶん遅れて送ることになる。
+            const bool hasMoreKeys = keyIndex < keys.size();
+            if (hasMoreKeys && nextKeyCycle > spent)
+            {
+                limit = std::min<x68k::u64>(limit, nextKeyCycle - spent);
+            }
+            const x68k::u32 chunk = static_cast<x68k::u32>(limit > 0 ? limit : 1);
             const x68k::u32 used = machine.run(chunk);
             if (used == 0)
             {
@@ -903,6 +999,28 @@ int main(int argc, char** argv)
             // run() は命令数を返さない。サイクル数から概算する
             // (統計を出さない経路なので、正確な命令数は要らない)。
             instructions += used / 4;
+
+            // 台本の時刻に達したキーを送る。押下と離鍵で 1 回ずつ。
+            if (hasMoreKeys && spent >= nextKeyCycle)
+            {
+                const x68k::u8 code = x68k::asciiToScanCode(keys[keyIndex]);
+                if (code == 0)
+                {
+                    ++keyIndex;  // 対応していない文字は飛ばす
+                }
+                else if (keyReleased)
+                {
+                    machine.pressKey(code);
+                    keyReleased = false;
+                }
+                else
+                {
+                    machine.pressKey(static_cast<x68k::u8>(code | 0x80u));
+                    keyReleased = true;
+                    ++keyIndex;
+                }
+                nextKeyCycle = spent + kKeyIntervalCycles;
+            }
         }
     }
 
@@ -1018,6 +1136,18 @@ int main(int argc, char** argv)
                 static_cast<unsigned long long>(instructions),
                 static_cast<unsigned long long>(spent));
 
+    if (shadowVerify)
+    {
+        // 不一致 = 「予測した期限より前に状態が変わった」。飛ばす実装は
+        // その変化を飛び越していたことになる。1 件でもあれば設計が誤り。
+        //
+        // 突き合わせ件数が 0 なら検証そのものが素通りしている。
+        // 「ぴたり」は予測が区間の中に収まった件数で、0 だと予測が常に
+        // 保守的すぎて 1 サイクルも飛ばせないことになる。
+        std::printf("[shadow] 不一致 %u 件 / 突き合わせ %u 件 (うちぴたり %u 件)\n",
+                    machine.shadowMismatches(), machine.shadowChecks(), machine.shadowExact());
+    }
+
     if (machine.isHalted())
     {
         const auto& s = machine.cpu().state();
@@ -1073,6 +1203,150 @@ int main(int argc, char** argv)
             }
             std::printf("[tvram] plane%u: %zu バイト 最初の行 %zu\n", plane, count, firstLine);
         }
+        // タイマの設定も出す。イベント駆動の設計は「次に状態が変わるまで
+        // 何サイクルあるか」で決まるので、ゲストがどの分周でタイマを
+        // 回しているかがそのまま効果を左右する
+        // (docs/knowledge/event-driven-devices.md)。
+        std::printf(
+            "[mfp] TACR=%02X TBCR=%02X TCDCR=%02X TADR=%02X TBDR=%02X TCDR=%02X TDDR=%02X\n",
+            machine.mfp().peek(x68k::Mfp::kTacr), machine.mfp().peek(x68k::Mfp::kTbcr),
+            machine.mfp().peek(x68k::Mfp::kTcdcr), machine.mfp().peek(x68k::Mfp::kTadr),
+            machine.mfp().peek(x68k::Mfp::kTbdr), machine.mfp().peek(x68k::Mfp::kTcdr),
+            machine.mfp().peek(x68k::Mfp::kTddr));
+#if X68K_COUNT_JIT_COVERAGE
+        // JIT の被覆率 h。10000 kHz に届くかは Chit だけでなく h で決まる。
+        {
+            const double h = g_jitTotal != 0 ? (double)g_jitDecodable / (double)g_jitTotal : 0.0;
+            std::printf("[jit] 実行 %lu 命令 / 翻訳可 %lu = h %.1f%%\n", g_jitTotal, g_jitDecodable,
+                        h * 100.0);
+            std::printf("[jit] グループ別 (実行数 / うち翻訳可):\n");
+            for (int g = 0; g < 16; ++g)
+            {
+                if (g_jitByGroup[g] == 0)
+                {
+                    continue;
+                }
+                std::printf("      $%X: %10lu / %10lu (%5.1f%%) 全体の %.1f%%\n", g,
+                            g_jitByGroup[g], g_jitDecodableByGroup[g],
+                            100.0 * (double)g_jitDecodableByGroup[g] / (double)g_jitByGroup[g],
+                            100.0 * (double)g_jitByGroup[g] / (double)g_jitTotal);
+            }
+            // h_native: 「長さが分かる」ではなく「ネイティブの直線コードで
+            // 続けられる」割合。ブロックを切る理由も出す。
+            {
+                unsigned long runs = 0;
+                unsigned long instrs = 0;
+                for (unsigned i = 1; i < 33; ++i)
+                {
+                    runs += g_nativeRunLen[i];
+                    instrs += g_nativeRunLen[i] * i;
+                }
+                std::printf("[jit] --- h_native (実ブロック) ---\n");
+                std::printf("[jit] ネイティブ区間 %lu 本 / 計 %lu 命令 = 平均 %.2f 命令\n", runs,
+                            instrs, runs != 0 ? (double)instrs / (double)runs : 0.0);
+                std::printf("[jit] 切れた理由: 分岐 %lu / 呼出・復帰 %lu / 書込 %lu / 割込 %lu\n",
+                            g_cutBranch, g_cutCall, g_cutStore, g_cutIrq);
+                for (unsigned i = 1; i < 33; ++i)
+                {
+                    if (g_nativeRunLen[i] != 0)
+                    {
+                        std::printf("      長さ %2u: %lu 本\n", i, g_nativeRunLen[i]);
+                    }
+                }
+            }
+            // 翻訳可否ごとの 1 命令あたりゲストサイクル数。
+            // Cavg モデルの「85」を全命令平均で使ってよいかを確かめる。
+            {
+                const double decAvg = g_jitDecodable != 0
+                                          ? (double)g_jitCyclesDecodable / (double)g_jitDecodable
+                                          : 0.0;
+                const unsigned long other = g_jitTotal - g_jitDecodable;
+                const double othAvg = other != 0 ? (double)g_jitCyclesOther / (double)other : 0.0;
+                const double allAvg =
+                    g_jitTotal != 0
+                        ? (double)(g_jitCyclesDecodable + g_jitCyclesOther) / (double)g_jitTotal
+                        : 0.0;
+                std::printf("[jit] ゲストサイクル/命令: 翻訳可 %.2f / 翻訳不可 %.2f / 全体 %.2f\n",
+                            decAvg, othAvg, allAvg);
+            }
+            // $4 の内訳。全体の 32.3% を占めるので、ここを足すのが最大の伸びしろ。
+            {
+                const char* names[12] = {"JSR",   "JMP", "RTS", "NOP",  "LEA",  "TST/TAS",
+                                         "MOVEM", "PEA", "CLR", "LINK", "UNLK", "その他"};
+                std::printf("[jit] $4 の内訳 (全体の %.1f%%):\n",
+                            100.0 * (double)g_jitByGroup[4] / (double)g_jitTotal);
+                for (int i = 0; i < 12; ++i)
+                {
+                    if (g_g4Named[i] == 0)
+                    {
+                        continue;
+                    }
+                    std::printf("      %-8s %10lu (全体の %.1f%%)\n", names[i], g_g4Named[i],
+                                100.0 * (double)g_g4Named[i] / (double)g_jitTotal);
+                }
+            }
+            // 連続長: 呼び出しコスト 6.7 サイクルを何命令で償却できるか。
+            unsigned long runs = 0;
+            unsigned long instrs = 0;
+            for (unsigned i = 1; i < 33; ++i)
+            {
+                runs += g_jitRunLen[i];
+                instrs += g_jitRunLen[i] * i;
+            }
+            std::printf("[jit] 連続 %lu 本 / 計 %lu 命令 = 平均 %.2f 命令\n", runs, instrs,
+                        runs != 0 ? (double)instrs / (double)runs : 0.0);
+            for (unsigned i = 1; i < 33; ++i)
+            {
+                if (g_jitRunLen[i] != 0)
+                {
+                    std::printf("      長さ %2u: %lu 本\n", i, g_jitRunLen[i]);
+                }
+            }
+        }
+#endif
+#if X68K_COUNT_FETCH_ORIGIN
+        // 段 0: ブロックキャッシュを ROM 窓に限れるかを決めるための計測。
+        // 「IPL-ROM 79%」は起動中の値で、Human68k 稼働中は未計測だった。
+        {
+            const unsigned long tot = g_refillFromRom + g_refillFromRam;
+            std::printf("[fetch] refill ROM=%lu RAM=%lu (ROM %.1f%%)\n", g_refillFromRom,
+                        g_refillFromRam,
+                        tot != 0 ? 100.0 * (double)g_refillFromRom / (double)tot : 0.0);
+            // 集中度: 実行回数の多い順に並べ、上位 N でどれだけ覆えるか。
+            {
+                std::vector<unsigned long> v(g_blockHits, g_blockHits + 65536);
+                std::sort(v.begin(), v.end(), std::greater<unsigned long>());
+                unsigned long all = 0;
+                for (unsigned long x : v)
+                {
+                    all += x;
+                }
+                unsigned long acc = 0;
+                const int marks[] = {50, 100, 200, 500, 1000, 2000};
+                for (int m : marks)
+                {
+                    acc = 0;
+                    for (int i = 0; i < m && i < 65536; ++i)
+                    {
+                        acc += v[(std::size_t)i];
+                    }
+                    std::printf("[block] 上位 %5d 個で動的実行の %.1f%%\n", m,
+                                all != 0 ? 100.0 * (double)acc / (double)all : 0.0);
+                }
+                std::size_t nonzero = 0;
+                for (unsigned long x : v)
+                {
+                    if (x != 0)
+                    {
+                        ++nonzero;
+                    }
+                }
+                std::printf("[block] 到達したブロック先頭 %zu 個\n", nonzero);
+            }
+        }
+#endif
+        std::printf("[mfp] IERB=%02X IMRB=%02X IPRB=%02X\n", machine.mfp().peek(x68k::Mfp::kIerb),
+                    machine.mfp().peek(x68k::Mfp::kImrb), machine.mfp().peek(x68k::Mfp::kIprb));
         std::printf("[mfp] IERA=%02X IPRA=%02X IMRA=%02X RSR=%02X UDR=%02X SR=%04X\n",
                     machine.mfp().peek(0x03), machine.mfp().peek(0x05), machine.mfp().peek(0x09),
                     machine.mfp().peek(0x15), machine.mfp().peek(0x17), machine.cpu().state().sr);

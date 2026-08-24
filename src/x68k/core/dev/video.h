@@ -56,17 +56,84 @@ public:
     // 報告しない (最終状態が呼ぶ前と同じなら false になる)。
     // まとめて進める呼び方をするなら、境界ごとに刻むか、通過したエッジを
     // 返せる形へ作り直す必要がある。
-    bool tick(u32 cycles);
+    //
+    // ここは **毎命令通る**。1 命令ぶんのサイクルは常に 1 フレームより
+    // 遥かに短く、垂直帰線の境界を跨ぐのは 1 フレーム = 180,342 サイクルに
+    // 2 度だけ。つまりほぼ全ての呼び出しは「足して、境界を跨がず、false」で
+    // 終わる。その経路だけをヘッダに置き、剰余が要る場合と状態が変わる場合を
+    // .cpp 側の tickSlow() に残す。
+    //
+    // Why not quantum でまとめないか: 一度 64 サイクル単位でまとめたが、
+    // ゲストは GPIP4 ($E88001) を命令単位でポーリングでき、垂直帰線の開始が
+    // 24 サイクル遅れるずれが観測できた
+    // (docs/knowledge/cores3-emulator-runtime.md)。渡す量は変えず、
+    // **呼び出しの間接性だけ**を消す。
+    //
+    // FastPath=false にすると、この最適化を入れる前と同じ「常に実呼び出し」
+    // へ戻る。実機で焼き直さずに効果を測るための口 (perf_switch.h)。
+    // テンプレートにしてあるのは、有効側の生成コードをスイッチ導入前と
+    // 同一に保つため。bool の引数だと毎命令フラグを読んで分岐する。
+    // 渡し忘れをコンパイルエラーにするため、既定引数は付けない
+    // (rtc.h の tickFast に理由がある)。
+    template <bool FastPath>
+    bool tickFast(u32 cycles)
+    {
+        const bool needsSlowPath = !FastPath || cycles >= kCyclesPerFrame;
+        if (needsSlowPath)
+        {
+            return tickSlow(cycles);  // 剰余が要る。ホストのまとめ呼びだけ
+        }
+        frameCycles_ += cycles;
+        if (frameCycles_ >= kCyclesPerFrame)
+        {
+            frameCycles_ -= kCyclesPerFrame;
+        }
+
+        // 表示期間の後ろに垂直帰線が来る。
+        const bool nowVBlank = frameCycles_ >= (kCyclesPerFrame - kVBlankCycles);
+        if (nowVBlank == inVBlank_)
+        {
+            return false;  // ここが最頻。フレーム中 2 回しか下へ落ちない。
+        }
+        inVBlank_ = nowVBlank;
+        return true;
+    }
 
     [[nodiscard]] bool inVerticalBlank() const
     {
         return inVBlank_;
     }
 
+    // 次に垂直帰線の状態が変わるまでの CPU サイクル数。
+    //
+    // 変わる点はフレーム内に 2 つしかない: 表示期間の終わり
+    // (kCyclesPerFrame - kVBlankCycles) と、フレームの終わり
+    // (= 次フレームの 0)。今どちら側に居るかで次の点が決まる。
+    //
+    // 周期はコンパイル時定数なので、CRTC レジスタが書かれても変わらない。
+    // 将来 R04-R09 から実周期を計算する実装へ変えたら、ここも
+    // レジスタ依存になり、Crtc::write が期限を無効化する必要が出る。
+    [[nodiscard]] u32 cyclesUntilVBlankEdge() const
+    {
+        static constexpr u32 kVBlankBegin = kCyclesPerFrame - kVBlankCycles;
+        if (inVBlank_)
+        {
+            return kCyclesPerFrame - frameCycles_;
+        }
+        // 表示期間中。ただし frameCycles_ が既に境界を越えているのに
+        // inVBlank_ が false という状態は tickFast の直後には起こらない
+        // (越えた瞬間に true になる)。念のため 0 を返さないよう畳む。
+        return frameCycles_ < kVBlankBegin ? kVBlankBegin - frameCycles_
+                                           : kCyclesPerFrame - frameCycles_;
+    }
+
     // 現在のラスタ番号。ラスタ割り込みや $E80028 の読み出しに使う。
     [[nodiscard]] u32 rasterNumber() const;
 
 private:
+    // tick() の遅い側。1 フレーム以上をまとめて渡されたときだけ呼ばれる。
+    bool tickSlow(u32 cycles);
+
     std::array<u16, kRegCount> reg_{};
     u32 frameCycles_ = 0;
     bool inVBlank_ = false;

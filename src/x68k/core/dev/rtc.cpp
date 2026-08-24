@@ -8,8 +8,8 @@ namespace x68k
 namespace
 {
 
-// X68000 の CPU は 10MHz。1 秒ぶんのサイクル数。
-constexpr u32 kCyclesPerSecond = 10000000;
+// kCyclesPerSecond は Rtc のメンバへ移した。tick() の速い側がヘッダで
+// 閾値を比較するため、ヘッダから見える場所に無いと inline できない。
 
 // うるう年を考慮した各月の日数。
 u32 daysInMonth(u32 month, u32 year)
@@ -208,9 +208,13 @@ void Rtc::advanceOneSecond()
     year_ = (year_ + 1) % 100;
 }
 
-void Rtc::tick(u32 cycles)
+void Rtc::tickCarry()
 {
-    cycleAccumulator_ += cycles;
+    // 累算は呼び出し側 (ヘッダの tick) が済ませてある。ここへ来た時点で
+    // 1 秒ぶん以上溜まっていることが確定している。
+    //
+    // while なのは、1 回の呼び出しで 1 秒を超えるサイクルを渡されうるため
+    // (ホストのランナーは --cycles をまとめて渡せる)。
     while (cycleAccumulator_ >= kCyclesPerSecond)
     {
         cycleAccumulator_ -= kCyclesPerSecond;

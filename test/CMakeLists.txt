@@ -77,6 +77,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_alu.cpp
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_misc.cpp
   ${X68K_ROOT}/src/x68k/core/cpu/m68k_ops_group4.cpp
+  ${X68K_ROOT}/src/x68k/core/cpu/block_planner.cpp
   ${X68K_ROOT}/src/x68k/core/bus.cpp
   ${X68K_ROOT}/src/x68k/core/machine.cpp
   ${X68K_ROOT}/src/x68k/core/dev/sram.cpp
@@ -117,6 +118,27 @@ add_executable(x68k_tests
   # バス経由と結果が変わらないことを実際の命令実行で押さえる。
   test_m68k_fastram.cpp
   test_device_timing.cpp
+  # イベント駆動が毎命令 tick と 1 サイクルもずれないこと。
+  test_scheduler.cpp
+  # ブロック翻訳器。許可リストの内側と外側を 65,536 通り全部で問う。
+  test_block_plan.cpp
+  # Xtensa の命令エンコーダ。platform/jit/ のヘッダオンリーなので、ESP-IDF にも
+  # M5Unified にも触らずホストでビルドできる (吐くのは Xtensa のバイト列であって、
+  # ホストで実行するわけではない)。
+  #
+  # ここをホストテストに入れるのは、**アセンブラとの突き合わせが段 2 の正しさの
+  # 土台**だから。機械語のフィールドが 1 ニブルずれても別の正当な命令として実行
+  # されてしまい、実機では別の命令の途中へ飛んだ先で壊れる。実機に焼く前に、
+  # 手元の ctest で毎回問える場所に置く。
+  test_xtensa_encoder.cpp
+  # BlockPlan → Xtensa の発行器。エンコーダと同じくホストでバイト列を検査する
+  # (吐くのは Xtensa の機械語であって、ホストで実行するわけではない)。
+  #
+  # ここで問うのは 2 つ。**出口で書き戻すレジスタが 1 つも漏れていないこと**
+  # (漏れは次のブロックが読むまで誰にも見えず、原因から遠いところで表面化する)
+  # と、**ADD/SUB のフラグ式が alu::add / alu::sub と一致すること**
+  # (直線コードで出す V と C は、読んで納得しても根拠にならない)。
+  test_block_emitter.cpp
   test_sram.cpp
   test_sram_persist.cpp
   test_bus.cpp
@@ -144,6 +166,13 @@ add_executable(x68k_tests
   test_app_mode.cpp
   test_avatar.cpp
   test_audio.cpp
+  ${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp
+  ${X68K_ROOT}/src/x68k/platform/jit/block_runner.cpp
+  # 実行可能メモリの切り出し。ESP32 では MALLOC_CAP_EXEC、ホストでは
+  # 整列付きの new から取る。**整列と容量の判断はホストでも同じコードを回す**
+  # (実機でしか試せない形にすると、壊れたままになる)。
+  # 生成コードを実際に呼ぶ runBlock だけは ESP32 専用で、ホストでは落ちる。
+  ${X68K_ROOT}/src/x68k/platform/jit/exec_memory.cpp
   ${X68K_ROOT}/src/x68k/platform/key_queue.cpp
   # 音声の受け渡し。platform/ にあるが ESP-IDF に触らないのでホストで
   # ビルドできる (M5Unified を叩くのは speaker_m5.h の方)。実機では音を
@@ -186,6 +215,26 @@ target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/src/x68k/platform)
 # 確かめられないと壊れたままになる判断を持つので、ここだけを引き上げる。
 target_include_directories(x68k_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/freertos_shim)
 add_test(NAME x68k_tests COMMAND x68k_tests)
+
+# --- コンパイルが失敗しなければならないテスト -------------------------------
+#
+# x68k::Settled が偽造できないことを、**実際にコンパイルさせて**確かめる。
+#
+# Why not doctest の static_assert で済ませないか: private な defaulted
+# default ctor は std::is_default_constructible_v を false にしたまま
+# `f({})` を通してしまう (実測で確認)。型特性は「守れていない状態」を
+# false で報告するので、そこだけ見ると守れているように見える。
+# 実際にコンパイルさせて落ちることを見るしかない。
+#
+# EXCLUDE_FROM_ALL を付けるのは、通常のビルドでこれを作らせないため。
+# ctest がこのターゲットだけを名指しでビルドし、失敗することを期待する。
+add_executable(x68k_compile_fail_settled EXCLUDE_FROM_ALL compile_fail_settled.cpp)
+target_link_libraries(x68k_compile_fail_settled PRIVATE x68k_core)
+add_test(
+  NAME settled_is_unforgeable
+  COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target x68k_compile_fail_settled --config $<CONFIG>
+)
+set_tests_properties(settled_is_unforgeable PROPERTIES WILL_FAIL TRUE)
 
 # --- ホストのエミュレータランナー -------------------------------------------
 # 実機に焼かずに IPL-ROM と Human68k の起動をデバッグするための入口。

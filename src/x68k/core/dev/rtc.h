@@ -52,13 +52,62 @@ public:
     void write(u32 regIndex, u8 value);
 
     // CPU サイクルぶん時間を進める。秒が繰り上がる。
-    void tick(u32 cycles);
+    //
+    // ここは **毎命令通る**のに、実際に秒が繰り上がるのは 1 秒 =
+    // 10,000,000 サイクルに 1 度だけ。つまり実行のほぼ全ては
+    // 「累算して閾値に届かない」で終わる。その判定だけをヘッダに置き、
+    // 繰り上がる回だけ .cpp 側の tickCarry() を呼ぶ。
+    //
+    // Why not quantum でまとめないか: 一度「RTC は 1 秒単位でしか変わらない
+    // から 10000 サイクルまとめてよい」として実装したが、ゲストは秒レジスタを
+    // 命令単位でポーリングでき、秒の境界が最大 1998 サイクル遅れるずれが
+    // 観測できた (docs/knowledge/cores3-emulator-runtime.md)。ここは
+    // まとめず、渡す量はそのままで**呼び出しの間接性だけを消す**。
+    // 状態遷移はサイクル単位で完全に元のままになる。
+    //
+    // FastPath=false にすると、この最適化を入れる前と同じ「常に実呼び出し」
+    // へ戻る。実機で焼き直さずに効果を測るための口 (perf_switch.h)。
+    // テンプレートにしてあるのは、有効側の生成コードをスイッチ導入前と
+    // 同一に保つため。bool の引数だと毎命令フラグを読んで分岐する。
+    // Why not 既定引数を付けて tick(cycles) でも呼べるようにしないか:
+    // Machine の配線が FastPath を渡し忘れても既定の true が入り、
+    // 切った側と入れた側が同じ経路になる。同値テストはその取り違えを
+    // 見逃す (codex の指摘)。名前を分けて必ず明示させれば、渡し忘れは
+    // コンパイルエラーになる。
+    template <bool FastPath>
+    void tickFast(u32 cycles)
+    {
+        cycleAccumulator_ += cycles;
+        const bool canReturnEarly = FastPath && cycleAccumulator_ < kCyclesPerSecond;
+        if (canReturnEarly)
+        {
+            return;  // ここが最頻。1 秒に 1 度しか下へ落ちない。
+        }
+        tickCarry();
+    }
+
+    // 次に秒が繰り上がるまでの CPU サイクル数。
+    //
+    // 期限が時計の値に依存しないのがこのデバイスの性質で、Rtc::write も
+    // setDateTime も cycleAccumulator_ に触らない。だから書き込みで期限を
+    // 捨ててはいけない (捨てると秒の位相がリセットされて実機と違う)。
+    [[nodiscard]] u32 cyclesUntilCarry() const
+    {
+        return kCyclesPerSecond - cycleAccumulator_;
+    }
 
     // 起点となる日時を設定する。エミュレータの起動時にホストの時刻を渡す。
     // year は西暦の下 2 桁 (RP5C15 は 2 桁しか持たない)。
     void setDateTime(u32 year, u32 month, u32 day, u32 hour, u32 minute, u32 second);
 
 private:
+    // X68000 の CPU は 10MHz。1 秒ぶんのサイクル数。
+    // tick() の速い側がヘッダで比較するので、ここに置く。
+    static constexpr u32 kCyclesPerSecond = 10000000;
+
+    // tick() の遅い側。累算が閾値に届いたときだけ呼ばれる。
+    void tickCarry();
+
     void advanceOneSecond();
 
     // 時計の値。BCD ではなく 10 進の各桁として持つ (レジスタが 4bit 幅のため)。

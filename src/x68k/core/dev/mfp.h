@@ -119,7 +119,14 @@ public:
     // 近似にしてある (タイマ精度は Human68k の起動に影響しない)。
     static constexpr u32 kCpuToMfpShift = 1;
 
-    void tick(u32 cycles)
+    // FastPath=false にすると、タイマの最頻経路を展開せず常に
+    // tickTimerCounted を呼ぶ (この最適化を入れる前と同じ形)。実機で
+    // 焼き直さずに効果を測るための口 (perf_switch.h)。テンプレートに
+    // してあるのは、有効側の生成コードをスイッチ導入前と同一に保つため。
+    // 渡し忘れをコンパイルエラーにするため、既定引数は付けない
+    // (rtc.h の tickFast に理由がある)。
+    template <bool FastPath>
+    void tickFast(u32 cycles)
     {
         const u32 mfpCycles = cycles >> kCpuToMfpShift;
         if (mfpCycles == 0)
@@ -149,6 +156,28 @@ public:
             {
                 continue;  // まだ 1 回も減らない。ここが最頻。
             }
+
+            // 閾値に届いた回のうち、圧倒的多数は「1 回だけ減って、まだ 0 に
+            // ならない」で終わる。タイムアウトはデータレジスタの値ぶんに
+            // 1 度しか来ないし (タイマ C の既定なら 200 回に 1 度)、
+            // 2 回以上減るのは 1 命令のサイクル数が分周値を超えたときだけ。
+            //
+            // その最頻の経路だけをここへ出す。tickTimerCounted は別 TU に
+            // あるので、ESP32-S3 では実呼び出しになる。RTC と CRTC で同じ形が
+            // 効いたのと同じ理由 (TU を跨ぐ呼び出しだけが削れる)。
+            //
+            // Why not 全部を展開しないか: タイムアウト側はリロードと raise()
+            // を含み、展開すると毎命令通るこのループが膨らむ。過去に即値と
+            // 絶対ロングの展開で -3.1% を実測している。分ける位置が要点。
+            const u32 remainder = counter - t.prescale;
+            u8& value = timerValue_[t.index];
+            const bool decrementsOnce = FastPath && remainder < t.prescale && value > 1;
+            if (decrementsOnce)
+            {
+                counter = remainder;
+                --value;
+                continue;
+            }
             tickTimerCounted(static_cast<int>(t.index), t.prescale);
         }
     }
@@ -160,6 +189,20 @@ private:
         std::size_t index = 0;  // 0-3
         u32 prescale = 0;       // MFP サイクル単位
     };
+
+    // このタイマがタイムアウトしたとき IPR を立てるか。
+    //
+    // raise() (mfp.cpp) の早期リターン条件と同じ判定をここに置く。
+    // IER が落ちているタイマは、タイムアウトしても外から観測できる変化を
+    // 起こさない (timerValue_ は変わるが、それは読み出し時の実体化で守る)。
+    [[nodiscard]] bool timerRaises(std::size_t index) const
+    {
+        // タイマ A/B は IERA、C/D は IERB。ビットの割り当ては
+        // kIntTimerA/B/C/D と同じ。
+        static constexpr u8 kBits[4] = {kIntTimerA, kIntTimerB, kIntTimerC, kIntTimerD};
+        const u32 ierIndex = index < 2 ? kIera : kIerb;
+        return (reg_[ierIndex] & kBits[index]) != 0;
+    }
 
     // 制御レジスタから running_ を組み直す。制御レジスタを書いたときに呼ぶ。
     void refreshRunningTimers()
@@ -189,6 +232,73 @@ private:
     }
 
 public:
+    // 「次に外から見える変化が起きるまでの CPU サイクル数」。
+    // 期限が無ければ kNoDeadline を返す。
+    //
+    // 外から見える変化 = raise() が IPR を立てること。IER で早期リターン
+    // する本数 (X68000 の既定ではタイマ B) は、割り込みを上げないので
+    // 期限に入れない。**これが段 4 の核心**で、タイマ B (分周 4 = 8 CPU
+    // サイクル) を期限から外せるから MFP をイベント化できる。
+    //
+    // timerValue_ そのものは期限に入らないが、ゲストは TBDR を読める。
+    // 読み出しの側は Machine が settle してから read() を呼ぶことで守る
+    // (実体化リストの 1-4)。
+    static constexpr u32 kNoDeadline = 0xFFFFFFFFu;
+
+    [[nodiscard]] u32 cyclesUntilNextRaise() const
+    {
+        u32 best = kNoDeadline;
+        for (u32 i = 0; i < runningCount_; ++i)
+        {
+            const RunningTimer& t = running_[i];
+            if (!timerRaises(t.index))
+            {
+                continue;  // IER が落ちている。IPR は立たないので期限に入れない
+            }
+            // タイムアウトまでに要るデクリメント回数。データレジスタの 0 は
+            // 256 を意味するので、現在値 0 は 256 回ぶん残っている
+            // (tickTimerCounted が 0 を 0xFF へ巻き戻して数え続ける)。
+            const u32 value = timerValue_[t.index];
+            const u32 decrements = value == 0 ? 256u : value;
+            // 1 回減るのに要る MFP サイクルは prescale。分周カウンタに
+            // 溜まっているぶんを差し引く。
+            const std::uint64_t needMfp =
+                static_cast<std::uint64_t>(decrements) * t.prescale - prescaleCounter_[t.index];
+            // CPU サイクルは MFP の 2 倍 (kCpuToMfpShift)。命令のサイクル数は
+            // 常に偶数なので、この 2 倍は端数を落とさない。
+            const std::uint64_t needCpu = needMfp << kCpuToMfpShift;
+            if (needCpu < best)
+            {
+                best = static_cast<u32>(needCpu);
+            }
+        }
+        return best;
+    }
+
+    // 「次にタイマの現在値が 1 でも変わるまでの CPU サイクル数」。
+    //
+    // cyclesUntilNextRaise と違い、IER を見ない。割り込みを上げないタイマ
+    // (X68000 の既定ではタイマ B) も、ゲストは TBDR で読める。段 1 の
+    // shadow 検証はこちらを予測に使う — nextEventCycle と同じものを
+    // 予測に使うと「自分が正しいと思っていること」を確かめるだけになり、
+    // 読み出し時の実体化が要る本数を一つも見つけられない。
+    [[nodiscard]] u32 cyclesUntilAnyTimerChange() const
+    {
+        u32 best = kNoDeadline;
+        for (u32 i = 0; i < runningCount_; ++i)
+        {
+            const RunningTimer& t = running_[i];
+            // 次に 1 回減るまでに要る MFP サイクル。
+            const u32 needMfp = t.prescale - prescaleCounter_[t.index];
+            const u32 needCpu = needMfp << kCpuToMfpShift;
+            if (needCpu < best)
+            {
+                best = needCpu;
+            }
+        }
+        return best;
+    }
+
     // 垂直帰線の開始/終了を通知する。GPIP4 の状態が変わり、
     // 設定によっては割り込みが上がる。
     void setVerticalBlank(bool active);

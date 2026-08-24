@@ -11,6 +11,9 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
+#if X68K_MEASURE_DISK
+#include "esp_timer.h"
+#endif
 #include "sram_persist.h"
 
 namespace x68k_platform
@@ -263,12 +266,30 @@ bool SdDisk::isPresent() const
     return file_ != nullptr;
 }
 
+#if X68K_MEASURE_DISK
+// ディスク読み出しの実時間を測る。**恒久的な機能ではない。**
+//
+// 「実効クロックが落ちるのはディスク由来」という診断は、これまで
+// スライス全体の実時間からの逆算でしかなかった。ディスクに触るスライスは
+// 全体の 1% 未満なので、逆算では平均の落ち込みを説明できない可能性がある。
+// 推定で対策を入れる前に、readSector の中で何 ms 使っているかを直接測る。
+//
+// X68K_MEASURE_DISK で囲むのは、ホットパスに esp_timer_get_time() を
+// 常駐させないため。判断が済んだらこのブロックごと消す。
+std::int64_t g_diskReadUs = 0;
+std::uint32_t g_diskReadCount = 0;
+std::int64_t g_diskSeekUs = 0;
+#endif
+
 bool SdDisk::readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCount)
 {
     if (file_ == nullptr)
     {
         return false;
     }
+#if X68K_MEASURE_DISK
+    const std::int64_t t0 = esp_timer_get_time();
+#endif
     auto* f = static_cast<std::FILE*>(file_);
     const long offset = static_cast<long>(lba) * static_cast<long>(kSectorSize);
     if (std::fseek(f, offset, SEEK_SET) != 0)
@@ -276,7 +297,17 @@ bool SdDisk::readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCount)
         return false;
     }
     const std::size_t want = static_cast<std::size_t>(sectorCount) * kSectorSize;
+#if X68K_MEASURE_DISK
+    const std::int64_t t1 = esp_timer_get_time();
+    const bool ok = std::fread(buffer, 1, want, f) == want;
+    const std::int64_t t2 = esp_timer_get_time();
+    g_diskSeekUs += t1 - t0;
+    g_diskReadUs += t2 - t1;
+    ++g_diskReadCount;
+    return ok;
+#else
     return std::fread(buffer, 1, want, f) == want;
+#endif
 }
 
 bool SdDisk::writeSector(x68k::u32 lba, const x68k::u8* buffer, x68k::u32 sectorCount)

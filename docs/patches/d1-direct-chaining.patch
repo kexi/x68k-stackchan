@@ -1,0 +1,1652 @@
+diff --git a/main/main.cpp b/main/main.cpp
+index a98876e..3506512 100644
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -1844,6 +1844,22 @@ private:
+                      st->blocksRun != 0
+                          ? 100.0 * (double)st->endedWithBranch / (double)st->blocksRun
+                          : 0.0);
++            // **1 呼び出しあたりの平均チェーン長** (段 D-1)。
++            // これがそのまま「回収した往復の回数」で、1.00 のままなら
++            // ループが 1 度も 2 本目へ進んでいない。
++            ESP_LOGI(kTag, "[jit] チェーン長 %.3f 本/呼 (呼び出し %llu)",
++                     st->runCalls != 0 ? (double)st->blocksRun / (double)st->runCalls : 0.0,
++                     (unsigned long long)st->runCalls);
++            // **切れ方の内訳。和は runCalls と一致する** (勘定の保存)。
++            // どこで伸び止まっているかで、次に何を直すかが決まる:
++            //   miss が支配的   → 命中率 f の問題 (スロット数 / 索引)
++            //   budget が支配的 → 期限が近すぎる (デバイス側の設計)
++            //   defer が支配的  → 割り込みが頻繁 (伸ばしようがない)
++            ESP_LOGI(kTag, "[jit] チェーン切れ: 鍵外れ %llu / 半端 %llu / 受理 %llu / 期限 %llu",
++                     (unsigned long long)st->chainStopMiss,
++                     (unsigned long long)st->chainStopIncomplete,
++                     (unsigned long long)st->chainStopDefer,
++                     (unsigned long long)st->chainStopBudget);
+             ESP_LOGI(kTag, "[jit] 世代を捨て直した %llu 回",
+                      (unsigned long long)st->generationReset);
+             ESP_LOGI(kTag, "[jit] 負のキャッシュで省いた再翻訳 %llu 回",
+diff --git a/src/x68k/core/cpu/m68k.h b/src/x68k/core/cpu/m68k.h
+index ec66804..ffe7a50 100644
+--- a/src/x68k/core/cpu/m68k.h
++++ b/src/x68k/core/cpu/m68k.h
+@@ -112,14 +112,18 @@ public:
+         return nativeExec_.stats != nullptr ? nativeExec_.stats(nativeExec_.context) : nullptr;
+     }
+ 
+-    // ブロックを 1 本走らせる。走らなければ kDeferToStep。
++    // ブロックを走らせる。1 本も走らなければ kDeferToStep。
+     //
+     // **呼び出し側は kDeferToStep なら step() を 1 回回す。**
+     // 未対応命令 / halted / stopped / 割り込み保留の 3 つを区別しないのは、
+     // step() が 3 つとも正しく処理するから (native_exec.h の NativeExit 参照)。
+-    NativeResult tryNative()
++    //
++    // budget は「次の期限まであと何サイクルか」。実行器は続けて走ってよいが、
++    // 積んだサイクルがここに達したら戻る (段 D-1)。**戻り値の cycles は
++    // 走った全ブロックの合計**なので、呼び出し側はそのまま advance へ渡す。
++    NativeResult tryNative(u32 budget)
+     {
+-        return nativeExec_.run(nativeExec_.context, *this);
++        return nativeExec_.run(nativeExec_.context, *this, budget);
+     }
+ 
+     // ブロックへ入る前に「インタプリタへ落とすべきか」を問う。
+diff --git a/src/x68k/core/cpu/native_exec.h b/src/x68k/core/cpu/native_exec.h
+index dba26b2..77a70f6 100644
+--- a/src/x68k/core/cpu/native_exec.h
++++ b/src/x68k/core/cpu/native_exec.h
+@@ -59,7 +59,23 @@ struct NativeResult
+ //   - kDeferToStep を返したなら、**状態を 1 ビットも変えていない**
+ //   - 例外に入らない。入りうる命令はブロックへ入れない
+ //   - 割り込みを自分で配送しない。呼び出し側が step() 経由で見る
+-using NativeRunFn = NativeResult (*)(void* context, M68k& cpu);
++//
++// budget は「次の期限まであと何サイクルか」。実行器は**複数ブロックを
++// 続けて走らせてよい**が、積んだサイクルが budget に達したらそこで戻る
++// (段 D-1 の direct chaining)。
++//
++// Why budget が要るか: チェーンの間デバイスは 1 サイクルも進まない。
++// 上限が無いと、期限を跨いだまま何十本も走って**割り込み源が時刻通りに
++// 発火しなくなる**。budget で切れば期限超過の上限は 1 ブロックのままで、
++// 保証のクラスが変わらない。
++//
++// **budget を無視して 1 ブロックで戻る実装も契約を満たす** (超過しない
++// のだから)。段 1 の PlanInterpreter はその形でよい。
++//
++// Why not 残りサイクルを実行器に持たせないか: 期限は Scheduler が持って
++// いて、実行器は core/ の外にある。持たせると platform/ が core/ の
++// スケジューラを知ることになり、依存の向きが逆流する。
++using NativeRunFn = NativeResult (*)(void* context, M68k& cpu, u32 budget);
+ 
+ // 実行器の内訳。速度そのものではなく、**どこで諦めたか**を数える。
+ //
+@@ -69,6 +85,25 @@ struct NativeStats
+ {
+     u64 blocksRun = 0;
+     u64 insnsRun = 0;
++    // run() が呼ばれた回数 (段 D-1)。
++    //
++    // **blocksRun / runCalls が 1 呼び出しあたりの平均チェーン長**で、
++    // これがそのまま「回収した往復の回数」になる。1.0 のままなら、
++    // ループが 1 度も 2 本目へ進んでいない (= 何も回収していない) 印。
++    //
++    // Why not 命中率 f を直接数えないか: f は「直結が当たった割合」だが、
++    // 実際に回収できるのは f のうち defer / budget で切れなかった分だけ。
++    // 商なら**切れた理由を問わず実際に回収した量**が出る。
++    u64 runCalls = 0;
++    // チェーンが切れた理由 (段 D-1)。**和が runCalls と一致する。**
++    //
++    // 一致しなければ、どのカウンタにも乗らない break がある。
++    // (fullDeferred が無かったせいで実機 45 秒の主因を見落とした前例と
++    // 同じ形なので、収支をテストで縛る)
++    u64 chainStopMiss = 0;        // 次の鍵が外れた (未翻訳 / 世代違い)
++    u64 chainStopIncomplete = 0;  // ガード脱出 / 1 本も走らなかった
++    u64 chainStopDefer = 0;       // 割り込み保留 / halted / stopped
++    u64 chainStopBudget = 0;      // 期限までの残りを使い切った
+     u64 deferHalted = 0;       // halted / stopped で降りた
+     u64 deferInterrupt = 0;    // 割り込み保留で降りた
+     u64 deferUnsupported = 0;  // 未対応命令で降りた
+diff --git a/src/x68k/core/machine.cpp b/src/x68k/core/machine.cpp
+index 416c4c4..94f6a96 100644
+--- a/src/x68k/core/machine.cpp
++++ b/src/x68k/core/machine.cpp
+@@ -402,7 +402,21 @@ u32 Machine::runEventDriven(u32 cycles)
+             // Why ここに if を書いてよいか: UseNative は template 引数なので
+             // 非選択枝は実体化されない。UseNative=false の生成コードに
+             // このブロックは 1 命令も残らない。
+-            const NativeResult r = cpu_.tryNative();
++            // **期限までの残りを budget として渡す** (段 D-1)。
++            //
++            // debt_ は「期限まであと何サイクルか」を負数で持つので、
++            // 符号を返せばそのまま残量になる。0 以上なら期限に達している
++            // (次の advance で遅い側へ落ちる) ので budget は 0 —
++            // それでも 1 本は走る。chainStop が「1 本走ってから比べる」形
++            // なので、budget 0 が「1 命令も実行しない」に化けることはない。
++            //
++            // Why not 残量を切り上げないか: 切り上げるとチェーンが期限を
++            // 跨いだまま伸び、**期限超過の上限が 1 ブロックである**という
++            // 保証がその分だけ緩む。デバイスの発火時刻がずれる形で壊れ、
++            // 症状 (音のずれ・タイマ割り込みの取りこぼし) は原因から遠い。
++            const std::int32_t debt = sched_.debt();
++            const u32 budget = debt < 0 ? static_cast<u32>(-debt) : 0u;
++            const NativeResult r = cpu_.tryNative(budget);
+             used = r.exit == NativeExit::kRan ? r.cycles : cpu_.step();
+         }
+         else
+diff --git a/src/x68k/platform/jit/block_emitter.h b/src/x68k/platform/jit/block_emitter.h
+index a1423f5..6de0637 100644
+--- a/src/x68k/platform/jit/block_emitter.h
++++ b/src/x68k/platform/jit/block_emitter.h
+@@ -259,6 +259,78 @@ constexpr BranchDecision nextBranch(const BlockReturn& r, std::uint32_t staticTa
+     return BranchDecision{};
+ }
+ 
++// direct chaining (段 D-1) で「もう 1 本続けてよいか」の判断。
++//
++// ## なぜ純関数に出すか
++//
++// guardExitMadeProgress / nextBranch と同じ理由。ループ本体は runBlock
++// (ESP32 のアセンブリ) を呼ぶのでホストで走らせられず、この判断を
++// ループの中の if で書くと**ホストのテストが一切問えない**。
++//
++// このループが守っているものは全部「省いても正しさが静かにしか壊れない」
++// 形をしている:
++//   - defer 検査を省く → 割り込みの受理が遅れるだけ。状態は正しい
++//   - budget 検査を省く → デバイスの期限を跨ぐだけ。状態は正しい
++//   - ガード脱出で続ける → 半端に進んだブロックの続きを別経路が実行する
++// **どれも「状態を比べるテスト」では見えない** (MEMORY.md の
++// 「保守的なフォールバックはテストの盲点になる」の裏返しで、こちらは
++// 積極的すぎる側が見えない)。判断を値として取り出せば、全数で問える。
++//
++// ## 引数の意味
++//
++// spent は**このチェーンで既に積んだサイクル数**、budget は run() の
++// 呼び出し側が渡した「次の期限までの残り」。ranOk は直前のブロックが
++// 走り切ったか (ガード脱出でも defer でもない) を表す。
++//
++// Why not budget の残量を引き算で持ち回らないか: 引き算で持つと
++// 「使い切った」が 0 と「1 本目から予算 0」の区別を失う。積算と上限の
++// 比較なら、budget == 0 が「1 本も走らせない」ではなく「1 本走ったら
++// もう続けない」を意味することが式から読める (1 本目は必ず走る)。
++enum class ChainStop : std::uint8_t
++{
++    // 続けてよい。次の hop へ進む。
++    kContinue,
++    // 直前のブロックが走り切らなかった (ガード脱出 / defer)。
++    // 続きはインタプリタか次の run() が拾う。
++    kExitIncomplete,
++    // 割り込み保留 / halted / stopped。**受理をこれ以上遅らせない。**
++    kExitDefer,
++    // 期限までの残りを使い切った。デバイスを進めてもらう。
++    kExitBudget,
++};
++
++// もう 1 本続けてよいか。**呼ぶ順序が意味そのもの。**
++//
++// ranOk を最初に見るのは、走り切っていないブロックの後ろに次の hop を
++// 繋ぐと「半端に進んだ状態の続き」を JIT が実行してしまうため。ガード
++// 脱出は残りを step() に本物の read/write で実行させるための出口なので、
++// チェーンはそこで必ず切れる。
++//
++// defer を budget より先に見るのは、両方成り立つときに**受理の遅れを
++// 短くする側**へ倒すため。どちらで抜けても呼び出し側の扱いは同じ
++// (kRan を返して Machine が続きを回す) なので、順序が挙動を変えるのは
++// 統計と、テストがどちらを問えるかだけ。
++constexpr ChainStop chainStop(bool ranOk, bool mustDefer, std::uint32_t spent,
++                              std::uint32_t budget)
++{
++    if (!ranOk)
++    {
++        return ChainStop::kExitIncomplete;
++    }
++    if (mustDefer)
++    {
++        return ChainStop::kExitDefer;
++    }
++    // **>= で切る。** ちょうど使い切った時点で止める。> にすると、
++    // 期限に 0 サイクル残した状態からもう 1 本 (最大 176 サイクル) 走り、
++    // 「期限超過の上限は 1 ブロック」という保証が 2 ブロックに緩む。
++    if (spent >= budget)
++    {
++        return ChainStop::kExitBudget;
++    }
++    return ChainStop::kContinue;
++}
++
+ // 翻訳時に焼き込む「窓の実体」。
+ //
+ // **mappingEpoch を鍵に持つブロックへ焼く以外の用途に使ってはいけない。**
+diff --git a/src/x68k/platform/jit/block_runner.cpp b/src/x68k/platform/jit/block_runner.cpp
+index 07536d5..21042cd 100644
+--- a/src/x68k/platform/jit/block_runner.cpp
++++ b/src/x68k/platform/jit/block_runner.cpp
+@@ -291,12 +291,15 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
+     return &slot;
+ }
+ 
+-NativeResult BlockRunner::run(M68k& cpu)
++NativeResult BlockRunner::run(M68k& cpu, std::uint32_t budget)
+ {
++    ++stats_.runCalls;
++
+     // 設計 §5.4: 入口で必ず見る。
+     if (cpu.mustDeferToStep())
+     {
+         ++stats_.deferInterrupt;
++        ++stats_.chainStopDefer;
+         return NativeResult{0, NativeExit::kDeferToStep};
+     }
+ 
+@@ -305,175 +308,262 @@ NativeResult BlockRunner::run(M68k& cpu)
+     // 世代はページ単位だが写像は全体に効く。個別に持つより一括で捨てる方が
+     // 安く、かつ漏れようがない。写像が動くのは setFastRam / setFastRom /
+     // reset / loadStateForTest だけなので稀。
+-    const u32 nowEpoch = cpu.codeGenMap().mappingEpoch();
++    CodeGenMap& map = cpu.codeGenMap();
++    const u32 nowEpoch = map.mappingEpoch();
+     if (nowEpoch != seenEpoch_)
+     {
+         neg_.clear();
+         seenEpoch_ = nowEpoch;
+     }
+ 
+-    // 現在の命令語アドレス。プリフェッチの契約により pc は「命令語 + 4」。
++    // **epoch の現在値だけはループの外へ持ち上げてよい。**
++    //
++    // 唯一省いてよい再ロード。epoch を動かす経路 (setFastRam /
++    // setFastRamReadable / setFastRom / reset / loadStateForTest /
++    // CodeGenMap::setStorage) は**全部ホスト側の API** で、生成コードから
++    // 到達できない。チェーンが回っている間に値が変わる経路が存在しない。
++    //
++    // **比較そのものは毎 hop 必要。** スロット側の mappingEpoch は
++    // スロットごとに古くなりうる (前の epoch で翻訳されたブロックが
++    // 居座っている)。持ち上げてよいのは「現在値のロード」だけで、
++    // 「照合」ではない。
++    //
++    // 世代 (pageGen) は逆に持ち上げてはいけない。下の hop のコメント参照。
+     const M68kState& st = cpu.state();
+-    const u32 entryPc = st.pc - 4;
+-
+-    BlockSlot* slot = &slots_[slotIndex(entryPc)];
++    u32 entryPc = st.pc - 4;
++    u32 spent = 0;
+ 
+-    // 設計 §5.5 の順で照合する。**順序が意味を持つ。**
+-    CodeGenMap& map = cpu.codeGenMap();
+-    const std::uint16_t nowGen = map.generation(slot->page << CodeGenMap::kPageShift);
+-    const bool hit = slot->code != nullptr &&                     // 翻訳済み
+-                     slot->entryPc != 0 &&                        // 空きの番兵
+-                     slot->entryPc == entryPc &&                  // タグ
+-                     slot->count <= kMaxOps &&                    // ゴミ検査
+-                     slot->mappingEpoch == map.mappingEpoch() &&  // 写像
+-                     nowGen != CodeGenMap::kAlwaysStale &&        // **先に見る**
+-                     nowGen == slot->pageGen;                     // 世代の一致
+-
+-    if (!hit)
++    for (;;)
+     {
+-        if (slot->code == nullptr)
+-        {
+-            // 空きスロット (コールドミス)。**ここを数えていなかったので、
+-            // 取りこぼしの最大成分が統計から消えていた。**
+-            ++stats_.keyMissCold;
+-        }
+-        else
++        BlockSlot* slot = &slots_[slotIndex(entryPc)];
++
++        // 設計 §5.5 の順で照合する。**順序が意味を持つ** (keyMatches)。
++        //
++        // **世代は生の配列から毎 hop 読む。キャッシュしてはいけない。**
++        // チェーンの中で先行ブロックがゲスト RAM を書くと (Tier C の
++        // G14/G16 が touch を写す)、その書き込みが**次の hop の的を
++        // 無効化する**。「直前の hop が次の hop の前提を壊す」がチェーンの
++        // 内側で起きるので、hop の外へ持ち上げた瞬間に**書き換え直後の
++        // 古いコードを実行する**。pull 型が壊れるのはこの 1 行。
++        const std::uint16_t nowGen = map.generation(slot->page << CodeGenMap::kPageShift);
++        const bool hit = keyMatches(*slot, entryPc, nowGen, nowEpoch);
++
++        if (!hit)
+         {
+-            // 鍵が外れた理由を分けて数える。段 3 の判断材料になる。
+-            //
+-            // **判定 (hit) の順序と帰属の順序は別物。** hit は
+-            // kAlwaysStale を世代一致より先に見る (§5.5 の正しさの根拠) が、
+-            // ここでタグより先に見ると、居座りブロックのページが飽和して
+-            // いるだけでスロット衝突が「飽和」に化ける。実機ではページ 0
+-            // が真っ先に飽和するので、衝突 151 万件がまるごと誤帰属された。
++            // **2 本目以降は、ここで諦めて現行経路へ戻る。**
+             //
+-            // タグを先に見れば、飽和を数える時点で slot->page は entryPc の
+-            // ページと同一が保証され、keyMissStale は「自分のページの飽和」
+-            // だけを意味する。
+-            if (slot->entryPc != entryPc)
++            // Why not チェーンの中で翻訳しないか: 翻訳・負のキャッシュ・
++            // 満杯からの回復は、どれも「何本目か」と無関係に成り立つべき
++            // 経路で、ループの中へ入れるとチェーン長がそれらの統計を歪める
++            // (満杯の閾値が 1 呼び出しで何度も進む等)。1 本目と同じ扱いを
++            // 受けさせるには、break して次の run() に任せるのが最も薄い。
++            // 呼び出し側から見た挙動は「チェーンが 1 本短い」だけ。
++            if (spent != 0)
+             {
+-                ++stats_.keyMissTag;
++                ++stats_.chainStopMiss;
++                return NativeResult{spent, NativeExit::kRan};
+             }
+-            else if (slot->mappingEpoch != map.mappingEpoch())
++
++            if (slot->code == nullptr)
+             {
+-                ++stats_.keyMissEpoch;
++                // 空きスロット (コールドミス)。**ここを数えていなかったので、
++                // 取りこぼしの最大成分が統計から消えていた。**
++                ++stats_.keyMissCold;
+             }
+-            else if (nowGen == CodeGenMap::kAlwaysStale)
++            else
+             {
+-                ++stats_.keyMissStale;
++                // 鍵が外れた理由を分けて数える。段 3 の判断材料になる。
++                //
++                // **判定 (keyMatches) の順序と帰属の順序は別物。** keyMatches は
++                // kAlwaysStale を世代一致より先に見る (§5.5 の正しさの根拠) が、
++                // ここでタグより先に見ると、居座りブロックのページが飽和して
++                // いるだけでスロット衝突が「飽和」に化ける。実機ではページ 0
++                // が真っ先に飽和するので、衝突 151 万件がまるごと誤帰属された。
++                //
++                // タグを先に見れば、飽和を数える時点で slot->page は entryPc の
++                // ページと同一が保証され、keyMissStale は「自分のページの飽和」
++                // だけを意味する。
++                if (slot->entryPc != entryPc)
++                {
++                    ++stats_.keyMissTag;
++                }
++                else if (slot->mappingEpoch != nowEpoch)
++                {
++                    ++stats_.keyMissEpoch;
++                }
++                else if (nowGen == CodeGenMap::kAlwaysStale)
++                {
++                    ++stats_.keyMissStale;
++                }
++                else
++                {
++                    ++stats_.keyMissGen;
++                }
+             }
+-            else
++            slot = translate(cpu, entryPc);
++            if (slot == nullptr)
+             {
+-                ++stats_.keyMissGen;
++                ++stats_.deferUnsupported;
++                ++stats_.chainStopMiss;
++                return NativeResult{0, NativeExit::kDeferToStep};
+             }
+         }
+-        slot = translate(cpu, entryPc);
+-        if (slot == nullptr)
++
++        // 生成コードを呼ぶ。**引数の順は (state, code)。**
++        const std::uint32_t ret = runBlock(&cpu.state(), slot->code);
++
++        ++stats_.blocksRun;
++        // **実行ごとの終端理由。** translate() で数えると、キャッシュが温まった
++        // 後は翻訳が起きないので実態が見えない (Tier C で踏んだ)。
++        // 分岐で終わったブロックの割合。direct chaining が効くかを決める。
++        if (slot->endsWithBranch)
+         {
+-            ++stats_.deferUnsupported;
+-            return NativeResult{0, NativeExit::kDeferToStep};
++            ++stats_.endedWithBranch;
++        }
++        if (slot->endsWithDynamicBranch)
++        {
++            ++stats_.endedWithDynamicBranch;
+         }
+-    }
+ 
+-    // 生成コードを呼ぶ。**引数の順は (state, code)。**
+-    const std::uint32_t ret = runBlock(&cpu.state(), slot->code);
++        const BlockReturn decoded = decodeBlockReturn(ret);
+ 
+-    ++stats_.blocksRun;
+-    // **実行ごとの終端理由。** translate() で数えると、キャッシュが温まった
+-    // 後は翻訳が起きないので実態が見えない (Tier C で踏んだ)。
+-    // 分岐で終わったブロックの割合。direct chaining が効くかを決める。
+-    if (slot->endsWithBranch)
+-    {
+-        ++stats_.endedWithBranch;
+-    }
+-    if (slot->endsWithDynamicBranch)
+-    {
+-        ++stats_.endedWithDynamicBranch;
+-    }
++        // **チェーンを続けてよいかは純関数が決める** (chainStop)。
++        // ranOk = 「走り切ったか」で、ガード脱出と G10 の defer を排除する。
++        bool ranOk = true;
+ 
+-    const BlockReturn decoded = decodeBlockReturn(ret);
+-    const u32 cycles = decoded.cycles;
++        if (decoded.guardExit)
++        {
++            // ガードが不成立で降りた。**実際に走った命令数だけ数える。**
++            ++stats_.guardExit;
++            stats_.insnsRun += decoded.ranOps;
+ 
+-    if (decoded.guardExit)
+-    {
+-        // ガードが不成立で降りた。**実際に走った命令数だけ数える。**
+-        ++stats_.guardExit;
+-        stats_.insnsRun += decoded.ranOps;
++            if (decoded.selfPageExit)
++            {
++                // G13/G18: 自ページ書き換えで降りた。
++                //
++                // **このあと step() が書いて、そのページの世代を必ず上げる。**
++                // 次に同じ entryPc へ来ると鍵が世代で外れ、毎周まるごと
++                // 再翻訳になる。ふつうの負のキャッシュは (pc, gen) 一致でしか
++                // 効かないので、gen が毎回動くと素通りする。
++                // **世代を鍵から外した印**を焼くことでしか止められない。
++                //
++                // 保守的すぎる面がある (一度きりの自己パッチでも epoch が
++                // 動くまでその番地の JIT を失う) ので、selfPageExit を数えて
++                // blocksRun に対する比率を見る。0.1% を超えるなら、
++                // 「N 回までは許す」等の再設計を検討する材料になる。
++                ++stats_.selfPageExit;
++                neg_.insert(entryPc, NegativeCache::kAnyGen);
++            }
+ 
+-        if (decoded.selfPageExit)
+-        {
+-            // G13/G18: 自ページ書き換えで降りた。
++            // G10: 1 命令も進んでいないなら kDeferToStep を返す。
+             //
+-            // **このあと step() が書いて、そのページの世代を必ず上げる。**
+-            // 次に同じ entryPc へ来ると鍵が世代で外れ、毎周まるごと
+-            // 再翻訳になる。ふつうの負のキャッシュは (pc, gen) 一致でしか
+-            // 効かないので、gen が毎回動くと素通りする。
+-            // **世代を鍵から外した印**を焼くことでしか止められない。
++            // **これが無いと Machine::run が used == 0 を halted と誤読する**か、
++            // 同じブロックを 0 サイクルで回し続ける。ガードは状態を 1 bit も
++            // 変えずに降りているので、NativeExec の「何も起きなかった」という
++            // 事後条件をそのまま満たす。
+             //
+-            // 保守的すぎる面がある (一度きりの自己パッチでも epoch が
+-            // 動くまでその番地の JIT を失う) ので、selfPageExit を数えて
+-            // blocksRun に対する比率を見る。0.1% を超えるなら、
+-            // 「N 回までは許す」等の再設計を検討する材料になる。
+-            ++stats_.selfPageExit;
+-            neg_.insert(entryPc, NegativeCache::kAnyGen);
+-        }
++            // **チェーンの 2 本目以降なら、既に積んだぶんを返す。** 状態は
++            // そこまで進んでいるので、捨てると時間が消える。
++            if (!guardExitMadeProgress(decoded))
++            {
++                if (spent != 0)
++                {
++                    ++stats_.chainStopIncomplete;
++                    return NativeResult{spent, NativeExit::kRan};
++                }
++                ++stats_.deferGuard;
++                ++stats_.chainStopIncomplete;
++                return NativeResult{0, NativeExit::kDeferToStep};
++            }
+ 
+-        // G10: 1 命令も進んでいないなら kDeferToStep を返す。
+-        //
+-        // **これが無いと Machine::run が used == 0 を halted と誤読する**か、
+-        // 同じブロックを 0 サイクルで回し続ける。ガードは状態を 1 bit も
+-        // 変えずに降りているので、NativeExec の「何も起きなかった」という
+-        // 事後条件をそのまま満たす。
+-        if (!guardExitMadeProgress(decoded))
+-        {
+-            ++stats_.deferGuard;
+-            return NativeResult{0, NativeExit::kDeferToStep};
++            // 途中まで進んだ。残りは step() が本物の read16 / read32 で実行し、
++            // そこで例外 (アドレスエラー / バスエラー) や I/O の副作用が起きる。
++            // **チェーンはここで必ず切れる** (半端に進んだ状態の続きを
++            // JIT に実行させない)。
++            ranOk = false;
+         }
++        else
++        {
++            stats_.insnsRun += slot->count;
+ 
+-        // 途中まで進んだ。残りは step() が本物の read16 / read32 で実行し、
+-        // そこで例外 (アドレスエラー / バスエラー) や I/O の副作用が起きる。
+-        return NativeResult{cycles, NativeExit::kRan};
+-    }
++            // **飛び先の決定は純関数に出してある** (block_emitter.h の nextBranch)。
++            // ここは決まった答えに従うだけ。runner は runBlock (ESP32 のアセンブリ)
++            // に依存していてホストで走らせられないので、if をここに書くと
++            // 「静的とメールボックスのどちらから飛び先を採ったか」をホストの
++            // テストが一切問えなくなる (guardExitMadeProgress と同じ手口)。
++            const BranchDecision decision =
++                nextBranch(decoded, slot->branchTarget, branchMailbox_);
+ 
+-    stats_.insnsRun += slot->count;
++            if (decision.source == BranchSource::kMailbox)
++            {
++                ++stats_.dynamicBranch;
++            }
+ 
+-    // **飛び先の決定は純関数に出してある** (block_emitter.h の nextBranch)。
+-    // ここは決まった答えに従うだけ。runner は runBlock (ESP32 のアセンブリ)
+-    // に依存していてホストで走らせられないので、if をここに書くと
+-    // 「静的とメールボックスのどちらから飛び先を採ったか」をホストの
+-    // テストが一切問えなくなる (guardExitMadeProgress と同じ手口)。
+-    const BranchDecision decision = nextBranch(decoded, slot->branchTarget, branchMailbox_);
++            if (decision.shouldBranch())
++            {
++                // 設計 §5.2: プリフェッチを詰め直すのは成立側だけ。
++                //
++                // 静的分岐の奇数は I7 が翻訳時に、動的分岐の奇数は生成コードの
++                // ガード (G22) が弾いているので通常は起きない。起きたら branchTo が
++                // 既にアドレスエラーへ入っており、そのまま返してよい。
++                //
++                // **ここに残る 2 行はホストで検査できない。** 純関数に出せるのは
++                // 「飛ぶか」と「どこへ」の判断までで、branchTo を実際に呼ぶ行は
++                // runBlock 経由でしか到達しないため、テストで殺せる変異にならない
++                // (decision.target を slot->branchTarget に戻す変異、shouldBranch を
++                // 無視して常に飛ぶ変異は、いずれもホストのテストを素通りする)。
++                // 残す代わりに **判断を一切含まない形**に保つ: 条件は shouldBranch
++                // そのまま、引数は decision.target そのまま。ここに if を足したり
++                // 別の値を渡したりしたくなったら、それは nextBranch 側へ動かす。
++                //
++                // **D-1 では branchTo をそのまま呼ぶ** (B_refill = 46.2 サイクルは
++                // 回収しない)。定数ストアへ置き換えるのは段 D-2 の仕事で、
++                // 分けておけば「ループが効いたのか refill が効いたのか」を
++                // 実測で切り分けられる。
++                (void)cpu.branchTo(decision.target);
++            }
++        }
+ 
+-    if (decision.source == BranchSource::kMailbox)
+-    {
+-        ++stats_.dynamicBranch;
+-    }
++        spent += decoded.cycles;
++
++        // **次の入口 PC は状態から読む。** 飛んだなら branchTo が
++        // pc = target + 4 を書いており、素通りなら生成コードが
++        // pc = fallThroughPc + 4 を書いている。どちらも「pc は命令語 + 4」
++        // というプリフェッチの契約そのものなので、種別で場合分けする必要が
++        // ない (場合分けを足すと、動的分岐で staticTarget を採る類の
++        // 取り違えがここにも生える)。
++        const u32 nextPc = st.pc - 4;
++
++        // **毎 hop 見る。** mustDeferToStep も budget も、省いても状態は
++        // 正しいまま「割り込みが遅れる / 期限を跨ぐ」としか壊れない。
++        // 判断を値にしてホストのテストで全数に問える形へ出してある。
++        const ChainStop stop = chainStop(ranOk, cpu.mustDeferToStep(), spent, budget);
++        if (stop != ChainStop::kContinue)
++        {
++            switch (stop)
++            {
++                case ChainStop::kExitIncomplete:
++                    ++stats_.chainStopIncomplete;
++                    break;
++                case ChainStop::kExitDefer:
++                    ++stats_.chainStopDefer;
++                    break;
++                case ChainStop::kExitBudget:
++                    ++stats_.chainStopBudget;
++                    break;
++                case ChainStop::kContinue:
++                    break;
++            }
++            return NativeResult{spent, NativeExit::kRan};
++        }
+ 
+-    if (decision.shouldBranch())
+-    {
+-        // 設計 §5.2: プリフェッチを詰め直すのは成立側だけ。
+-        //
+-        // 静的分岐の奇数は I7 が翻訳時に、動的分岐の奇数は生成コードの
+-        // ガード (G22) が弾いているので通常は起きない。起きたら branchTo が
+-        // 既にアドレスエラーへ入っており、そのまま返してよい。
+-        //
+-        // **ここに残る 2 行はホストで検査できない。** 純関数に出せるのは
+-        // 「飛ぶか」と「どこへ」の判断までで、branchTo を実際に呼ぶ行は
+-        // runBlock 経由でしか到達しないため、テストで殺せる変異にならない
+-        // (decision.target を slot->branchTarget に戻す変異、shouldBranch を
+-        // 無視して常に飛ぶ変異は、いずれもホストのテストを素通りする)。
+-        // 残す代わりに **判断を一切含まない形**に保つ: 条件は shouldBranch
+-        // そのまま、引数は decision.target そのまま。ここに if を足したり
+-        // 別の値を渡したりしたくなったら、それは nextBranch 側へ動かす。
+-        (void)cpu.branchTo(decision.target);
++        entryPc = nextPc;
+     }
+-
+-    return NativeResult{cycles, NativeExit::kRan};
+ }
+ 
+-NativeResult BlockRunner::runThunk(void* context, M68k& cpu)
++NativeResult BlockRunner::runThunk(void* context, M68k& cpu, std::uint32_t budget)
+ {
+-    return static_cast<BlockRunner*>(context)->run(cpu);
++    return static_cast<BlockRunner*>(context)->run(cpu, budget);
+ }
+ 
+ const NativeStats* BlockRunner::statsThunk(void* context)
+diff --git a/src/x68k/platform/jit/block_runner.h b/src/x68k/platform/jit/block_runner.h
+index c692623..f5845e7 100644
+--- a/src/x68k/platform/jit/block_runner.h
++++ b/src/x68k/platform/jit/block_runner.h
+@@ -8,6 +8,25 @@
+ // 現在の PC からブロックを 1 本探し、あれば生成コードを呼ぶ。無ければ
+ // 翻訳して置く。翻訳できなければインタプリタへ落とす。
+ //
++// ## direct chaining (段 D-1)
++//
++// **走り切ったら、飛び先のブロックを探して続けて走る。** 生成コードには
++// 何も焼かない — ループするのは run() 自身で、毎 hop 現行と同一の鍵照合を
++// 踏む。
++//
++// Why not 飛び先を生成コードへ patch しないか (教科書的な direct chaining):
++// patch は**push 型そのもの**で、捨てるときに逆リンクを辿って戻す必要が
++// ある。code_gen_map.h が push 型を棄却した論理 (「1 つ漏らしても既存
++// テストが検出できない」「症状が原因から遠い」) がそのまま当てはまる。
++// 加えて ESP32-S3 の IRAM は 32bit アクセスのみで J 命令は 3 バイトなので、
++// patch 先が語境界をまたぐと**実行中コードへの非アトミックな書き換え**に
++// なる。ループなら焼かないので、reset() も eviction も「スロットが空く」
++// だけで次の hop の照合が自然に外す。**無効化コードはゼロ行。**
++//
++// **翻訳はチェーンの中でやらない。** 鍵が外れたら break して現行経路へ
++// 戻るだけ。翻訳・負のキャッシュ・満杯処理はループの外にあり、チェーンは
++// それらの経路を 1 バイトも動かさない (ループを薄く保つ)。
++//
+ // ## 鍵の照合 (設計 §5.5)
+ //
+ // **順序が意味を持つ。** kAlwaysStale の検査を世代の一致より先に置く。
+@@ -19,6 +38,14 @@
+ // 入口で M68k::mustDeferToStep() を見る。これが無いと、割り込みが立った後も
+ // ネイティブが成功し続ける限り step() が呼ばれず、次に reachSlow へ落ちる
+ // までの最大 80,000 サイクル受理が遅れる。
++//
++// **チェーンでも毎 hop 見る。** 見なければ、チェーンが伸びる限り受理が
++// 遅れる (上限がチェーン長ぶん伸びる)。毎 hop 見れば、保留済み割り込みの
++// 受理遅れは**チェーンの有無にかかわらず 1 ブロック**のまま。
++//
++// 期限の側は budget が押さえる。チェーン中はデバイスが 1 サイクルも
++// 進まないので、呼び出し側が「次の期限までの残り」を渡し、積んだ
++// サイクルがそれに達したら戻る。**期限超過の上限も 1 ブロックのまま。**
+ 
+ #ifndef X68K_PLATFORM_JIT_BLOCK_RUNNER_H
+ #define X68K_PLATFORM_JIT_BLOCK_RUNNER_H
+@@ -91,7 +118,7 @@ public:
+     }
+ 
+     // NativeExec に渡す関数。
+-    static NativeResult runThunk(void* context, M68k& cpu);
++    static NativeResult runThunk(void* context, M68k& cpu, std::uint32_t budget);
+     static const NativeStats* statsThunk(void* context);
+ 
+     [[nodiscard]] NativeExec exec()
+@@ -129,9 +156,46 @@ public:
+     // 全部捨てる。実行可能メモリも巻き戻す。
+     void reset();
+ 
++    // 動的分岐 (Tier D) の飛び先を受け取る 1 語。
++    //
++    // **テスト専用。** 実物では翻訳時にこのアドレスが生成コードへ焼かれる
++    // (EmitEnv::mailboxAddr) ので、runner の外から名前で呼ぶ必要はない。
++    // ホストのテストは翻訳を通さずにスロットを手で置く形でチェーンを
++    // 組み立てるため、偽のブロックが飛び先を書く先をここで教わる。
++    [[nodiscard]] std::uint32_t* branchMailboxForTest()
++    {
++        return &branchMailbox_;
++    }
++
+ private:
+-    NativeResult run(M68k& cpu);
++    NativeResult run(M68k& cpu, std::uint32_t budget);
+     void rememberFailure(std::uint32_t entryPc, std::uint16_t gen);
++    // 設計 §5.5 の鍵照合 7 項。**唯一の実装。**
++    //
++    // Why not 呼ぶ側それぞれに書かないか: チェーン (段 D-1) は毎 hop
++    // 「現行と同一の 7 項」を踏むことで pull 型を保っている。実物と hop が
++    // 別々の式を持つと、片方だけ直したときに**もう片方が古い判定で走り
++    // 続ける**。段 D-0 の計測でも同じ構造を踏みかけた (索引式を写して
++    // 変異が素通りした前例: test_block_emitter.cpp の runnerSlotIndex)。
++    //
++    // **順序が意味を持つ。** kAlwaysStale の検査を世代の一致より先に置く
++    // (このヘッダ冒頭の理由)。
++    //
++    // nowGen と nowMappingEpoch は呼ぶ側が渡す。鍵外れの帰属
++    // (keyMissStale か keyMissGen か) が同じ値を要るので、ここで読み直すと
++    // 2 回引くことになる。
++    [[nodiscard]] static bool keyMatches(const BlockSlot& slot, std::uint32_t entryPc,
++                                         std::uint16_t nowGen, std::uint32_t nowMappingEpoch)
++    {
++        return slot.code != nullptr &&                   // 翻訳済み
++               slot.entryPc != 0 &&                      // 空きの番兵
++               slot.entryPc == entryPc &&                // タグ
++               slot.count <= kMaxOps &&                  // ゴミ検査
++               slot.mappingEpoch == nowMappingEpoch &&   // 写像
++               nowGen != CodeGenMap::kAlwaysStale &&     // **先に見る**
++               nowGen == slot.pageGen;                   // 世代の一致
++    }
++
+     // 翻訳して置く。置けたらスロットを返す。
+     BlockSlot* translate(M68k& cpu, std::uint32_t entryPc);
+     [[nodiscard]] std::uint32_t slotIndex(std::uint32_t pc) const
+diff --git a/src/x68k/platform/jit/exec_memory.cpp b/src/x68k/platform/jit/exec_memory.cpp
+index 66190e0..c1d0daf 100644
+--- a/src/x68k/platform/jit/exec_memory.cpp
++++ b/src/x68k/platform/jit/exec_memory.cpp
+@@ -31,6 +31,12 @@ namespace
+ constexpr const char* kTag = "jit";
+ #endif
+ 
++#if !(defined(ESP_PLATFORM) && defined(__XTENSA__))
++// ホストのテストが差し替える runBlock の中身 (exec_memory.h の理由)。
++// **実機のビルドにはこの変数が存在しない。**
++RunBlockHook g_runBlockHook = nullptr;
++#endif
++
+ // 切り出しの整列。l32r のリテラルが 4 バイト整列を要求する。
+ constexpr std::size_t kAlign = 4;
+ 
+@@ -170,12 +176,25 @@ X68K_JIT_IRAM std::uint32_t runBlock(void* state, const void* code)
+     __asm__ __volatile__("" : "+r"(arg));
+     return arg;
+ #else
+-    // ホストでは呼べない。**黙って 0 を返さない** — 0 は「実行できなかった」の
+-    // 意味を持ちうるので、呼ばれたこと自体を見えるようにする。
++    // ホストでは Xtensa の機械語へ飛べない。テストが差し替えていれば
++    // そちらへ渡し、差し替えていなければ**黙って 0 を返さない** —
++    // 0 は「実行できなかった」の意味を持ちうるので、呼ばれたこと自体を
++    // 見えるようにする。
++    if (g_runBlockHook != nullptr)
++    {
++        return g_runBlockHook(state, code);
++    }
+     (void)code;
+     (void)state;
+     std::abort();
+ #endif
+ }
+ 
++#if !(defined(ESP_PLATFORM) && defined(__XTENSA__))
++void setRunBlockHookForTest(RunBlockHook hook)
++{
++    g_runBlockHook = hook;
++}
++#endif
++
+ }  // namespace x68k::jit
+diff --git a/src/x68k/platform/jit/exec_memory.h b/src/x68k/platform/jit/exec_memory.h
+index 5d6c218..7ab3d15 100644
+--- a/src/x68k/platform/jit/exec_memory.h
++++ b/src/x68k/platform/jit/exec_memory.h
+@@ -144,6 +144,44 @@ private:
+ // callx0 を書くと通るのに、関数にすると落ちるのが手がかりだった。
+ std::uint32_t runBlock(void* state, const void* code) X68K_JIT_IRAM;
+ 
++#if !(defined(ESP_PLATFORM) && defined(__XTENSA__))
++// **ホスト専用。** 実機のビルドにはこの宣言も定義も存在しない。
++//
++// ## なぜこれが要るか
++//
++// runBlock は Xtensa の機械語へ飛ぶので、ホストでは呼べない (呼べば
++// std::abort)。ところが段 D-1 の direct chaining は **runBlock を呼んだ
++// 後の判断**をループにしたもので、ループが 2 周目へ進むかどうかは
++// runBlock が戻ってからでないと決まらない。つまり
++// **「1 本目で必ず落ちる」ままでは、チェーンの 2 本目以降を 1 行も
++// テストできない。**
++//
++// これが危ない理由は、ループが守っているものの壊れ方にある。毎 hop の
++// 鍵照合を省く / defer を省く / budget を省く — どれも**状態は正しい
++// まま**「古いコードを実行する」「割り込みが遅れる」としか壊れず、
++// block_runner.h が守ろうとしている pull 型の性質そのものが、
++// テストできないところへ落ちる。
++//
++// そこでホストのビルドでだけ runBlock の中身を差し替えられるようにする。
++// テストは「ブロックが走った」ことにして戻り値と副作用 (pc の書き戻し、
++// ゲスト RAM への書き込み) を自分で作り、**その後のループの判断だけ**を
++// 実物のコードで走らせる。
++//
++// Why not runner 側に「1 本走らせる」の口を作って差し替えないか:
++// 差し替えるのが runner の中の関数だと、**テストが通る経路と実機が通る
++// 経路が別物**になる。差し替え点を runBlock (= ホストで元々呼べない
++// 唯一の関数) に置けば、その 1 行より上のループ本体は実機と 1 文字も
++// 変わらないものをテストが踏む。
++//
++// Why not #if を使わず常に持たないか: 実機のホットパスに関数ポインタの
++// 間接呼び出しが 1 つ増える。JIT の往復は実測 218 サイクルで、そのうち
++// 回収しにいくのが 43 サイクル。計測対象と同じ桁のものをホットパスへ
++// 足すと、以後の計測が全部ずれる (MEMORY.md「計測スイッチをホットパスに
++// 残さない」)。
++using RunBlockHook = std::uint32_t (*)(void* state, const void* code);
++void setRunBlockHookForTest(RunBlockHook hook);
++#endif
++
+ }  // namespace x68k::jit
+ 
+ #endif  // X68K_PLATFORM_JIT_EXEC_MEMORY_H
+diff --git a/test/test_block_emitter.cpp b/test/test_block_emitter.cpp
+index bbb52d2..03d1ede 100644
+--- a/test/test_block_emitter.cpp
++++ b/test/test_block_emitter.cpp
+@@ -34,6 +34,8 @@
+ #include <cstdint>
+ #include <algorithm>
+ #include <cstring>
++#include <map>
++#include <memory>
+ #include <string>
+ #include <vector>
+ 
+@@ -7263,10 +7265,14 @@ struct Harness
+     //
+     // **入口の事前条件を本物のインタプリタに作らせる** (pc == 命令語 + 4)。
+     // 手で pc を組むと、契約を取り違えたときにテストが先に壊れる。
+-    x68k::NativeResult runAt(u32 entryPc)
++    // budget の既定は「1 呼び出しでチェーンが伸びきる」ほど大きい値。
++    // **既存のテストは全部翻訳が失敗する形なので、値は挙動に効かない**
++    // (1 本も走らないので chainStop まで届かない)。チェーンを問うテストは
++    // 明示的に渡す。
++    x68k::NativeResult runAt(u32 entryPc, std::uint32_t budget = 0xFFFFFFFFu)
+     {
+         cpu().refillPrefetchForTest(entryPc);
+-        return x68k::jit::BlockRunner::runThunk(&runner, cpu());
++        return x68k::jit::BlockRunner::runThunk(&runner, cpu(), budget);
+     }
+ 
+     // **実装が pc をどのスロットへ写すかを、実装に訊く。**
+@@ -7797,3 +7803,794 @@ TEST_CASE("空きスロットを引いたらコールドミスとして数える
+ 
+     checkDeferAccounting(h.stats(), "コールドミス");
+ }
++
++// ============================================================================
++// 段 D-1: direct chaining (ランナー内ディスパッチループ)
++// ============================================================================
++//
++// ## ここで問うのは「ループが余計に走らないこと」
++//
++// チェーンが守っているものは全部**積極的すぎる側**に壊れる。
++//
++//   毎 hop の鍵照合を省く   → 書き換えられた番地の古いコードを実行する
++//   毎 hop の世代を持ち上げる → 同上。しかも**先行ブロック自身の書き込み**で起きる
++//   毎 hop の defer を省く   → 割り込みの受理がチェーン長ぶん遅れる
++//   budget を省く           → デバイスの期限を跨いだまま何本も走る
++//   ガード脱出で続ける       → 半端に進んだ状態の続きを JIT が実行する
++//   チェーンの中で翻訳する   → 満杯の閾値や負のキャッシュの統計が歪む
++//
++// **後ろ 2 つ以外は、実行後の状態を比べても 1 ビットも違わない。**
++// 割り込みは遅れて受理されるだけ、期限はずれて発火するだけで、
++// M68kState もメモリも「正しい」。MEMORY.md の
++// 「保守的なフォールバックはテストの盲点になる」の裏返しで、
++// **積極的すぎる側も、正しさのテストでは見えない。**
++//
++// なので問い方を変える。ここでは全部「何本走ったか」と「どこで切れたか」
++// を数え、期待した本数と切れ方に一致することを問う。
++//
++// ## runBlock をホストで走らせる
++//
++// 生成コードは Xtensa の機械語なのでホストでは呼べず、チェーンの 2 本目
++// 以降は**実物を走らせない限り 1 行も踏めない**。exec_memory.h の
++// setRunBlockHookForTest でホストのビルドだけ runBlock の中身を差し替え、
++// 「ブロックが走った」ことにして戻り値と副作用を偽物が作る。
++// **差し替え点は runBlock ただ 1 行**なので、その上のループ本体は実機と
++// 1 文字も変わらないものをテストが踏む。
++
++namespace runner_chain
++{
++
++using runner_accounting::Harness;
++
++// 偽のブロック 1 本ぶんの台本。**生成コードの出口の契約をそのまま真似る。**
++//
++//   - 素通り  : pc = fallThroughPc + 4 を自分で書く (生成コードがそうする)
++//   - 静的分岐: pc は書かない。runner が branchTo(BlockSlot::branchTarget) する
++//   - 動的分岐: メールボックスへ飛び先を書き、bit29 を立てる
++//
++// writeAddr が非 0 なら、走るついでにゲスト RAM を 1 バイト書いて世代を
++// touch する (Tier C の G14/G16 が生成コードの中でやること)。
++// **これがチェーンの自己無効化を作る唯一の道具。**
++struct FakeBlock
++{
++    u32 cycles = 8;
++    // 素通りのときに書き戻す pc (命令語 + 4 の形で渡す)。
++    u32 fallThroughPc = 0;
++    bool branchTaken = false;
++    bool dynamicBranch = false;
++    u32 dynamicTarget = 0;
++    bool guardExit = false;
++    std::uint8_t ranOps = 0;
++    bool selfPageExit = false;
++    // 走るついでにゲスト RAM を書く番地 (0 なら書かない)。
++    u32 writeAddr = 0;
++};
++
++// 差し替えた runBlock が読む台本。**code ポインタを鍵にする**ので、
++// スロットごとに違うブロックを演じられる。
++struct Script
++{
++    x68k::M68k* cpu = nullptr;
++    x68k::CodeGenMap* map = nullptr;
++    std::vector<u8>* ram = nullptr;
++    // 偽のブロックが飛び先を書く先 (BlockRunner::branchMailboxForTest)。
++    std::uint32_t* mailbox = nullptr;
++    std::map<const void*, FakeBlock> blocks;
++    // 実際に呼ばれた code ポインタの並び。**何本走ったかの一次資料。**
++    std::vector<const void*> calls;
++    // n 本目を走らせる直前に割り込みを立てる (0 なら立てない)。
++    int raiseIrqBefore = 0;
++};
++
++Script* g_script = nullptr;
++
++std::uint32_t fakeRunBlock(void* state, const void* code)
++{
++    REQUIRE(g_script != nullptr);
++    Script& sc = *g_script;
++    // **state は必ず本物の M68kState を指すこと。** 実物の runner は
++    // &cpu.state() を渡す。ここが違えば、ループが状態を取り違えている。
++    REQUIRE(state == static_cast<void*>(&sc.cpu->state()));
++
++    const auto it = sc.blocks.find(code);
++    REQUIRE(it != sc.blocks.end());
++    const FakeBlock& b = it->second;
++
++    sc.calls.push_back(code);
++
++    if (sc.raiseIrqBefore != 0 && static_cast<int>(sc.calls.size()) == sc.raiseIrqBefore)
++    {
++        // **走り終えた直後に割り込みが立つ形。** 実機では MFP が
++        // reachSlow で立てるが、ここでは「このブロックの実行中に立った」
++        // ことにする。次の hop の mustDeferToStep が見るべきもの。
++        sc.cpu->requestInterrupt(6, 0x40);
++    }
++
++    if (b.writeAddr != 0)
++    {
++        // 生成コードがゲスト RAM を書くときは、必ず世代も touch する
++        // (Tier C の G14/G16)。**片方だけ真似ると、テストが実機より
++        // 甘くなる**ので両方やる。
++        (*sc.ram)[b.writeAddr] = 0x4E;
++        sc.map->touch(b.writeAddr);
++    }
++
++    std::uint32_t ret = b.cycles & x68k::jit::kCycleMask;
++    if (b.guardExit)
++    {
++        ret |= x68k::jit::kGuardExitFlag;
++        ret |= (static_cast<std::uint32_t>(b.ranOps) & x68k::jit::kGuardCountMask)
++               << x68k::jit::kGuardCountShift;
++        if (b.selfPageExit)
++        {
++            ret |= x68k::jit::kSelfPageExitFlag;
++        }
++        // ガード脱出は途中で降りるので pc は書き換えない。
++        return ret;
++    }
++    if (b.branchTaken)
++    {
++        // 静的分岐。**pc は runner の branchTo が書く。**
++        return ret | x68k::jit::kBranchTakenFlag;
++    }
++    if (b.dynamicBranch)
++    {
++        // 動的分岐。飛び先はメールボックスへ (アドレスは翻訳時に焼かれる)。
++        REQUIRE(sc.mailbox != nullptr);
++        *sc.mailbox = b.dynamicTarget;
++        return ret | x68k::jit::kDynamicBranchFlag;
++    }
++    // 素通り。生成コードが pc を fallThroughPc + 4 へ書く。
++    sc.cpu->state().pc = b.fallThroughPc + 4;
++    return ret;
++}
++
++}  // namespace runner_chain
++
++namespace runner_chain
++{
++
++// runBlock の差し替えを 1 つのテストの間だけ有効にする。
++struct HookGuard
++{
++    explicit HookGuard(Script& sc)
++    {
++        g_script = &sc;
++        x68k::jit::setRunBlockHookForTest(&fakeRunBlock);
++    }
++    ~HookGuard()
++    {
++        x68k::jit::setRunBlockHookForTest(nullptr);
++        g_script = nullptr;
++    }
++    HookGuard(const HookGuard&) = delete;
++    HookGuard& operator=(const HookGuard&) = delete;
++};
++
++// チェーンを手で組み立てる台。
++//
++// **翻訳を通さない。** 翻訳はホストでも走るが、成功すると本物の Xtensa の
++// 機械語がスロットへ載る。ここで問いたいのは「走り切った後にループが
++// どう判断するか」なので、スロットの鍵だけを実物と同じ形で置き、
++// code には偽のブロックの目印を入れる。
++//
++// **鍵は実装と同じ 7 項が当たる値を入れる。** 1 項でも外れれば hit に
++// ならず、テストは「チェーンが伸びなかった」として落ちる — つまり
++// この台自体が鍵照合の存在を前提にしている。
++struct ChainBuilder
++{
++    Harness& h;
++    Script& sc;
++    // 偽ブロックの目印。中身は読まれない (差し替えた runBlock が鍵に使うだけ)。
++    std::vector<std::unique_ptr<std::uint8_t[]>> marks;
++
++    ChainBuilder(Harness& harness, Script& script) : h(harness), sc(script)
++    {
++        sc.cpu = &h.cpu();
++        sc.map = &h.cpu().codeGenMap();
++        sc.ram = &h.ram;
++        sc.mailbox = h.runner.branchMailboxForTest();
++    }
++
++    // entryPc に「当たる」スロットを 1 つ置く。
++    const void* place(u32 entryPc, const FakeBlock& block, u32 branchTarget = 0,
++                      bool endsWithBranch = false, bool endsWithDynamicBranch = false)
++    {
++        marks.push_back(std::make_unique<std::uint8_t[]>(4));
++        const std::uint8_t* mark = marks.back().get();
++
++        x68k::CodeGenMap& map = h.cpu().codeGenMap();
++        x68k::jit::BlockSlot& slot = h.slots[foldedIndexOf(entryPc)];
++        slot.entryPc = entryPc;
++        slot.mappingEpoch = map.mappingEpoch();
++        slot.page = entryPc >> x68k::CodeGenMap::kPageShift;
++        slot.pageGen = map.generation(entryPc);
++        slot.count = 1;
++        slot.code = mark;
++        slot.endsWithBranch = endsWithBranch;
++        slot.endsWithDynamicBranch = endsWithDynamicBranch;
++        slot.branchTarget = branchTarget;
++
++        sc.blocks[mark] = block;
++        return mark;
++    }
++
++    std::uint32_t foldedIndexOf(u32 pc) const
++    {
++        return runner_accounting::foldedIndex(pc, Harness::kSlots);
++    }
++};
++
++}  // namespace runner_chain
++
++// --- D1: チェーンは実際に伸びる ---------------------------------------------
++
++TEST_CASE("direct chaining: 静的分岐で繋がったブロックを続けて走る")
++{
++    // **これが土台。** 以下の全テストは「本来なら N 本走る」ことを前提に
++    // 「壊すと N 本走らなくなる」形で問う。まず N 本走ることを確かめる。
++    //
++    // 3 本鎖: A --BRA--> B --BRA--> C (C は素通りで終わり、その先は空きスロット)
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    constexpr u32 kC = 0x3000;
++    constexpr u32 kEnd = 0x4000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++    cb.place(kB, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kC, true);
++    cb.place(kC, FakeBlock{8, kEnd, false, false, 0, false, 0, false, 0});
++    // kEnd のスロットは置かない = 4 本目の鍵が外れてチェーンが切れる。
++
++    const x68k::NativeResult r = h.runAt(kA);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    // **3 本ぶんのサイクルが合計で返ること。** 1 本ぶんしか返さないなら、
++    // Machine が時間を落とす (デバイスの時刻が遅れる)。
++    CHECK(r.cycles == 24);
++    REQUIRE(sc.calls.size() == 3);
++    CHECK(h.stats().blocksRun == 3);
++    CHECK(h.stats().runCalls == 1);
++    // 4 本目の鍵が外れて切れたこと。**翻訳は 1 度も呼ばれていない**
++    // (チェーンの中で翻訳しない)。
++    CHECK(h.stats().chainStopMiss == 1);
++    CHECK(h.stats().translated == 0);
++    CHECK(h.stats().translateFail == 0);
++    // 最後の pc が kEnd の入口を指していること (branchTo / 素通りの書き戻し)。
++    CHECK(h.cpu().state().pc == kEnd + 4);
++}
++
++// --- D2: 同値性 (チェーン実行と 1 ブロック実行がビット単位で一致) ------------
++
++TEST_CASE("direct chaining: チェーン実行は 1 本ずつ実行したのとビット単位で同じ")
++{
++    // **チェーンが状態を変えないことの主張。** 同じ 3 本鎖を
++    //   (a) budget を大きくして 1 呼び出しで 3 本
++    //   (b) budget を 0 にして 1 本ずつ 3 呼び出し
++    // で走らせ、M68kState・ゲスト RAM・世代配列を全部比べる。
++    //
++    // **変異: 世代の照合を hop で省く** → (a) は書き換え後のページの
++    // 古いブロックを走らせ、(b) は鍵が外れて走らせない。差が出る。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    constexpr u32 kC = 0x3000;
++    constexpr u32 kEnd = 0x4000;
++    // 走るついでにゲスト RAM を書く (世代が動く = 状態の一部)。
++    constexpr u32 kWrite = 0x9000;
++
++    auto build = [](runner_accounting::Harness& h, Script& sc, ChainBuilder& cb)
++    {
++        cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, kWrite}, kB, true);
++        cb.place(kB, FakeBlock{6, 0, false, true, kC, false, 0, false, 0}, 0, false, true);
++        cb.place(kC, FakeBlock{4, kEnd, false, false, 0, false, 0, false, 0});
++        (void)h;
++    };
++
++    // (a) 1 呼び出しで 3 本。
++    x68k::M68kState chained{};
++    std::vector<u8> chainedRam;
++    std::vector<std::uint16_t> chainedGen;
++    {
++        runner_accounting::Harness h;
++        Script sc;
++        ChainBuilder cb(h, sc);
++        HookGuard guard(sc);
++        build(h, sc, cb);
++
++        const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++        REQUIRE(r.exit == x68k::NativeExit::kRan);
++        REQUIRE(sc.calls.size() == 3);
++        chained = h.cpu().state();
++        chainedRam = h.ram;
++        chainedGen = h.gen;
++    }
++
++    // (b) budget 0 で 1 本ずつ 3 回。**同じ台本・同じ順序。**
++    x68k::M68kState stepped{};
++    std::vector<u8> steppedRam;
++    std::vector<std::uint16_t> steppedGen;
++    {
++        runner_accounting::Harness h;
++        Script sc;
++        ChainBuilder cb(h, sc);
++        HookGuard guard(sc);
++        build(h, sc, cb);
++
++        u32 pc = kA;
++        for (int i = 0; i < 3; ++i)
++        {
++            const x68k::NativeResult r = h.runAt(pc, 0);
++            REQUIRE(r.exit == x68k::NativeExit::kRan);
++            // budget 0 なので必ず 1 本で戻る。
++            REQUIRE(static_cast<int>(sc.calls.size()) == i + 1);
++            pc = h.cpu().state().pc - 4;
++        }
++        stepped = h.cpu().state();
++        steppedRam = h.ram;
++        steppedGen = h.gen;
++    }
++
++    // **ビット単位で比べる。** M68kState は POD なので memcmp でよい。
++    CHECK(std::memcmp(&chained, &stepped, sizeof(x68k::M68kState)) == 0);
++    CHECK(chainedRam == steppedRam);
++    CHECK(chainedGen == steppedGen);
++}
++
++// --- D3: 割り込みの受理は 1 ブロック以上遅れない ------------------------------
++
++TEST_CASE("direct chaining: 割り込みが立った直後の hop で必ず切れる")
++{
++    // **変異: hop の mustDeferToStep() を消す** → チェーンが 3 本走り切る。
++    //
++    // これは実行後の状態を比べても見えない。割り込みは遅れて受理される
++    // だけで、M68kState もメモリも「正しい」。**何本目で切れたか**を
++    // 直接問うしかない。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    constexpr u32 kC = 0x3000;
++    constexpr u32 kEnd = 0x4000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++    cb.place(kB, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kC, true);
++    cb.place(kC, FakeBlock{8, kEnd, false, false, 0, false, 0, false, 0});
++    cb.place(kEnd, FakeBlock{8, 0x5000, false, false, 0, false, 0, false, 0});
++
++    // **1 本目の実行中に割り込みが立つ。**
++    sc.raiseIrqBefore = 1;
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    // **1 本走ったところで切れること。** 遅れの上限が 1 ブロック。
++    CHECK(sc.calls.size() == 1);
++    CHECK(r.cycles == 8);
++    CHECK(h.stats().chainStopDefer == 1);
++    // 受理はまだ。Machine が step() を回して受理する。
++    CHECK(h.cpu().pendingInterruptLevel() == 6);
++}
++
++TEST_CASE("direct chaining: 入口で割り込みが立っていれば 1 本も走らない")
++{
++    // 現行の入口検査 (設計 §5.4) が生きていること。**チェーンにしたときに
++    // 入口の検査をループの中へ畳んで消す**変異を捕まえる。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0x2000, false, false, 0, false, 0, false, 0});
++    h.cpu().requestInterrupt(6, 0x40);
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kDeferToStep);
++    CHECK(r.cycles == 0);
++    CHECK(sc.calls.empty());
++    CHECK(h.stats().deferInterrupt == 1);
++}
++
++// --- D4: budget ---------------------------------------------------------------
++
++TEST_CASE("direct chaining: budget を超えたら次のブロックを走らせない")
++{
++    // **変異: budget 検査を消す** → 4 本全部走る。
++    //
++    // これも実行後の状態は正しいまま。デバイスの期限を跨ぐだけなので、
++    // **走った本数を数える**以外に問い方がない。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    constexpr u32 kC = 0x3000;
++    constexpr u32 kD = 0x4000;
++    constexpr u32 kEnd = 0x5000;
++
++    // 1 本 8 サイクル。budget = 20 なら 8 + 8 = 16 < 20 で 3 本目へ進み、
++    // 24 >= 20 でそこで切れる。**「超えたら止める」ではなく
++    // 「達したら止める」** (期限超過の上限を 1 ブロックに保つため)。
++    auto runWithBudget = [](std::uint32_t budget, std::size_t& calls, std::uint32_t& cycles,
++                            std::uint64_t& stopBudget)
++    {
++        runner_accounting::Harness h;
++        Script sc;
++        ChainBuilder cb(h, sc);
++        HookGuard guard(sc);
++
++        cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++        cb.place(kB, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kC, true);
++        cb.place(kC, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kD, true);
++        cb.place(kD, FakeBlock{8, kEnd, false, false, 0, false, 0, false, 0});
++
++        const x68k::NativeResult r = h.runAt(kA, budget);
++        calls = sc.calls.size();
++        cycles = r.cycles;
++        stopBudget = h.stats().chainStopBudget;
++    };
++
++    SUBCASE("budget 0 でも 1 本は走る")
++    {
++        // **1 本目は必ず走る。** budget 0 を「1 命令も実行しない」と読むと、
++        // 期限に達した瞬間に JIT が完全に止まる (Machine は kDeferToStep を
++        // 見て step() へ落ちるので正しさは保たれるが、被覆が黙って消える)。
++        std::size_t calls = 0;
++        std::uint32_t cycles = 0;
++        std::uint64_t stopBudget = 0;
++        runWithBudget(0, calls, cycles, stopBudget);
++        CHECK(calls == 1);
++        CHECK(cycles == 8);
++        CHECK(stopBudget == 1);
++    }
++
++    SUBCASE("budget 20 なら 8+8+8 で 3 本目に達して止まる")
++    {
++        std::size_t calls = 0;
++        std::uint32_t cycles = 0;
++        std::uint64_t stopBudget = 0;
++        runWithBudget(20, calls, cycles, stopBudget);
++        CHECK(calls == 3);
++        CHECK(cycles == 24);
++        CHECK(stopBudget == 1);
++    }
++
++    SUBCASE("budget 16 ならちょうど使い切った 2 本目で止まる")
++    {
++        // **境界。** > で切る変異はここで落ちる (3 本走ってしまう)。
++        std::size_t calls = 0;
++        std::uint32_t cycles = 0;
++        std::uint64_t stopBudget = 0;
++        runWithBudget(16, calls, cycles, stopBudget);
++        CHECK(calls == 2);
++        CHECK(cycles == 16);
++        CHECK(stopBudget == 1);
++    }
++}
++
++// --- D5: チェーン中の自己無効化 (pull 型を守っている証拠) ---------------------
++
++TEST_CASE("direct chaining: 先行ブロックが次のページを書いたら次の hop で切れる")
++{
++    // **これがチェーンの一番危ないところ。**
++    //
++    // 「直前の hop が次の hop の的を無効化する」がチェーンの内側で起きる。
++    // Tier C の書き形は生成コードの中でゲスト RAM を書き、世代を touch する
++    // (G14/G16)。その書き込み先が**次に飛ぶブロックのページ**だったら、
++    // 次の hop はもう古い。
++    //
++    // **変異: 世代を hop の外へ持ち上げる** (run() の入口で 1 回だけ読む)
++    // → 2 本目が走ってしまう。**書き換えられた番地の古いコードを実行する** —
++    // pull 型が原理的に排除していたはずの状態がチェーンの中に生まれる。
++    //
++    // 実行後の状態を比べる形では見えない (偽のブロックは何を実行しても
++    // 「正しい」ので)。**走った本数だけが証拠。**
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    // A は走るついでに **B のページ**を書く。
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, kB + 0x10}, kB, true);
++    cb.place(kB, FakeBlock{8, 0x3000, false, false, 0, false, 0, false, 0});
++
++    // 置いた時点では B の鍵は当たる状態。**A が走る前は繋がっている。**
++    REQUIRE(h.slots[cb.foldedIndexOf(kB)].pageGen == h.cpu().codeGenMap().generation(kB));
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    // **A だけが走ること。** B は A 自身の書き込みで古くなった。
++    CHECK(sc.calls.size() == 1);
++    CHECK(r.cycles == 8);
++    CHECK(h.stats().chainStopMiss == 1);
++    // 世代が実際に動いていること (テストの前提が成り立っている確認)。
++    CHECK(h.cpu().codeGenMap().generation(kB) != h.slots[cb.foldedIndexOf(kB)].pageGen);
++}
++
++TEST_CASE("direct chaining: 同じページを書いても他のページのブロックは繋がる")
++{
++    // 上の裏。**世代を毎 hop 読むことが「常に切る」に化けていないこと。**
++    // 切りすぎる変異 (毎 hop 必ず miss にする) はチェーンを 1 本に潰すが、
++    // 正しさは 1 ビットも壊れないので D2 も D5 も通ってしまう。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    // B とは別のページ (1KB ページなので 0x2000 と 0x8000 は別)。
++    constexpr u32 kWrite = 0x8000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, kWrite}, kB, true);
++    cb.place(kB, FakeBlock{8, 0x3000, false, false, 0, false, 0, false, 0});
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    CHECK(sc.calls.size() == 2);
++    CHECK(r.cycles == 16);
++}
++
++// --- D6: miss で break (チェーンの中で翻訳しない) -----------------------------
++
++TEST_CASE("direct chaining: 飛び先が未翻訳ならチェーンの中で翻訳しない")
++{
++    // **変異: ループ内で translate を呼ぶ** → translated / translateFail が
++    // 動く。
++    //
++    // 翻訳・負のキャッシュ・満杯からの回復は「何本目か」と無関係に成り立つ
++    // べき経路で、ループへ入れるとチェーン長がそれらの統計を歪める
++    // (満杯の閾値が 1 呼び出しで何度も進む等)。段 0-I の admission が
++    // 「機構が測定どおりに動かない」形で撤回になった直後なので、
++    // **測る対象を動かす変更は明示的に排除する。**
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    // A は B へ飛ぶが、B のスロットは置かない (= 未翻訳)。
++    // **B の番地には翻訳できる命令列がある** (Harness が MOVEQ を敷いて
++    // いる) ので、翻訳を呼べば成功してしまう = 呼んでいないことが問える。
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++
++    const std::uint64_t translatedBefore = h.stats().translated;
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    CHECK(sc.calls.size() == 1);
++    // **1 度も翻訳していないこと。**
++    CHECK(h.stats().translated == translatedBefore);
++    CHECK(h.stats().translateFail == 0);
++    CHECK(h.stats().negativeHit == 0);
++    CHECK(h.stats().fullDeferred == 0);
++    // 鍵外れの帰属も動かないこと (2 本目以降の miss は現行経路の統計を
++    // 触らずに break する)。
++    CHECK(h.stats().keyMissCold == 0);
++    CHECK(h.stats().chainStopMiss == 1);
++    // 呼び出し側は次の run() で kB から普通に始められる。
++    CHECK(h.cpu().state().pc == kB + 4);
++}
++
++// --- D7: ガード脱出でチェーンが切れる -----------------------------------------
++
++TEST_CASE("direct chaining: ガード脱出したらチェーンは必ず切れる")
++{
++    // 半端に進んだブロックの続きは step() が本物の read/write で実行する。
++    // **その手前でチェーンを続けると、I/O の副作用や例外を飛ばしたまま
++    // 次のブロックへ進む。**
++    //
++    // 変異: chainStop の ranOk 検査を消す → 2 本目が走る。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    SUBCASE("途中まで進んだガード脱出")
++    {
++        // ranOps = 1 なので kRan で戻る。**チェーンは続けない。**
++        cb.place(kA, FakeBlock{4, 0, false, false, 0, true, 1, false, 0}, kB, true);
++        cb.place(kB, FakeBlock{8, 0x3000, false, false, 0, false, 0, false, 0});
++
++        const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++        CHECK(r.exit == x68k::NativeExit::kRan);
++        CHECK(r.cycles == 4);
++        CHECK(sc.calls.size() == 1);
++        CHECK(h.stats().guardExit == 1);
++        CHECK(h.stats().chainStopIncomplete == 1);
++    }
++
++    SUBCASE("1 命令も進まなかったガード脱出 (G10)")
++    {
++        cb.place(kA, FakeBlock{0, 0, false, false, 0, true, 0, false, 0}, kB, true);
++
++        const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++        CHECK(r.exit == x68k::NativeExit::kDeferToStep);
++        CHECK(r.cycles == 0);
++        CHECK(h.stats().deferGuard == 1);
++        CHECK(h.stats().chainStopIncomplete == 1);
++    }
++}
++
++TEST_CASE("direct chaining: チェーン 2 本目以降の G10 は積んだサイクルを捨てない")
++{
++    // **1 本目が走った後で 2 本目が 1 命令も進まなかった場合。**
++    //
++    // ここで kDeferToStep を返すと、契約 (「kDeferToStep なら状態を 1 ビットも
++    // 変えていない」) を破る — 1 本目は状態を進めている。**時間が消えて
++    // デバイスが遅れる**形で壊れ、症状は原因から遠い。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++    cb.place(kB, FakeBlock{0, 0, false, false, 0, true, 0, false, 0});
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    // **kRan で 1 本目のサイクルを返すこと。**
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    CHECK(r.cycles == 8);
++    CHECK(sc.calls.size() == 2);
++    // 1 本も進まなかった扱い (deferGuard) にはしない。
++    CHECK(h.stats().deferGuard == 0);
++    CHECK(h.stats().chainStopIncomplete == 1);
++}
++
++// --- D8: 勘定の保存 -----------------------------------------------------------
++
++TEST_CASE("direct chaining: チェーンの切れ方の内訳が runCalls と一致する")
++{
++    // **T1 と同じ問い方。** 和が合わなければ、どのカウンタにも乗らない
++    // break がある。fullDeferred が無かったせいで実機 45 秒の主因を
++    // 見落とした前例と同じ形なので、収支を縛る。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++    constexpr u32 kC = 0x3000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kB, true);
++    cb.place(kB, FakeBlock{8, 0, true, false, 0, false, 0, false, 0}, kC, true);
++    cb.place(kC, FakeBlock{8, 0x4000, false, false, 0, false, 0, false, 0});
++
++    // miss / budget / defer / incomplete を全部踏ませる。
++    h.runAt(kA, 0xFFFFFFFFu);  // miss (kC の先が空き)
++    h.runAt(kA, 8);            // budget
++    h.cpu().requestInterrupt(6, 0x40);
++    h.runAt(kA, 0xFFFFFFFFu);  // 入口 defer
++
++    const x68k::NativeStats& s = h.stats();
++    const std::uint64_t sum =
++        s.chainStopMiss + s.chainStopIncomplete + s.chainStopDefer + s.chainStopBudget;
++    INFO("runCalls=", s.runCalls, " miss=", s.chainStopMiss, " incomplete=", s.chainStopIncomplete,
++         " defer=", s.chainStopDefer, " budget=", s.chainStopBudget);
++    CHECK(s.runCalls == 3);
++    CHECK(sum == s.runCalls);
++}
++
++// --- D9: 回帰 — pull 型は依然として守られている --------------------------------
++
++TEST_CASE("direct chaining: ページ書き込み後は旧ブロックが決して実行されない")
++{
++    // **明示的な回帰。** これは D-1 以前から成り立っていた性質だが、
++    // チェーンを入れた今こそ落ちうる (毎 hop の照合を省く変異が入りうる)。
++    //
++    // code_gen_map.h が push 型を棄却した根拠そのもの: 「消し忘れた
++    // ブロックを実行する」状態が原理的に存在しない。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    cb.place(kA, FakeBlock{8, 0x2000, false, false, 0, false, 0, false, 0});
++
++    // 置いた直後は当たる。
++    h.runAt(kA, 0);
++    REQUIRE(sc.calls.size() == 1);
++
++    // 再翻訳を封じる。**窓は触らない** (setFastRamReadable は
++    // bumpMappingEpoch を呼ぶので、鍵が世代ではなく epoch で外れてしまい、
++    // 問いたい「世代で外れる」が測れなくなる)。命令語を奇数番地にしても
++    // 同じ理由で鍵の外れ方が変わるので、**負のキャッシュへ「世代不問」を
++    // 焼いて**再翻訳だけを止める。
++    h.runner.setNegativeStorage(h.negEntries.data(),
++                                static_cast<std::uint32_t>(h.negEntries.size()));
++
++    // **ゲストがそのページを書いた。**
++    h.cpu().codeGenMap().touch(kA + 0x20);
++
++    const x68k::NativeResult r = h.runAt(kA, 0);
++
++    // **1 本も走っていないこと。** 古いコードは二度と実行されない。
++    // (翻訳は成功しうるが、成功したら偽物ではない本物の Xtensa の機械語が
++    //  載るので runBlock の差し替えは呼ばれない = calls は増えない)
++    CHECK(sc.calls.size() == 1);
++    // **世代で外れたこと。** 他の理由で外れていたら、この回帰は
++    // 「たまたま走らなかった」を見ているだけになる。
++    CHECK(h.stats().keyMissGen == 1);
++    CHECK(h.stats().keyMissEpoch == 0);
++    CHECK(h.stats().keyMissTag == 0);
++    (void)r;
++}
++
++// --- D10: 動的分岐 (RTS / JSR) でも繋がる --------------------------------------
++
++TEST_CASE("direct chaining: 動的分岐の飛び先へも繋がる")
++{
++    // 実測で動的分岐は形成 23.2% / 命中 67.4%。**メールボックス経由の
++    // 飛び先でチェーンが伸びること**を問う。
++    //
++    // 変異: 次の entryPc を slot->branchTarget から採る (動的分岐スロットの
++    // branchTarget は設計上つねに 0 なので、0 番地のブロックを探しにいく)。
++    using namespace runner_chain;
++
++    constexpr u32 kA = 0x1000;
++    constexpr u32 kB = 0x2000;
++
++    runner_accounting::Harness h;
++    Script sc;
++    ChainBuilder cb(h, sc);
++    HookGuard guard(sc);
++
++    // branchTarget は 0 のまま (動的分岐スロットの実態)。
++    cb.place(kA, FakeBlock{8, 0, false, true, kB, false, 0, false, 0}, 0, false, true);
++    cb.place(kB, FakeBlock{8, 0x3000, false, false, 0, false, 0, false, 0});
++
++    const x68k::NativeResult r = h.runAt(kA, 0xFFFFFFFFu);
++
++    CHECK(r.exit == x68k::NativeExit::kRan);
++    CHECK(sc.calls.size() == 2);
++    CHECK(r.cycles == 16);
++    CHECK(h.stats().dynamicBranch == 1);
++    CHECK(h.cpu().state().pc == 0x3000 + 4);
++}

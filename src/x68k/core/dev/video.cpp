@@ -54,23 +54,23 @@ u32 Crtc::rasterNumber() const
                             kCyclesPerFrame);
 }
 
-bool Crtc::tick(u32 cycles)
+bool Crtc::tickSlow(u32 cycles)
 {
-    // フレーム内の位置を進める。1 フレームを超える cycles でも範囲に収まる。
+    // 1 フレーム以上をまとめて渡された場合と、計測のために速い側を
+    // 切っている場合 (perf_switch.h) にここへ来る。
     //
-    // Why not 剰余だけで済ませないか: ここは毎命令通る。ESP32-S3 では
-    // 64bit 除算が重く、素直に剰余へ変えたら実機の実効クロックが
-    // 3.19MHz から 2.77MHz へ落ちた (実測)。1 フレーム以上を渡された
-    // ときだけ剰余を使い、通常は加算と 1 回の比較で済ませる。
+    // どちらでも正しいよう、cycles の大小を仮定していない。1 フレーム
+    // 未満なら剰余は素通りで、あとは速い側と同じ計算になる。
+    //
+    // Why not 剰余を速い側にも置かないか: ここは毎命令通る経路から呼ばれる。
+    // ESP32-S3 では 64bit 除算が重く、素直に剰余へ変えたら実機の実効クロックが
+    // 3.19MHz から 2.77MHz へ落ちた (実測)。命令 1 つのサイクル数は 1 フレームに
+    // 遠く及ばないので、ヘッダ側は加算と比較だけで済む。
     //
     // 足す前に減らすのは u32 の桁溢れを避けるため。剰余のあとは
     // remaining < kCyclesPerFrame、frameCycles_ も同様なので、和は
     // 高々 2 倍で収まる。
-    u32 remaining = cycles;
-    if (remaining >= kCyclesPerFrame)
-    {
-        remaining %= kCyclesPerFrame;
-    }
+    const u32 remaining = cycles % kCyclesPerFrame;
     frameCycles_ += remaining;
     if (frameCycles_ >= kCyclesPerFrame)
     {

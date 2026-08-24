@@ -16,7 +16,11 @@
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_system.h>
+#include <esp_cpu.h>
 #include <esp_timer.h>
+
+// キャッシュのアクセス/ミスカウンタ (計測用。恒久機能ではない)。
+#include "soc/extmem_reg.h"
 #include <driver/usb_serial_jtag.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -25,6 +29,10 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+
+#include "jit/block_runner.h"
+#include "jit/xtensa_encoder.h"
+#include "jit/exec_memory.h"
 
 #include "app_mode.h"
 #include "audio.h"
@@ -105,6 +113,98 @@ x68k_platform::M5SpeakerSink g_speaker;
 #define X68K_ENABLE_AUDIO 1
 #endif
 std::atomic<bool> g_audioEnabled{X68K_ENABLE_AUDIO != 0};
+
+// 毎命令通る経路の最適化を入れるか (src/x68k/core/perf_switch.h)。
+//
+// Why not コンパイル時に決めないか: 最適化が効いたかどうかは実機でしか
+// 判定できないのに、実効クロックは起動ごとに揺れる (SD の中身、PSRAM の
+// 割り付け、温度)。焼き直して前後を比べるとその揺れが混ざるので、
+// **同じ起動の中で切り替えて**比べる。音源の '|' が同じ形で先にある。
+//
+// これを 1 回焼けば、5 秒ごとの実効クロックの報告を挟みながら
+// 全ての組み合わせを順に測れる。既定は有効 (本番の姿)。
+//
+// 立てるのはシリアルを受けるタスク、読むのはエミュレーションコア。
+// 切り替えても状態遷移は変わらないので、遷移が 1 スライス遅れて
+// 効いても計測には影響しない。
+std::atomic<bool> g_fastTickEnabled{true};
+
+// イベント駆動 (docs/knowledge/event-driven-implementation.md)。
+//
+// 命令ごとに全デバイスへサイクルを配るのをやめ、「次にどれかの状態が
+// 変わる時点」まで時間を溜めて一度に流す。状態が変わる瞬間は 1 サイクルも
+// ずれない (quantum と違う点がここ)。
+//
+// **既定は無効**。有効側の生成コードを変えないまま、同じ起動の中で
+// '$' で切り替えて前後を測るために入れてある。効果を確かめて確定するまでは
+// 本番の姿を動かさない。
+//
+// 立てるのはシリアルを受けるタスク、読むのはエミュレーションコア。
+// 切り替えはスライスの切れ目でしか効かないので、run の途中で経路が
+// 変わることは無い。
+std::atomic<bool> g_eventDrivenEnabled{false};
+
+// JIT の上限を測るモード (src/x68k/core/cpu/jit_probe.h)。
+//
+// 命令の実行を空回しにして走らせ、ループ運営・割り込み判定・デバイスの
+// tick だけが残った状態の実効クロックを見る。ここで出る数字が
+// 「JIT が命令を無限に速く実行できたとして届く上限」になる。
+//
+// **状態が進まないのでゲストは止まって見える。** 恒久的な機能ではなく、
+// JIT に着手するかどうかを決めるための実測用。既定は無効。
+std::atomic<bool> g_nullExecProbe{false};
+std::atomic<int> g_nullExecStage{0};
+std::atomic<bool> g_eventNullExec{false};
+
+// スライスの実時間の内訳を測る。恒久的な機能ではない。
+//
+// 実効クロックからの逆算は「1 スライスあたり何回それが起きるか」の仮定に
+// 依存する。その仮定が外れて誤診したことがあるので (SD が原因と読み違えた)、
+// 直接測れる形を常設にしておく。
+std::int64_t g_runUs = 0;
+std::uint32_t g_runCount = 0;
+#if X68K_MEASURE_DISK
+std::int64_t g_renderUs = 0;
+std::uint32_t g_renderCount = 0;
+#endif
+
+// 上限計測の段に名前を付ける。段の定義は machine.cpp の switch にある。
+//
+// 段 4-7 は tickDevices (全体の 59%) の中身を MFP / RTC / CRTC へ
+// 分解するためにある。CRTC をイベント化するかどうかの判断が、CRTC 単独の
+// 寄与を知らないと決まらない (docs/knowledge/event-driven-implementation.md)。
+const char* nullExecStageName(int stage)
+{
+    static const char* const kNames[x68k::Machine::kNullExecStageCount] = {
+        "全部含む (基準)", "tickDevices を外す", "割り込み判定を外す", "両方外す (床)",
+        "MFP だけ外す",    "RTC だけ外す",       "CRTC だけ外す",      "CRTC だけ残す",
+    };
+    const bool isKnown = stage >= 0 && stage < x68k::Machine::kNullExecStageCount;
+    if (!isKnown)
+    {
+        return "不明";
+    }
+    return kNames[stage];
+}
+
+// 段を選び直す。'_' の巡回と '#' の直接指定が両方ここを通る。
+//
+// Machine へ写すのはシリアルのタスクだが、setNullExecStage が書くのは
+// int 1 つで、エミュレーションコアが読むのはスライスの入口だけ。
+// 途中で切り替わっても、次のスライスから新しい段になるだけで壊れない。
+void applyNullExecStage(int stage)
+{
+    g_nullExecStage = stage;
+    g_machine.setNullExecStage(stage);
+    ESP_LOGI(kTag, "上限計測 stage %d: %s", stage, nullExecStageName(stage));
+}
+
+// 上の値をエミュレーションコアが Machine へ写したかどうか。
+// 毎スライス atomic を読んで書き戻すのは無駄なので、変化したときだけ writes。
+bool g_fastTickApplied = true;
+
+// 同じくイベント駆動を Machine へ写したかどうか。既定は無効。
+bool g_eventDrivenApplied = false;
 
 // 音声タスクが動いているか。スピーカーを開けなかったときは false のまま。
 bool g_speakerReady = false;
@@ -214,7 +314,21 @@ std::atomic<x68k::u32> g_allowedSliceCycles{0};
 // AppModeMachine::sliceCycles(kSliceCycles) を呼んで g_allowedSliceCycles を
 // 決めるので、両方のコアから見える必要がある。2 か所に書くと、
 // 片方だけ変えたときに顔モードとの比が意図せず変わる。
-constexpr x68k::u32 kSliceCycles = 20000;
+// Why 60000 か: イベント駆動の期限は armDeadline が sliceEnd_ で切り詰める
+// ので、**スライス長がそのまま期限の上限になる** (scheduler.h)。20000 の
+// ときは期限の平均が 13,000 サイクルにしかならず、実測でも 1 スライスあたり
+// 約 2 回も遅い側へ落ちていた。60000 にすると期限平均が 25,000 へ倍増し、
+// 実効クロックが 7579 -> 8024 kHz (+5.9%) になった (実機で実測)。
+//
+// Why not もっと伸ばさないか: 180000 (1 フレーム相当) でも試したが
+// 8307 kHz で、60000 からの伸びは +3.5% しかない。一方でキー入力と
+// マウスの投入はスライスの切れ目でしか起きないので、待ち時間が
+// スライス長に比例して増える。音声も 1 スライスにつき最大 1 ブロック
+// (32.8ms ぶん) しか補充しないので、伸ばしすぎると途切れる。
+// 伸ばす価値と応答の悪化が釣り合う点として 60000 を選んだ。
+//
+// kFallbackSpan (65536) は超えないので、期限が頭打ちになることもない。
+constexpr x68k::u32 kSliceCycles = 60000;
 
 // X68000 へ戻ったので画面を作り直してほしい。表示コアが立て、
 // エミュレーションコアが消す。
@@ -240,9 +354,453 @@ std::atomic<bool> g_redrawRequested{false};
 //
 // Why not 大きい定数を入れないか: MOVI.N の即値は 4bit しか無い。
 // ここで確かめたいのは「走るか」だけなので、幅は要らない。
-// 既定では呼ばない。CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
-// MALLOC_CAP_EXEC が必ず失敗する (実測)。JIT を再検討するときに
-// sdkconfig で保護を切ってから呼ぶ。
+// シリアルの 'j' で呼ぶ。
+//
+// かつて「CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は MALLOC_CAP_EXEC が
+// 必ず失敗する」と書いていたが、**現在その設定は無効** (sdkconfig の
+// # CONFIG_ESP_SYSTEM_MEMPROT_FEATURE is not set) で、実機で確かめたら
+// EXEC|32BIT で確保でき、生成したコードが正しく走った (2026-08-18)。
+// 前提が変わったら測り直すこと。
+// ネイティブ発行の上限を測る。**恒久的な機能ではない。**
+//
+// インタプリタは 1 ゲスト命令に約 85 CPU サイクル使っている (実測)。
+// これをネイティブコードにしたら何サイクルになりうるかを、
+// 「ゲスト命令 1 つぶんの仕事」を手書きの Xtensa で回して測る。
+//
+// ここで測るのは **床** であって、実際の JIT が出す値ではない。
+// 床がインタプリタと大差なければ、JIT を書いても意味が無い。
+// 段 0-C2: ブロックキャッシュの経路そのものの費用を測る。
+// **恒久的な機能ではない。**
+//
+// JIT が届くかは「ネイティブ命令本体の速さ」だけでは決まらない。
+// ブロックへ入るたびに検索・タグ比較・世代検査を払い、出るたびに
+// 状態を書き戻す。**これらはエミッタを書かなくても測れる。**
+//
+// ここで出すのは E_budget = ネイティブ命令本体に使える予算:
+//
+//   E_budget = 必要 Chit - (検索 + 世代検査 + ゲートウェイ + 出口)
+//
+// これが小さすぎるなら、エミッタをいくら磨いても届かない。
+//
+// **床でないものを引く。** 空ループのコストを必ず差し引く
+// (かつて 14.1 サイクルと記録した床が、実は 4.7 サイクルのループと
+// windowed ABI の交絡込みだった)。
+[[maybe_unused]] void probeCachePathCost()
+{
+    // 実際のブロックキャッシュに近い形の表を内部 SRAM に置く。
+    // PSRAM は使わない (散らばったアクセスで実機が止まった実績がある)。
+    constexpr unsigned kSlots = 512;
+    struct Slot
+    {
+        std::uint32_t pc;  // タグ
+        std::uint16_t ir;  // プリフェッチ状態も鍵に含む
+        std::uint16_t irc;
+        std::uint32_t epoch;  // 写像の世代
+        std::uint16_t gen0;   // コードページの世代 (2 ページぶん)
+        std::uint16_t gen1;
+        std::uint32_t code;  // 生成コードの位置
+    };
+    auto* slots = static_cast<Slot*>(
+        heap_caps_calloc(kSlots, sizeof(Slot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    auto* gens = static_cast<std::uint16_t*>(
+        heap_caps_calloc(2048, sizeof(std::uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (slots == nullptr || gens == nullptr)
+    {
+        ESP_LOGW(kTag, "[c2] 内部 SRAM を確保できない (空き %u / 最大ブロック %u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        heap_caps_free(slots);
+        heap_caps_free(gens);
+        return;
+    }
+
+    // 実ワークロードに近い分布で埋める。ホストの計測では上位 50 ブロックが
+    // 96.6% を占めていたので、少数のスロットを繰り返し引く。
+    constexpr unsigned kHot = 64;
+    for (unsigned i = 0; i < kSlots; ++i)
+    {
+        slots[i].pc = 0xFF0000u + i * 8u;
+        slots[i].ir = static_cast<std::uint16_t>(i);
+        slots[i].irc = static_cast<std::uint16_t>(i * 3u);
+        slots[i].epoch = 1;
+        slots[i].gen0 = 0;
+        slots[i].gen1 = 0;
+        slots[i].code = 0x40000000u + i * 64u;
+    }
+
+    constexpr int kIters = 2000000;
+    std::uint32_t sink = 0;
+
+    // --- 空ループ (これを全部から引く) ---
+    std::uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+        sink += static_cast<std::uint32_t>(i);
+    }
+    std::uint32_t t1 = esp_cpu_get_cycle_count();
+    const double loopCycles = (double)(t1 - t0) / (double)kIters;
+
+    // --- 1. 検索 (ハッシュ + タグ比較) ---
+    // ブロックへ入るたびに必ず払う。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        if (s.pc == pc)
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double lookupCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 2. 検索 + プリフェッチ状態の照合 ---
+    // 鍵は pc だけでは足りない。ir/irc と写像の世代も一致していないと、
+    // 違うプリフェッチ状態のまま実行してしまう。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        const std::uint16_t ir = static_cast<std::uint16_t>(idx);
+        const std::uint16_t irc = static_cast<std::uint16_t>(idx * 3u);
+        if (s.pc == pc && s.ir == ir && s.irc == irc && s.epoch == 1u)
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double keyCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 3. 検索 + 鍵 + 世代検査 2 ページ ---
+    // ブロックが跨ぐ可能性のある 2 ページぶんを見る。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t pc = 0xFF0000u + (static_cast<std::uint32_t>(i) % kHot) * 8u;
+        const unsigned idx = (pc >> 1) & (kSlots - 1);
+        const Slot& s = slots[idx];
+        const std::uint16_t ir = static_cast<std::uint16_t>(idx);
+        const std::uint16_t irc = static_cast<std::uint16_t>(idx * 3u);
+        const unsigned page = (pc >> 10) & 2047u;
+        if (s.pc == pc && s.ir == ir && s.irc == irc && s.epoch == 1u && s.gen0 == gens[page] &&
+            s.gen1 == gens[(page + 1u) & 2047u])
+        {
+            sink += s.code;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double fullCheckCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+
+    // --- 4. 出口の状態書き戻し ---
+    // ブロックを抜けるとき pc/ir/irc を必ず実体化する。
+    // インタプリタが命令ごとに払っていたものを、ブロック単位に減らせるかが
+    // JIT の利得の中心だったので、その残りを測る。
+    // **ループの外へ持ち上げられないようにする。**
+    //
+    // 静的な 1 つの変数へ書くと、コンパイラは最後の 1 回だけ残して
+    // ループから追い出す (実測で -7.09 サイクル = 空ループぶんの
+    // マイナスが出た。消えている証拠)。
+    // volatile にすると毎回ストアは立つが、レジスタ割り当ても妨げるので
+    // 過大に出る。実際の JIT は M68kState の連続した領域へ書くので、
+    // 書き先を回して「消せないが volatile でもない」形にする。
+    struct StateOut
+    {
+        std::uint32_t pc;
+        std::uint16_t ir;
+        std::uint16_t irc;
+    };
+    auto* outs = static_cast<StateOut*>(
+        heap_caps_calloc(64, sizeof(StateOut), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (outs == nullptr)
+    {
+        ESP_LOGW(kTag, "[c2] 出口計測の領域を確保できない");
+        heap_caps_free(slots);
+        heap_caps_free(gens);
+        return;
+    }
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        StateOut& o = outs[static_cast<unsigned>(i) & 63u];
+        o.pc = 0xFF0000u + static_cast<std::uint32_t>(i);
+        o.ir = static_cast<std::uint16_t>(i);
+        o.irc = static_cast<std::uint16_t>(i * 3u);
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double commitCycles = (double)(t1 - t0) / (double)kIters - loopCycles;
+    // 最適化で消えていないことを確かめる (消えていれば 0 に近い値になる)。
+    sink += outs[0].pc + outs[0].ir + outs[0].irc;
+
+    ESP_LOGI(kTag, "[c2] 内部 SRAM 空き %u / 最大ブロック %u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    ESP_LOGI(kTag, "[c2] 空ループ %.2f サイクル (以下は差し引き済み)", loopCycles);
+    ESP_LOGI(kTag, "[c2] 検索 (ハッシュ+タグ)            %.2f", lookupCycles);
+    ESP_LOGI(kTag, "[c2] + 鍵の照合 (ir/irc/epoch)       %.2f", keyCycles);
+    ESP_LOGI(kTag, "[c2] + 世代検査 2 ページ             %.2f", fullCheckCycles);
+    ESP_LOGI(kTag, "[c2] 出口の状態書き戻し (pc/ir/irc)  %.2f", commitCycles);
+    ESP_LOGI(kTag, "[c2] ブロック 1 本あたり = %.2f + ゲートウェイ 6.7 = %.2f サイクル",
+             fullCheckCycles + commitCycles, fullCheckCycles + commitCycles + 6.7);
+    ESP_LOGI(kTag, "[c2] sink=%u", static_cast<unsigned>(sink));
+
+    heap_caps_free(slots);
+    heap_caps_free(gens);
+    heap_caps_free(outs);
+}
+
+// 段 0-C3: ネイティブ命令本体の実費を測る。**恒久的な機能ではない。**
+//
+// 0-C2 でブロックの固定費が出た。残る未知は「ネイティブの命令本体が
+// インタプリタ比で何倍になるか」。**4 倍なら Go、2 倍なら No-Go。**
+//
+// エミッタは書かない。C++ で「JIT が吐くであろう形」を手書きし、
+// -O2 の生成コードを実測する。Xtensa のエンコーディングを自分で
+// 組み立てるのは 2 度失敗しているので、コンパイラに吐かせる。
+//
+// **これは上限寄りの値。** 実際のエミッタはレジスタ割り当てが
+// これより下手になる。下回ったら No-Go の材料になる。
+[[maybe_unused]] void probeNativeBody()
+{
+    // ゲストのレジスタファイル。JIT も同じ形で持つ。
+    static std::uint32_t d[8];
+    static std::uint32_t a[8];
+    static std::uint16_t sr;
+    static std::uint8_t ram[65536];
+    for (int i = 0; i < 8; ++i)
+    {
+        d[i] = 0x12345678u + static_cast<std::uint32_t>(i);
+        a[i] = 0x1000u + static_cast<std::uint32_t>(i) * 4u;
+    }
+
+    constexpr int kIters = 2000000;
+    std::uint32_t sink = 0;
+
+    // --- 空ループ ---
+    std::uint32_t t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+        sink += static_cast<std::uint32_t>(i);
+    }
+    std::uint32_t t1 = esp_cpu_get_cycle_count();
+    const double loop = (double)(t1 - t0) / (double)kIters;
+
+    // --- 1. MOVE.w D0,D1 + N/Z フラグ ---
+    // 最も単純な形。JIT が最も得意とする命令。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **転送元を毎回変える。** 固定だと結果が不変になり、
+        // ループ外へ持ち上げられる (実測で負の値が出た)。
+        d[0] = d[0] + static_cast<std::uint32_t>(i);
+        const std::uint32_t v = d[0] & 0xFFFFu;
+        d[1] = (d[1] & 0xFFFF0000u) | v;
+        std::uint16_t s = static_cast<std::uint16_t>(sr & 0xFFF0u);
+        if (v == 0)
+        {
+            s |= 0x0004u;
+        }
+        if ((v & 0x8000u) != 0)
+        {
+            s |= 0x0008u;
+        }
+        sr = s;
+        sink += v;
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveReg = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 2. MOVE.w (A0),D1 : fast RAM 読み + 境界検査 + ビッグエンディアン組立 ---
+    // 実効アドレスが窓に収まるかを実行時に見る (Codex の言う runtime guard)。
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **アドレスを毎回変える。** 定数だと境界検査もアドレス計算も
+        // ループ外へ持ち上げられ、実測が無意味になる。
+        const std::uint32_t ea = (a[0] + static_cast<std::uint32_t>(i) * 2u) & 0xFFFEu;
+        if ((ea & 1u) == 0 && ea + 1u < sizeof(ram))
+        {
+            const std::uint32_t v = static_cast<std::uint32_t>((ram[ea] << 8) | ram[ea + 1]);
+            d[1] = (d[1] & 0xFFFF0000u) | v;
+            std::uint16_t s = static_cast<std::uint16_t>(sr & 0xFFF0u);
+            if (v == 0)
+            {
+                s |= 0x0004u;
+            }
+            if ((v & 0x8000u) != 0)
+            {
+                s |= 0x0008u;
+            }
+            sr = s;
+            sink += v;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveLoad = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 3. MOVE.w D1,(A0) : fast RAM 書き + 世代の更新 ---
+    static std::uint16_t gens[64];
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        const std::uint32_t ea = (a[0] + static_cast<std::uint32_t>(i) * 2u) & 0xFFFEu;
+        if ((ea & 1u) == 0 && ea + 1u < sizeof(ram))
+        {
+            const std::uint32_t v = d[1] & 0xFFFFu;
+            ram[ea] = static_cast<std::uint8_t>(v >> 8);
+            ram[ea + 1] = static_cast<std::uint8_t>(v);
+            // CodeGenMap::touch 相当 (飽和つき)
+            const unsigned page = (ea >> 10) & 63u;
+            const std::uint16_t cur = gens[page];
+            gens[page] = cur == 0xFFFFu ? 0xFFFFu : static_cast<std::uint16_t>(cur + 1);
+            sink += v;
+        }
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double moveStore = (double)(t1 - t0) / (double)kIters - loop;
+
+    // --- 4. Bcc の条件評価 + 期限判定 ---
+    // ブロック内の各命令の後に debt を進めて期限を見る。
+    static std::int32_t debt = -1000000;
+    t0 = esp_cpu_get_cycle_count();
+    for (int i = 0; i < kIters; ++i)
+    {
+        // **sr を毎回変える。** 固定だと条件が定数畳み込みされ、
+        // 分岐そのものが消える (実測で負の値が出た)。
+        sr = static_cast<std::uint16_t>(sink & 0x001Fu);
+        const bool taken = (sr & 0x0004u) != 0;
+        debt += 8;
+        if (debt >= 0)
+        {
+            debt = -1000000;
+        }
+        sink += taken ? 1u : 3u;
+    }
+    t1 = esp_cpu_get_cycle_count();
+    const double bccDebt = (double)(t1 - t0) / (double)kIters - loop;
+
+    constexpr double kInterp = 85.0;
+    ESP_LOGI(kTag, "[c3] 空ループ %.2f (以下は差し引き済み)", loop);
+    ESP_LOGI(kTag, "[c3] MOVE.w D0,D1 + NZ            %.2f (インタプリタ比 %.1f 倍)", moveReg,
+             kInterp / (moveReg > 0.01 ? moveReg : 0.01));
+    ESP_LOGI(kTag, "[c3] MOVE.w (A0),D1 + guard + NZ  %.2f (%.1f 倍)", moveLoad,
+             kInterp / (moveLoad > 0.01 ? moveLoad : 0.01));
+    ESP_LOGI(kTag, "[c3] MOVE.w D1,(A0) + guard + gen %.2f (%.1f 倍)", moveStore,
+             kInterp / (moveStore > 0.01 ? moveStore : 0.01));
+    ESP_LOGI(kTag, "[c3] Bcc + debt 更新              %.2f (%.1f 倍)", bccDebt,
+             kInterp / (bccDebt > 0.01 ? bccDebt : 0.01));
+    // 実行分布で重み付けした平均 (レジスタ間 30% / 読み 30% / 書き 20% / 分岐 20%)
+    const double weighted = moveReg * 0.3 + moveLoad * 0.3 + moveStore * 0.2 + bccDebt * 0.2;
+    ESP_LOGI(kTag, "[c3] 分布で重み付けした本体 %.2f サイクル (インタプリタ比 %.2f 倍)", weighted,
+             kInterp / (weighted > 0.01 ? weighted : 0.01));
+    // **負の値は測定が壊れている合図。** 差分を取る計測では、
+    // 最適化で消えた側が空ループぶんのマイナスとして現れる。
+    const bool anyNegative = moveReg < 0.0 || moveLoad < 0.0 || moveStore < 0.0 || bccDebt < 0.0;
+    if (anyNegative)
+    {
+        ESP_LOGW(kTag, "[c3] **負の値がある = 最適化で消えている。この結果は無効**");
+    }
+    ESP_LOGI(kTag, "[c3] sink=%u", static_cast<unsigned>(sink));
+}
+
+[[maybe_unused]] void probeNativeCeiling()
+{
+    constexpr std::size_t kBytes = 256;
+    auto* code =
+        static_cast<std::uint8_t*>(heap_caps_malloc(kBytes, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT));
+    if (code == nullptr)
+    {
+        ESP_LOGW(kTag, "[native] 実行可能メモリを確保できない");
+        return;
+    }
+
+    // 生成するのは `int loop(int n) { while (n--) ; return 0; }` に
+    // ゲスト命令 1 つぶんの仕事を混ぜたもの。
+    //
+    // ゲストの MOVE.L D0,D1 に相当する最小の仕事:
+    //   - レジスタ配列から 1 ワード読む
+    //   - 別の位置へ書く
+    //   - フラグを更新する (N/Z の 2 ビット)
+    // Xtensa なら l32i + s32i + 数命令。**4-8 サイクル**が床になる。
+    //
+    // エンコーディングは推測しない。probeJitFeasibility のコメントに
+    // ある通り、自分で組み立てて 2 回落ちている。ここでは
+    // 「entry / 単純ループ / retw.n」だけに留め、既に検証済みの
+    // バイト列を組み合わせる。
+    //
+    //   004136  entry a1, 32
+    //   a20c    movi.n a2, 10      (戻り値)
+    //   f01d    retw.n
+    //
+    // ループは入れず、**呼び出しのコストだけ**を測る。
+    // 1 回の callx8 + entry + retw が何 ns かが分かれば、
+    // 「1 命令ごとにネイティブへ飛ぶ」形の下限が出る。
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(code);
+    word[0] = 0x0C004136u;
+    word[1] = 0x00F01DA2u;
+    asm volatile("isync" ::: "memory");
+
+    using Fn = int (*)();
+    auto fn = reinterpret_cast<Fn>(code);
+
+    // 1000 万回呼んで実時間を測る。
+    constexpr int kIters = 10000000;
+    const std::int64_t t0 = esp_timer_get_time();
+    int sink = 0;
+    for (int i = 0; i < kIters; ++i)
+    {
+        sink += fn();
+    }
+    const std::int64_t t1 = esp_timer_get_time();
+    const double nsPerCall = (double)(t1 - t0) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] 呼び出し 1 回 %.1f ns (%.1f CPU サイクル) sink=%d", nsPerCall,
+             nsPerCall * 0.24, sink);
+    ESP_LOGI(kTag, "[native] 参考: インタプリタは 1 ゲスト命令 約 85 CPU サイクル");
+
+    // ここまでは windowed ABI (entry / retw.n / callx8) の値。
+    //
+    // **床が呼び出しそのもののコストなのか、レジスタウィンドウの
+    // 回転コストなのかを切り分ける。** JIT が出すコードは call0 ABI を
+    // 選べるので、ウィンドウ回転が主因なら床は下がる。
+    //
+    //   ret.n  = 0xF00D
+    // entry も retw も使わない。call0 は戻り番地を a0 に置くだけなので、
+    // 何もしない関数は ret.n 1 命令で足りる。
+    word[0] = 0x0000F00Du;
+    asm volatile("isync" ::: "memory");
+
+    const std::int64_t t2 = esp_timer_get_time();
+    // callx0 は a0 を壊す。clobber に入れて退避を任せる。
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("callx0 %0" ::"r"(code) : "a0", "memory");
+    }
+    const std::int64_t t3 = esp_timer_get_time();
+    const double ns0 = (double)(t3 - t2) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] call0 呼び出し 1 回 %.1f ns (%.1f CPU サイクル)", ns0, ns0 * 0.24);
+
+    // **空ループそのもののコストを引く。** 上の 2 つは「ループ 1 周 +
+    // 呼び出し 1 回」を測っている。呼び出しの実費を知るには、同じ形の
+    // ループで呼び出しだけ抜いた値が要る。
+    const std::int64_t t4 = esp_timer_get_time();
+    for (int i = 0; i < kIters; ++i)
+    {
+        asm volatile("" ::: "memory");
+    }
+    const std::int64_t t5 = esp_timer_get_time();
+    const double nsLoop = (double)(t5 - t4) * 1000.0 / (double)kIters;
+    ESP_LOGI(kTag, "[native] 空ループ 1 周 %.1f ns (%.1f CPU サイクル)", nsLoop, nsLoop * 0.24);
+    ESP_LOGI(kTag, "[native] → 呼び出しの実費: windowed %.1f / call0 %.1f CPU サイクル",
+             (nsPerCall - nsLoop) * 0.24, (ns0 - nsLoop) * 0.24);
+
+    heap_caps_free(code);
+}
+
 [[maybe_unused]] void probeJitFeasibility()
 {
     constexpr std::size_t kProbeBytes = 64;
@@ -329,6 +887,76 @@ void reportMemory(const char* phase)
 // フォールバックする (動くが遅くなる)。
 x68k::u8* g_sasiBuffer = nullptr;
 
+// コードページの世代。2MB / 1KB = 2048 ページ = 4KB。
+//
+// Why 静的配列にしないか: 内部 SRAM の .bss を膨らませると、すぐ下で
+// IPL-ROM 128KB を内部 SRAM へ置く処理が失敗する (既存のコメント参照)。
+// 確保に失敗したら未配線のままにする。**未配線でも壊れない**ように
+// 照合側で kAlwaysStale を弾く契約にしてある。
+constexpr x68k::u32 kCodeGenPages = x68k::kMainRamSize / x68k::CodeGenMap::kPageSize;
+std::uint16_t* g_codeGen = nullptr;
+
+// JIT のブロックキャッシュ。
+//
+// スロット数は 2 の冪 (slotIndex がマスクで畳む)。**PSRAM には置かない**
+// (散らばったアクセスで実機が止まる)。
+//
+// **512 → 2048 へ増やした (段 F)。** 容量無制限のハーネスで焼き直しの
+// 原因を数えたところ、空きスロット 47.09% + スロット衝突 36.99% で
+// 8 割超がスロット不足だった。
+//
+// **バイト照合と同時でなければ効かない。** 片方だけでは再翻訳率が
+// 944.0x → 600.8x (スロットのみ) / 521.1x (照合のみ) で 2 倍未満に
+// とどまるのに、両方だと 9.1x (104 倍) になる。一方の churn がもう一方を
+// 再点火し続けるので、片方を潰しても意味が薄い。
+//
+// 取れなければ 512 へ落とす。**JIT ごと死なせない** (段 0-I で 8192
+// エントリの確保に失敗した前例があり、フォールバックは設計どおり働いた)。
+constexpr x68k::u32 kJitSlotsWanted = 2048;
+constexpr x68k::u32 kJitSlotsFallback = 512;
+x68k::u32 g_jitSlotCount = 0;
+
+// 「翻訳できない」を覚える表。**成功ブロックとは別に持つ。**
+// 1024 件 x 8 バイト = 8,192 バイト。2 の冪でなければならない。
+constexpr x68k::u32 kJitNegEntries = 2048;
+x68k::jit::NegEntry* g_jitNeg = nullptr;
+
+// スロット (8 語) に収まらない控えの置き場 (段 G)。
+//
+// **実測 176 本**しか無い。31 語まで持てる 1 件が 72 バイトなので、
+// 192 件で 13.5KB。控えを持てなかった 2 本が世代外れの 28.7% (57 万件) を
+// 占めていて、arena が満杯で翻訳し直しも弾かれるため、**そのまま
+// インタプリタへ落ちていた**。
+//
+// **段 G の初回計測で 256 件 (18KB) の確保に失敗した。** 起動時点の内部
+// SRAM は空き 133,567 / **最大連続 90,112** で、スロット 2048 個 (81,920)
+// がその最大ブロックを食う。残るのは断片なので、要求が大きいほど落ちる。
+// **空きの総量ではなく最大連続ブロックが効く**ので、段 0-I (8192 エントリの
+// 確保失敗) と同じ形をここでも踏んだ。
+//
+// **内部 SRAM の残りが本当の上限。** 192 件 (13,824 バイト) は確保できたが、
+// その後にエミュレーションタスクの 8KB スタックが取れず
+// (`エミュレーションタスクを作れません`)、**エミュレータが 1 命令も
+// 走らなかった**。確保に成功しても、後から要る分を食えば同じことである。
+//
+// 幸い**救う対象は密**で、実測では控えを持てない 176 本のうち **2 本**
+// ($00FAB6 / $00FB3E) が世代外れの 71.3% を占める。全部を救う必要はない。
+//
+// 32 件 = 2,304 バイトなら、確保後も largest free block が 8KB スタックの
+// 側に残る。**溢れたら控えを持たない**ので、入り切らない分は現行と同じ動作。
+//
+// 取れなければ段階的に落とす。**どの段でも控えを持たないだけで正しさは
+// 1 ビットも変わらない** (段 F と同じ動作へ縮退する)。
+constexpr x68k::u32 kJitVerifySidesWanted = 32;
+constexpr x68k::u32 kJitVerifySidesFallback = 8;
+x68k::u32 g_jitSideCount = 0;
+x68k::jit::VerifySide* g_jitSides = nullptr;
+x68k::jit::BlockSlot* g_jitSlots = nullptr;
+x68k::jit::ExecMemory g_jitCode;
+x68k::jit::BlockRunner g_jitRunner;
+// 実行可能メモリの要求量。実測で 21KB 取れる。
+constexpr std::size_t kJitCodeBytes = 16 * 1024;
+
 // 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
 x68k::u16* g_avatarSprite = nullptr;
 
@@ -360,6 +988,119 @@ bool reserveMemory()
     // ので、PSRAM に置いても実害が小さい。
     g_sasiBuffer = static_cast<x68k::u8*>(
         heap_caps_calloc(1, x68k::Machine::kSasiBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+
+    // JIT のブロックキャッシュと実行可能メモリ。
+    //
+    // **どちらも失敗してよい。** 取れなければ JIT を教わらないので、
+    // 現行インタプリタのまま動く (挙動は 1 ビットも変わらない)。
+    // **実行可能メモリを最初に取る。** これだけ MALLOC_CAP_EXEC で、
+    // 実行できる IRAM からしか取れない。スロットや負のキャッシュは
+    // MALLOC_CAP_INTERNAL なので DRAM でも IRAM でも満たせてしまい、
+    // 先に取ると実行可能な側を食って acquire を失敗させる。
+    //
+    // 実際に踏んだ: スロット 20KB + 負のキャッシュ 16KB を先に取った
+    // ビルドで「実行可能メモリを確保できません」になり、JIT がまるごと
+    // 無効化された (さらに IPL-ROM も内部 SRAM から溢れて PSRAM へ落ち、
+    // インタプリタ単体より遅い状態で起動していた)。
+    //
+    // Why not 全部 MALLOC_CAP_EXEC にするか: 実行可能 IRAM は最も希少で、
+    // データにしか使わないものを置くと本当に必要な生成コードが入らない。
+    // **希少な順に取る**のが確保順の原則。
+    if (!g_jitCode.acquire(kJitCodeBytes))
+    {
+        // **EXEC の残量を必ず一緒に出す。** 空きが 0 なら断片化ではなく
+        // 「IRAM が heap に登録されていない」= memprot が有効になっている。
+        // これを出さなかったせいで、原因の特定に実機を何度も焼き直した。
+        ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)。EXEC 空き=%u 最大連続=%u",
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_EXEC)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC)));
+    }
+    // **最大連続空きを先に出す。** 確保が通ったか落ちたかだけでは、
+    // 落ちた理由が「足りない」のか「断片化」なのか分からない (段 0-I で
+    // 確保失敗の原因特定に実機を何度も焼き直した)。
+    ESP_LOGI(kTag, "JIT スロット確保前: 内部 SRAM 空き=%u 最大連続=%u (要求=%u バイト)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(kJitSlotsWanted * sizeof(x68k::jit::BlockSlot)));
+
+    g_jitSlotCount = kJitSlotsWanted;
+    g_jitSlots = static_cast<x68k::jit::BlockSlot*>(heap_caps_calloc(
+        kJitSlotsWanted, sizeof(x68k::jit::BlockSlot), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitSlots == nullptr)
+    {
+        // **取れなければ半分以下へ落とす。** ここで諦めると JIT がまるごと
+        // 無効になり、インタプリタ単体より遅い状態で起動する。
+        g_jitSlotCount = kJitSlotsFallback;
+        g_jitSlots = static_cast<x68k::jit::BlockSlot*>(
+            heap_caps_calloc(kJitSlotsFallback, sizeof(x68k::jit::BlockSlot),
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_LOGW(kTag, "JIT スロット %u 個を置けません。%u 個へ落とします",
+                 static_cast<unsigned>(kJitSlotsWanted), static_cast<unsigned>(kJitSlotsFallback));
+    }
+    if (g_jitSlots == nullptr)
+    {
+        g_jitSlotCount = 0;
+        ESP_LOGW(kTag, "JIT のスロットを内部 SRAM に置けません (JIT は無効)");
+    }
+    else
+    {
+        ESP_LOGI(kTag, "JIT スロット %u 個 (%u バイト) を確保しました",
+                 static_cast<unsigned>(g_jitSlotCount),
+                 static_cast<unsigned>(g_jitSlotCount * sizeof(x68k::jit::BlockSlot)));
+    }
+    g_jitNeg = static_cast<x68k::jit::NegEntry*>(heap_caps_calloc(
+        kJitNegEntries, sizeof(x68k::jit::NegEntry), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitNeg == nullptr)
+    {
+        ESP_LOGW(kTag, "JIT の負のキャッシュを置けません (再翻訳が減りません)");
+    }
+
+    ESP_LOGI(kTag, "JIT 照合サイドテーブル確保前: 内部 SRAM 空き=%u 最大連続=%u (要求=%u バイト)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(kJitVerifySidesWanted * sizeof(x68k::jit::VerifySide)));
+
+    g_jitSideCount = kJitVerifySidesWanted;
+    g_jitSides = static_cast<x68k::jit::VerifySide*>(
+        heap_caps_calloc(kJitVerifySidesWanted, sizeof(x68k::jit::VerifySide),
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitSides == nullptr)
+    {
+        // **断片しか残っていないなら小さく取り直す。** 実測で控えを持てない
+        // のは 176 本だが、その全部を救えなくても**上位の常連 2 本が
+        // 世代外れの 28.7% を占める**ので、少数でも効く。
+        g_jitSideCount = kJitVerifySidesFallback;
+        g_jitSides = static_cast<x68k::jit::VerifySide*>(
+            heap_caps_calloc(kJitVerifySidesFallback, sizeof(x68k::jit::VerifySide),
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_LOGW(kTag, "JIT 照合サイドテーブル %u 件を置けません。%u 件へ落とします",
+                 static_cast<unsigned>(kJitVerifySidesWanted),
+                 static_cast<unsigned>(kJitVerifySidesFallback));
+    }
+    if (g_jitSides == nullptr)
+    {
+        // **控えを持たないだけで、正しさは 1 ビットも変わらない。**
+        // 長いブロックは世代が動くたびに翻訳し直す (段 F と同じ動作)。
+        g_jitSideCount = 0;
+        ESP_LOGW(kTag, "JIT の照合サイドテーブルを置けません (長いブロックが控えを持ちません)");
+    }
+    else
+    {
+        ESP_LOGI(kTag, "JIT 照合サイドテーブル %u 件 (%u バイト) を確保しました",
+                 static_cast<unsigned>(g_jitSideCount),
+                 static_cast<unsigned>(g_jitSideCount * sizeof(x68k::jit::VerifySide)));
+    }
+
+    // コードページの世代は内部 SRAM に置く。ブロックの入口で毎回引くので、
+    // PSRAM への散らばったアクセスは避ける (実機を止めた実績がある)。
+    g_codeGen = static_cast<std::uint16_t*>(heap_caps_calloc(
+        kCodeGenPages, sizeof(std::uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_codeGen == nullptr)
+    {
+        ESP_LOGW(kTag, "コードページの世代を内部 SRAM に置けません (JIT は無効のまま動きます)");
+    }
 
     // IPL-ROM は内部 SRAM を優先。ブート中のホットパスなので効果が大きい。
     g_iplRom = static_cast<x68k::u8*>(
@@ -507,6 +1248,18 @@ bool loadRoms()
     g_machine.setSasiBuffer(g_sasiBuffer);
     g_machine.setDisk(&g_disk);
 
+    // ゲスト RAM の書き換えを追う世代マップを配線する。
+    //
+    // **配線しないと「常に古い」が「常に有効」に化ける。** 未配線だと
+    // pageCount_ = 0 なので generation() が全アドレスに kAlwaysStale を
+    // 返し、素朴な照合 (控え == 現在) が 0xFFFF == 0xFFFF で通ってしまう。
+    // 照合側でも kAlwaysStale を弾くが、ここで配線しておけば
+    // 通常のページは正しく世代で判定できる。
+    //
+    // 2MB / 1KB = 2048 ページ = 4KB。内部 SRAM に置く (PSRAM への
+    // 散らばったアクセスは実機を止めた実績がある)。
+    g_machine.cpu().codeGenMap().setStorage(g_codeGen, kCodeGenPages);
+
     return true;
 }
 
@@ -611,10 +1364,47 @@ void emulatorTask(void* /*arg*/)
         // SRAM の書き戻しと停止の検出を持つ。眠りを伸ばすとそちらの
         // 反応まで鈍る。停止中は下の vTaskDelay(1) を毎周回すので、
         // 止めている間の CPU は run を飛ばすだけで十分に空く。
+        // 最適化スイッチが切り替わったら Machine へ写す。
+        //
+        // スライスの切れ目で writes ので、run の途中で経路が変わることは
+        // 無い。毎スライス atomic を 1 回読むだけなので、計測している
+        // ホットループの中には何も足さない。
+        const bool wantFastTick = g_fastTickEnabled.load(std::memory_order_relaxed);
+        if (wantFastTick != g_fastTickApplied)
+        {
+            x68k::PerfSwitch sw;
+            sw.inlineRtcTick = wantFastTick;
+            sw.inlineCrtcTick = wantFastTick;
+            sw.inlineMfpTimer = wantFastTick;
+            g_machine.setPerfSwitch(sw);
+            g_fastTickApplied = wantFastTick;
+        }
+
+        // イベント駆動の切り替えも同じ形で写す。run() の入口で 1 回だけ
+        // 読まれるので、ホットループの中には何も足さない。
+        const bool wantEventDriven = g_eventDrivenEnabled.load(std::memory_order_relaxed);
+        if (wantEventDriven != g_eventDrivenApplied)
+        {
+            g_machine.setEventDriven(wantEventDriven);
+            g_eventDrivenApplied = wantEventDriven;
+        }
+
         const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
         if (sliceCycles > 0)
         {
-            g_machine.run(sliceCycles);
+            // JIT の上限計測モードでは命令を実行せず、ループ運営と
+            // デバイスの時間だけを回す (jit_probe.h)。
+            const std::int64_t runT0 = esp_timer_get_time();
+            if (g_nullExecProbe.load(std::memory_order_relaxed))
+            {
+                g_machine.runNullExec(sliceCycles);
+            }
+            else
+            {
+                g_machine.run(sliceCycles);
+            }
+            g_runUs += esp_timer_get_time() - runT0;
+            ++g_runCount;
             totalCycles += sliceCycles;
         }
 
@@ -700,7 +1490,17 @@ void emulatorTask(void* /*arg*/)
         // Machine を読むのはこのコアだけ。表示コアへは完成した RGB565 を
         // 渡すので、テキスト VRAM やダーティフラグを両コアで奪い合わない。
         followCursor();
+#if X68K_MEASURE_DISK
+        const std::int64_t renderT0 = esp_timer_get_time();
+#endif
         const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
+#if X68K_MEASURE_DISK
+        g_renderUs += esp_timer_get_time() - renderT0;
+        if (rendered)
+        {
+            ++g_renderCount;
+        }
+#endif
         if (rendered && !g_frames.publish())
         {
             // 表示コアがまだ前のフレームを転送中で渡せなかった。
@@ -721,6 +1521,54 @@ void emulatorTask(void* /*arg*/)
             const std::uint32_t elapsed = now - lastReportMs;
             const unsigned khz =
                 elapsed > 0 ? static_cast<unsigned>((totalCycles - lastReportCycles) / elapsed) : 0;
+#if X68K_MEASURE_DISK
+            // スライスの実時間の内訳。ディスクだけでは説明が付かないので、
+            // Machine::run そのものに何 ms かかっているかも並べて出す。
+            {
+                // run の実時間は下の無条件ブロックが出す。ここでは描画だけ。
+                // 両方で g_runUs を読むと、先に読んだ側がリセットして
+                // もう一方が 0 を見る (実際に踏んだ)。
+                const std::int64_t renderUs = g_renderUs;
+                const std::uint32_t renders = g_renderCount;
+                g_renderUs = 0;
+                g_renderCount = 0;
+                ESP_LOGI(kTag, "[render] %lldus 描画=%u 回 (5 秒)", renderUs, renders);
+            }
+            // ディスクに費やした実時間を実効クロックと並べて出す。
+            // ディスクに触るスライスは全体の 1% 未満なので、平均の落ち込みが
+            // 本当にディスク由来かは、逆算ではなくこの数字でしか分からない。
+            {
+                const std::int64_t readUs = x68k_platform::g_diskReadUs;
+                const std::int64_t seekUs = x68k_platform::g_diskSeekUs;
+                const std::uint32_t reqs = x68k_platform::g_diskReadCount;
+                x68k_platform::g_diskReadUs = 0;
+                x68k_platform::g_diskSeekUs = 0;
+                x68k_platform::g_diskReadCount = 0;
+                ESP_LOGI(kTag, "[disk] read=%lldus seek=%lldus req=%u (この 5 秒間)", readUs,
+                         seekUs, reqs);
+            }
+#endif
+            // イベント駆動が実際にどれだけ飛べているか。
+            // 実効クロックだけでは縮退している区間が見えない。
+            {
+                const std::int64_t runUs = g_runUs;
+                const std::uint32_t runs = g_runCount;
+                g_runUs = 0;
+                g_runCount = 0;
+                ESP_LOGI(kTag, "[slice] run=%lldus n=%u (5 秒 = 5000000us)", runUs, runs);
+            }
+            {
+                const auto& st = g_machine.schedulerStats();
+                const unsigned long long far = st.armedFar;
+                const unsigned long long avg = far != 0 ? st.spanSum / far : 0;
+                ESP_LOGI(kTag,
+                         "[sched] 遅い側=%llu 期限=%llu(平均%llucyc) 近すぎ=%llu 保留=%llu "
+                         "rearm=%llu wake=%llu",
+                         st.reaches, far, avg, st.armedNear, st.heldPending,
+                         static_cast<unsigned long long>(st.rearms),
+                         static_cast<unsigned long long>(st.wakes));
+                g_machine.resetSchedulerStats();
+            }
             ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
                      static_cast<unsigned long long>(totalCycles), khz);
             lastReportMs = now;
@@ -916,6 +1764,398 @@ private:
             const bool enabled = !g_audioEnabled.load();
             g_audioEnabled = enabled;
             ESP_LOGI(kTag, "音源: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '&' で毎命令通る経路の最適化を切り替える。
+        //
+        // 音源の '|' と同じ理由で、焼き直さずに同じ起動の中で比べるため
+        // にある。切り替えたら 5 秒ごとの「実効 NNNN kHz」を 20 回ほど
+        // 読んで、収束後の平均を前後で比べる (起動直後は低めに出るので
+        // 最初の数回は捨てる)。
+        //
+        // Why not 'p' のような文字か: 無条件に横取りする口 ('~' '|' '!'
+        // '<' '>') は全て記号にしてある。英字を無条件で取ると Human68k へ
+        // 打てなくなる (顔モード限定の 'e' 'S' 'h' は isFaceMode で
+        // 守られているが、これは X68K モードでも使いたい)。
+        const bool isPerfToggle = c == '&';
+        if (isPerfToggle)
+        {
+            const bool enabled = !g_fastTickEnabled.load();
+            g_fastTickEnabled = enabled;
+            ESP_LOGI(kTag, "毎命令経路の最適化: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '$' でイベント駆動を切り替える。
+        //
+        // '&' と同じく、焼き直さずに同じ起動の中で前後を比べるため。
+        // **Human68k を A> まで起動させてから**測ること。ディスク無しだと
+        // 同じ変更が +3.17% と +6.40% で倍違った実測がある。
+        //
+        // 切り替えても状態遷移は変わらない (ホストの同値テストが第 4 の軸
+        // として固定している) ので、走らせたまま何度でも往復してよい。
+        const bool isEventDrivenToggle = c == '$';
+        if (isEventDrivenToggle)
+        {
+            const bool enabled = !g_eventDrivenEnabled.load();
+            g_eventDrivenEnabled = enabled;
+            ESP_LOGI(kTag, "イベント駆動: %s", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '%' で JIT の上限計測モードを切り替える (jit_probe.h)。
+        //
+        // 命令の実行を空回しにするので、**ゲストは止まって見える**。
+        // 実効クロックの報告だけが意味を持つ。JIT に着手するかどうかを
+        // 決めるための実測用で、恒久的な機能ではない。
+        const bool isNullExecToggle = c == '%';
+        if (isNullExecToggle)
+        {
+            const bool enabled = !g_nullExecProbe.load();
+            g_nullExecProbe = enabled;
+            ESP_LOGI(kTag, "JIT 上限計測モード: %s (ゲストは進みません)", enabled ? "ON" : "OFF");
+            return;
+        }
+
+        // '_' で、上限計測モードの段を 1 つ進める。段 0-3 が全体の内訳
+        // (tickDevices / 割り込み判定 / 床)、段 4-7 が tickDevices の内訳。
+        //
+        // 上限計測モード ('%') が ON のときだけ意味がある。
+        const bool isSkipDevicesToggle = c == '_';
+        if (isSkipDevicesToggle)
+        {
+            const int stage = (g_nullExecStage.load() + 1) % x68k::Machine::kNullExecStageCount;
+            applyNullExecStage(stage);
+            return;
+        }
+
+        // '#' で段 4 (MFP だけ外す) へ直接飛ぶ。
+        //
+        // Why not '_' の巡回だけで済ませないか: 段 4-7 は 5 秒ごとの報告を
+        // 数回ぶん見てから次へ進めたい。巡回だけだと段 6 (CRTC) へ行くのに
+        // '_' を 7 回押すことになり、その間に温度と SD の状態が変わる。
+        // 内訳は同一起動の中で連続して測らないと差が揺れに埋もれる
+        // (焼き直しの揺れ 3711 vs 3630 kHz を一度踏んでいる)。
+        const bool isBreakdownJump = c == '#';
+        if (isBreakdownJump)
+        {
+            applyNullExecStage(4);
+            return;
+        }
+
+        // '@' で MFP タイマの設定を出す。
+        //
+        // イベント駆動の設計は「次に状態が変わるまで何サイクルあるか」で
+        // 決まるので、ゲストが実際にどの分周でタイマを回しているかが
+        // そのまま効果を左右する。推測せずに実機から読む。
+        const bool isMfpDump = c == '@';
+        if (isMfpDump)
+        {
+            const auto& m = g_machine.mfp();
+            ESP_LOGI(kTag, "MFP TACR=%02X TBCR=%02X TCDCR=%02X", m.peek(x68k::Mfp::kTacr),
+                     m.peek(x68k::Mfp::kTbcr), m.peek(x68k::Mfp::kTcdcr));
+            ESP_LOGI(kTag, "MFP TADR=%02X TBDR=%02X TCDR=%02X TDDR=%02X", m.peek(x68k::Mfp::kTadr),
+                     m.peek(x68k::Mfp::kTbdr), m.peek(x68k::Mfp::kTcdr), m.peek(x68k::Mfp::kTddr));
+            ESP_LOGI(kTag, "MFP IERA=%02X IERB=%02X IMRA=%02X IMRB=%02X", m.peek(x68k::Mfp::kIera),
+                     m.peek(x68k::Mfp::kIerb), m.peek(x68k::Mfp::kImra), m.peek(x68k::Mfp::kImrb));
+
+            // SRAM の起動デバイスと、CPU が今どこを走っているか。
+            //
+            // ホストで起動するイメージが実機で起動しないとき、SRAM の
+            // 設定 (SD に永続化される) と PC の居場所で切り分けられる。
+            const auto& sr = g_machine.sram();
+            ESP_LOGI(kTag, "SRAM 起動デバイス=%04X 画面モード=%02X マジック有効=%d",
+                     static_cast<unsigned>(sr.read16(x68k::Sram::kOffsetBootDevice)),
+                     sr.read8(x68k::Sram::kOffsetScreenMode),
+                     g_machine.sram().hasValidMagic() ? 1 : 0);
+            ESP_LOGI(kTag, "CPU PC=%08X SR=%04X halted=%d", g_machine.cpu().state().pc,
+                     g_machine.cpu().state().sr, g_machine.isHalted() ? 1 : 0);
+
+            // 画面モードと表示許可。描画が 1 回 23ms かかる原因が
+            // グラフィック合成かテキストのみかを切り分けるために出す。
+            // $E82600 の bit5 がテキスト、bit4-0 がグラフィックの表示許可。
+            const auto& v = g_machine.video();
+            ESP_LOGI(kTag, "VIDEO 画面モード=%04X 表示制御=%04X プライオリティ=%04X",
+                     v.screenMode(), v.displayControl(), v.priority());
+            return;
+        }
+
+        // '=' でイベント駆動のまま命令実行だけを空回しにする (計測用)。
+        // ゲストは止まって見える。恒久的な機能ではない。
+        const bool isEventNullExec = c == '=';
+        if (isEventNullExec)
+        {
+            const bool on = !g_eventNullExec.load();
+            g_eventNullExec = on;
+            g_machine.setNullExecInEvent(on);
+            ESP_LOGI(kTag, "イベント駆動のまま命令を空回し: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'n' でネイティブ発行の上限を測る。恒久機能ではない。
+        //
+        // 「命令の意味を最速で実行したら何 ns か」を知りたい。
+        // 生成したネイティブコードを実行可能メモリに置いて、
+        // ゲスト 1 命令ぶんに相当する仕事 (レジスタ間 MOVE) を
+        // 大量に回して測る。インタプリタの 85 CPU サイクル/命令と
+        // 比べれば、ネイティブ化で何倍になりうるかが出る。
+        // 'C' で段 0-C2 (キャッシュ経路の費用) を測る。恒久機能ではない。
+        // 'B' で段 0-C3 (ネイティブ命令本体の実費) を測る。恒久機能ではない。
+        // 'J' で JIT を切り替える。**同じ起動の中で往復して測れる**ので、
+        // ビルド差やキャッシュの温まり方が結果に混じらない。
+        const bool isJitToggle = c == 'J';
+        if (isJitToggle)
+        {
+            const bool on = !g_machine.cpu().hasNativeExec();
+            if (on)
+            {
+                if (g_jitSlots == nullptr || !g_jitCode.isReady())
+                {
+                    ESP_LOGW(kTag, "JIT: 置き場が無いので有効にできません");
+                    return;
+                }
+                g_jitRunner.setStorage(g_jitSlots, g_jitSlotCount, &g_jitCode);
+                g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
+                // **スロットを教えた後に置く。** 索引はスロットの中にあるので、
+                // 表を差し替えるときに全部打ち消す必要がある (setVerifySideStorage)。
+                g_jitRunner.setVerifySideStorage(g_jitSides, g_jitSideCount);
+                g_jitRunner.reset();
+                g_machine.cpu().setNativeExec(g_jitRunner.exec());
+                // **JIT はイベント駆動の経路にしか無い。**
+                // 毎命令 tick のまま JIT を ON にしても何も起きず、
+                // 「ON にしたのに統計が 0」という紛らわしい状態になる。
+                // 沈黙の無効化を作らないよう、ここで一緒に ON にする。
+                if (!g_eventDrivenEnabled.load(std::memory_order_relaxed))
+                {
+                    g_eventDrivenEnabled = true;
+                    ESP_LOGI(kTag, "JIT: イベント駆動も ON にしました");
+                }
+            }
+            else
+            {
+                g_machine.cpu().setNativeExec(x68k::NativeExec{});
+            }
+            ESP_LOGI(kTag, "JIT: %s", on ? "ON" : "OFF");
+            return;
+        }
+
+        // 'K' で JIT の統計を出す。
+        const bool isJitStats = c == 'K';
+        if (isJitStats)
+        {
+            const x68k::NativeStats* st = g_machine.cpu().nativeStats();
+            if (st == nullptr)
+            {
+                ESP_LOGI(kTag, "JIT: 教わっていません");
+                return;
+            }
+            ESP_LOGI(kTag, "[jit] ブロック %llu 本 / 命令 %llu", (unsigned long long)st->blocksRun,
+                     (unsigned long long)st->insnsRun);
+            ESP_LOGI(kTag, "[jit] 分岐で終端 %llu (実行の %.0f%%)",
+                     (unsigned long long)st->endedWithBranch,
+                     st->blocksRun != 0
+                         ? 100.0 * (double)st->endedWithBranch / (double)st->blocksRun
+                         : 0.0);
+            ESP_LOGI(kTag, "[jit] 世代を捨て直した %llu 回",
+                     (unsigned long long)st->generationReset);
+            ESP_LOGI(kTag, "[jit] 負のキャッシュで省いた再翻訳 %llu 回",
+                     (unsigned long long)st->negativeHit);
+            ESP_LOGI(kTag, "[jit] 落とした: 割込 %llu / 未対応 %llu / 翻訳失敗 %llu",
+                     (unsigned long long)st->deferInterrupt,
+                     (unsigned long long)st->deferUnsupported,
+                     (unsigned long long)st->translateFail);
+            ESP_LOGI(kTag,
+                     "[jit] 鍵外れ: タグ %llu / 写像 %llu / 世代 %llu / 飽和 %llu / 空き %llu",
+                     (unsigned long long)st->keyMissTag, (unsigned long long)st->keyMissEpoch,
+                     (unsigned long long)st->keyMissGen, (unsigned long long)st->keyMissStale,
+                     (unsigned long long)st->keyMissCold);
+            // **照合の内訳 (段 F)。** verifyHit が偽共有を弾いた回数で、
+            // これが keyMissGen の大半を占めるなら狙いどおり効いている。
+            ESP_LOGI(
+                kTag,
+                "[jit] 照合: 一致 %llu / 実差 %llu / 控え無し %llu (世代外れ %llu の %.1f%%) / "
+                "控えを持てず %llu 本 / 側表へ逃がした %llu 本",
+                (unsigned long long)st->verifyHit, (unsigned long long)st->verifyMiss,
+                (unsigned long long)st->verifyNoSnapshot, (unsigned long long)st->keyMissGen,
+                st->keyMissGen != 0 ? 100.0 * (double)st->verifyHit / (double)st->keyMissGen : 0.0,
+                (unsigned long long)st->verifyTooLong, (unsigned long long)st->verifySideUsed);
+            // **収支が閉じているかを出す。** 諦めた回数と理由の合計が
+            // 合わないなら、無勘定の早期 return がある (実際に踏んだ)。
+            // 平均ブロックサイズ。**arena に何本入るかの唯一の根拠。**
+            if (st->translated != 0)
+            {
+                ESP_LOGI(
+                    kTag, "[jit] 翻訳 %llu 本 / %llu バイト (平均 %llu バイト、%llu 本入る)",
+                    (unsigned long long)st->translated, (unsigned long long)st->translatedBytes,
+                    (unsigned long long)(st->translatedBytes / st->translated),
+                    (unsigned long long)(kJitCodeBytes / (st->translatedBytes / st->translated)));
+            }
+            ESP_LOGI(kTag, "[jit] 満杯で諦めた %llu / 満杯で捨てた %llu (収支 %lld)",
+                     (unsigned long long)st->fullDeferred, (unsigned long long)st->capacityReset,
+                     (long long)st->deferUnsupported - (long long)st->negativeHit -
+                         (long long)st->translateFail - (long long)st->fullDeferred);
+            // ガード脱出の内訳。**blocksRun に対する比率で読む。**
+            // guardExit が 10% を超えるなら (An) 経由の I/O が空回りしている。
+            // selfPageExit が 0.1% を超えるなら、自ページ脱出のブラックリストが
+            // 過剰 (正しさは壊れないが JIT を諦めすぎている)。
+            ESP_LOGI(kTag, "[jit] ガード脱出 %llu (0 進捗 %llu / 自ページ %llu)",
+                     (unsigned long long)st->guardExit, (unsigned long long)st->deferGuard,
+                     (unsigned long long)st->selfPageExit);
+            // **統計が 0 のときに自己診断できるようにする。**
+            // 経路が違えば tryNative は呼ばれないので、統計は 0 のまま。
+            ESP_LOGI(kTag, "[jit] 経路: イベント駆動 %s / JIT %s",
+                     g_machine.eventDriven() ? "ON" : "OFF",
+                     g_machine.cpu().hasNativeExec() ? "ON" : "OFF");
+            ESP_LOGI(kTag, "[jit] 実行可能メモリ %u / %u バイト", (unsigned)g_jitCode.used(),
+                     (unsigned)g_jitCode.capacity());
+            return;
+        }
+
+        // 'L' で「JIT の経路だけ」を最小コードで試す。恒久機能ではない。
+        //
+        // 生成コードを疑うか、経路 (実行可能メモリ / ゲートウェイ / isync) を
+        // 疑うかを切り分ける。**ret.n 1 命令だけ**を置いて呼ぶ。
+        // これが落ちるなら経路が悪い。通るなら生成コードが悪い。
+        const bool isMinimalBlockProbe = c == 'L';
+        if (isMinimalBlockProbe)
+        {
+            if (!g_jitCode.isReady())
+            {
+                ESP_LOGW(kTag, "[probe] 実行可能メモリが無い");
+                return;
+            }
+            // **段 0 のプローブと同じ形でその場で確保する。**
+            // 起動時に確保した ExecMemory と、その場で確保したものを
+            // 比べれば「いつ確保したか」が効くかが分かる。
+            auto* fresh = static_cast<std::uint8_t*>(
+                heap_caps_malloc(64, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT));
+            ESP_LOGI(kTag, "[probe] 起動時=%p その場=%p", (void*)g_jitCode.base(), (void*)fresh);
+            if (fresh == nullptr)
+            {
+                ESP_LOGW(kTag, "[probe] その場で確保できない");
+                return;
+            }
+            std::uint8_t* p = fresh;
+            auto* dst = reinterpret_cast<volatile std::uint32_t*>(p);
+
+            // --- A: windowed で書いて普通の関数ポインタで呼ぶ (段 0 と同じ) ---
+            // entry a1,32 / movi.n a2,10 / retw.n
+            dst[0] = 0x0C004136u;
+            dst[1] = 0x00F01DA2u;
+            __asm__ __volatile__("isync" ::: "memory");
+            using FnW = int (*)();
+            const int rw = reinterpret_cast<FnW>(p)();
+            ESP_LOGI(kTag, "[probe] A windowed = %d (10 なら成功)", rw);
+
+            // --- B: call0 で書いて runBlock で呼ぶ ---
+            alignas(4) std::uint8_t stage[8] = {};
+            std::size_t n = x68k::jit::movi(stage, 2, 4);
+            n += x68k::jit::retN(stage + n);
+            const auto* srcw = reinterpret_cast<const std::uint32_t*>(stage);
+            dst[0] = srcw[0];
+            dst[1] = srcw[1];
+            __asm__ __volatile__("isync" ::: "memory");
+            ESP_LOGI(kTag, "[probe] B call0 %u バイト。まず素の callx0 で呼ぶ", (unsigned)n);
+
+            // --- B1: 退避なしの素の callx0 ---
+            // ゲートウェイの退避が悪いのか、callx0 そのものが悪いのかを分ける。
+            {
+                register std::uint32_t arg __asm__("a2") = 0;
+                register const void* tgt __asm__("a3") = p;
+                __asm__ __volatile__("callx0 %1" : "+r"(arg) : "r"(tgt) : "a0", "memory");
+                ESP_LOGI(kTag, "[probe] B1 素の callx0 = %u (4 なら成功)", (unsigned)arg);
+            }
+
+            // --- B2: runBlock 経由 ---
+            // **static にする。** 84 バイトの M68kState をこのハンドラの
+            // スタックへ置くと、シリアルタスクのスタックが足りない疑いがある。
+            // B2 の直前に、B1 と同じ形をもう一度だけ実行する。
+            // 「1 回目は通るが 2 回目で落ちる」なら isync / キャッシュの話。
+            {
+                register std::uint32_t arg __asm__("a2") = 0;
+                register const void* tgt __asm__("a3") = p;
+                __asm__ __volatile__("callx0 %1" : "+r"(arg) : "r"(tgt) : "a0", "memory");
+                ESP_LOGI(kTag, "[probe] B1b 2 回目 = %u", (unsigned)arg);
+            }
+
+            static x68k::M68kState dummy{};
+            const std::uint32_t r = x68k::jit::runBlock(&dummy, p);
+            ESP_LOGI(kTag, "[probe] B2 runBlock = %u (4 なら成功)", (unsigned)r);
+            return;
+        }
+
+        const bool isNativeBodyProbe = c == 'B';
+        if (isNativeBodyProbe)
+        {
+            probeNativeBody();
+            return;
+        }
+
+        const bool isCachePathProbe = c == 'C';
+        if (isCachePathProbe)
+        {
+            probeCachePathCost();
+            return;
+        }
+
+        const bool isNativeProbe = c == 'n';
+        if (isNativeProbe)
+        {
+            probeNativeCeiling();
+            return;
+        }
+
+        // 'j' で JIT の実現性を確かめる。恒久機能ではない。
+        //
+        // 記録には「CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=y の間は
+        // MALLOC_CAP_EXEC が必ず失敗する」とあるが、現在の sdkconfig では
+        // **その設定は無効になっている**。前提が変わっているので測り直す。
+        const bool isJitProbe = c == 'j';
+        if (isJitProbe)
+        {
+            probeJitFeasibility();
+            // どれだけ取れるかも見る。コードキャッシュの設計はここで決まる。
+            {
+                const std::size_t largest =
+                    heap_caps_get_largest_free_block(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+                const std::size_t total =
+                    heap_caps_get_free_size(MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+                ESP_LOGI(kTag, "[jit] 実行可能メモリ 空き=%u 最大連続=%u",
+                         static_cast<unsigned>(total), static_cast<unsigned>(largest));
+            }
+            return;
+        }
+
+        // 'c' でキャッシュのアクセス数とミス数を出す。恒久機能ではない。
+        //
+        // 88 CPU サイクル/命令が「1 つの重い処理」なのか「合算」なのかは、
+        // ミス率を見れば分かる。I-cache のミスが多ければコード配置、
+        // PSRAM のミスが多ければメインメモリのアクセスが律速。
+        //
+        // Why not 顔モードの 'e' 等と衝突しないか: あちらは isFaceMode で
+        // 守られている。ここは X68K モードでも使いたいので、記号ではなく
+        // 英字だが、Human68k のコマンドラインで 'c' 単独を打つ機会は
+        // 実質無い (打ちたければ切ってから測る)。
+        const bool isCacheStats = c == 'c';
+        if (isCacheStats)
+        {
+            const uint32_t ibusAcs = REG_READ(EXTMEM_IBUS_ACS_CNT_REG);
+            const uint32_t ibusMiss = REG_READ(EXTMEM_IBUS_ACS_MISS_CNT_REG);
+            const uint32_t dbusAcs = REG_READ(EXTMEM_DBUS_ACS_CNT_REG);
+            const uint32_t dbusFlashMiss = REG_READ(EXTMEM_DBUS_ACS_FLASH_MISS_CNT_REG);
+            const uint32_t dbusRamMiss = REG_READ(EXTMEM_DBUS_ACS_SPIRAM_MISS_CNT_REG);
+            ESP_LOGI(kTag, "[cache] ibus acs=%lu miss=%lu (%.2f%%)", (unsigned long)ibusAcs,
+                     (unsigned long)ibusMiss,
+                     ibusAcs != 0 ? 100.0 * (double)ibusMiss / (double)ibusAcs : 0.0);
+            ESP_LOGI(kTag, "[cache] dbus acs=%lu flashMiss=%lu spiramMiss=%lu (%.2f%%)",
+                     (unsigned long)dbusAcs, (unsigned long)dbusFlashMiss,
+                     (unsigned long)dbusRamMiss,
+                     dbusAcs != 0 ? 100.0 * (double)(dbusFlashMiss + dbusRamMiss) / (double)dbusAcs
+                                  : 0.0);
+            // 次の測定のために 0 へ戻す。
+            REG_WRITE(EXTMEM_CACHE_ACS_CNT_CLR_REG, 0x3);
+            REG_WRITE(EXTMEM_CACHE_ACS_CNT_CLR_REG, 0x0);
             return;
         }
 
@@ -1475,7 +2715,8 @@ extern "C" void app_main(void)
     {
         ESP_LOGI(kTag,
                  "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ、"
-                 "'|' で音源の ON/OFF");
+                 "'|' で音源の ON/OFF、'&' で毎命令経路の最適化の ON/OFF、"
+                 "'$' でイベント駆動の ON/OFF");
     }
     else
     {
