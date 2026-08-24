@@ -12,7 +12,7 @@ sources:
   - docs/knowledge/event-driven-devices.md
   - 実測（IPL-ROM EXPERT 用 v1.0、MD5 7fd4caabac1d9169e289f0f7bbf71d8e）
   - 実測（Human68k 3.02 の HUMAN.SYS、58496 バイト）
-updated: 2026-08-17
+updated: 2026-08-24
 ---
 
 # ナレッジ索引
@@ -31,8 +31,8 @@ X68000 の仕様と、このプロジェクトで実際に手を動かして分�
 | [X68000 エミュレータ実装の落とし穴](x68000-emulator-pitfalls.md) | `confirmed` | 実物の IPL-ROM を走らせて初めて露見したバグ。症状 → 原因 → 見分け方。ROM の読み違えで一度誤った結論に達した例も含む |
 | [X68000 の SASI 起動経路](x68000-sasi-boot.md) | `confirmed` | SASI から Human68k が起動するまでのレジスタ・プロトコル・ディスク構造、IOCS とキーボードのワーク。実物の ROM と HUMAN.SYS から読み取った値 |
 | [CoreS3 実機でエミュレータを動かすときの知見](cores3-emulator-runtime.md) | `confirmed` | ウォッチドッグ、シリアル経由のデバッグ、メモリ配置、LCD の見え方。ホストでは起きない種類の問題 |
-| [デバイスへ時間を渡す仕組みをイベント駆動にする](event-driven-devices.md) | `measured` | 律速は 68000 の命令実行ではなくデバイスの tick だった。JIT が上限 1.03 倍と測れた経緯と、代わりの設計 |
-| [イベント駆動デバイス — 実装確定版](event-driven-implementation.md) | `measured` | 敵対的レビューで壊しにいった結果を反映した確定設計。実体化・無効化・wake の完全なリストと、実機で測れる 8 段階 |
+| [デバイスへ時間を渡す仕組みをイベント駆動にする](event-driven-devices.md) | `measured` | 律速は 68000 の命令実行ではなくデバイスの tick だった。**「JIT は 1.03 倍にしかならない」という結論は誤りで、2026-08-24 に訂正**。上限の見積もりがどう外れるかの記録として残してある |
+| [イベント駆動デバイスと JIT — 実機 10MHz までの記録](event-driven-implementation.md) | `measured` | イベント駆動から JIT まで、**実機 10063 kHz (実機比 100.6%)** に到達するまでの実測。効かなかった手 (admission / direct chaining / eviction) と、その見誤りの構造も残してある |
 | [ストレージ実装方針](storage-readahead.md) | `measured` | SD の読み出しが遅い件。flash 移行と LRU キャッシュを却下した根拠と、「そもそもディスク由来か」を先に測る撤退条件 |
 
 ## X68000 の仕様（資料ベース + 一部実測）
