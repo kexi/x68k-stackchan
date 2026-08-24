@@ -4151,16 +4151,22 @@ TEST_CASE("Tier G / H を 4 つ並べたブロックが kMaxBlockBytes に収ま
         plan.page = kEntry >> 10;
         plan.end = BlockEnd::kUnsupported;
         plan.fallThroughPc = kEntry + x68k::kMaxOps * 8u;
+        // **kMaxOps 個ぶん要る。** 4 個固定で書いていたせいで、段 E で
+        // kMaxOps を 4 → 6 にしたときに配列の外を読んでいた
+        // (サニタイザだけが気づいた。素のテストは通っていた)。
+        // 種類が足りなければ巡回させる。
         const WorstCase mix[] = {cases[2], cases[0], cases[4], cases[3]};
+        constexpr std::size_t kMixCount = sizeof(mix) / sizeof(mix[0]);
         for (std::uint32_t i = 0; i < x68k::kMaxOps; ++i)
         {
+            const WorstCase& pick = mix[i % kMixCount];
             PlannedOp& op = plan.ops[i];
             op.pc = kEntry + i * 8u;
             op.length = 6;
-            op.kind = mix[i].kind;
-            op.eaMode = mix[i].eaMode;
-            op.size = mix[i].size;
-            op.aluOp = mix[i].aluOp;
+            op.kind = pick.kind;
+            op.eaMode = pick.eaMode;
+            op.size = pick.size;
+            op.aluOp = pick.aluOp;
             op.cycles = 8;
             op.srcReg = 1;
             op.dstReg = 2;
