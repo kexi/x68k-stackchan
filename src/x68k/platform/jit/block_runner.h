@@ -64,7 +64,62 @@ namespace x68k::jit
 // (「症状が原因から遠い」) がそのまま当てはまる。語をそのまま持てば
 // 偽陽性は原理的に存在しない。8 語 16 バイトの比較は、翻訳 1 本
 // (平均 239 バイト発行) に比べて 2 桁安い。
+//
+// **9 語以上のブロックはサイドテーブルへ逃がす (段 G)。** スロットの中に
+// 収まらないだけで、控えを持てないわけではない。下の VerifySide を見よ。
 inline constexpr std::uint32_t kMaxVerifyWords = 8;
+
+// サイドテーブル 1 件が控える命令語の上限。
+//
+// **kMaxOps = 6 の最悪 (最長命令 10 バイトが 6 本 + 出口の ir/irc) が
+// 31 語**なので、そこまで持てば「長すぎて控えられない」形は原理的に
+// 無くなる。1 件 = 31 語 x 2 + 索引 8 バイト = 70 バイト。
+//
+// Why not スロット側を 16 語へ広げないか: BlockSlot が 40 → 56 バイトになり、
+// 2048 スロットが 80KB → 112KB で実測の largest free block 90KB を超える。
+// スロットを 1024 へ半減させることになり、**段 F が実測で棄却した
+// 「片方だけ当たる」形**に戻る (照合とスロット増は掛け算で効き、
+// 片方ずつ +1.9% / +2.5% に対し両方で +5.6%)。長い側は実測 176 本しか
+// 無いので、**全スロットを太らせるのではなく、その 176 本だけを逃がす**。
+inline constexpr std::uint32_t kMaxSideVerifyWords = 31;
+
+// スロットが「サイドテーブルを持たない」ことを表す索引。
+//
+// **0 を番兵にしない。** 0 は正当な索引なので、ゼロ初期化された
+// BlockSlot が 0 番の控えを指してしまう (`BlockSlot{}` は reset() と
+// スロット追い出しの両方で作られる)。
+inline constexpr std::uint16_t kNoVerifySide = 0xFFFFu;
+
+// スロットに収まらない控えの置き場 1 件。
+//
+// ## 寿命 —— 「解放済みの控えを読む」が原理的に存在しない形
+//
+// **個別の解放をしない。** 表はバンプアロケータ (ExecMemory と同じ規律) で、
+// 空きへ戻る唯一の経路は BlockRunner::reset() の全捨てだけ。つまり
+// 「解放してから読む」という順序自体が作れない。
+//
+// では**スロットが別の番地に上書きされたとき**に古い控えが読まれないのは
+// なぜか。索引を返す側ではなく、**控えの側に持ち主の番地 (ownerPc) を
+// 持たせて、引くたびに突き合わせる**からである。上書きされたスロットは
+// entryPc が変わるので、古い索引をそのまま持っていても ownerPc と一致せず
+// 「控え無し」に落ちる (= 現行と同じ保守的な側)。
+//
+// Why not 参照カウントや free list にしないか: どちらも「解放し忘れ」と
+// 「早すぎる解放」の 2 つの失敗形を持ち込む。前者は表が埋まって縮退する
+// だけだが、**後者は他人の控えを自分のものとして読む** = 「違うのに同じ」で
+// 古いコードを静かに実行し続ける形になり、code_gen_map.h が push 型を
+// 棄却した論理がそのまま当てはまる。持ち主を控えに書いておけば、
+// 取り違えは**照合の前に必ず落ちる**。
+struct VerifySide
+{
+    // この控えの持ち主の entryPc。**0 なら未使用。**
+    // スロットの entryPc と一致しなければ、この控えは読まない。
+    std::uint32_t ownerPc = 0;
+    // 持ち主の写像世代。写像が変われば読めた語の意味も変わる。
+    std::uint32_t mappingEpoch = 0;
+    std::uint16_t words = 0;  // 実際に控えた語数
+    std::uint16_t verify[kMaxSideVerifyWords] = {};
+};
 
 // キャッシュの 1 スロット。
 //
@@ -118,6 +173,18 @@ struct BlockSlot
     bool endsWithBranch = false;
     // 動的分岐で終端したか (戻り値の bit29 を見てよいか、Tier D)。
     bool endsWithDynamicBranch = false;
+
+    // --- 長すぎてスロットに収まらない控えの索引 (段 G) ---
+    //
+    // kNoVerifySide なら持たない。**この欄はスロットを 1 バイトも太らせない**:
+    // 上の欄を並べた時点で 38 バイトあり、4 バイト整列のために 2 バイトの
+    // 詰め物ができていた。そこへちょうど収まる (下の static_assert が
+    // 40 バイトのままであることを縛る)。
+    //
+    // **索引だけでは古い控えを指しうる** (スロットが別の番地に上書きされても
+    // 索引は残る)。指した先の ownerPc と突き合わせて初めて有効になる
+    // —— 寿命の設計は VerifySide の冒頭にある。
+    std::uint16_t verifySide = kNoVerifySide;
 };
 
 // **スロットの大きさを固定する。** ポインタ 4 バイトの実機 (ESP32-S3) で
@@ -127,7 +194,12 @@ struct BlockSlot
 // 欄を足したり並べ替えたりして 40 を超えたら、ここで**ビルドが落ちる**。
 // 黙って容量が減って「なぜか遅くなった」を追う羽目にならないようにする。
 // ホスト (ポインタ 8 バイト) では 4 バイト増えるので、そちらは 48 で見る。
-static_assert(sizeof(BlockSlot) <= (sizeof(void*) == 4 ? 40u : 48u),
+//
+// **段 G で「以下」ではなく「ちょうど」に締めた。** サイドテーブルの索引は
+// 既存の詰め物へ入れる約束で足したので、40 を下回ることも上回ることも
+// 「詰め物の勘定が変わった」ことを意味する。上限だけを縛っていると、
+// 詰め物を食い潰した次の 1 バイトで黙って 44 へ跳ねる。
+static_assert(sizeof(BlockSlot) == (sizeof(void*) == 4 ? 40u : 48u),
               "BlockSlot が太ると 2048 スロットが内部 SRAM に収まらない");
 
 // ブロックキャッシュ。
@@ -151,6 +223,25 @@ public:
     void setNegativeStorage(NegEntry* entries, std::uint32_t count)
     {
         neg_.setStorage(entries, count);
+    }
+
+    // スロットに収まらない控えの置き場を教わる (段 G)。
+    //
+    // **教わらなくても動く。** 内部 SRAM は逼迫しているので確保に失敗しうる。
+    // その場合は長いブロックが控えを持たないだけで、段 F と同じ動作
+    // (世代が動いたら翻訳し直す) に縮退する。**JIT ごと死なせない**
+    // (段 0-I で 8192 エントリの確保に失敗したときと同じ流儀)。
+    void setVerifySideStorage(VerifySide* entries, std::uint32_t count)
+    {
+        sides_ = entries;
+        sideCount_ = entries != nullptr ? count : 0;
+        // **索引が表より外を指す状態を残さない。** 表を差し替えたら、
+        // 前の表を指していた索引は全部無効になる。
+        sideUsed_ = 0;
+        for (std::uint32_t i = 0; i < slotCount_; ++i)
+        {
+            slots_[i].verifySide = kNoVerifySide;
+        }
     }
 
     [[nodiscard]] bool isReady() const
@@ -241,7 +332,38 @@ private:
     // Why not 読めなかった語を「一致」とみなさないか: 窓の外へ出た番地は
     // peekCodeWord が false を返す。そこを一致扱いにすると、写像が変わって
     // 読めなくなったブロックを**古いまま実行し続ける**。読めなければ不一致。
-    [[nodiscard]] static bool verifyMatches(const BlockSlot& slot, M68k& cpu);
+    //
+    // **段 G で static をやめた。** 長いブロックの控えはサイドテーブルにあり、
+    // 表そのものは runner のメンバなので this が要る。
+    [[nodiscard]] bool verifyMatches(const BlockSlot& slot, M68k& cpu) const;
+
+    // スロットに紐づく控えを取り出す。**無ければ nullptr。**
+    //
+    // 索引が有効であることと、指した先が**このスロットのもの**であることは
+    // 別。上書きされたスロットは索引を持ったままなので、持ち主 (ownerPc と
+    // mappingEpoch) を突き合わせて初めて読んでよい (VerifySide の冒頭)。
+    [[nodiscard]] const VerifySide* sideFor(const BlockSlot& slot) const
+    {
+        const bool hasIndex = slot.verifySide != kNoVerifySide && slot.verifySide < sideCount_;
+        if (!hasIndex)
+        {
+            return nullptr;
+        }
+        const VerifySide& side = sides_[slot.verifySide];
+        const bool isOwner = side.ownerPc != 0 && side.ownerPc == slot.entryPc &&
+                             side.mappingEpoch == slot.mappingEpoch;
+        if (!isOwner)
+        {
+            return nullptr;
+        }
+        return &side;
+    }
+
+    // 長いブロックの控えをサイドテーブルへ取る。取れたら索引を返す。
+    //
+    // **溢れたら kNoVerifySide** (控えを持たない = 段 F と同じ保守的な側)。
+    [[nodiscard]] std::uint16_t captureSide(M68k& cpu, std::uint32_t entryPc,
+                                            std::uint32_t mappingEpoch, std::uint32_t words);
     [[nodiscard]] std::uint32_t slotIndex(std::uint32_t pc) const
     {
         // PC は必ず偶数なので 1 bit 落としてから畳む。
@@ -293,6 +415,15 @@ private:
     BlockSlot* slots_ = nullptr;
     std::uint32_t slotCount_ = 0;
     ExecMemory* code_ = nullptr;
+
+    // --- スロットに収まらない控えの表 (段 G) ---
+    //
+    // **バンプアロケータ。** sideUsed_ を進めるだけで、個別には解放しない。
+    // 空きへ戻るのは reset() の全捨てだけ (ExecMemory と同じ規律)。
+    // 「解放済みの控えを読む」順序が作れないのはこのため (VerifySide の冒頭)。
+    VerifySide* sides_ = nullptr;
+    std::uint32_t sideCount_ = 0;
+    std::uint32_t sideUsed_ = 0;
     // 飽和したページに当たった回数。閾値を超えたら世代を捨てて数え直す。
     //
     // Why 即座に捨てないか: 1 回の飽和で全部の世代を捨てると、正常な

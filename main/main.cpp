@@ -920,6 +920,37 @@ x68k::u32 g_jitSlotCount = 0;
 // 1024 件 x 8 バイト = 8,192 バイト。2 の冪でなければならない。
 constexpr x68k::u32 kJitNegEntries = 2048;
 x68k::jit::NegEntry* g_jitNeg = nullptr;
+
+// スロット (8 語) に収まらない控えの置き場 (段 G)。
+//
+// **実測 176 本**しか無い。31 語まで持てる 1 件が 72 バイトなので、
+// 192 件で 13.5KB。控えを持てなかった 2 本が世代外れの 28.7% (57 万件) を
+// 占めていて、arena が満杯で翻訳し直しも弾かれるため、**そのまま
+// インタプリタへ落ちていた**。
+//
+// **段 G の初回計測で 256 件 (18KB) の確保に失敗した。** 起動時点の内部
+// SRAM は空き 133,567 / **最大連続 90,112** で、スロット 2048 個 (81,920)
+// がその最大ブロックを食う。残るのは断片なので、要求が大きいほど落ちる。
+// **空きの総量ではなく最大連続ブロックが効く**ので、段 0-I (8192 エントリの
+// 確保失敗) と同じ形をここでも踏んだ。
+//
+// **内部 SRAM の残りが本当の上限。** 192 件 (13,824 バイト) は確保できたが、
+// その後にエミュレーションタスクの 8KB スタックが取れず
+// (`エミュレーションタスクを作れません`)、**エミュレータが 1 命令も
+// 走らなかった**。確保に成功しても、後から要る分を食えば同じことである。
+//
+// 幸い**救う対象は密**で、実測では控えを持てない 176 本のうち **2 本**
+// ($00FAB6 / $00FB3E) が世代外れの 71.3% を占める。全部を救う必要はない。
+//
+// 32 件 = 2,304 バイトなら、確保後も largest free block が 8KB スタックの
+// 側に残る。**溢れたら控えを持たない**ので、入り切らない分は現行と同じ動作。
+//
+// 取れなければ段階的に落とす。**どの段でも控えを持たないだけで正しさは
+// 1 ビットも変わらない** (段 F と同じ動作へ縮退する)。
+constexpr x68k::u32 kJitVerifySidesWanted = 32;
+constexpr x68k::u32 kJitVerifySidesFallback = 8;
+x68k::u32 g_jitSideCount = 0;
+x68k::jit::VerifySide* g_jitSides = nullptr;
 x68k::jit::BlockSlot* g_jitSlots = nullptr;
 x68k::jit::ExecMemory g_jitCode;
 x68k::jit::BlockRunner g_jitRunner;
@@ -1023,6 +1054,43 @@ bool reserveMemory()
     if (g_jitNeg == nullptr)
     {
         ESP_LOGW(kTag, "JIT の負のキャッシュを置けません (再翻訳が減りません)");
+    }
+
+    ESP_LOGI(kTag, "JIT 照合サイドテーブル確保前: 内部 SRAM 空き=%u 最大連続=%u (要求=%u バイト)",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(
+                 heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(kJitVerifySidesWanted * sizeof(x68k::jit::VerifySide)));
+
+    g_jitSideCount = kJitVerifySidesWanted;
+    g_jitSides = static_cast<x68k::jit::VerifySide*>(
+        heap_caps_calloc(kJitVerifySidesWanted, sizeof(x68k::jit::VerifySide),
+                         MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    if (g_jitSides == nullptr)
+    {
+        // **断片しか残っていないなら小さく取り直す。** 実測で控えを持てない
+        // のは 176 本だが、その全部を救えなくても**上位の常連 2 本が
+        // 世代外れの 28.7% を占める**ので、少数でも効く。
+        g_jitSideCount = kJitVerifySidesFallback;
+        g_jitSides = static_cast<x68k::jit::VerifySide*>(
+            heap_caps_calloc(kJitVerifySidesFallback, sizeof(x68k::jit::VerifySide),
+                             MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        ESP_LOGW(kTag, "JIT 照合サイドテーブル %u 件を置けません。%u 件へ落とします",
+                 static_cast<unsigned>(kJitVerifySidesWanted),
+                 static_cast<unsigned>(kJitVerifySidesFallback));
+    }
+    if (g_jitSides == nullptr)
+    {
+        // **控えを持たないだけで、正しさは 1 ビットも変わらない。**
+        // 長いブロックは世代が動くたびに翻訳し直す (段 F と同じ動作)。
+        g_jitSideCount = 0;
+        ESP_LOGW(kTag, "JIT の照合サイドテーブルを置けません (長いブロックが控えを持ちません)");
+    }
+    else
+    {
+        ESP_LOGI(kTag, "JIT 照合サイドテーブル %u 件 (%u バイト) を確保しました",
+                 static_cast<unsigned>(g_jitSideCount),
+                 static_cast<unsigned>(g_jitSideCount * sizeof(x68k::jit::VerifySide)));
     }
 
     // コードページの世代は内部 SRAM に置く。ブロックの入口で毎回引くので、
@@ -1849,6 +1917,9 @@ private:
                 }
                 g_jitRunner.setStorage(g_jitSlots, g_jitSlotCount, &g_jitCode);
                 g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
+                // **スロットを教えた後に置く。** 索引はスロットの中にあるので、
+                // 表を差し替えるときに全部打ち消す必要がある (setVerifySideStorage)。
+                g_jitRunner.setVerifySideStorage(g_jitSides, g_jitSideCount);
                 g_jitRunner.reset();
                 g_machine.cpu().setNativeExec(g_jitRunner.exec());
                 // **JIT はイベント駆動の経路にしか無い。**
@@ -1904,11 +1975,11 @@ private:
             ESP_LOGI(
                 kTag,
                 "[jit] 照合: 一致 %llu / 実差 %llu / 控え無し %llu (世代外れ %llu の %.1f%%) / "
-                "控えを持てず %llu 本",
+                "控えを持てず %llu 本 / 側表へ逃がした %llu 本",
                 (unsigned long long)st->verifyHit, (unsigned long long)st->verifyMiss,
                 (unsigned long long)st->verifyNoSnapshot, (unsigned long long)st->keyMissGen,
                 st->keyMissGen != 0 ? 100.0 * (double)st->verifyHit / (double)st->keyMissGen : 0.0,
-                (unsigned long long)st->verifyTooLong);
+                (unsigned long long)st->verifyTooLong, (unsigned long long)st->verifySideUsed);
             // **収支が閉じているかを出す。** 諦めた回数と理由の合計が
             // 合わないなら、無勘定の早期 return がある (実際に踏んだ)。
             // 平均ブロックサイズ。**arena に何本入るかの唯一の根拠。**

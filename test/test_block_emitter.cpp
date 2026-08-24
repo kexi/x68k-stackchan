@@ -8330,6 +8330,464 @@ TEST_CASE("スロット数が変わっても実装の索引はテストの再現
     }
 }
 
+// --- T9: 控えを持てないブロックのサイドテーブル (段 G) ---------------------
+
+namespace verify_stage_g
+{
+
+using namespace runner_accounting;
+using namespace verify_stage_f;
+
+// スロットの控え (8 語) に収まらない長いブロックを作る。
+//
+// **長さは「命令の実体」で作る。** MOVE.l #imm,Dn は 6 バイト (符号 2 +
+// 即値 4) で、kMaxOps 本並べれば照合範囲は
+// 6 x kMaxOps / 2 + 2 (出口の ir / irc) 語になる。kMaxOps = 6 なら 20 語で、
+// kMaxVerifyWords = 8 を大きく超える。
+//
+// Why not 定数から本数を逆算しないか: kMaxVerifyWords を写して長さを決めると、
+// **上限を動かす変異に合わせてテストの入力まで動く**。実際に踏んだ形
+// (T7 の「出口の ir/irc」が控えの語数から書き込み位置を導いていた) と同じ
+// なので、命令の形から独立に長くする。
+constexpr u32 kLongEntry = kEntry + 0x100;
+
+// kLongEntry から MOVE.l #imm,D0 を count 本置く。
+void fillLongBlock(Harness& h, u32 at, std::uint32_t count, x68k::u8 immTail = 0x00)
+{
+    for (std::uint32_t i = 0; i < count; ++i)
+    {
+        const u32 pc = at + i * 6u;
+        h.ram[pc] = 0x20;      // MOVE.l #imm,D0
+        h.ram[pc + 1] = 0x3C;  //
+        h.ram[pc + 2] = 0x00;
+        h.ram[pc + 3] = 0x00;
+        h.ram[pc + 4] = 0x00;
+        h.ram[pc + 5] = immTail;
+    }
+}
+
+// 照合範囲が本当にスロットの上限を超えているか。
+//
+// **超えていなければ、以下のテストは全部空虚になる** (スロット側の控えで
+// 通ってしまい、サイドテーブルを 1 度も引かない)。名指しで要求する。
+void requireLongerThanSlot(Harness& h, u32 at)
+{
+    const x68k::jit::BlockSlot& placed = h.slots[foldedIndex(at, Harness::kSlots)];
+    REQUIRE(placed.entryPc == at);
+    // 本体 6 バイト x count + 出口の ir/irc 4 バイト。
+    const u32 words = (static_cast<u32>(placed.count) * 6u + 4u) / 2u;
+    INFO("count=", (unsigned)placed.count, " words=", words,
+         " kMaxVerifyWords=", x68k::jit::kMaxVerifyWords);
+    REQUIRE(words > x68k::jit::kMaxVerifyWords);
+    // スロット側は控えを持っていないこと (持っていたら段 F で足りている)。
+    REQUIRE(placed.verifyWords == 0);
+}
+
+// サイドテーブル付きの台。**表を持たせるところまでが台の責務。**
+struct SideHarness
+{
+    VerifyHarness v;
+    std::vector<x68k::jit::VerifySide> sides;
+
+    explicit SideHarness(std::uint32_t count = 64) : sides(count)
+    {
+        v.h.runner.setVerifySideStorage(sides.data(), static_cast<std::uint32_t>(sides.size()));
+        fillLongBlock(v.h, kLongEntry, 16);
+    }
+
+    Harness& h()
+    {
+        return v.h;
+    }
+};
+
+}  // namespace verify_stage_g
+
+TEST_CASE("控えがスロットに収まらない長いブロックでも偽共有なら翻訳し直さない")
+{
+    // **What: 照合範囲が 8 語を超えるブロックでも、命令語が変わっていなければ
+    // 翻訳し直さずそのまま実行すること。**
+    //
+    // 段 F の控えはスロットの中に 8 語しか持てず、超えた分は照合を試みてすら
+    // いなかった。実機ではその 2 本が世代外れの 28.7% (57 万件) を占め、
+    // **arena が満杯なので翻訳し直しも弾かれてインタプリタへ落ちていた**。
+    // 救う効果は翻訳の節約ではなく、そのインタプリタ落ちの回避である。
+    using namespace verify_stage_g;
+
+    SideHarness s;
+    Harness& h = s.h();
+
+    h.runAt(kLongEntry);
+    REQUIRE(h.stats().translated == 1u);
+    REQUIRE(VerifyHarness::ran == 1);
+    // **前提: 本当にスロットへ収まらない長さであること。**
+    requireLongerThanSlot(h, kLongEntry);
+    // サイドテーブルへ逃がしたこと。
+    REQUIRE(h.stats().verifySideUsed == 1u);
+    // **「控えを持てなかった」に数えないこと。** 逃がせたのだから持てている。
+    CHECK(h.stats().verifyTooLong == 0u);
+
+    // 命令語は変えず、ページの世代だけ上げる (偽共有そのもの)。
+    bumpPageOnly(h, kLongEntry);
+
+    h.runAt(kLongEntry);
+
+    INFO("translated=", h.stats().translated, " verifyHit=", h.stats().verifyHit,
+         " verifyNoSnapshot=", h.stats().verifyNoSnapshot);
+    // **翻訳し直さないこと。** ここが本体。
+    CHECK(h.stats().translated == 1u);
+    CHECK(h.stats().verifyHit == 1u);
+    // **照合を試みてすらいない、が消えたこと。**
+    CHECK(h.stats().verifyNoSnapshot == 0u);
+    // **そして実行されたこと。** 翻訳しないだけで実行もしないなら、
+    // それは「諦めた」であって「救った」ではない。
+    CHECK(VerifyHarness::ran == 2);
+}
+
+TEST_CASE("サイドテーブル経由でも本物の書き換えでは翻訳し直す")
+{
+    // **What: 長いブロックの控えをサイドテーブルから引いても、命令語が実際に
+    // 変わったら必ず翻訳し直すこと。**
+    //
+    // **これが pull 型の核心。** 控えの置き場を変えたせいで照合が甘くなると、
+    // 書き換えられた番地で**古いコードを静かに実行し続ける**。
+    // code_gen_map.h が push 型を棄却した理由がそのまま当てはまる失敗形。
+    //
+    // 書き換える位置は **スロットの控えが届かない範囲** (9 語目以降) にする。
+    // ここが素通りするなら、サイドテーブルは長さのぶんを照合していない。
+    using namespace verify_stage_g;
+
+    SideHarness s;
+    Harness& h = s.h();
+
+    h.runAt(kLongEntry);
+    REQUIRE(h.stats().translated == 1u);
+    requireLongerThanSlot(h, kLongEntry);
+
+    // **9 語目以降を書き換える。** スロットの控え (8 語) の外側なので、
+    // 段 F のままなら照合できず、サイドテーブルだけが捕まえられる。
+    const u32 beyondSlot = kLongEntry + x68k::jit::kMaxVerifyWords * 2u;
+    REQUIRE(h.ram[beyondSlot + 1] == 0x00);
+    h.ram[beyondSlot + 1] = 0x01;
+    bumpPageOnly(h, kLongEntry);
+
+    h.runAt(kLongEntry);
+
+    INFO("beyondSlot=", beyondSlot, " translated=", h.stats().translated,
+         " verifyMiss=", h.stats().verifyMiss);
+    // **翻訳し直したこと。**
+    CHECK(h.stats().translated == 2u);
+    CHECK(h.stats().verifyMiss == 1u);
+    CHECK(h.stats().verifyHit == 0u);
+}
+
+TEST_CASE("スロットが上書きされたら古い控えを読まない")
+{
+    // **What: サイドテーブルの索引を持ったスロットが別の番地に取られたら、
+    // その控えは二度と使われないこと。**
+    //
+    // 索引はスロットの中にあるので、スロットが上書きされても**索引の値は
+    // 残る**。持ち主を突き合わせずに引くと、**他人の控えを自分のものとして
+    // 読む** = 「違うのに同じ」で古いコードを実行し続ける形になる。
+    //
+    // 直接は観測できない (控えは private) ので、**振る舞いで問う**:
+    // 先客を追い出した後、新しい番地が偽共有で救われてはならない
+    // ——救われたなら、それは先客の控えを読んで「同じ」と答えたということ。
+    using namespace verify_stage_g;
+
+    SideHarness s;
+    Harness& h = s.h();
+
+    // 先客: 長いブロックを置いてサイドテーブルの 0 番を取らせる。
+    h.runAt(kLongEntry);
+    REQUIRE(h.stats().translated == 1u);
+    requireLongerThanSlot(h, kLongEntry);
+    REQUIRE(h.stats().verifySideUsed == 1u);
+
+    // **同じスロットへ写る別の番地**を用意する。索引は実装に訊けないので、
+    // 畳み込みの式で作る (T4 が式そのものは実装の振る舞いで問うている)。
+    const std::uint32_t slotOf = foldedIndex(kLongEntry, Harness::kSlots);
+    u32 intruder = 0;
+    for (u32 candidate = kEntry + 0x600; candidate < kEntry + 0x3000; candidate += 2)
+    {
+        const bool sameSlot = foldedIndex(candidate, Harness::kSlots) == slotOf;
+        if (sameSlot && candidate != kLongEntry)
+        {
+            intruder = candidate;
+            break;
+        }
+    }
+    REQUIRE(intruder != 0);
+
+    // **侵入者は短いブロック** (MOVEQ が並ぶ既定の埋め草) にする。
+    // 長さが違うので、先客の控えを読んだら語数からして食い違う。
+    h.runAt(intruder);
+    const x68k::jit::BlockSlot& taken = h.slots[slotOf];
+    INFO("slot=", slotOf, " entryPc=", taken.entryPc, " intruder=", intruder);
+    // 本当に上書きされたこと (されていなければ以下は空虚)。
+    REQUIRE(taken.entryPc == intruder);
+
+    // **先客が戻ってくる。** 索引が残った状態で、そのページに偽共有を作る。
+    bumpPageOnly(h, kLongEntry);
+    const std::uint64_t hitBefore = h.stats().verifyHit;
+    h.runAt(kLongEntry);
+
+    INFO("verifyHit ", hitBefore, " -> ", h.stats().verifyHit);
+    // **救われてはならない。** 先客はスロットを失っているので、
+    // タグ外れで翻訳し直すのが正しい。ここで verifyHit が増えるなら、
+    // 上書きされたスロットの索引から**他人の控え**を読んでいる。
+    CHECK(h.stats().verifyHit == hitBefore);
+
+    SUBCASE("侵入者自身も先客の控えで救われない")
+    {
+        // 侵入者のページに偽共有を作る。**侵入者は短いブロックなので
+        // スロット側の控えを持っている**が、もし索引を引き継いでいて
+        // そちらを先に読むなら、長さの違う控えで照合してしまう。
+        //
+        // ここは「救われないこと」ではなく「**正しく**救われること」を
+        // 問う: 自分の控えで照合が通り、翻訳し直さない。
+        SideHarness s2;
+        Harness& h2 = s2.h();
+
+        h2.runAt(kLongEntry);
+        REQUIRE(h2.stats().verifySideUsed == 1u);
+        h2.runAt(intruder);
+        const std::uint64_t translatedBefore = h2.stats().translated;
+
+        bumpPageOnly(h2, intruder);
+        h2.runAt(intruder);
+
+        INFO("intruder translated ", translatedBefore, " -> ", h2.stats().translated);
+        // 自分の控え (スロット側 8 語以内) で救われること。
+        CHECK(h2.stats().translated == translatedBefore);
+        CHECK(h2.stats().verifyHit >= 1u);
+    }
+
+    SUBCASE("枠が別の持ち主へ回った後、古い索引で他人の控えを読まない")
+    {
+        // **これが持ち主の突き合わせが存在する理由そのもの。**
+        //
+        // 索引はスロットの中にあり、枠 (VerifySide) はバンプで再利用される。
+        // 「索引を持ったままのスロット」と「別の持ち主へ回った枠」が同時に
+        // 存在すると、突き合わせが無い実装は**他人の控えで照合して
+        // 「同じ」と答える** = 古いコードを静かに実行し続ける。
+        //
+        // **その状態を作るには盤面を直接置く。** 索引を残したままスロットを
+        // 生かす経路は、実装が索引を打ち消しているぶん公開 API からは
+        // 作れない —— つまり**今の実装が正しいからこそ作れない**。
+        // 正しさの根拠が「作れないこと」に寄りかかっていると、
+        // 打ち消しを外す変異も突き合わせを外す変異も同時に素通りする。
+        // 盤面を置けば、突き合わせだけを名指しで問える。
+        SideHarness s3(1);
+        Harness& h3 = s3.h();
+
+        // 枠 0 を別の番地 (kEntry) の持ち物にする。
+        // **語の中身は kLongEntry の実メモリと一致させる** ——
+        // 突き合わせが無ければ「照合が通ってしまう」形にするため。
+        // 通らない控えを置いたのでは、弾いたのが持ち主の照合なのか
+        // 語の不一致なのか区別が付かない。
+        s3.sides[0].ownerPc = kEntry;
+        s3.sides[0].mappingEpoch = h3.cpu().codeGenMap().mappingEpoch();
+        s3.sides[0].words = static_cast<std::uint16_t>(x68k::jit::kMaxVerifyWords + 1u);
+        for (std::uint32_t i = 0; i < s3.sides[0].words; ++i)
+        {
+            s3.sides[0].verify[i] = static_cast<std::uint16_t>(
+                (static_cast<std::uint16_t>(h3.ram[kLongEntry + i * 2u]) << 8) |
+                h3.ram[kLongEntry + i * 2u + 1u]);
+        }
+
+        // kLongEntry のスロットを「翻訳済み・枠 0 を指す」状態に置く。
+        // **持ち主は kEntry なので、この索引は他人のもの。**
+        static std::uint8_t probeCode[4] = {0, 0, 0, 0};
+        const std::uint32_t idx = foldedIndex(kLongEntry, Harness::kSlots);
+        x68k::jit::BlockSlot& victim = h3.slots[idx];
+        victim = x68k::jit::BlockSlot{};
+        victim.entryPc = kLongEntry;
+        victim.mappingEpoch = h3.cpu().codeGenMap().mappingEpoch();
+        victim.pageGen = h3.cpu().codeGenMap().generation(kLongEntry);
+        victim.count = 1;
+        victim.code = probeCode;
+        victim.verifyWords = 0;  // スロット側の控えは持たない (長いブロック)
+        victim.verifySide = 0;   // **他人の枠を指す索引**
+
+        // 世代だけ動かす (偽共有)。照合へ入る条件を作る。
+        bumpPageOnly(h3, kLongEntry);
+        const std::uint64_t hitBefore = h3.stats().verifyHit;
+        const std::uint64_t noSnapBefore = h3.stats().verifyNoSnapshot;
+        h3.runAt(kLongEntry);
+
+        INFO("verifyHit ", hitBefore, " -> ", h3.stats().verifyHit, " verifyNoSnapshot ",
+             noSnapBefore, " -> ", h3.stats().verifyNoSnapshot);
+        // **救われてはならない。** 語が一致していても、持ち主が違う控えは
+        // 読んではいけない。
+        CHECK(h3.stats().verifyHit == hitBefore);
+        // **「控え無し」に落ちること** (= 保守的な側へ倒れて翻訳し直す)。
+        CHECK(h3.stats().verifyNoSnapshot == noSnapBefore + 1u);
+    }
+}
+
+TEST_CASE("サイドテーブルが満杯なら控えを持たず段 F と同じ動作になる")
+{
+    // **What: 表を使い切ったら、長いブロックは控えを持たない (= 世代が動いたら
+    // 翻訳し直す) こと。溢れても正しさは 1 ビットも変わらない。**
+    //
+    // 内部 SRAM は逼迫しているので、表は取れないことも使い切ることもある。
+    // **そのとき静かに壊れるのではなく、静かに縮退する**のが設計。
+    // 縮退した状態は「控えを持てず」に数え上がるので、黙って被覆が減らない。
+    using namespace verify_stage_g;
+
+    // 表を 1 件しか持たない台。2 本目の長いブロックが必ず溢れる。
+    SideHarness s(1);
+    Harness& h = s.h();
+
+    // 2 本目の長いブロックを別ページに置く (互いのスロットも世代も干渉しない)。
+    const u32 secondEntry = kLongEntry + 0x800;
+    REQUIRE((secondEntry >> x68k::CodeGenMap::kPageShift) !=
+            (kLongEntry >> x68k::CodeGenMap::kPageShift));
+    fillLongBlock(h, secondEntry, 16);
+
+    h.runAt(kLongEntry);
+    REQUIRE(h.stats().verifySideUsed == 1u);
+    REQUIRE(h.stats().verifyTooLong == 0u);
+
+    h.runAt(secondEntry);
+    requireLongerThanSlot(h, secondEntry);
+
+    INFO("verifySideUsed=", h.stats().verifySideUsed, " verifyTooLong=", h.stats().verifyTooLong);
+    // **溢れたこと。** 逃がせた本数は増えず、持てなかった本数が増える。
+    CHECK(h.stats().verifySideUsed == 1u);
+    CHECK(h.stats().verifyTooLong == 1u);
+
+    // 溢れた側は段 F と同じ動作 = 偽共有でも翻訳し直す。
+    const std::uint64_t translatedBefore = h.stats().translated;
+    bumpPageOnly(h, secondEntry);
+    h.runAt(secondEntry);
+
+    INFO("translated ", translatedBefore, " -> ", h.stats().translated);
+    CHECK(h.stats().translated == translatedBefore + 1u);
+    // **照合を試みてすらいない**に数えること (実差と混ぜない)。
+    CHECK(h.stats().verifyNoSnapshot == 1u);
+    CHECK(h.stats().verifyMiss == 0u);
+
+    SUBCASE("表を教わらなくても動く")
+    {
+        // 確保に失敗した実機と同じ状態。**JIT ごと死なせない。**
+        SideHarness s2;
+        Harness& h2 = s2.h();
+        h2.runner.setVerifySideStorage(nullptr, 0);
+
+        h2.runAt(kLongEntry);
+        REQUIRE(h2.stats().translated == 1u);
+        CHECK(h2.stats().verifySideUsed == 0u);
+        CHECK(h2.stats().verifyTooLong == 1u);
+
+        // 段 F と同じ: 偽共有でも翻訳し直す (正しさは無傷)。
+        bumpPageOnly(h2, kLongEntry);
+        h2.runAt(kLongEntry);
+        CHECK(h2.stats().translated == 2u);
+        CHECK(h2.stats().verifyNoSnapshot == 1u);
+    }
+}
+
+TEST_CASE("reset の後に古い控えが残らない")
+{
+    // **What: reset() は控えも一緒に巻き戻すこと。**
+    //
+    // 2 つの失敗形を同時に問う。
+    //
+    //   巻き戻し**忘れ**: 表が埋まったまま二度と空かず、以後の長いブロックが
+    //     全部控えを持てなくなる。**正しさは無傷なので、正しさのテストでは
+    //     永遠に落ちない** (段 E の「黙って諦める罠」と同じ形)。
+    //   巻き戻し**すぎ**: スロットがまだ索引を持っているのに枠を再利用すると、
+    //     他人の控えを読む。reset() はスロットも全部捨てるので両立する。
+    using namespace verify_stage_g;
+
+    SideHarness s(1);
+    Harness& h = s.h();
+
+    h.runAt(kLongEntry);
+    REQUIRE(h.stats().verifySideUsed == 1u);
+    REQUIRE(h.stats().verifyTooLong == 0u);
+
+    h.runner.reset();
+
+    // **同じ長いブロックをもう一度置ける**こと (枠が空いている)。
+    h.runAt(kLongEntry);
+    INFO("verifySideUsed=", h.stats().verifySideUsed, " verifyTooLong=", h.stats().verifyTooLong);
+    CHECK(h.stats().verifySideUsed == 2u);
+    // **1 本も「持てなかった」に落ちていないこと。** 巻き戻し忘れならここ。
+    CHECK(h.stats().verifyTooLong == 0u);
+
+    // 巻き戻した後の控えがちゃんと効くこと (救えること)。
+    bumpPageOnly(h, kLongEntry);
+    const std::uint64_t translatedBefore = h.stats().translated;
+    h.runAt(kLongEntry);
+    CHECK(h.stats().translated == translatedBefore);
+    CHECK(h.stats().verifyHit >= 1u);
+}
+
+TEST_CASE("照合の内訳は世代外れの総数と一致する (サイドテーブルを混ぜても)")
+{
+    // **What: verifyHit + verifyMiss + verifyNoSnapshot == keyMissGen が、
+    // 長いブロックと短いブロックを混ぜても常に成り立つこと。**
+    //
+    // 保存則。破れることは「世代が外れたのに照合もせず翻訳もしない経路が
+    // ある」か「世代外れ以外から照合へ入る経路がある」ことと同値で、
+    // どちらも pull 型の穴になる。**控えの置き場を 2 つに増やしたので、
+    // 帰属が片方に寄って落ちる形が新しく生まれうる。**
+    using namespace verify_stage_g;
+
+    // 表を 1 件だけにして、救われる側 (kLongEntry) と溢れる側を両方作る。
+    SideHarness s(1);
+    Harness& h = s.h();
+    const u32 secondEntry = kLongEntry + 0x800;
+    fillLongBlock(h, secondEntry, 16);
+
+    for (int i = 0; i < 8; ++i)
+    {
+        h.runAt(kEntry);       // 短い (スロット側の控え)
+        h.runAt(kLongEntry);   // 長い (サイドテーブル)
+        h.runAt(secondEntry);  // 長いが溢れた (控え無し)
+        bumpPageOnly(h, kEntry);
+        bumpPageOnly(h, kLongEntry);
+        bumpPageOnly(h, secondEntry);
+        if (i % 3 == 0)
+        {
+            // ときどき本当に書き換える (照合が「違う」と答える側も通す)。
+            h.ram[kEntry + 1] = static_cast<x68k::u8>(h.ram[kEntry + 1] + 1u);
+            const u32 beyondSlot = kLongEntry + x68k::jit::kMaxVerifyWords * 2u;
+            h.ram[beyondSlot + 1] = static_cast<x68k::u8>(h.ram[beyondSlot + 1] + 1u);
+        }
+    }
+
+    INFO("verifyHit=", h.stats().verifyHit, " verifyMiss=", h.stats().verifyMiss,
+         " verifyNoSnapshot=", h.stats().verifyNoSnapshot, " keyMissGen=", h.stats().keyMissGen);
+    // 3 つの側を実際に通っていること (通っていなければ以下は空虚)。
+    CHECK(h.stats().verifyHit > 0u);
+    CHECK(h.stats().verifyMiss > 0u);
+    CHECK(h.stats().verifyNoSnapshot > 0u);
+    CHECK(h.stats().verifyHit + h.stats().verifyMiss + h.stats().verifyNoSnapshot ==
+          h.stats().keyMissGen);
+}
+
+TEST_CASE("BlockSlot は 40 バイトのまま")
+{
+    // **What: サイドテーブルの索引を足しても 1 スロットの大きさが動かないこと。**
+    //
+    // 40 バイトは **2048 スロット = 80KB** の前提で、実測の largest free block
+    // 90KB の内側に収まる根拠そのもの。56 バイトへ膨らむと 112KB になり、
+    // スロットを 1024 へ半減させることになる ——**段 F が実測で棄却した
+    // 「片方だけ当たる」形** (照合とスロット増は掛け算で効き、片方ずつ
+    // +1.9% / +2.5% に対し両方で +5.6%)。
+    //
+    // 実体は block_runner.h の static_assert が**ビルド時**に落とす。
+    // ここで実行時にも問うのは、**その static_assert が消されたら気づく**ため
+    // (縛りを 1 箇所に置くと、縛りごと消す変異が素通りする)。
+    const std::size_t expected = sizeof(void*) == 4 ? 40u : 48u;
+    INFO("sizeof(BlockSlot)=", sizeof(x68k::jit::BlockSlot), " expected=", expected);
+    CHECK(sizeof(x68k::jit::BlockSlot) == expected);
+}
+
 TEST_CASE("スロット数が 512 でも 2048 でも同じように動く")
 {
     // **What: 確保に失敗して 512 へ落ちた構成でも、ランナーが正しく動くこと。**

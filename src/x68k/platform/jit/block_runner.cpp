@@ -58,6 +58,22 @@ void BlockRunner::reset()
     {
         code_->reset();
     }
+    // **サイドテーブルも一緒に巻き戻す (段 G)。**
+    //
+    // スロットを全部 BlockSlot{} に戻した = どの索引も残っていないので、
+    // ここで sideUsed_ を 0 に戻しても「まだ誰かが指している控え」を
+    // 潰すことにはならない。**逆に戻し忘れると**、表だけが埋まったまま
+    // 二度と空かず、以後の長いブロックが全部控えを持てなくなる
+    // (正しさは無傷で、静かに段 F へ縮退するだけ = 気づけない形)。
+    //
+    // ownerPc も消す。索引を持ったスロットは今ここで全部消えたので
+    // 突き合わせは既に不可能だが、**表を覗いたときに「使用中」に
+    // 見える状態を残さない** (統計と debug が嘘をつかない)。
+    for (std::uint32_t i = 0; i < sideUsed_; ++i)
+    {
+        sides_[i].ownerPc = 0;
+    }
+    sideUsed_ = 0;
     neg_.clear();
     codeFull_ = false;
 }
@@ -302,6 +318,16 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     const u32 verifyBytes = plan.fallThroughPc + 4u - plan.entryPc;
     const u32 verifyWords = verifyBytes / 2u;
     slot.verifyWords = 0;
+    // 索引を打ち消してから置き直す。このスロットには別の番地が居座って
+    // いたかもしれず、その索引は他人の枠を指している。
+    //
+    // **正しさを担っているのはこの行ではなく sideFor の持ち主照合。**
+    // この行を外す変異はテストを 1 件も落とさず、持ち主照合を外す変異だけが
+    // 落ちる (両方外すと落ちる) ことを確かめてある。つまりこれは
+    // **二重の守りであって、守りの本体ではない**。残すのは、索引が
+    // 他人を指したまま生き延びる状態を統計やデバッガで見たときに
+    // 「弾かれるから平気」を読み手に推論させないため。
+    slot.verifySide = kNoVerifySide;
     if (verifyWords <= kMaxVerifyWords)
     {
         bool readable = true;
@@ -323,33 +349,97 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
             slot.verifyWords = static_cast<std::uint8_t>(verifyWords);
         }
     }
-    if (slot.verifyWords == 0)
+    else
+    {
+        // **スロットに収まらない長さ。サイドテーブルへ逃がす (段 G)。**
+        //
+        // 実測で控えを持てなかったのは静的に 176 本しかないのに、その 2 本が
+        // 世代外れの 28.7% (57 万件) を占めて毎回インタプリタへ落ちていた
+        // (arena が満杯なので翻訳し直しは弾かれる)。**救う効果は翻訳の
+        // 節約ではなく、インタプリタ落ちの回避**である。
+        slot.verifySide = captureSide(cpu, plan.entryPc, plan.mappingEpoch, verifyWords);
+        if (slot.verifySide != kNoVerifySide)
+        {
+            ++stats_.verifySideUsed;
+        }
+    }
+    if (slot.verifyWords == 0 && slot.verifySide == kNoVerifySide)
     {
         ++stats_.verifyTooLong;
     }
     return &slot;
 }
 
-bool BlockRunner::verifyMatches(const BlockSlot& slot, M68k& cpu)
+std::uint16_t BlockRunner::captureSide(M68k& cpu, std::uint32_t entryPc, std::uint32_t mappingEpoch,
+                                       std::uint32_t words)
 {
-    // **控えが無ければ照合しない。** 範囲が kMaxVerifyWords を超えたブロックは
-    // 語を持っていないので、同じかどうかを言えない。言えないなら翻訳し直す
-    // (保守的な側)。
-    if (slot.verifyWords == 0)
+    const bool fits = sides_ != nullptr && words <= kMaxSideVerifyWords && sideUsed_ < sideCount_;
+    if (!fits)
+    {
+        // 表が無い / 満杯 / 31 語でも足りない。**控えを持たない**
+        // (段 F と同じ縮退で、世代が動いたら翻訳し直すだけ)。
+        return kNoVerifySide;
+    }
+
+    // **確保するのは全語を読み終えてから。** 途中で読めない語に当たった
+    // ときに枠を進めてしまうと、誰の持ち物でもない使用済みの枠が
+    // 表に溜まる (バンプなので二度と返らない)。
+    VerifySide& side = sides_[sideUsed_];
+    for (std::uint32_t i = 0; i < words; ++i)
+    {
+        u16 word = 0;
+        if (!cpu.peekCodeWord(entryPc + i * 2u, word))
+        {
+            // 読めない語が混ざったら控えを持たない。**部分的に控えると
+            // 「控えた範囲は同じだが読めなかった語が変わっている」ブロックを
+            // 同一と判定する** (スロット側と同じ理由)。
+            return kNoVerifySide;
+        }
+        side.verify[i] = word;
+    }
+    side.words = static_cast<std::uint16_t>(words);
+    // **持ち主を最後に書く。** sideFor はこの 2 欄で有効性を判定するので、
+    // 語を書き終える前に持ち主が立つ状態を作らない。
+    side.ownerPc = entryPc;
+    side.mappingEpoch = mappingEpoch;
+    return static_cast<std::uint16_t>(sideUsed_++);
+}
+
+bool BlockRunner::verifyMatches(const BlockSlot& slot, M68k& cpu) const
+{
+    // 控えの在処は 2 つある。スロットの中 (8 語まで) と、長いブロックのための
+    // サイドテーブル (段 G)。**どちらも命令語をそのまま持つ** ので、
+    // 引く先が変わっても偽陽性は原理的に存在しない。
+    const std::uint16_t* words = nullptr;
+    std::uint32_t count = 0;
+    if (slot.verifyWords != 0)
+    {
+        words = slot.verify;
+        count = slot.verifyWords;
+    }
+    else if (const VerifySide* side = sideFor(slot); side != nullptr)
+    {
+        words = side->verify;
+        count = side->words;
+    }
+
+    // **控えが無ければ照合しない。** 語を持っていないので、同じかどうかを
+    // 言えない。言えないなら翻訳し直す (保守的な側)。
+    if (count == 0)
     {
         return false;
     }
 
     // **窓の中からだけ読む。** バスを叩くと照合しただけで MFP の割り込み
     // 要因レジスタが動く (readCodeWord と同じ理由)。
-    for (std::uint32_t i = 0; i < slot.verifyWords; ++i)
+    for (std::uint32_t i = 0; i < count; ++i)
     {
         u16 word = 0;
         if (!cpu.peekCodeWord(slot.entryPc + i * 2u, word))
         {
             return false;
         }
-        if (word != slot.verify[i])
+        if (word != words[i])
         {
             return false;
         }
@@ -450,7 +540,7 @@ NativeResult BlockRunner::run(M68k& cpu)
                     slot->pageGen = nowGen;
                     verified = true;
                 }
-                else if (slot->verifyWords == 0)
+                else if (slot->verifyWords == 0 && sideFor(*slot) == nullptr)
                 {
                     // 控えが無いので照合を試みてすらいない。**本物の
                     // 書き換えと混ぜない。** 混ぜたせいで実機の 26.7% を
