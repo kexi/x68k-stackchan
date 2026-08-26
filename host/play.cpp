@@ -190,6 +190,8 @@ void printUsage()
         "                  Human68k の起動を待つ間、実時間に合わせると遅すぎるため\n"
         "  --zoom N        表示倍率 (既定 3)\n"
         "  --full          768x512 全体を出す (既定は左上 256x240)\n"
+        "  --shot PATH     指定フレームの合成結果を PPM で書いて終わる\n"
+        "  --shot-frame N  --shot を撮るフレーム (既定 120)\n"
         "\n"
         "終了は窓を閉じるか ESC。\n");
 }
@@ -210,6 +212,8 @@ int main(int argc, char** argv)
     x68k::u64 fastCycles = 400000000;
     int zoom = kZoom;
     bool full = false;
+    std::string shotPath;
+    unsigned long shotFrame = 120;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -238,6 +242,14 @@ int main(int argc, char** argv)
         else if (arg == "--zoom" && hasNext)
         {
             zoom = std::atoi(argv[++i]);
+        }
+        else if (arg == "--shot" && hasNext)
+        {
+            shotPath = argv[++i];
+        }
+        else if (arg == "--shot-frame" && hasNext)
+        {
+            shotFrame = std::strtoul(argv[++i], nullptr, 0);
         }
         else if (arg == "--full")
         {
@@ -362,6 +374,7 @@ int main(int argc, char** argv)
     std::printf("[play] 窓を閉じるか ESC で終了します\n");
 
     bool running = true;
+    unsigned long frameNo = 0;
     while (running)
     {
         const x68k::u32 frameStart = SDL_GetTicks();
@@ -407,6 +420,30 @@ int main(int argc, char** argv)
         SDL_RenderClear(renderer);
         SDL_RenderCopy(renderer, texture, nullptr, nullptr);
         SDL_RenderPresent(renderer);
+
+        // 切り分け用のスクリーンショット。窓を開けない環境でも
+        // 「絵が出ているか」を機械的に確かめられるようにする。
+        if (!shotPath.empty() && frameNo == shotFrame)
+        {
+            std::FILE* f = std::fopen(shotPath.c_str(), "wb");
+            if (f != nullptr)
+            {
+                std::fprintf(f, "P6\n%u %u\n255\n", viewW, viewH);
+                for (std::size_t i = 0; i < pixels.size(); ++i)
+                {
+                    const x68k::u16 c = pixels[i];
+                    const unsigned char rgb[3] = {
+                        static_cast<unsigned char>(((c >> 11) & 0x1F) << 3),
+                        static_cast<unsigned char>(((c >> 5) & 0x3F) << 2),
+                        static_cast<unsigned char>((c & 0x1F) << 3)};
+                    std::fwrite(rgb, 1, 3, f);
+                }
+                std::fclose(f);
+                std::printf("[shot] %s に書き出しました\n", shotPath.c_str());
+            }
+            running = false;
+        }
+        ++frameNo;
 
         // 55.45Hz に合わせる。1 フレーム約 18ms。
         constexpr x68k::u32 kFrameMs = 18;
