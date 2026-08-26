@@ -410,6 +410,88 @@ bool parseMouseScript(const std::string& text, std::vector<MouseEvent>* out)
     return true;
 }
 
+// 入力台本の 1 項目。指定サイクルでキーを押す/離す。
+struct InputEvent
+{
+    x68k::u64 cycle;
+    x68k::u8 code;  // bit7 が立っていれば離鍵
+};
+
+// 台本を読む。1 行 = "<cycle> <down|up> <key>"。
+//
+// key は ASCII 1 文字 (asciiToScanCode で引く) か、0xNN の生スキャンコード。
+// 生を許すのは、矢印キーのように ASCII に無いキーを送れるようにするため。
+// '#' から行末まではコメント。
+//
+// Why not --keys を拡張しないか: --keys は「文字列を等間隔で打ち込む」
+// もので、起動コマンドを入れるのに使う。ゲームの操作は「いつ押して
+// いつ離すか」が要るので、別の口にする方が両方とも素直になる。
+bool loadInputScript(const std::string& path, std::vector<InputEvent>& out)
+{
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr)
+    {
+        return false;
+    }
+
+    char line[256];
+    int lineNo = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr)
+    {
+        ++lineNo;
+        char* hash = std::strchr(line, '#');
+        if (hash != nullptr)
+        {
+            *hash = '\0';
+        }
+
+        char cycleBuf[64] = {0};
+        char actionBuf[16] = {0};
+        char keyBuf[16] = {0};
+        const int got = std::sscanf(line, "%63s %15s %15s", cycleBuf, actionBuf, keyBuf);
+        if (got <= 0)
+        {
+            continue;  // 空行
+        }
+        if (got != 3)
+        {
+            std::printf("[script] %d 行目を読めません: %s", lineNo, line);
+            std::fclose(f);
+            return false;
+        }
+
+        InputEvent e;
+        e.cycle = std::strtoull(cycleBuf, nullptr, 0);
+
+        x68k::u8 code = 0;
+        if (keyBuf[0] == '0' && (keyBuf[1] == 'x' || keyBuf[1] == 'X'))
+        {
+            code = static_cast<x68k::u8>(std::strtoul(keyBuf, nullptr, 16));
+        }
+        else
+        {
+            code = x68k::asciiToScanCode(keyBuf[0]);
+        }
+        if (code == 0)
+        {
+            std::printf("[script] %d 行目のキーを解釈できません: %s\n", lineNo, keyBuf);
+            std::fclose(f);
+            return false;
+        }
+
+        const bool isUp = std::strcmp(actionBuf, "up") == 0;
+        e.code = isUp ? static_cast<x68k::u8>(code | 0x80u) : code;
+        out.push_back(e);
+    }
+
+    std::fclose(f);
+
+    // 時刻順に並べる。書く側が順番を気にしなくて済むように。
+    std::sort(out.begin(), out.end(),
+              [](const InputEvent& a, const InputEvent& b) { return a.cycle < b.cycle; });
+    return true;
+}
+
 void printUsage()
 {
     std::printf(
@@ -432,6 +514,9 @@ void printUsage()
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
+        "  --input-script F  キーの台本を読む。1 行 \"<cycle> <down|up> <key>\"\n"
+        "                  key は ASCII 1 文字か 0xNN の生スキャンコード。\n"
+        "                  押しっぱなしを表せるので、ゲームの操作を再現できる\n"
         "  --mouse SCRIPT  マウスを動かす。CYCLE:DX:DY[:LR] をカンマ区切りで並べる\n"
         "                  (例: 400000000:10:0:L,401000000:0:0:)\n"
         "                  DX/DY は相対量。X68000 のマウスは絶対座標を持たない\n"
@@ -624,6 +709,7 @@ int main(int argc, char** argv)
     bool trace = false;
     bool traceDisk = false;
     std::string keys;
+    std::string inputScriptPath;
     x68k::u32 watchAddr = 0;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
@@ -693,6 +779,10 @@ int main(int argc, char** argv)
         else if (arg == "--keys" && hasNext)
         {
             keys = argv[++i];
+        }
+        else if (arg == "--input-script" && hasNext)
+        {
+            inputScriptPath = argv[++i];
         }
         else if (arg == "--text-only")
         {
@@ -956,6 +1046,19 @@ int main(int argc, char** argv)
     // 台本のどこまで送ったか。
     std::size_t mouseIndex = 0;
 
+    // 入力台本。指定サイクルでキーを押す/離す。
+    std::vector<InputEvent> inputScript;
+    std::size_t inputIndex = 0;
+    if (!inputScriptPath.empty())
+    {
+        if (!loadInputScript(inputScriptPath, inputScript))
+        {
+            return 1;
+        }
+        std::printf("[script] %s から %zu 件のキー操作を読みました\n", inputScriptPath.c_str(),
+                    inputScript.size());
+    }
+
     // トレースも統計もキー入力も要らないときは、実機と同じ run() を回す。
     //
     // Why これが要るか: 実機は run() を呼ぶ (main/main.cpp)。プロファイルを
@@ -1000,6 +1103,13 @@ int main(int argc, char** argv)
             // run() は命令数を返さない。サイクル数から概算する
             // (統計を出さない経路なので、正確な命令数は要らない)。
             instructions += used / 4;
+
+            // 入力台本。指定の時刻を過ぎたものを順に送る。
+            while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+            {
+                machine.pressKey(inputScript[inputIndex].code);
+                ++inputIndex;
+            }
 
             // 台本の時刻に達したキーを送る。押下と離鍵で 1 回ずつ。
             if (hasMoreKeys && spent >= nextKeyCycle)
@@ -1102,6 +1212,13 @@ int main(int argc, char** argv)
                 continue;
             }
             ++mouseIndex;
+        }
+
+        // 入力台本。指定の時刻を過ぎたものを順に送る。
+        while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+        {
+            machine.pressKey(inputScript[inputIndex].code);
+            ++inputIndex;
         }
 
         // キーを 1 つずつ打つ。押下と解放を交互に送る。
