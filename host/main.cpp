@@ -44,6 +44,7 @@ extern unsigned long g_refillFromRam;
 extern unsigned long g_blockHits[65536];
 #endif
 #include "video/cgrom_fallback.h"
+#include "video/compositor.h"
 #include "video/graphic_raster.h"
 #include "video/text_raster.h"
 #include "video/text_scrape.h"
@@ -1396,8 +1397,8 @@ int main(int argc, char** argv)
         }
         else
         {
-            x68k::GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0,
-                                           0, kWidth, kHeight, pixels.data(), kWidth);
+            x68k::Compositor::render(graphicVram.data(), textVram.data(), &machine.sprite(),
+                                     machine.video(), 0, 0, kWidth, kHeight, pixels.data(), kWidth);
         }
 
         if (writePpm(ppmPath, pixels.data(), kWidth, kHeight))

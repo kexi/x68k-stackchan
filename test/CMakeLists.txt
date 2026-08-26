@@ -95,6 +95,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/sprite_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/compositor.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
@@ -144,6 +145,7 @@ add_executable(x68k_tests
   test_bus.cpp
   test_gvram_bus.cpp
   test_text_raster.cpp
+  test_compositor.cpp
   test_graphic_raster.cpp
   test_sprite.cpp
   test_text_scrape.cpp

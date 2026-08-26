@@ -6,7 +6,9 @@
 #include <M5Unified.h>
 #include <esp_log.h>
 
+#include "video/compositor.h"
 #include "video/graphic_raster.h"
+#include "video/sprite_raster.h"
 #include "video/text_raster.h"
 
 namespace x68k_platform
@@ -82,7 +84,17 @@ bool DisplayLcd::shouldComposite(x68k::Machine& machine) const
     // 書いている) ので、SX-Window を起動するまでは払う必要のない代金になる。
     // ゲストが自分で許可を出した時だけ合成へ切り替えれば、既存のコンソールは
     // 今までどおりの速さで動く。
-    return graphicVram_ != nullptr && machine.video().graphicEnabled();
+    // スプライト面 (BG 2 面 + スプライト) も合成が要る。
+    //
+    // Why not グラフィック面だけ見ればよいか: ゲームは BG とスプライトだけで
+    // 絵を作り、G-VRAM を一切使わないことがある。グラフィック面の許可だけを
+    // 条件にすると、その場合にテキスト単独の経路へ落ちてスプライトが
+    // 1 つも出ない。上の「使う側が許可を出した時だけ払う」という考え方は
+    // そのままに、払う理由をもう 1 つ足す。
+    const bool hasGraphic = graphicVram_ != nullptr && machine.video().graphicEnabled();
+    const bool hasSprites =
+        x68k::SpriteRaster::hasVisibleContent(machine.sprite(), machine.video());
+    return hasGraphic || hasSprites;
 }
 
 void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, x68k::u32 srcWidth,
@@ -90,9 +102,9 @@ void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, 
 {
     if (shouldComposite(machine))
     {
-        // 奥から順に重ねる。優先順位と透明の扱いは GraphicRaster が持つ。
-        x68k::GraphicRaster::composite(graphicVram_, textVram, machine.video(), viewX_, viewY_,
-                                       srcWidth, srcHeight, out, kScreenWidth);
+        // 奥から順に重ねる。優先順位と透明の扱いは Compositor が持つ。
+        x68k::Compositor::render(graphicVram_, textVram, &machine.sprite(), machine.video(), viewX_,
+                                 viewY_, srcWidth, srcHeight, out, kScreenWidth);
         return;
     }
 
