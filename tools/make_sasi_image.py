@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import struct
 import sys
+import tempfile
 from pathlib import Path
 
 # SASI のセクタ長。X68000 の SASI HDD は 256 バイト/セクタ。
@@ -440,7 +441,7 @@ class HumanFat:
 MINIMAL_CONFIG_SYS = b"SHELL = \\COMMAND.X\r\n"
 
 
-def collect_files(source: Path) -> list[tuple[str, bytes]]:
+def collect_files(source: Path, extra: list[Path] | None = None) -> list[tuple[str, bytes]]:
     """イメージへ入れるファイルを集める。
 
     Human68k の起動に要るのは HUMAN.SYS と COMMAND.X。CONFIG.SYS は
@@ -458,10 +459,23 @@ def collect_files(source: Path) -> list[tuple[str, bytes]]:
 
     files.append(("CONFIG.SYS", MINIMAL_CONFIG_SYS))
 
+    # 追加ファイル (自作の .X など) を後ろへ足す。
+    #
+    # Why not source の中身を全部入れるか: Human68k の配布物には
+    # 起動に要らないものが多数入っていて、入れるとイメージが太るうえ
+    # 「何が入っているか」が配布物の中身に左右されて再現しなくなる。
+    # 明示的に指定されたものだけを足す。
+    for path in extra or []:
+        if not path.exists():
+            raise FileNotFoundError(f"追加ファイルが見つかりません: {path}")
+        files.append((path.name.upper(), path.read_bytes()))
+
     return files
 
 
-def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
+def build_image(
+    source: Path, output: Path, hdd_bytes: int, extra: list[Path] | None = None
+) -> None:
     total_sectors = hdd_bytes // SASI_SECTOR_SIZE
     if total_sectors < MIN_TOTAL_SECTORS:
         raise ValueError(
@@ -470,7 +484,7 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
         )
 
     image = bytearray(hdd_bytes)
-    files = collect_files(source)
+    files = collect_files(source, extra)
 
     # HUMAN.SYS はメモリ上の姿へ展開してから置く。
     #
@@ -550,32 +564,143 @@ def build_image(source: Path, output: Path, hdd_bytes: int) -> None:
     print(f"    ルートディレクトリ {fat.entry_count} エントリ")
 
 
+def read_root_files(image: bytes) -> dict[str, bytes]:
+    """既存のイメージのルートディレクトリからファイルを取り出す。
+
+    Human68k の配布物が手元に無くても、いちど作ったイメージがあれば
+    そこから HUMAN.SYS と COMMAND.X を回収して組み直せる。配布物の
+    再入手を開発の前提から外すためにある。
+
+    寸法は HumanFat と同じ式で求める。ディスク上の BPB は読まない
+    (Human68k 自身が読まないので、BPB が正しい保証が無い)。
+    """
+    total_sectors = len(image) // SASI_SECTOR_SIZE
+    partition_sasi_sectors = total_sectors - FAT_START_LBA
+    fat = HumanFat(partition_sasi_sectors * SASI_SECTOR_SIZE // FAT_BYTES_PER_SECTOR)
+
+    base = FAT_START_LBA * SASI_SECTOR_SIZE
+    fat_table_off = base + fat.fat_start * FAT_BYTES_PER_SECTOR
+    root_off = base + fat.root_start * FAT_BYTES_PER_SECTOR
+    data_off = base + fat.data_start * FAT_BYTES_PER_SECTOR
+    cluster_bytes = FAT_SECTORS_PER_CLUSTER * FAT_BYTES_PER_SECTOR
+
+    def fat_entry(index: int) -> int:
+        if fat.fat_bits == 16:
+            return struct.unpack_from(">H", image, fat_table_off + index * 2)[0]
+        # 12bit は 2 エントリで 3 バイト。
+        off = fat_table_off + (index * 3) // 2
+        pair = struct.unpack_from(">H", image, off)[0]
+        return (pair >> 4) if index % 2 == 0 else (pair & 0x0FFF)
+
+    out: dict[str, bytes] = {}
+    for i in range(FAT_ROOT_ENTRIES):
+        entry = image[root_off + i * DIR_ENTRY_SIZE : root_off + (i + 1) * DIR_ENTRY_SIZE]
+        if not entry or entry[0] in (0x00, 0xE5):
+            continue
+        stem = entry[0:8].decode("ascii", "replace").rstrip()
+        ext = entry[8:11].decode("ascii", "replace").rstrip()
+        name = f"{stem}.{ext}" if ext else stem
+        start = struct.unpack_from("<H", entry, 0x1A)[0]
+        size = struct.unpack_from("<I", entry, 0x1C)[0]
+
+        body = bytearray()
+        cluster = start
+        # 壊れた FAT で無限に回らないよう、クラスタ数を上限にする。
+        for _ in range(fat.cluster_count + 2):
+            if cluster < 2 or cluster >= fat.end_of_chain:
+                break
+            off = data_off + (cluster - 2) * cluster_bytes
+            body += image[off : off + cluster_bytes]
+            if len(body) >= size:
+                break
+            cluster = fat_entry(cluster)
+        out[name] = bytes(body[:size])
+
+    return out
+
+
+def inject_image(source_image: Path, output: Path, add: list[Path]) -> None:
+    """既存の起動可能イメージへファイルを足した新しいイメージを作る。
+
+    Why not 既存イメージを直接書き換えるか: FAT の空きクラスタ管理と
+    ディレクトリエントリの挿入を「読み書き両対応」で書くことになり、
+    書き込みだけの現行コードより壊れやすい。いったん中身を取り出して
+    組み直せば、既に動いている build_image の経路をそのまま通せる。
+    """
+    image = source_image.read_bytes()
+    found = read_root_files(image)
+
+    missing = [n for n in ("HUMAN.SYS", "COMMAND.X") if n not in found]
+    if missing:
+        raise ValueError(f"元のイメージに {', '.join(missing)} がありません: {source_image}")
+
+    # build_image はディレクトリを受け取るので、取り出した中身を
+    # いったん一時ディレクトリへ置く。
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        (work / "human.sys").write_bytes(found["HUMAN.SYS"])
+        (work / "command.x").write_bytes(found["COMMAND.X"])
+        build_image(work, output, len(image), add)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", type=Path, help="Human68k を展開したディレクトリ")
-    parser.add_argument("output", type=Path, help="生成する SASI HDD イメージ")
-    parser.add_argument(
+    sub = parser.add_subparsers(dest="command")
+
+    # 既定の動作 (配布物のディレクトリから作る)。
+    build = sub.add_parser("build", help="Human68k のディレクトリからイメージを作る")
+    build.add_argument("source", type=Path, help="Human68k を展開したディレクトリ")
+    build.add_argument("output", type=Path, help="生成する SASI HDD イメージ")
+    build.add_argument(
         "--size",
         type=int,
         default=DEFAULT_HDD_BYTES,
         help=f"HDD の容量 (バイト、既定 {DEFAULT_HDD_BYTES})",
     )
+    build.add_argument("--add", type=Path, action="append", default=[], help="追加で入れるファイル")
+
+    # 既存イメージへ足す。Human68k の配布物が手元に無くても使える。
+    inject = sub.add_parser("inject", help="既存イメージへファイルを足して作り直す")
+    inject.add_argument("source", type=Path, help="元にする起動可能イメージ")
+    inject.add_argument("output", type=Path, help="生成する SASI HDD イメージ")
+    inject.add_argument(
+        "--add", type=Path, action="append", default=[], help="追加で入れるファイル"
+    )
+
+    # 既存イメージの中身を一覧する (切り分け用)。
+    ls = sub.add_parser("ls", help="イメージのルートディレクトリを一覧する")
+    ls.add_argument("source", type=Path, help="調べるイメージ")
+
     args = parser.parse_args()
 
-    if not args.source.is_dir():
-        print(f"ディレクトリが見つかりません: {args.source}", file=sys.stderr)
-        return 1
-
     try:
-        build_image(args.source, args.output, args.size)
+        if args.command == "inject":
+            inject_image(args.source, args.output, args.add)
+            print()
+            print("次の手順:")
+            print(f"  just run --hdd {args.output} --dump-text")
+            return 0
+
+        if args.command == "ls":
+            for name, body in read_root_files(args.source.read_bytes()).items():
+                print(f"{name:<14} {len(body)} バイト")
+            return 0
+
+        if args.command == "build":
+            if not args.source.is_dir():
+                print(f"ディレクトリが見つかりません: {args.source}", file=sys.stderr)
+                return 1
+            build_image(args.source, args.output, args.size, args.add)
+            print()
+            print("次の手順:")
+            print(f"  just run --hdd {args.output} --ppm /tmp/boot.ppm")
+            return 0
+
+        parser.print_help()
+        return 1
     except (FileNotFoundError, ValueError) as e:
         print(f"エラー: {e}", file=sys.stderr)
         return 1
-
-    print()
-    print("次の手順:")
-    print(f"  just run --hdd {args.output} --ppm /tmp/boot.ppm")
-    return 0
 
 
 if __name__ == "__main__":
