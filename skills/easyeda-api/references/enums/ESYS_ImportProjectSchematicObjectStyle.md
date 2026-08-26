@@ -1,0 +1,57 @@
+# ESYS\_ImportProjectSchematicObjectStyle enum
+
+Import project schematic primitive style
+
+## Signature
+
+```typescript
+export enum ESYS_ImportProjectSchematicObjectStyle 
+```
+
+## Enumeration Members
+
+<table><thead><tr><th>
+
+Member
+
+
+</th><th>
+
+Value
+
+
+</th><th>
+
+Description
+
+
+</th></tr></thead>
+<tbody><tr><td>
+
+USE\_SOURCE\_FILE\_STYLE
+
+
+</td><td>
+
+`'custom'`
+
+
+</td><td>
+
+
+</td></tr>
+<tr><td>
+
+USE\_SYSTEM\_THEME
+
+
+</td><td>
+
+`'system'`
+
+
+</td><td>
+
+
+</td></tr>
+</tbody></table>
