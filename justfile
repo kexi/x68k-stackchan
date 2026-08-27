@@ -116,6 +116,24 @@ build:
 flash:
     idf.py flash
 
+# ROM とディスクイメージを storage パーティションへ焼く。
+#
+# 既定では SD から読むが、カード無しで動かしたいときはこちら。
+# ディスクは疎で持つので、20MB のイメージでも実体は数百 KB で収まる。
+[doc('ROM とディスクを flash 用の 1 ファイルにまとめる')]
+pack-data HDD OUT="build/x68kdata.bin":
+    uv run tools/mkflashimage.py --iplrom rom/iplrom.dat --hdd {{HDD}} --out {{OUT}}
+
+# storage パーティションの位置は partitions.csv の 0x410000。
+[doc('まとめたデータを storage パーティションへ書き込む')]
+flash-data DATA="build/x68kdata.bin":
+    # esptool は単体のコマンドとしては PATH に無い。ESP-IDF が供給する
+    # Python モジュールとして呼ぶ (idf.py が内部でやっているのと同じ形)。
+    python -m esptool --chip esp32s3 write_flash 0x410000 {{DATA}}
+
+[doc('ファームとデータを両方書き込む (カード無しで動く状態にする)')]
+flash-all HDD: build (pack-data HDD) flash flash-data
+
 [doc('CoreS3 のシリアル出力を読む')]
 monitor:
     idf.py monitor

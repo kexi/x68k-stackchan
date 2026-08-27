@@ -38,6 +38,7 @@ idf_component_register(
         "${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp"
         # --- platform: ESP32 専用 ---
         "${X68K_ROOT}/src/x68k/platform/storage_sd.cpp"
+        "${X68K_ROOT}/src/x68k/platform/storage_flash.cpp"
         "${X68K_ROOT}/src/x68k/platform/display_lcd.cpp"
         "${X68K_ROOT}/src/x68k/platform/frame_channel.cpp"
         "${X68K_ROOT}/src/x68k/platform/key_queue.cpp"

@@ -45,6 +45,7 @@
 #include "servo.h"
 #include "io/ascii_keymap.h"
 #include "machine.h"
+#include "storage_flash.h"
 #include "storage_sd.h"
 #include "video/cgrom_fallback.h"
 #include "video/text_scrape.h"
@@ -76,6 +77,7 @@ x68k::u16* g_frameBufferB = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
+x68k_platform::FlashDisk g_flashDisk;
 // フロッピー 2 台。イメージが無ければ「ディスクが入っていない」まま。
 x68k_platform::SdFloppy g_floppy[x68k::Fdc::kDriveCount];
 x68k_platform::DisplayLcd g_display;
@@ -1170,8 +1172,19 @@ bool reserveMemory()
 // SD から ROM を読む。IPL-ROM が無ければ起動できない。
 bool loadRoms()
 {
-    const std::size_t iplSize =
+    // SD を先に見る。焼き直さずに中身を変えられる方が開発中は都合がよい。
+    // 無ければ flash に焼いたものへ落ちる (カード無しで動かすため)。
+    std::size_t iplSize =
         x68k_platform::loadFile(x68k_platform::kIplromPath, g_iplRom, kIplromBytes);
+    if (iplSize != kIplromBytes)
+    {
+        const std::size_t fromFlash = x68k_platform::loadFlashIplRom(g_iplRom, kIplromBytes);
+        if (fromFlash > 0)
+        {
+            iplSize = fromFlash;
+            ESP_LOGI(kTag, "IPL-ROM を flash から読みました");
+        }
+    }
     // 長さまで確かめる。
     //
     // loadFile はバッファに収まる限り任意の長さを成功として返す。
@@ -1196,8 +1209,15 @@ bool loadRoms()
     // 一切読めなくなる。ホスト側 (host/main.cpp) と同じ扱いに揃える。
     //
     // バッファ自体は reserveMemory で確保済み (取れなければそこで止まる)。
-    const std::size_t cgSize =
-        x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes);
+    std::size_t cgSize = x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes);
+    if (cgSize != kCgromBytes)
+    {
+        const std::size_t fromFlash = x68k_platform::loadFlashCgRom(g_cgRom, kCgromBytes);
+        if (fromFlash > 0)
+        {
+            cgSize = fromFlash;
+        }
+    }
 
     // 長さも見る。短いものを受け入れると大半の字形が欠け、「表示は出るが
     // 読めない」という切り分けにくい状態になる。合わなければ代替へ落とす。
@@ -1217,9 +1237,23 @@ bool loadRoms()
         ESP_LOGW(kTag, "CGROM がありません。IPL-ROM 内蔵 6x12 ANK フォントで代替します");
     }
 
-    if (!g_disk.open(x68k_platform::kHddPath))
+    // ディスクは flash を先に見る。
+    //
+    // Why not SD を優先しないか: flash に焼くのは「このファームで動かす
+    // ものを固定したい」という意思表示なので、たまたま挿さっている
+    // カードより優先する方が意図に沿う。SD の中身を使いたいときは
+    // flash を消す (esptool erase-region) か、SD 用のファームを焼く。
+    //
+    // ROM (IPL/CGROM) は逆に SD を優先している。あちらは「差し替えたい」
+    // 対象で、ディスクほど「これで固定したい」ものではないため。
+    bool diskFromSd = false;
+    if (!g_flashDisk.open())
     {
-        ESP_LOGW(kTag, "HDD イメージを開けません: %s", x68k_platform::kHddPath);
+        diskFromSd = g_disk.open(x68k_platform::kHddPath);
+        if (!diskFromSd)
+        {
+            ESP_LOGI(kTag, "SD に HDD イメージがありません: %s", x68k_platform::kHddPath);
+        }
     }
 
     // フロッピーは任意。無くても SASI から起動できるので、開けなくても
@@ -1246,7 +1280,21 @@ bool loadRoms()
     memory.cgRom = g_cgRom;
     g_machine.setMemory(memory);
     g_machine.setSasiBuffer(g_sasiBuffer);
-    g_machine.setDisk(&g_disk);
+    // flash に焼いたものがあればそれを、無ければ SD のものを使う。
+    if (g_flashDisk.isPresent())
+    {
+        g_machine.setDisk(&g_flashDisk);
+        ESP_LOGI(kTag, "HDD イメージを flash から使います");
+    }
+    else if (diskFromSd)
+    {
+        g_machine.setDisk(&g_disk);
+        ESP_LOGI(kTag, "HDD イメージを SD から使います");
+    }
+    else
+    {
+        ESP_LOGW(kTag, "HDD イメージがありません (SD にも flash にも)");
+    }
 
     // ゲスト RAM の書き換えを追う世代マップを配線する。
     //
@@ -1445,10 +1493,32 @@ void emulatorTask(void* /*arg*/)
             ESP_LOGI(kTag, "テスト音: キーオフ");
         }
 
+        // 音声はリングの空きを埋めるまで作る。
+        //
+        // Why not 1 スライスに 1 ブロックか: 元はそうしていたが、
+        // スライスの回る回数がそのまま音声の生成レートになる。
+        // スライスが重いソフト (毎フレーム BG を書き換えるゲーム等) では
+        // 5 秒で 60 回程度しか回らず、必要な 30 ブロック/秒に届かない。
+        // 実機で音がぶつぶつ切れた。
+        //
+        // 空きを埋める形にすれば、スライスの回数と音声のレートが切り離される。
+        // 1 回で作るのは高々 kBlockCount-1 枚なので、ここで長く居座らない。
         const bool isAudioOn = g_audioEnabled.load(std::memory_order_relaxed);
-        if (isAudioOn && g_audio.pending() < x68k_platform::AudioChannel::kBlockCount - 2)
+        if (isAudioOn)
         {
-            static_cast<void>(x68k_platform::pumpAudio(g_machine, g_audio));
+            // 1 枚は空けたまま止める。
+            //
+            // Why not 埋め切らないか: 埋め切ると、次に作った 1 枚が必ず
+            // 捨てられる (writeBlock が満杯で nullptr を返す)。実機で
+            // 「取りこぼし」が増え続けたのがこれ。少し余らせておけば、
+            // 消費が一瞬遅れても捨てずに済む。
+            while (g_audio.pending() + 1 < x68k_platform::AudioChannel::kBlockCount - 1)
+            {
+                if (!x68k_platform::pumpAudio(g_machine, g_audio))
+                {
+                    break;
+                }
+            }
         }
 
         // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
@@ -2576,11 +2646,23 @@ extern "C" void app_main(void)
         return;
     }
 
-    if (!x68k_platform::mountSd())
+    // flash に焼いたデータがあるかを先に見ておく。
+    //
+    // SD が無くても、flash に ROM とディスクが焼いてあれば動く。
+    // カードを挿さずに配れるようにするため。
+    const bool hasFlashData = x68k_platform::mountFlashData();
+
+    const bool hasSd = x68k_platform::mountSd();
+    if (!hasSd)
     {
-        ESP_LOGE(kTag, "SD をマウントできません");
-        x68k_platform::DisplayLcd::showMessage("NO SD CARD", "see NOTICE.md for ROM setup");
-        return;
+        ESP_LOGW(kTag, "SD をマウントできません");
+        if (!hasFlashData)
+        {
+            // どちらも無ければ ROM が手に入らない。ここで止める。
+            x68k_platform::DisplayLcd::showMessage("NO SD CARD", "see NOTICE.md for ROM setup");
+            return;
+        }
+        ESP_LOGI(kTag, "SD が無いので flash のデータで起動します");
     }
 
     if (!loadRoms())
