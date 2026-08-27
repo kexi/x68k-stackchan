@@ -20,8 +20,33 @@ void Compositor::render(const u8* graphicVram, const u8* textVram, const Sprite*
 
     // 先にグラフィックとテキストを重ねる。ここで背景が黒に塗られるので、
     // スプライト面は「透明でないドットだけ上書きする」形で乗せられる。
-    GraphicRaster::composite(graphicVram, textVram, video, srcX, srcY, width, height, out,
-                             outStride);
+    //
+    // グラフィック面もテキスト面も出ていないなら、composite がやるのは
+    // 「全画面を黒で埋める」だけになる。BG が全面を覆うソフト
+    // (BG とスプライトだけで絵を作るゲーム) では、その黒がそのまま
+    // 上書きされて消えるので、埋める意味が無い。
+    //
+    // PSRAM 上のフレームバッファへの書き込みは高い。CoreS3 の実測で
+    // 320x240 の 1 パスが無視できない重さだったので、要らないパスは飛ばす。
+    const bool showGraphic = graphicVram != nullptr && video.graphicEnabled();
+    const bool showText = textVram != nullptr && video.textEnabled();
+    if (showGraphic || showText)
+    {
+        GraphicRaster::composite(graphicVram, textVram, video, srcX, srcY, width, height, out,
+                                 outStride);
+    }
+    else
+    {
+        // どちらも出ないなら、背景を黒にするだけ。
+        for (u32 y = 0; y < height; ++y)
+        {
+            u16* row = out + static_cast<std::size_t>(y) * outStride;
+            for (u32 x = 0; x < width; ++x)
+            {
+                row[x] = 0;
+            }
+        }
+    }
 
     // 出すものが無いなら触らない。
     //

@@ -46,6 +46,7 @@
 #include "io/ascii_keymap.h"
 #include "machine.h"
 #include "storage_flash.h"
+
 #include "storage_sd.h"
 #include "video/cgrom_fallback.h"
 #include "video/text_scrape.h"
@@ -1563,7 +1564,30 @@ void emulatorTask(void* /*arg*/)
 #if X68K_MEASURE_DISK
         const std::int64_t renderT0 = esp_timer_get_time();
 #endif
-        const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
+        // 描画は 1 秒あたりの回数を抑える。
+        //
+        // Why: 合成中 (BG やスプライトを使うソフト) はダーティ追跡が効かず
+        // 毎スライス 320x240 を作り直す。CoreS3 では 1 回 50ms かかり、
+        // スライスが回るだけ描くと描画だけで実時間を使い切って、
+        // エミュレーションが 5MHz -> 0.7MHz まで落ちた。
+        //
+        // X68000 の垂直同期は 55.45Hz なので、それより速く描いても
+        // ゲスト側に新しい絵は無い。LCD の転送も間に合わない。
+        // 30Hz に間引くと、見た目はほとんど変わらずに時間が空く。
+        //
+        // Why not ダーティ追跡を BG/スプライトへ広げないか: それが本筋だが、
+        // 追跡する対象が PCG・ネームテーブル・スプライトレジスタと広く、
+        // 変更の入口も多い。まず「描きすぎ」を止めて効果を見る。
+        static std::int64_t lastRenderUs = 0;
+        constexpr std::int64_t kMinRenderIntervalUs = 33333;  // 30Hz
+        const std::int64_t nowUs = esp_timer_get_time();
+        const bool mayRender = (nowUs - lastRenderUs) >= kMinRenderIntervalUs;
+        bool rendered = false;
+        if (mayRender)
+        {
+            lastRenderUs = nowUs;
+            rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
+        }
 #if X68K_MEASURE_DISK
         g_renderUs += esp_timer_get_time() - renderT0;
         if (rendered)

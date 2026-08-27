@@ -87,3 +87,13 @@ if(DEFINED X68K_MEASURE_DISK)
 else()
     target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_MEASURE_DISK=0)
 endif()
+
+# 音源を最初から切った状態で焼く。
+#
+# main.cpp が X68K_ENABLE_AUDIO を見る作りになっていたのに、CMake 側に
+# 受け口が無く -D が届いていなかった。夜間など「音を出さずに動かしたい」
+# ときに焼き直しで切れるようにする。実行時に '|' で戻せるのは従来どおり。
+if(DEFINED X68K_ENABLE_AUDIO)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE X68K_ENABLE_AUDIO=${X68K_ENABLE_AUDIO})
+endif()
+

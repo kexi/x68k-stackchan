@@ -376,7 +376,17 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
         u16* row = out + static_cast<std::size_t>(y) * outStride;
         const u32 lineBase = vy * kTvramBytesPerLine;
 
-        for (u32 x = 0; x < width; ++x)
+        // 8 ドットぶんをまとめて読む。
+        //
+        // Why: 1 ドットごとに 4 プレーンを引くと、プレーンは 128KB 離れて
+        // いるので毎回 4 回の遠いメモリアクセスになる。320x240 で
+        // 307200 回。CoreS3 は VRAM を PSRAM に置いているため、この
+        // アクセスが描画時間の半分以上を占めていた (実測 29ms/フレーム)。
+        //
+        // プレーンはビットで詰まっているので、1 バイト読めば 8 ドットぶんが
+        // 一度に取れる。読み出しの回数が 1/8 になる。
+        u32 x = 0;
+        while (x < width)
         {
             const u32 vx = srcX + x;
             if (vx >= 1024)
@@ -384,32 +394,48 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
                 break;
             }
 
-            // 4 プレーンの同じビット位置を集めて 4bit にする。
-            // text_raster.cpp と同じくインライン展開する。
             const u32 byteOffset = lineBase + (vx >> 3);
-            const u8 mask = static_cast<u8>(1u << (7u - (vx & 7u)));
+            const u8 p0 = vram[byteOffset];
+            const u8 p1 = vram[kTvramPlaneSize + byteOffset];
+            const u8 p2 = vram[2 * kTvramPlaneSize + byteOffset];
+            const u8 p3 = vram[3 * kTvramPlaneSize + byteOffset];
 
-            u32 index = 0;
-            if ((vram[byteOffset] & mask) != 0)
+            // 4 プレーンとも 0 なら、この 8 ドットは全部透明。
+            // テキスト画面はほとんどが空白なので、ここで抜ける割合が高い。
+            if ((p0 | p1 | p2 | p3) == 0)
             {
-                index |= 1u;
-            }
-            if ((vram[kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 2u;
-            }
-            if ((vram[2 * kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 4u;
-            }
-            if ((vram[3 * kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 8u;
+                const u32 skip = 8u - (vx & 7u);
+                x += skip;
+                continue;
             }
 
-            if (index != kTransparentIndex)
+            // このバイトに含まれるドットを順に出す。
+            const u32 first = vx & 7u;
+            for (u32 bit = first; bit < 8u && x < width; ++bit, ++x)
             {
-                row[x] = palette[index];
+                const u8 mask = static_cast<u8>(1u << (7u - bit));
+                u32 index = 0;
+                if ((p0 & mask) != 0)
+                {
+                    index |= 1u;
+                }
+                if ((p1 & mask) != 0)
+                {
+                    index |= 2u;
+                }
+                if ((p2 & mask) != 0)
+                {
+                    index |= 4u;
+                }
+                if ((p3 & mask) != 0)
+                {
+                    index |= 8u;
+                }
+
+                if (index != kTransparentIndex)
+                {
+                    row[x] = palette[index];
+                }
             }
         }
     }

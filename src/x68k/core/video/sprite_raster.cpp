@@ -136,31 +136,71 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
         const u32 cellY = bgY / kCell;
         const u32 inCellY = bgY & (kCell - 1u);
 
+        // セルの情報は 16 ドットぶん変わらない。内側で毎回引き直さない。
+        //
+        // Why: 1 ドットごとにネームテーブルを読んでパターン番号と反転を
+        // 解いていたが、隣り合う 16 ドットは同じセルなので同じ答えになる。
+        // 実機 (CoreS3) で描画が 1 フレーム 50ms かかり、その大半がここだった。
+        // セルが変わったときだけ引き直す。
+        u32 cachedCell = 0xFFFFFFFFu;
+        u32 pattern = 0;
+        bool flipH = false;
+        bool flipV = false;
+
         for (u32 x = 0; x < width; ++x)
         {
             const u32 bgX = (srcX + x + scrollX) & (kBgPixelsX - 1u);
             const u32 cellX = bgX / kCell;
 
-            // ネームテーブルの 1 セルは 1 ワード。X が 2 バイト刻み、
-            // Y が 128 バイト刻み (BGTEXTST $FFC2A2 の計算と同じ)。
-            const u32 nameOffset = nameBase + cellY * (Sprite::kBgCellsX * 2u) + cellX * 2u;
-            if (nameOffset + 1 >= Sprite::kVramSize)
+            if (cellX != cachedCell)
+            {
+                cachedCell = cellX;
+
+                // ネームテーブルの 1 セルは 1 ワード。X が 2 バイト刻み、
+                // Y が 128 バイト刻み (BGTEXTST $FFC2A2 の計算と同じ)。
+                const u32 nameOffset = nameBase + cellY * (Sprite::kBgCellsX * 2u) + cellX * 2u;
+                if (nameOffset + 1 >= Sprite::kVramSize)
+                {
+                    // 範囲外のセルは透明として飛ばす。次のセルで引き直す。
+                    pattern = 0xFFFFFFFFu;
+                    continue;
+                }
+
+                // ネームテーブルのワードはスプライトの属性ワードと同じ形。
+                const u16 name = static_cast<u16>((static_cast<u16>(vram[nameOffset]) << 8) |
+                                                  vram[nameOffset + 1]);
+                pattern = name & 0x00FFu;
+                flipH = (name & 0x0100u) != 0;
+                flipV = (name & 0x0200u) != 0;
+            }
+
+            if (pattern == 0xFFFFFFFFu)
             {
                 continue;
             }
-
-            // ネームテーブルのワードはスプライトの属性ワードと同じ形。
-            const u16 name =
-                static_cast<u16>((static_cast<u16>(vram[nameOffset]) << 8) | vram[nameOffset + 1]);
-            const u32 pattern = name & 0x00FFu;
-            const bool flipH = (name & 0x0100u) != 0;
-            const bool flipV = (name & 0x0200u) != 0;
 
             const u32 inCellX = bgX & (kCell - 1u);
             const u32 px = flipH ? (kCell - 1u - inCellX) : inCellX;
             const u32 py = flipV ? (kCell - 1u - inCellY) : inCellY;
 
-            const u8 index = pcgPixel(vram, pattern, px, py);
+            // PCG のバイトを直に引く。
+            //
+            // Why not pcgPixel を呼ばないか: あちらはドットごとに
+            // 「16x16 のどの 8x8 か」を判定し、パターン番号からアドレスを
+            // 組み立て直す。同じセルの中では上位の計算が変わらないので、
+            // ここでは 1 ドットぶんのバイト読みまで落とす。
+            // CoreS3 では VRAM が PSRAM にあり、この経路が描画時間の
+            // 半分近くを占めていた。
+            const u32 quadrant = ((py >= 8u) ? 2u : 0u) | ((px >= 8u) ? 1u : 0u);
+            const u32 offset =
+                (pattern * 4u + quadrant) * Sprite::kPcg8Bytes + (py & 7u) * 4u + ((px & 7u) >> 1);
+            if (offset >= Sprite::kVramSize)
+            {
+                continue;
+            }
+            const u8 packed = vram[offset];
+            const u8 index =
+                static_cast<u8>((px & 1u) ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu));
             if (index != kTransparentIndex)
             {
                 row[x] = palette[index];
