@@ -48,6 +48,31 @@ pre-commit:
       glob: "justfile"
       run: nix develop -c just --list
 
+    # 「IPL-ROM を逆アセンブルして確かめた」という主張の検査。
+    #
+    # lint は ROM が要らないので常時走らせる。番地を根拠に書いたのに生ワード列を
+    # 付けなかったコミットを、その場で数として見せる (ラチェットは CI 側)。
+    verify-rom-lint:
+      glob: "{src/x68k/core/**/*.h,docs/knowledge/*.md}"
+      run: nix develop -c uv run tools/verify_iplrom.py lint --quiet
+
+    # check は ROM (rom/iplrom.dat) がある人だけ走る。
+    #
+    # 終了コード 3 = ROM が無い、4 = 既知でない ROM。どちらも「照合できなかった」
+    # のであって「主張が誤っている」ではないので、コミットは止めない。
+    # 1 (MISMATCH) だけを失敗として扱う。
+    #
+    # Why not ROM が無いときに黙って成功しないか: スクリプトは SKIPPED を必ず
+    # 出力する。何も出さずに通ると「照合した」と見分けがつかず、ROM を置き忘れた
+    # まま「検証済み」と思い込む経路ができる。
+    verify-rom-check:
+      glob: "{src/x68k/core/**/*.h,docs/knowledge/*.md}"
+      run: |
+        code=0
+        nix develop -c uv run tools/verify_iplrom.py check || code=$?
+        if [ "$code" -eq 3 ] || [ "$code" -eq 4 ]; then exit 0; fi
+        exit "$code"
+
     gitleaks:
       run: nix develop -c gitleaks git --staged --no-banner --redact
 

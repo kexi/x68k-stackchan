@@ -87,6 +87,71 @@ jobs:
       - name: Check justfile
         run: nix develop -c just --list
 
+  # 「IPL-ROM を逆アセンブルして確かめた」という主張の検査。
+  #
+  # ここで走るのは selftest と lint だけで、**ROM との照合 (check) は走らない**。
+  # IPL-ROM はライセンス上リポジトリに置けず、CI にも置けないため。
+  # つまり CI が緑でも「主張が ROM と一致する」ことは何も保証していない。
+  # 保証しているのは次の 2 つに限られる:
+  #   1. 抽出・比較ロジック自体が壊れていないこと (selftest / 合成 ROM)
+  #   2. 生ワード列を伴わない番地の言及が増えていないこと (lint / ラチェット)
+  #
+  # 実際の照合は ROM を持っている人が手元で `just verify-rom` を回すしかない。
+  # これが本プロジェクトの既知の盲点で、ジョブ名にもそう書いてある。隠さない。
+  #
+  # Why not ROM を暗号化して CI に置くか: 復号鍵を持つジョブから ROM が
+  # 取り出せるので、再配布にあたる。ライセンスの制約は CI でも変わらない。
+  verify-rom-claims:
+    name: IPL-ROM claims (lint + selftest only; NO ROM comparison in CI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          # チェックアウト後に Git の認証情報は要らない。
+          # 残すと後続のステップから push できてしまう。
+          persist-credentials: false
+
+      - uses: DeterminateSystems/nix-installer-action@21a544727d0c62386e78b4befe52d19ad12692e3 # v17
+
+      - uses: nix-community/cache-nix-action@135667ec418502fa5a3598af6fb9eb733888ce6a # v6.1.3
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          purge: false
+          save: false
+
+      # 合成 ROM で抽出・比較ロジックを検査する。実物の ROM のバイト列は
+      # 1 バイトも使っていない (生成式は tools/verify_iplrom.py にある)。
+      - name: Selftest (synthetic ROM, no real ROM involved)
+        run: nix develop -c just verify-rom-selftest
+
+      # 生ワード列を伴わない番地の言及をラチェットする。増えたら落とす。
+      - name: Lint claims (ratchet against baseline)
+        run: nix develop -c just verify-rom-lint
+
+      # CI が何を保証していないかを、ジョブの要約にも残す。
+      # ログを開かずに緑だけを見る人に、盲点が見えるようにする。
+      - name: State what CI does not check
+        if: always()
+        run: |
+          {
+            echo "## IPL-ROM claims"
+            echo
+            echo "**CI では ROM 照合は走らない。**"
+            echo
+            echo "IPL-ROM (\`rom/iplrom.dat\`) はライセンス上リポジトリにも CI にも"
+            echo "置けない。したがってこのジョブが緑でも、コメントや OKF の主張が"
+            echo "実際の ROM と一致することは**何も保証していない**。"
+            echo
+            echo "| 検査 | CI | 保証すること |"
+            echo "|---|---|---|"
+            echo "| \`selftest\` | 走る | 抽出・比較ロジックが壊れていない (合成 ROM) |"
+            echo "| \`lint\` | 走る | 生ワード列の無い番地の言及が増えていない |"
+            echo "| \`check\` | **走らない** | 主張が ROM と一致すること |"
+            echo
+            echo "照合するには ROM を手元に置いて \`just verify-rom\` を回す。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   host-tests:
     name: host tests and lint
     runs-on: ubuntu-latest
