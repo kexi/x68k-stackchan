@@ -71,8 +71,22 @@ public:
     // RR0 (送受信状態) のビット。
     //
     // bit0 Rx Character Available / bit2 Tx Buffer Empty が要るところ。
-    // IPL-ROM $FF8042 が bit2 を、受信割り込みハンドラが bit0 相当の
-    // 「データがある」ことを前提に動く。
+    //
+    // **根拠の書き方が誤っていたので直す (2026-08-26)。** 以前は
+    // 「IPL-ROM $FF8042 が bit2 を」と書いていたが、ROM を読むと
+    // $FF8042 は `clr.l d0` で、続く $FF8044 は
+    // `btst #1, ($00000926).L` である。**ビット番号は 1、しかも
+    // 参照先は SCC のレジスタではなくワークエリア $926 だった。**
+    //
+    // $926 / $929 を ROM 全体で追うと、触っているのは bit0 と bit1 だけで
+    // **bit2 は 1 度も現れない** ($FF1266 / $FF1298 / $FF12E2 / $FF7FE4 /
+    // $FF8044 / $FF806A / $FF8080 と、$929 側の 9 箇所)。$FF7F2C の
+    // `move.b d0, ($928).L / move.b d0, ($929).L` から、ここは
+    // IOCS がチャネルごとに持つ状態のワークだと分かる。
+    //
+    // **値そのもの (kRr0TxEmpty = 0x04) は SCC の RR0 の仕様として正しい。**
+    // 誤っていたのは「IPL-ROM のこの番地がその根拠だ」という部分だけ。
+    // 資料上の RR0 のビット割り当てを根拠にする。
     static constexpr u8 kRr0RxAvailable = 0x01;
     static constexpr u8 kRr0Dcd = 0x08;
     static constexpr u8 kRr0TxEmpty = 0x04;
