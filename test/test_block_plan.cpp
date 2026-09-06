@@ -373,9 +373,11 @@ bool specSafeBranch(x68k::u16 op)
 //   opType == 4          BTST/BCHG/BCLR/BSET #imm。**BTST だけ**が
 //                        読むだけで書き戻さない (bit6-7 == 0)
 //   opType == 6          CMPI。結果を書かずフラグだけ
-//   opType 0/1/2/3/5     ORI/ANDI/SUBI/ADDI/EORI。**書き戻しがある**ので
-//                        入れない (Dn 宛てでも d[] へ書く形は
-//                        kAluImmToDreg と同じで、符号だけが違う)
+//   opType 1/2/3         ANDI/SUBI/ADDI。**対象が Dn なら書き戻し先は
+//                        レジスタ**なのでメモリの読みガードが要らない
+//   opType == 0          ORI。**入れない。** opcode 0x0000 がそれ自身なので、
+//                        ゼロで埋まった領域が全部この命令として読める
+//   opType == 5          EORI。**入れない。** エミッタが kEor を扱わない
 //
 // どちらも **対象は Dn (mode 0) だけ**。メモリ対象は読みガードを背負う。
 bool specSafeImmediate(x68k::u16 op)
@@ -404,8 +406,11 @@ bool specSafeImmediate(x68k::u16 op)
         return ((op >> 6) & 3u) == 0;
     }
 
-    const bool isCmpi = opType == 6;
-    if (!isCmpi)
+    // ANDI(1) / SUBI(2) / ADDI(3) / CMPI(6)。
+    // ORI(0) は opcode 0x0000 がそれ自身なのでゼロ領域を命令として読ませない
+    // ために除く。EORI(5) はエミッタが kEor を扱わないので除く。
+    const bool isAllowedAlu = opType == 1 || opType == 2 || opType == 3 || opType == 6;
+    if (!isAllowedAlu)
     {
         return false;
     }

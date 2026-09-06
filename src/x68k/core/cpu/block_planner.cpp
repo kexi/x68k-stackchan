@@ -733,14 +733,43 @@ bool planImmediate(u16 op, PlannedOp& out)
         return true;
     }
 
-    // CMPI : 0000 110 ss mmm rrr。
+    // 即値 ALU : 0000 ooo ss mmm rrr。opType が演算種別。
     //
-    // **opType 6 だけ。** ORI/ANDI/SUBI/ADDI/EORI は書き戻しがあるので
-    // 入れない (この関数の冒頭のコメント)。
-    const bool isCmpi = opType == 6;
-    if (!isCmpi)
+    //   0=ORI  1=ANDI  2=SUBI  3=ADDI  5=EORI  6=CMPI
+    //
+    // **対象が Dn なら書き戻し先はレジスタなので、メモリの読みガードが要らない。**
+    // かつては CMPI だけを通し「他は書き戻しがあるから入れない」としていたが、
+    // 判断の分かれ目は書き戻しの有無ではなく**どこへ書き戻すか**である。
+    // emitAluBody は kAnd/kOr を emitLogicAluCore、kAdd/kSub/kCmp を
+    // emitArithAluCore へ渡し、どちらも CMP 以外は emitWriteDataRegister で
+    // d[] へ書き戻す。つまりエミッタ側は既に対応済みで、ここで弾いていた
+    // ことだけが制約だった。
+    //
+    // 実測: ゲームを 900M サイクル走らせ 1 命令ごとに planOne を呼ぶと、
+    // JIT 不可は実行回数比 15.0%。うち ANDI が 2.87%、ADDI が 0.92% で最多。
+    // この変更で被覆率は 85.0% -> 89.2% になった。
+    //
+    // **ORI (opType 0) は入れない。** opcode 0x0000 がちょうど
+    // ORI.B #imm,D0 になるため、ゼロで埋まった領域が全部この命令として
+    // 読める。未初期化 RAM やデータ領域へブロックが伸びる形を作りたくない。
+    // **EORI (opType 5) も入れない。** emitAluBody が kEor で e.failed を立てる。
+    PlanAluOp aluOp = PlanAluOp::kCmp;
+    switch (opType)
     {
-        return false;
+        case 1:
+            aluOp = PlanAluOp::kAnd;
+            break;
+        case 2:
+            aluOp = PlanAluOp::kSub;
+            break;
+        case 3:
+            aluOp = PlanAluOp::kAdd;
+            break;
+        case 6:
+            aluOp = PlanAluOp::kCmp;
+            break;
+        default:
+            return false;
     }
     // **対象は Dn だけ。** メモリ対象は読みガードを背負う。
     if (mode != 0)
@@ -758,7 +787,7 @@ bool planImmediate(u16 op, PlannedOp& out)
     // 違うのはサイクルだけなので、kind を増やさず cycles で分ける
     // (block_plan.h の Tier H のコメント)。
     out.kind = PlanKind::kAluImmToDreg;
-    out.aluOp = PlanAluOp::kCmp;
+    out.aluOp = aluOp;
     out.dstReg = static_cast<u8>(reg);
     out.size = static_cast<u8>(sizeBits == 0 ? kByte : (sizeBits == 1 ? kWord : kLong));
     // **8 サイクル。** CMP #imm,Dn の 4 ではない
