@@ -511,9 +511,15 @@ bool planAlu(u16 op, PlannedOp& out)
     const bool isAddressOrMulDiv = opmode == 3 || opmode == 7;
     if (isAddressOrMulDiv)
     {
-        // mode 0/1 以外は入れない (メモリ形と PC 相対と即値)。
+        // mode 0/1 と即値 (mode 7.4) を入れる。メモリ形と PC 相対は入れない。
+        //
+        // 即値を足す根拠: src が翻訳時定数になるだけで、本体 (フラグの式・
+        // 常に 32bit で作用する点) はレジスタ形と 1 mm も変わらない。
+        // 読みガードも要らない (メモリを触らない)。
+        // 実測では 0xB0FC/0xB1FC (CMPA #imm) が実行の 1.19% を占めていた。
+        const bool srcIsImmediateAddr = mode == 7 && reg == 4;
         const bool srcIsRegisterDirect = mode == 0 || mode == 1;
-        if (!srcIsRegisterDirect)
+        if (!srcIsRegisterDirect && !srcIsImmediateAddr)
         {
             return false;
         }
@@ -534,21 +540,25 @@ bool planAlu(u16 op, PlannedOp& out)
         switch (group)
         {
             case 0xDu:  // ADDA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kAddaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kAddaAregToAreg
+                                                                      : PlanKind::kAddaDregToAreg);
                 out.aluOp = PlanAluOp::kAdd;
                 // **8 サイクル。** ADD / SUB の 4 ではない (m68k_ops_alu.cpp:81)。
+                // 即値形も同じ 8 (src の読み方が変わるだけ)。
                 out.cycles = 8;
                 break;
             case 0x9u:  // SUBA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kAddaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kAddaAregToAreg
+                                                                      : PlanKind::kAddaDregToAreg);
                 out.aluOp = PlanAluOp::kSub;
                 out.cycles = 8;
                 break;
             case 0xBu:  // CMPA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kCmpaAregToAreg : PlanKind::kCmpaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kCmpaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kCmpaAregToAreg
+                                                                      : PlanKind::kCmpaDregToAreg);
                 out.aluOp = PlanAluOp::kCmp;
                 // **6 サイクル。** CMP の 4 でも ADDA の 8 でもない
                 // (m68k_ops_alu.cpp:283)。
@@ -1042,6 +1052,14 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         // **拡張ワードを持たないので、ここでは何もしない。**
         case PlanKind::kAddqImmToAreg:
             break;
+        // ADDA / SUBA / CMPA #imm,An。**MOVEA と同じ符号拡張**。
+        //
+        // An 相手の加算と比較は常に 32bit で行う (m68k_ops_alu.cpp)。
+        // .w の即値をゼロ拡張のまま渡すと 0xFFFF が 65535 として扱われ、
+        // 符号が壊れる。kAluImmToDreg の枝 (size でマスクするだけ) とは
+        // ここが違うので、同じ枝に載せてはいけない。
+        case PlanKind::kAddaImmToAreg:
+        case PlanKind::kCmpaImmToAreg:
         case PlanKind::kMoveaImmToAreg:
             // MOVEA.w は符号拡張して 32bit 全体を書く。
             p.imm = p.size == 4 ? longValue : sext16(ext0);

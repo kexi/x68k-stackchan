@@ -202,6 +202,22 @@ enum class PlanKind : u8
     kCmpaDregToAreg,  // srcReg = Dn 番号 / dstReg = An 番号
     kCmpaAregToAreg,  // srcReg = An 番号 / dstReg = An 番号
 
+    // ADDA / SUBA / CMPA .w/l #imm,An (Tier A)。**src が翻訳時定数**。
+    //
+    // Why not 上の kAddaDregToAreg へ即値フラグを足して相乗りさせないか:
+    // srcReg 欄の意味が「レジスタ番号」から「意味を持たない」へ変わり、
+    // 代わりに imm 欄が有効になる。同じ kind に 2 つの読み方を持たせると
+    // エミッタが srcReg を誤読しても誰も気づかない。kind を分ければ
+    // -Wswitch が foldImmediate とエミッタの両方で足し忘れを落とす
+    // (foldImmediate に default を置いていないのはそのため)。
+    //
+    // **imm は符号拡張済みで入る。** kMoveaImmToAreg と同じ合成で、
+    // .w のとき foldImmediate が sext16 してから入れる。An 相手の加算と
+    // 比較は常に 32bit なので、ゼロ拡張のまま渡すと 0xFFFF が 65535 として
+    // 扱われて符号が壊れる (kAluImmToDreg の枝とはここが違う)。
+    kAddaImmToAreg,  // imm = 符号拡張済み / dstReg = An 番号
+    kCmpaImmToAreg,  // imm = 符号拡張済み / dstReg = An 番号
+
     // --- Tier H: 命令長デコーダの拡張が解禁した形 (CMPI / ADDQ / BTST) ---
     //
     // **どれも非終端** (Tier G と同じ条件で選んである)。長さデコーダが

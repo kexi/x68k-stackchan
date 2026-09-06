@@ -321,7 +321,10 @@ bool specSafeAlu(x68k::u16 op)
         {
             return false;
         }
-        return mode == 0 || mode == 1;
+        // Dn / An 直接に加えて即値 (mode 7.4) を受ける。src が翻訳時定数に
+        // なるだけで、メモリを読まないので読みガードが要らない。
+        // メモリ形と PC 相対はどちらも読みガードを背負うので入れない。
+        return mode == 0 || mode == 1 || (mode == 7 && reg == 4);
     }
 
     // --- Tier G: ALU <#imm>,Dn ---
