@@ -250,8 +250,11 @@ TEST_CASE("属性ワードはパターン番号 8bit・反転 2bit・パレッ�
     Sprite sprite;
     sprite.reset();
 
-    // パレットブロック 5、垂直反転、水平反転、パターン番号 $3C。
-    sprite.write(spriteReg(0, 2), 0x533Cu);
+    // 根拠: MAME の x68k_v.cpp は反転を $4000/$8000、パレットを $0F00、
+    // パターンを $00FF として読む。反転とパレットは別のビット領域。
+
+    // 垂直反転・水平反転、パレットブロック 5、パターン番号 $3C。
+    sprite.write(spriteReg(0, 2), 0xC53Cu);
 
     CHECK(sprite.spritePattern(0) == 0x3Cu);
     CHECK(sprite.spriteFlipH(0));
@@ -265,15 +268,28 @@ TEST_CASE("属性ワードはパターン番号 8bit・反転 2bit・パレッ�
     CHECK_FALSE(sprite.spriteFlipV(0));
     CHECK(sprite.spritePaletteBlock(0) == 0);
 
-    // 水平反転だけ (bit8)。
-    sprite.write(spriteReg(0, 2), 0x0100u);
+    // 水平反転だけ (bit14)。
+    sprite.write(spriteReg(0, 2), 0x4000u);
     CHECK(sprite.spriteFlipH(0));
     CHECK_FALSE(sprite.spriteFlipV(0));
 
-    // 垂直反転だけ (bit9)。
-    sprite.write(spriteReg(0, 2), 0x0200u);
+    // 垂直反転だけ (bit15)。
+    sprite.write(spriteReg(0, 2), 0x8000u);
     CHECK_FALSE(sprite.spriteFlipH(0));
     CHECK(sprite.spriteFlipV(0));
+
+    // パレットブロックへ書いても反転にはならない。ここを取り違えると、
+    // 実機では「反転せず色だけ変わる」という形で壊れる。
+    sprite.write(spriteReg(0, 2), 0x0300u);
+    CHECK_FALSE(sprite.spriteFlipH(0));
+    CHECK_FALSE(sprite.spriteFlipV(0));
+    CHECK(sprite.spritePaletteBlock(0) == 3);
+
+    // 逆に、反転bitはパレットブロックを汚さない。
+    sprite.write(spriteReg(0, 2), 0xC000u);
+    CHECK(sprite.spriteFlipH(0));
+    CHECK(sprite.spriteFlipV(0));
+    CHECK(sprite.spritePaletteBlock(0) == 0);
 }
 
 TEST_CASE("プライオリティは 2bit で、0 は非表示")
@@ -485,11 +501,11 @@ TEST_CASE("水平反転はパターンを左右に、垂直反転は上下に入
         CHECK(at(out, px, py) != 0);
     }
 
-    SUBCASE("水平反転 (bit8)")
+    SUBCASE("水平反転 (bit14)")
     {
         Sprite sprite = makeSprite();
         setPatternPixel16(sprite, 0, px, py, 4);
-        placeSprite(sprite, 0, 0, 0, 0x0100u, 1);
+        placeSprite(sprite, 0, 0, 0, 0x4000u, 1);
 
         std::vector<x68k::u16> out = makeOut();
         SpriteRaster::renderSprites(sprite, video, 0, 0, kOutW, kOutH, out.data(), kOutW);
@@ -497,11 +513,11 @@ TEST_CASE("水平反転はパターンを左右に、垂直反転は上下に入
         CHECK(at(out, px, py) == 0);
     }
 
-    SUBCASE("垂直反転 (bit9)")
+    SUBCASE("垂直反転 (bit15)")
     {
         Sprite sprite = makeSprite();
         setPatternPixel16(sprite, 0, px, py, 4);
-        placeSprite(sprite, 0, 0, 0, 0x0200u, 1);
+        placeSprite(sprite, 0, 0, 0, 0x8000u, 1);
 
         std::vector<x68k::u16> out = makeOut();
         SpriteRaster::renderSprites(sprite, video, 0, 0, kOutW, kOutH, out.data(), kOutW);
@@ -513,7 +529,7 @@ TEST_CASE("水平反転はパターンを左右に、垂直反転は上下に入
     {
         Sprite sprite = makeSprite();
         setPatternPixel16(sprite, 0, px, py, 4);
-        placeSprite(sprite, 0, 0, 0, 0x0300u, 1);
+        placeSprite(sprite, 0, 0, 0, 0xC000u, 1);
 
         std::vector<x68k::u16> out = makeOut();
         SpriteRaster::renderSprites(sprite, video, 0, 0, kOutW, kOutH, out.data(), kOutW);
@@ -814,8 +830,8 @@ TEST_CASE("BG のネームテーブルも反転ビットを持つ")
     sprite.write(kBgControlOffset, 0x0201u);
 
     setPatternPixel16(sprite, 1, 1, 2, 4);
-    // パターン 1 を水平反転で置く。
-    setBgCell(sprite, 0, 0, 0, 0x0101u);
+    // パターン 1 を水平反転 (bit14) で置く。
+    setBgCell(sprite, 0, 0, 0, 0x4001u);
 
     std::vector<x68k::u16> out = makeOut();
     SpriteRaster::renderBg(sprite, video, 0, 0, 0, kOutW, kOutH, out.data(), kOutW);

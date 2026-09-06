@@ -195,20 +195,28 @@ public:
     }
 
     // パレットブロック (0-15)。テキスト/スプライトパレット 16 色 x 16 ブロック。
+    //
+    // 根拠: MAME の x68k_v.cpp が `(m_spritereg[ptr+2] & 0x0f00) >> 8` を
+    // colour として読む。BG のタイル callback も同じ $0F00 を使う。
     [[nodiscard]] u8 spritePaletteBlock(u32 index) const
     {
-        return static_cast<u8>((spriteWord(index, 2) >> 12) & 0x0Fu);
+        return static_cast<u8>((spriteWord(index, 2) >> 8) & 0x0Fu);
     }
 
-    // 水平反転 (bit8) / 垂直反転 (bit9)。
+    // 水平反転 (bit14) / 垂直反転 (bit15)。
+    //
+    // Why not bit8/bit9 を使わないか: そこはパレットブロックの領分。
+    // MAME は `& 0x4000` を xflip、`& 0x8000` を yflip として読み、
+    // BG のタイル callback も `(& 0xc000) >> 14` を flags にする。
+    // bit8 を反転に流用すると、実機では反転されずパレット番号だけが変わる。
     [[nodiscard]] bool spriteFlipH(u32 index) const
     {
-        return (spriteWord(index, 2) & 0x0100u) != 0;
+        return (spriteWord(index, 2) & 0x4000u) != 0;
     }
 
     [[nodiscard]] bool spriteFlipV(u32 index) const
     {
-        return (spriteWord(index, 2) & 0x0200u) != 0;
+        return (spriteWord(index, 2) & 0x8000u) != 0;
     }
 
     // プライオリティ。0 は非表示、1-3 が表示 (値が大きいほど手前)。

@@ -153,8 +153,10 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
             const u16 name =
                 static_cast<u16>((static_cast<u16>(vram[nameOffset]) << 8) | vram[nameOffset + 1]);
             const u32 pattern = name & 0x00FFu;
-            const bool flipH = (name & 0x0100u) != 0;
-            const bool flipV = (name & 0x0200u) != 0;
+            // 反転は bit14/bit15。bit8-11 はパレットブロックなので使わない
+            // (MAME の BG タイル callback は (& 0xc000) >> 14 を flags にする)。
+            const bool flipH = (name & 0x4000u) != 0;
+            const bool flipV = (name & 0x8000u) != 0;
 
             const u32 inCellX = bgX & (kCell - 1u);
             const u32 px = flipH ? (kCell - 1u - inCellX) : inCellX;
