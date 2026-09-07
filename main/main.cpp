@@ -80,6 +80,7 @@ x68k::u8* g_cgRom = nullptr;
 // 表示コアがもう片方を LCD へ送る。
 x68k::u16* g_frameBufferA = nullptr;
 x68k::u16* g_frameBufferB = nullptr;
+x68k::u16* g_frameBufferC = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
@@ -1054,6 +1055,9 @@ bool reserveMemory()
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_frameBufferB = static_cast<x68k::u16*>(
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // 3 枚目。転送中でも Core1 が書いて渡せるようにする。
+    g_frameBufferC = static_cast<x68k::u16*>(
+        heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     // SASI の転送バッファ (64KiB)。
     //
@@ -1220,7 +1224,7 @@ bool reserveMemory()
     // 先で別の失敗を招く。
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
                     g_cgRom != nullptr && g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
-                    g_sasiBuffer != nullptr;
+                    g_frameBufferC != nullptr && g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
@@ -1487,7 +1491,8 @@ void emulatorTask(void* /*arg*/)
     if (hasTileMemory)
     {
         auto* const renderer = new (tileMemory) x68k::TiledCompositor;
-        g_display.attachTiledRenderer(g_machine, *renderer, g_frameBufferA, g_frameBufferB);
+        g_display.attachTiledRenderer(g_machine, *renderer, g_frameBufferA, g_frameBufferB,
+                                      g_frameBufferC);
     }
     ESP_LOGI(kTag, "[tile-renderer] enabled=%d bytes=%u zoom=1", hasTileMemory,
              static_cast<unsigned>(sizeof(x68k::TiledCompositor)));
@@ -1774,7 +1779,18 @@ void emulatorTask(void* /*arg*/)
         //
         // GVRAM の dirty を座標単位にして描画が 27.5 -> 4.2ms になったので、
         // ここを下げる意味が出た。順序が逆だと効かない。
-        static x68k_platform::RenderBudget renderBudget{33333};
+        // 25,000us (40fps ぶん) にする。
+        //
+        // Why 33,333 では足りないか: LCD 転送が 1 枚 32.29ms なので、
+        // 生産周期 33.33ms のほうが遅い。転送から戻っても次の 1 枚が
+        // まだ出来ておらず、Core0 が毎周 1.04ms 待つ。転送より速く
+        // 作らせれば、転送が律速になり 31fps まで出せる。
+        //
+        // 描画自体は 1 枚 2.4ms しかかからないので 25,000us でも余る。
+        // かつてこの値を試して効かなかったのは、当時バッファが 2 枚で
+        // backpressure が 490回/5秒 立っており、そちらが真の律速
+        // だったため。3 枚にして backpressure=0 になって初めて効く。
+        static x68k_platform::RenderBudget renderBudget{25000};
         const std::int64_t nowUs = esp_timer_get_time();
         const bool mayRender = renderBudget.mayStart(nowUs);
         auto* const renderTarget = mayRender ? g_frames.tryWriteBuffer() : nullptr;
@@ -3111,7 +3127,7 @@ extern "C" void app_main(void)
     //
     // これが無いと、エミュレーションコアが画面を作れずキーも届かない。
     // 起動できないので、失敗したらここで止める。
-    if (!g_frames.begin(g_frameBufferA, g_frameBufferB))
+    if (!g_frames.begin(g_frameBufferA, g_frameBufferB, g_frameBufferC))
     {
         ESP_LOGE(kTag, "フレームの受け渡しを用意できません");
         x68k_platform::DisplayLcd::showMessage("INIT ERROR", "frame channel");
@@ -3337,6 +3353,17 @@ extern "C" void app_main(void)
                 }
             }
             g_frames.done();
+            // 次の 1 枚が既に出来ているなら、眠らずに続けて送る。
+            //
+            // Why: 3 枚にしてから Core1 は転送中も作り続けており
+            // (backpressure=0)、転送から戻った時点で次はもう待っている。
+            // ここで 1 tick 眠ると、その 1ms がまるごと転送に使えない
+            // 時間になる。実測で 1 枚あたり 36.5ms のうち 4.3ms が
+            // 転送以外に消えており、30fps に必要な 33.3ms を超えていた。
+            //
+            // 転送は 32.2ms のあいだ DMA 待ちで CPU を手放すので、
+            // 連続で回しても idle task は走れる。
+            continue;
         }
 
         // 待ちは 1 tick に切り詰める。

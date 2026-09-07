@@ -185,7 +185,17 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
     // ダーティが立たないままグラフィックの残骸が画面に残るため。
     const bool didModeChange = isCompositing != wasComposited_;
 
-    const bool knownBuffer = out == buffers_[0] || out == buffers_[1];
+    // どの枚に描くかで世代の追い先が変わる。並びの添字を引く。
+    int bufferIndex = -1;
+    for (int i = 0; i < kBuffers; ++i)
+    {
+        if (out == buffers_[i])
+        {
+            bufferIndex = i;
+            break;
+        }
+    }
+    const bool knownBuffer = bufferIndex >= 0;
     const bool canTile = tiled_ != nullptr && zoom_ == 1 && isCompositing && knownBuffer;
     if (canTile)
     {
@@ -197,7 +207,7 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
         }
         lastRenderedTiles_ =
             tiled_->render(graphicVram_, textVram, &machine.sprite(), machine.video(), out,
-                           out == buffers_[0] ? 0u : 1u, &machine.crtc());
+                           static_cast<x68k::u32>(bufferIndex), &machine.crtc());
         bus.clearTextDirty();
         forceFullRedraw_ = false;
         wasComposited_ = isCompositing;

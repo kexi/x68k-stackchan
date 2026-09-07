@@ -42,11 +42,12 @@ public:
 
     // Core1で登録。rendererとbufferはDisplayLcdより長く生存する。
     void attachTiledRenderer(x68k::Machine& machine, x68k::TiledCompositor& renderer,
-                             x68k::u16* bufferA, x68k::u16* bufferB)
+                             x68k::u16* bufferA, x68k::u16* bufferB, x68k::u16* bufferC)
     {
         tiled_ = &renderer;
         buffers_[0] = bufferA;
         buffers_[1] = bufferB;
+        buffers_[2] = bufferC;
         machine.sprite().setVisualDamage(renderer.observer());
         machine.video().setVisualDamage(renderer.observer());
         machine.bus().setVisualDamage(renderer.observer());
@@ -143,7 +144,9 @@ private:
 
     const x68k::u8* graphicVram_ = nullptr;
     x68k::TiledCompositor* tiled_ = nullptr;
-    x68k::u16* buffers_[2] = {};
+    // FrameChannel と同じ 3 枚。世代はこの並び順の添字で追う。
+    static constexpr int kBuffers = 3;
+    x68k::u16* buffers_[kBuffers] = {};
     x68k::u32 lastRenderedTiles_ = 0;
     x68k::u32 viewX_ = 0;
     x68k::u32 viewY_ = 0;

@@ -29,6 +29,8 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <cstdint>
+
 #include "machine.h"
 
 namespace x68k_platform
@@ -42,18 +44,21 @@ public:
     FrameChannel(const FrameChannel&) = delete;
     FrameChannel& operator=(const FrameChannel&) = delete;
 
-    // バッファ 2 枚を受け取る。実体の確保は呼び出し側の責務
+    // バッファ 3 枚を受け取る。実体の確保は呼び出し側の責務
     // (PSRAM の断片化を避けるため起動直後に一括確保したい)。
     // 各バッファは width * height 個の u16 が要る。
-    bool begin(x68k::u16* bufferA, x68k::u16* bufferB);
+    //
+    // Why 3 枚か: LCD への転送は 1 枚 32.2ms かかる。2 枚だと、Core0 が
+    // 1 枚を転送で掴んでいる間、Core1 は残り 1 枚に書いた後どこへも
+    // 渡せずに止まる。実測では 5 秒に 490 回この待ちが起きていた。
+    // 3 枚あれば「転送中の 1 枚」「渡し済みの 1 枚」「書いている 1 枚」が
+    // 同時に成立するので、生産が転送で途切れない。
+    bool begin(x68k::u16* bufferA, x68k::u16* bufferB, x68k::u16* bufferC);
 
     // --- Core1 (エミュレーション) 側 ---
 
-    // 次のフレームを書き込む先。
-    [[nodiscard]] x68k::u16* writeBuffer()
-    {
-        return writeBuffer_;
-    }
+    // 次のフレームを書き込む先。tryWriteBuffer() が返した枚を覚えている。
+    [[nodiscard]] x68k::u16* writeBuffer();
 
     // 未取得/転送中の画像があればnullptr。Core1の単一producerだけが呼ぶ。
     // 確認後はpublishまで新規frontが生じないため、合成中にtakeされても安全。
@@ -81,13 +86,27 @@ public:
     void done();
 
 private:
+    static constexpr int kBuffers = 3;
+
+    // 1 枚ぶんの状態。どれか 1 つだけが真になる。
+    enum class Slot : std::uint8_t
+    {
+        Free,       // 誰も使っていない。Core1 が次に書ける
+        Writing,    // Core1 が書いている
+        Ready,      // 書き終えて公開済み。Core0 がまだ take していない
+        InTransfer  // Core0 が転送中。触ってはいけない
+    };
+
     // 入れ替えの一瞬だけを守る。変換も転送もこの外で走る。
     SemaphoreHandle_t mutex_ = nullptr;
 
-    x68k::u16* writeBuffer_ = nullptr;  // Core1 が書いている
-    x68k::u16* frontBuffer_ = nullptr;  // 公開済み。Core0 が送る
-    bool hasNewFrame_ = false;          // publish 済みでまだ take されていない
-    bool isFrontInUse_ = false;         // Core0 が転送中。入れ替え禁止
+    x68k::u16* buffers_[kBuffers] = {};
+    Slot slots_[kBuffers] = {};
+    // Ready が複数あるときに古い方から渡すための通し番号。
+    // 新しい絵を先に出して古い絵で上書きすると、画面が巻き戻って見える。
+    std::uint32_t readySeq_[kBuffers] = {};
+    std::uint32_t nextSeq_ = 1;
+    int writingIndex_ = -1;  // Writing の位置。publish で使う
 };
 
 }  // namespace x68k_platform

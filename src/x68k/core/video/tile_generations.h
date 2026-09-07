@@ -24,7 +24,11 @@ public:
     static constexpr std::uint32_t kColumns = kWidth / kTileSize;
     static constexpr std::uint32_t kRows = kHeight / kTileSize;
     static constexpr std::uint32_t kTiles = kColumns * kRows;
-    static constexpr std::uint32_t kBuffers = 2;
+    // Why 3 枚か: LCD への転送に 1 枚 32.2ms かかる。その間 Core0 は
+    // 1 枚を掴んだままなので、2 枚だと Core1 は残り 1 枚に書いた後、
+    // 転送が終わるまで publish できず止まる (実測 backpressure 490回/5秒)。
+    // 3 枚なら転送中でも書いて渡せるので、生産が転送で途切れない。
+    static constexpr std::uint32_t kBuffers = 3;
 
     TileGenerations()
     {

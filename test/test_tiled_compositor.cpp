@@ -211,8 +211,9 @@ TEST_CASE("同値のsprite/BG/PCG/palette書込みは合成を増やさず無効
     CHECK(scene.check(0) == 0);
     scene.tiled.invalidateAll();
     CHECK(scene.tiled.render(nullptr, nullptr, nullptr, machine.video(), nullptr, 0) == 0);
+    // 範囲外の buffer 番号は描かない。枚数は kBuffers なのでそれ自身が範囲外。
     CHECK(scene.tiled.render(nullptr, nullptr, nullptr, machine.video(), scene.reference.data(),
-                             2) == 0);
+                             x68k::TileGenerations<>::kBuffers) == 0);
     CHECK(scene.check(0) == 300);
 }
 
