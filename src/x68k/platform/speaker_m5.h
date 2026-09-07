@@ -108,9 +108,11 @@ public:
 
         // 既定の音量は最大 (255)。CoreS3 の内蔵スピーカーで X68000 の
         // FM を最大振幅で鳴らすと割れるので下げる。
-        // 深夜作業のため最小音量。元は 40/255。
-        // 音が鳴っていることは確認できるが、部屋には響かない水準にする。
-        M5.Speaker.setVolume(40);
+        //
+        // Why not 255 のままにしないか: 主旋律は出力段で 8 倍 (gain2048) して
+        // ピーク 17000 で圧縮している。その上でスピーカー側も最大にすると、
+        // 内蔵スピーカーの振幅が足りずに歪む。
+        M5.Speaker.setVolume(96);
 
         ESP_LOGI("x68k.spk", "スピーカー: %u Hz pin_data_out=%d bck=%d ws=%d core=%u",
                  static_cast<unsigned>(cfg.sample_rate), cfg.pin_data_out, cfg.pin_bck, cfg.pin_ws,

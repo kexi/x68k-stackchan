@@ -80,7 +80,7 @@ TEST_CASE("M5出力は呼び出し元の再利用と受付失敗でも再生中�
     M5.Speaker = TestSpeaker{};
     x68k_platform::M5SpeakerSink sink;
     REQUIRE(sink.begin());
-    CHECK(M5.Speaker.volume == 40);
+    CHECK(M5.Speaker.volume == 96);
     std::array<std::int16_t, x68k_platform::AudioChannel::kBlockFrames> samples{};
     for (std::int16_t n = 1; n < 20; ++n)
     {
@@ -106,7 +106,7 @@ TEST_CASE("stream再初期化はM5の参照を解放してからPCMを再利用�
     REQUIRE(sink.restartStream());
     CHECK(M5.Speaker.retained.empty());
     CHECK(sink.submissionStats().accepted == 2);
-    CHECK(M5.Speaker.volume == 40);
+    CHECK(M5.Speaker.volume == 96);
     samples.fill(-1234);
     sink.write(samples.data(), samples.size());
     M5.Speaker.verify();
