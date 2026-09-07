@@ -73,11 +73,6 @@ test-san:
     # 詳細は test/lsan.supp に書いた。
     # LSan の扱いは test/test_main.cpp の __lsan_default_options に書いた。
     # 外から LSAN_OPTIONS を渡す形はシンボル化が要り、CI で当たらなかった。
-    # doctest に 1 ケースずつ名前を出させる (-s)。ASan が abort したときは、
-    # 直前に出た名前が落ちたケースになる。macOS では ASan を切ってあるので
-    # (test/CMakeLists.txt のコメント参照)、Linux 専用の落ち方はこの情報が
-    # 無いと追えない。ctest 越しでは引数を渡せないので直接叩く。
-    {{ san_build }}/x68k_tests -s
     ctest --test-dir {{ san_build }} --output-on-failure
 
 [doc('ホストのエミュレータランナー x68k-run をビルドする')]
