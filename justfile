@@ -261,7 +261,7 @@ tidy:
 # ここに無い検査を CI にだけ足すと、手元で通ったのに CI で落ちるようになる。
 # 実機ファームのビルド (just build) だけは数分かかるので check には入れない。
 [doc('CI と同じ検査を一括で回す')]
-check: fmt-check lint core-guard tidy test-host test-san test-tools actionlint
+check: fmt-check lint core-guard verify-rom-selftest verify-rom-lint tidy test-host test-san test-tools actionlint
 
 # core/ に ESP32 依存が混入していないことを検査する。
 # core/ がホストで動くことが本プロジェクトの開発速度の前提なので、CI と
@@ -275,6 +275,27 @@ core-guard:
       exit 1
     fi
     echo "core/ is ESP32-independent: OK"
+
+# 「逆アセンブルして確かめた」と書いた主張を、機械的に ROM と突き合わせる。
+#
+# 根拠に番地を書いた主張のうち、生ワード列を伴うものだけが照合できる。
+# 実際にこれで 1 件の誤りが見つかった。値そのものは正しく、根拠の番地が
+# 違っていたので、テストでも実機でも露見しない種類の誤りだった。
+#
+# ROM はライセンス上リポジトリに含められないので、照合できるのは手元だけ。
+# CI で回るのは selftest と lint (どちらも ROM 不要) に限られる。
+
+[doc('IPL-ROM の生ワード列を ROM と照合する (rom/iplrom.dat が要る)')]
+verify-rom:
+    uv run tools/verify_iplrom.py check
+
+[doc('番地の言及のうち生ワード列を伴わないものを数える (ROM 不要)')]
+verify-rom-lint:
+    uv run tools/verify_iplrom.py lint --baseline tools/verify_iplrom.baseline
+
+[doc('生ワード列の抽出・比較ロジックを合成 ROM で検査する (ROM 不要)')]
+verify-rom-selftest:
+    uv run tools/verify_iplrom.py selftest
 
 [doc('GitHub Actions のワークフローを検査する')]
 actionlint:
