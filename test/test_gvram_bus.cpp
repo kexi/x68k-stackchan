@@ -23,7 +23,7 @@
 //   窓 1 つが実 VRAM 全体を覆う (= ページごとに VRAM が分かれてはいない)
 //     $FFAAB4: LEA $C00000,A0 / MOVE.L A0,$095C / LEA $C80000,A1 / BSR $FFABC0
 //     $FFABC0: CLR.L (A0)+ / CMPA.L A1,A0 / BNE.S -6
-//     512KB ぶんの消去だけで 4 ページ全部が消える。
+//     全ページが消えるかは R20 次第。幅設定を見ずに VC R0 と同一視しない。
 //
 //   1 ドットは MOVE.W で書き、値はゼロ拡張された 4bit (16 色モードの場合)
 //     $FFB0A0: MOVE.B (A1)+,D5 / MOVE.B D5,D0 / LSR.B #4,D0 / AND.W #$000F,D0
@@ -37,6 +37,7 @@
 #include "bus.h"
 #include "dev/video.h"
 #include "doctest.h"
+#include "machine.h"
 #include "video/graphic_raster.h"
 
 namespace
@@ -68,6 +69,7 @@ struct Gvram
     x68k::Sram sram;
     NullIo io;
     x68k::VideoController video;
+    x68k::Crtc crtc;
     x68k::SystemBus bus;
 
     Gvram() : vram(x68k::kTvramSize, 0), bus(x68k::MemoryMap{}, sram, io)
@@ -76,12 +78,13 @@ struct Gvram
         memory.graphicVram = vram.data();
         bus.setMemory(memory);
         video.reset();
-        bus.setVideoController(&video);
+        bus.setCrtc(&crtc);
     }
 
     void setColorMode(x68k::VideoController::GraphicColorMode mode)
     {
         video.write(kScreenModeOffset, static_cast<x68k::u16>(mode));
+        crtc.write(20, static_cast<x68k::u16>(static_cast<x68k::u16>(mode) << 8));
     }
 
     // ページ page の窓での、座標 (x, y) のアドレス。1 ドット 1 ワード。
@@ -215,20 +218,18 @@ TEST_CASE("256 色: 8bit を超える値は切り捨てられる")
     CHECK(g.rawWord(0, 0) == 0x55AB);
 }
 
-TEST_CASE("256 色: 窓 2 と 3 はページ 0 と 1 の繰り返しになる")
+TEST_CASE("256 色: 未使用の窓 2 と 3 は既存ページを変更しない")
 {
-    // 保証すること: 256 色モードで使うページは 2 つなので、$D00000 / $D80000 が
-    // $C00000 / $C80000 と同じページを指すこと。
-    //
-    // 壊れると: 存在しないページ 2/3 のためにワードの外へシフトし、
-    // 書き込みがどこにも当たらない (絵が出ない) か、別のビットを壊す。
+    // 保証すること: MAME CRTC gvram_w/r と同じ未使用窓になること。
     Gvram g;
     g.setColorMode(x68k::VideoController::GraphicColorMode::k256Color);
 
     g.bus.write16(Gvram::addrOf(2, 1, 1), 0x0033);
-    CHECK(g.rawWord(1, 1) == 0x0033);
+    CHECK(g.rawWord(1, 1) == 0);
     g.bus.write16(Gvram::addrOf(3, 1, 1), 0x0044);
-    CHECK(g.rawWord(1, 1) == 0x4433);
+    CHECK(g.rawWord(1, 1) == 0);
+    CHECK(g.bus.read16(Gvram::addrOf(2, 1, 1)) == 0xFFFF);
+    CHECK(g.bus.read16(Gvram::addrOf(3, 1, 1)) == 0xFFFF);
 }
 
 // --- 65536 色モード ---------------------------------------------------------
@@ -245,9 +246,85 @@ TEST_CASE("65536 色: ワード全体が 1 ドットになる")
     CHECK(g.rawWord(2, 3) == 0xBEEF);
     CHECK(g.bus.read16(Gvram::addrOf(0, 2, 3)) == 0xBEEF);
 
-    // どの窓から触っても同じワードに当たる。
+    // 標準 direct access は最初の窓だけが有効。
     g.bus.write16(Gvram::addrOf(3, 2, 3), 0x1234);
-    CHECK(g.rawWord(2, 3) == 0x1234);
+    CHECK(g.rawWord(2, 3) == 0xBEEF);
+    CHECK(g.bus.read16(Gvram::addrOf(3, 2, 3)) == 0xFFFF);
+}
+
+TEST_CASE("CRTC R20: CPUアクセス幅は表示色数とscrollから独立する")
+{
+    x68k::Machine machine;
+    std::vector<x68k::u8> vram(0x80000);
+    x68k::MemoryMap memory{};
+    memory.graphicVram = vram.data();
+    machine.setMemory(memory);
+    auto& bus = machine.bus();
+    bus.write16(0xE82400, 3);
+    bus.write16(0xE80028, 0);
+    bus.write16(0xC00000, 0xABCD);
+    CHECK(bus.read16(0xC00000) == 0x000D);
+    CHECK(vram[0] == 0);
+    CHECK(vram[1] == 0x0D);
+
+    bus.write16(0xE82400, 0);
+    bus.write8(0xE80028, 3);
+    bus.write8(0xE80029, 0x10);
+    CHECK(bus.read16(0xE80028) == 0x0310);
+    bus.write16(0xE80018, 511);
+    bus.write16(0xE8001A, 256);
+    bus.write16(0xC00000, 0xBEEF);
+    CHECK(bus.read16(0xC00000) == 0xBEEF);
+    CHECK(vram[0] == 0xBE);
+    CHECK(vram[1] == 0xEF);
+    CHECK(vram[256 * 1024 + 511 * 2] == 0);
+    bus.write16(0xC7FFFE, 0x9123);
+    CHECK(bus.read16(0xC7FFFE) == 0x9123);
+    for (x68k::u32 page = 1; page < 4; ++page)
+    {
+        const auto address = 0xC00000u + page * 0x80000u;
+        bus.write16(address, 0x7654);
+        bus.write8(address, 0x12);
+        bus.write8(address + 1, 0x34);
+        CHECK(bus.read16(address) == 0xFFFF);
+        CHECK(bus.read8(address) == 0xFF);
+        CHECK(bus.read8(address + 1) == 0xFF);
+    }
+    CHECK(bus.read16(0xC00000) == 0xBEEF);
+}
+
+TEST_CASE("CRTC R20: bufferアクセスと256色byte更新は他laneを保つ")
+{
+    Gvram g;
+    for (const x68k::u16 mode : std::initializer_list<x68k::u16>{0, 0x100, 0x200, 0x300})
+    {
+        g.crtc.write(20, static_cast<x68k::u16>(0x800u | mode));
+        g.bus.write16(0xC00000, 0xBEEF);
+        g.bus.write8(0xC00000, 0x12);
+        g.bus.write8(0xC00001, 0x34);
+        CHECK(g.rawWord(0, 0) == 0x1234);
+        g.bus.write16(0xC80000, 0xFFFF);
+        CHECK(g.rawWord(0, 0) == 0x1234);
+        // 未使用 buffer 窓の読取は安全な open-bus。実ハード挙動は未検証。
+        CHECK(g.bus.read16(0xC80000) == 0xFFFF);
+    }
+    g.crtc.write(20, 0x100);
+    g.bus.write8(0xC80001, 0xAB);
+    CHECK(g.rawWord(0, 0) == 0xAB34);
+    g.bus.write8(0xC80000, 0xCD);
+    CHECK(g.rawWord(0, 0) == 0xAB34);
+    CHECK(g.bus.read8(0xC80000) == 0);
+    CHECK(g.bus.read8(0xC80001) == 0xAB);
+    g.crtc.write(20, 0);
+    g.bus.write8(0xD00001, 7);
+    CHECK(g.rawWord(0, 0) == 0xA734);
+    g.bus.write8(0xD00000, 0xFF);
+    CHECK(g.rawWord(0, 0) == 0xA734);
+    // 未定義色数を direct と取り違えず、既存内容を保全する。
+    g.crtc.write(20, 0x200);
+    g.bus.write16(0xC00000, 0xFFFF);
+    CHECK(g.rawWord(0, 0) == 0xA734);
+    CHECK(g.bus.read16(0xC00000) == 0xFFFF);
 }
 
 TEST_CASE("65536 色: バイトアクセスがワードの上位/下位を選ぶ")

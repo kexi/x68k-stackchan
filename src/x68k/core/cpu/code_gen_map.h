@@ -39,6 +39,7 @@
 #ifndef X68K_CORE_CPU_CODE_GEN_MAP_H
 #define X68K_CORE_CPU_CODE_GEN_MAP_H
 
+#include <algorithm>
 #include <cstdint>
 
 #include "m68k_types.h"
@@ -148,6 +149,25 @@ public:
             const std::uint16_t current = gen_[page];
             gen_[page] =
                 current == kAlwaysStale ? kAlwaysStale : static_cast<std::uint16_t>(current + 1);
+        }
+    }
+
+    // 連続するバイト書き込みと同じ飽和カウントを、ページごとにまとめる。
+    void touchRange(u32 addr, u32 count)
+    {
+        while (count != 0)
+        {
+            const u32 chunk = std::min(count, kPageSize - (addr & (kPageSize - 1)));
+            const u32 page = addr >> kPageShift;
+            const bool isTracked = page < pageCount_;
+            if (isTracked)
+            {
+                const u32 next = static_cast<u32>(gen_[page]) + chunk;
+                gen_[page] =
+                    static_cast<std::uint16_t>(std::min(next, static_cast<u32>(kAlwaysStale)));
+            }
+            addr += chunk;
+            count -= chunk;
         }
     }
 

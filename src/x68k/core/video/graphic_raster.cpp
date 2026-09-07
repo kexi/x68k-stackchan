@@ -190,7 +190,7 @@ u16 GraphicRaster::pixelColor(const u8* vram, const VideoController& video, u32 
 // --- 矩形の変換 -------------------------------------------------------------
 
 void GraphicRaster::render(const u8* vram, const VideoController& video, u32 srcX, u32 srcY,
-                           u32 width, u32 height, u16* out, u32 outStride)
+                           u32 width, u32 height, u16* out, u32 outStride, const Crtc* crtc)
 {
     if (vram == nullptr || out == nullptr)
     {
@@ -208,6 +208,12 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     u16 palette[VideoController::kGraphicPaletteCount];
     const bool isDirectColor = mode == VideoController::GraphicColorMode::k65536Color ||
                                mode == VideoController::GraphicColorMode::kReserved;
+    // G0 の表示 fetch だけを折り返す。viewport や text/sprite 座標は動かさない。
+    // nullptr は raw VRAM の既存単体 fixture 用。本番は実 CRTC を渡す。
+    const bool scrollDirect =
+        crtc != nullptr && mode == VideoController::GraphicColorMode::k65536Color;
+    const u32 scrollX = scrollDirect ? crtc->graphicScrollX() : 0u;
+    const u32 scrollY = scrollDirect ? crtc->graphicScrollY() : 0u;
     if (!isDirectColor)
     {
         for (u32 i = 0; i < VideoController::kGraphicPaletteCount; ++i)
@@ -269,7 +275,8 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     for (u32 y = 0; y < height; ++y)
     {
         const u32 vy = srcY + y;
-        if (vy >= screen.height)
+        const bool outsideY = !scrollDirect && vy >= screen.height;
+        if (outsideY)
         {
             break;
         }
@@ -279,7 +286,8 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
         for (u32 x = 0; x < width; ++x)
         {
             const u32 vx = srcX + x;
-            if (vx >= screen.width)
+            const bool outsideX = !scrollDirect && vx >= screen.width;
+            if (outsideX)
             {
                 break;
             }
@@ -291,7 +299,9 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
                 // Why not ここでもページを重ねないか: 65536 色モードの表示
                 // ページは 1 枚しかない (IPL-ROM は $FFB30C で GS3-GS0 を
                 // moveq #$F と一括で立てる)。重ねる相手が存在しない。
-                const u16 color = readWord(vram, wordIndexOf(vx, vy));
+                const u32 sampleX = scrollDirect ? ((vx + scrollX) & 511u) : vx;
+                const u32 sampleY = scrollDirect ? ((vy + scrollY) & 511u) : vy;
+                const u16 color = readWord(vram, wordIndexOf(sampleX, sampleY));
                 if (color != 0)
                 {
                     row[x] = VideoController::toRgb565(color);
@@ -376,7 +386,17 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
         u16* row = out + static_cast<std::size_t>(y) * outStride;
         const u32 lineBase = vy * kTvramBytesPerLine;
 
-        for (u32 x = 0; x < width; ++x)
+        // 8 ドットぶんをまとめて読む。
+        //
+        // Why: 1 ドットごとに 4 プレーンを引くと、プレーンは 128KB 離れて
+        // いるので毎回 4 回の遠いメモリアクセスになる。320x240 で
+        // 307200 回。CoreS3 は VRAM を PSRAM に置いているため、この
+        // アクセスが描画時間の半分以上を占めていた (実測 29ms/フレーム)。
+        //
+        // プレーンはビットで詰まっているので、1 バイト読めば 8 ドットぶんが
+        // 一度に取れる。読み出しの回数が 1/8 になる。
+        u32 x = 0;
+        while (x < width)
         {
             const u32 vx = srcX + x;
             if (vx >= 1024)
@@ -384,32 +404,48 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
                 break;
             }
 
-            // 4 プレーンの同じビット位置を集めて 4bit にする。
-            // text_raster.cpp と同じくインライン展開する。
             const u32 byteOffset = lineBase + (vx >> 3);
-            const u8 mask = static_cast<u8>(1u << (7u - (vx & 7u)));
+            const u8 p0 = vram[byteOffset];
+            const u8 p1 = vram[kTvramPlaneSize + byteOffset];
+            const u8 p2 = vram[2 * kTvramPlaneSize + byteOffset];
+            const u8 p3 = vram[3 * kTvramPlaneSize + byteOffset];
 
-            u32 index = 0;
-            if ((vram[byteOffset] & mask) != 0)
+            // 4 プレーンとも 0 なら、この 8 ドットは全部透明。
+            // テキスト画面はほとんどが空白なので、ここで抜ける割合が高い。
+            if ((p0 | p1 | p2 | p3) == 0)
             {
-                index |= 1u;
-            }
-            if ((vram[kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 2u;
-            }
-            if ((vram[2 * kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 4u;
-            }
-            if ((vram[3 * kTvramPlaneSize + byteOffset] & mask) != 0)
-            {
-                index |= 8u;
+                const u32 skip = 8u - (vx & 7u);
+                x += skip;
+                continue;
             }
 
-            if (index != kTransparentIndex)
+            // このバイトに含まれるドットを順に出す。
+            const u32 first = vx & 7u;
+            for (u32 bit = first; bit < 8u && x < width; ++bit, ++x)
             {
-                row[x] = palette[index];
+                const u8 mask = static_cast<u8>(1u << (7u - bit));
+                u32 index = 0;
+                if ((p0 & mask) != 0)
+                {
+                    index |= 1u;
+                }
+                if ((p1 & mask) != 0)
+                {
+                    index |= 2u;
+                }
+                if ((p2 & mask) != 0)
+                {
+                    index |= 4u;
+                }
+                if ((p3 & mask) != 0)
+                {
+                    index |= 8u;
+                }
+
+                if (index != kTransparentIndex)
+                {
+                    row[x] = palette[index];
+                }
             }
         }
     }
@@ -417,7 +453,7 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
 
 void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
                               const VideoController& video, u32 srcX, u32 srcY, u32 width,
-                              u32 height, u16* out, u32 outStride)
+                              u32 height, u16* out, u32 outStride, const Crtc* crtc)
 {
     if (out == nullptr)
     {
@@ -454,7 +490,7 @@ void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
     {
         if (showGraphic)
         {
-            render(graphicVram, video, srcX, srcY, width, height, out, outStride);
+            render(graphicVram, video, srcX, srcY, width, height, out, outStride, crtc);
         }
         if (showText)
         {
@@ -469,7 +505,7 @@ void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
     }
     if (showGraphic)
     {
-        render(graphicVram, video, srcX, srcY, width, height, out, outStride);
+        render(graphicVram, video, srcX, srcY, width, height, out, outStride, crtc);
     }
 }
 

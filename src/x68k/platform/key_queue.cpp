@@ -18,7 +18,7 @@ constexpr UBaseType_t kQueueLength = 64;
 
 bool KeyQueue::begin()
 {
-    queue_ = xQueueCreate(kQueueLength, sizeof(char));
+    queue_ = xQueueCreate(kQueueLength, sizeof(Event));
     return queue_ != nullptr;
 }
 
@@ -32,7 +32,25 @@ void KeyQueue::push(char c)
     //
     // Why not 空くまで待つか: 呼ぶのは表示コアのループなので、
     // ここで待つと画面更新が止まる。キーを 1 つ取りこぼす方が軽い。
-    xQueueSend(queue_, &c, 0);
+    const auto code = x68k::asciiToScanCode(c);
+    const bool isTypable = code != 0;
+    if (!isTypable)
+    {
+        return;
+    }
+    const Event event{code, true};
+    xQueueSend(queue_, &event, 0);
+}
+
+bool KeyQueue::pushScan(x68k::u8 code)
+{
+    const bool isValid = queue_ != nullptr && (code & 0x7Fu) != 0;
+    if (!isValid)
+    {
+        return false;
+    }
+    const Event event{code, false};
+    return xQueueSend(queue_, &event, 0) == pdTRUE;
 }
 
 void KeyQueue::drain(x68k::Machine& machine)
@@ -58,21 +76,14 @@ void KeyQueue::drain(x68k::Machine& machine)
         return;
     }
 
-    char c = 0;
-    if (xQueueReceive(queue_, &c, 0) != pdTRUE)
+    Event event{};
+    if (xQueueReceive(queue_, &event, 0) != pdTRUE)
     {
         return;
     }
 
-    const x68k::u8 code = x68k::asciiToScanCode(c);
-    const bool isTypable = code != 0;
-    if (!isTypable)
-    {
-        return;
-    }
-
-    machine.pressKey(code);
-    pendingRelease_ = code;
+    machine.pressKey(event.code);
+    pendingRelease_ = event.autoRelease ? event.code : 0;
     stepsLeft_ = kStepsPerEvent;
 }
 

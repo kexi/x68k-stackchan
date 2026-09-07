@@ -20,6 +20,7 @@
 
 #include "io/ascii_keymap.h"
 #include "gui_demo.h"
+#include "run_deadline.h"
 #include "machine.h"
 
 #if X68K_COUNT_JIT_COVERAGE
@@ -44,6 +45,7 @@ extern unsigned long g_refillFromRam;
 extern unsigned long g_blockHits[65536];
 #endif
 #include "video/cgrom_fallback.h"
+#include "video/compositor.h"
 #include "video/graphic_raster.h"
 #include "video/text_raster.h"
 #include "video/text_scrape.h"
@@ -409,6 +411,88 @@ bool parseMouseScript(const std::string& text, std::vector<MouseEvent>* out)
     return true;
 }
 
+// 入力台本の 1 項目。指定サイクルでキーを押す/離す。
+struct InputEvent
+{
+    x68k::u64 cycle;
+    x68k::u8 code;  // bit7 が立っていれば離鍵
+};
+
+// 台本を読む。1 行 = "<cycle> <down|up> <key>"。
+//
+// key は ASCII 1 文字 (asciiToScanCode で引く) か、0xNN の生スキャンコード。
+// 生を許すのは、矢印キーのように ASCII に無いキーを送れるようにするため。
+// '#' から行末まではコメント。
+//
+// Why not --keys を拡張しないか: --keys は「文字列を等間隔で打ち込む」
+// もので、起動コマンドを入れるのに使う。ゲームの操作は「いつ押して
+// いつ離すか」が要るので、別の口にする方が両方とも素直になる。
+bool loadInputScript(const std::string& path, std::vector<InputEvent>& out)
+{
+    std::FILE* f = std::fopen(path.c_str(), "r");
+    if (f == nullptr)
+    {
+        return false;
+    }
+
+    char line[256];
+    int lineNo = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr)
+    {
+        ++lineNo;
+        char* hash = std::strchr(line, '#');
+        if (hash != nullptr)
+        {
+            *hash = '\0';
+        }
+
+        char cycleBuf[64] = {0};
+        char actionBuf[16] = {0};
+        char keyBuf[16] = {0};
+        const int got = std::sscanf(line, "%63s %15s %15s", cycleBuf, actionBuf, keyBuf);
+        if (got <= 0)
+        {
+            continue;  // 空行
+        }
+        if (got != 3)
+        {
+            std::printf("[script] %d 行目を読めません: %s", lineNo, line);
+            std::fclose(f);
+            return false;
+        }
+
+        InputEvent e;
+        e.cycle = std::strtoull(cycleBuf, nullptr, 0);
+
+        x68k::u8 code = 0;
+        if (keyBuf[0] == '0' && (keyBuf[1] == 'x' || keyBuf[1] == 'X'))
+        {
+            code = static_cast<x68k::u8>(std::strtoul(keyBuf, nullptr, 16));
+        }
+        else
+        {
+            code = x68k::asciiToScanCode(keyBuf[0]);
+        }
+        if (code == 0)
+        {
+            std::printf("[script] %d 行目のキーを解釈できません: %s\n", lineNo, keyBuf);
+            std::fclose(f);
+            return false;
+        }
+
+        const bool isUp = std::strcmp(actionBuf, "up") == 0;
+        e.code = isUp ? static_cast<x68k::u8>(code | 0x80u) : code;
+        out.push_back(e);
+    }
+
+    std::fclose(f);
+
+    // 時刻順に並べる。書く側が順番を気にしなくて済むように。
+    std::sort(out.begin(), out.end(),
+              [](const InputEvent& a, const InputEvent& b) { return a.cycle < b.cycle; });
+    return true;
+}
+
 void printUsage()
 {
     std::printf(
@@ -431,6 +515,9 @@ void printUsage()
         "  --trace         実行した命令を標準出力へ出す (大量)\n"
         "  --trace-disk    ディスクへのセクタ要求を出す\n"
         "  --keys TEXT     起動後にこの文字列をキーボードから打ち込む\n"
+        "  --input-script F  キーの台本を読む。1 行 \"<cycle> <down|up> <key>\"\n"
+        "                  key は ASCII 1 文字か 0xNN の生スキャンコード。\n"
+        "                  押しっぱなしを表せるので、ゲームの操作を再現できる\n"
         "  --mouse SCRIPT  マウスを動かす。CYCLE:DX:DY[:LR] をカンマ区切りで並べる\n"
         "                  (例: 400000000:10:0:L,401000000:0:0:)\n"
         "                  DX/DY は相対量。X68000 のマウスは絶対座標を持たない\n"
@@ -444,6 +531,7 @@ void printUsage()
         "  --no-fast-tick  毎命令通る経路の最適化を切って走らせる\n"
         "                  付けた側と付けない側で最終状態が一致するはず\n"
         "  --event-driven  次にデバイスの状態が変わる時点まで飛ばす\n"
+        "  --gpip-poll     GPIP待機の完全周回をまとめる (event-driven専用・実験用)\n"
         "                  (docs/knowledge/event-driven-implementation.md)\n"
         "                  付けた側と付けない側で最終状態が一致するはず\n"
         "  --shadow-verify 期限を計算するが飛ばさず、予測と実際を突き合わせる\n"
@@ -623,6 +711,7 @@ int main(int argc, char** argv)
     bool trace = false;
     bool traceDisk = false;
     std::string keys;
+    std::string inputScriptPath;
     x68k::u32 watchAddr = 0;
     x68k::u32 traceFrom = 0;
     bool hasTraceFrom = false;
@@ -630,6 +719,7 @@ int main(int argc, char** argv)
     bool showStats = false;
     bool noFastTick = false;
     bool eventDriven = false;
+    bool gpipPoll = false;
     bool shadowVerify = false;
 
     for (int i = 1; i < argc; ++i)
@@ -693,6 +783,10 @@ int main(int argc, char** argv)
         {
             keys = argv[++i];
         }
+        else if (arg == "--input-script" && hasNext)
+        {
+            inputScriptPath = argv[++i];
+        }
         else if (arg == "--text-only")
         {
             textOnly = true;
@@ -740,6 +834,10 @@ int main(int argc, char** argv)
         else if (arg == "--event-driven")
         {
             eventDriven = true;
+        }
+        else if (arg == "--gpip-poll")
+        {
+            gpipPoll = true;
         }
         // 段 1 の shadow 検証。飛ばさずに期限の予測だけを突き合わせる。
         else if (arg == "--shadow-verify")
@@ -955,6 +1053,19 @@ int main(int argc, char** argv)
     // 台本のどこまで送ったか。
     std::size_t mouseIndex = 0;
 
+    // 入力台本。指定サイクルでキーを押す/離す。
+    std::vector<InputEvent> inputScript;
+    std::size_t inputIndex = 0;
+    if (!inputScriptPath.empty())
+    {
+        if (!loadInputScript(inputScriptPath, inputScript))
+        {
+            return 1;
+        }
+        std::printf("[script] %s から %zu 件のキー操作を読みました\n", inputScriptPath.c_str(),
+                    inputScript.size());
+    }
+
     // トレースも統計もキー入力も要らないときは、実機と同じ run() を回す。
     //
     // Why これが要るか: 実機は run() を呼ぶ (main/main.cpp)。プロファイルを
@@ -975,10 +1086,17 @@ int main(int argc, char** argv)
     // キーは「次に打つサイクル」までで run() を刻めば送れる。
     const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
                                mouseScript.empty() && watchAddr == 0;
+    const bool enablePoll = gpipPoll && eventDriven && !shadowVerify && canUseFastRun;
+    machine.setGpipPollAcceleration(enablePoll);
     if (canUseFastRun)
     {
         while (spent < cycleLimit)
         {
+            while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+            {
+                machine.pressKey(inputScript[inputIndex].code);
+                ++inputIndex;
+            }
             // 1 回の run() で回す量。大きすぎると停止の検出が遅れる。
             constexpr x68k::u32 kFastRunChunk = 100000;
             x68k::u64 limit = std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent);
@@ -988,6 +1106,11 @@ int main(int argc, char** argv)
             if (hasMoreKeys && nextKeyCycle > spent)
             {
                 limit = std::min<x68k::u64>(limit, nextKeyCycle - spent);
+            }
+            const bool hasInputEvent = inputIndex < inputScript.size();
+            if (hasInputEvent)
+            {
+                limit = x68k_host::limitRunToEvent(limit, spent, inputScript[inputIndex].cycle);
             }
             const x68k::u32 chunk = static_cast<x68k::u32>(limit > 0 ? limit : 1);
             const x68k::u32 used = machine.run(chunk);
@@ -999,6 +1122,13 @@ int main(int argc, char** argv)
             // run() は命令数を返さない。サイクル数から概算する
             // (統計を出さない経路なので、正確な命令数は要らない)。
             instructions += used / 4;
+
+            // 入力台本。指定の時刻を過ぎたものを順に送る。
+            while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+            {
+                machine.pressKey(inputScript[inputIndex].code);
+                ++inputIndex;
+            }
 
             // 台本の時刻に達したキーを送る。押下と離鍵で 1 回ずつ。
             if (hasMoreKeys && spent >= nextKeyCycle)
@@ -1103,6 +1233,13 @@ int main(int argc, char** argv)
             ++mouseIndex;
         }
 
+        // 入力台本。指定の時刻を過ぎたものを順に送る。
+        while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+        {
+            machine.pressKey(inputScript[inputIndex].code);
+            ++inputIndex;
+        }
+
         // キーを 1 つずつ打つ。押下と解放を交互に送る。
         //
         const bool hasKeyLeft = keyIndex < keys.size();
@@ -1167,6 +1304,8 @@ int main(int argc, char** argv)
     {
         stats.dump();
     }
+    std::printf("[gpip-poll] enabled=%d skipped_cycles=%llu\n", enablePoll ? 1 : 0,
+                static_cast<unsigned long long>(machine.gpipPollSkippedCycles()));
 
     // SRAM と MFP の状態は --stats 無しでも出す。
     // run() 経路と step() 経路が同じ結果になることを確かめるのに使う
@@ -1396,8 +1535,9 @@ int main(int argc, char** argv)
         }
         else
         {
-            x68k::GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0,
-                                           0, kWidth, kHeight, pixels.data(), kWidth);
+            x68k::Compositor::render(graphicVram.data(), textVram.data(), &machine.sprite(),
+                                     machine.video(), 0, 0, kWidth, kHeight, pixels.data(), kWidth,
+                                     &machine.crtc());
         }
 
         if (writePpm(ppmPath, pixels.data(), kWidth, kHeight))

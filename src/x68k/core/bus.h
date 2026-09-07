@@ -75,34 +75,25 @@ public:
     {
         mem_ = memory;
         publishFastRam();
+        damage_.all();
     }
 
-    // G-VRAM のページ折り込みに使うビデオコントローラを教える。
-    //
-    // $C00000-$DFFFFF は 512KB の窓 4 つで、窓ごとに「どのページを見るか」が
-    // 変わる。どのビット幅を折り込むかは色数モード ($E82400 bit1-0) 次第なので、
-    // バスがモードを知らないと 16 色の書き込みを他ページごと潰してしまう。
-    //
-    // Why not IoHandler に色数を問い合わせるメソッドを足さないか: IoHandler は
-    // 「アドレスを渡すと読み書きが起きる」だけの口で、副作用のある経路。
-    // ドット 1 つの書き込みごとにそこを通すと、I/O 側にアクセスログや
-    // ウェイトを足したときに G-VRAM の書き込みが巻き込まれる。
-    //
-    // Why not MemoryMap にモードを持たせないか: MemoryMap は「実体の在りか」を
-    // 表す値の集まりで、platform 層が確保時に一度作って渡す。時間とともに
-    // 変わるモードを混ぜると、モード変更のたびに setMemory を呼ぶ設計になり
-    // 所有の切り分けが崩れる。
-    //
-    // 未設定 (nullptr) なら 16 色モードとして扱う。VideoController::reset() が
-    // $E82400 を 0 (=16 色) にするので、実機のリセット直後と同じ状態になる。
-    void setVideoController(const VideoController* video)
+    void setVisualDamage(VisualDamage damage)
     {
-        video_ = video;
+        damage_ = damage;
+    }
+
+    // Why not VC R0 を使わないか: 表示色数と CPU のアクセス幅は別設定。
+    // R20 が未接続ならリセット値の 4bit 窓として扱う。
+    void setCrtc(const Crtc* crtc)
+    {
+        crtc_ = crtc;
     }
 
     u8 read8(u32 addr) override;
     u16 read16(u32 addr) override;
     void write8(u32 addr, u8 value) override;
+    bool tryWriteRamBlock(u32 addr, const u8* data, u32 count);
     void write16(u32 addr, u16 value) override;
 
     [[nodiscard]] bool lastAccessFaulted() const override
@@ -231,6 +222,9 @@ private:
     };
     [[nodiscard]] GvramLane gvramLaneOf(u32 addr) const;
 
+    // 書いた G-VRAM ワードの座標だけを dirty にする。1024 モードは全面へ戻す。
+    void markGraphicDirty(u32 byteOffset);
+
     // 窓アドレスに対応するドットを、ページのぶんだけ残したワードとして返す。
     // 16 色なら $000X、256 色なら $00XX、65536 色ならワードそのもの。
     [[nodiscard]] u16 readGvramDot(u32 addr) const;
@@ -239,10 +233,11 @@ private:
     void writeGvramDot(u32 addr, u16 value);
 
     MemoryMap mem_;
+    VisualDamage damage_{};
     Sram& sram_;
     IoHandler& io_;
     // 色数モードを引くためだけに持つ。所有しない (Machine が持つ)。
-    const VideoController* video_ = nullptr;
+    const Crtc* crtc_ = nullptr;
     bool romAtZero_ = true;
     // 直前のアクセスが応答しない領域だったか。
     // IPL-ROM は SCSI ROM ($FC0000) の有無をバスエラーで調べるので、

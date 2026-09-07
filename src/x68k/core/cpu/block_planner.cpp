@@ -8,6 +8,11 @@
 #include "code_gen_map.h"
 #include "m68k_alu.h"
 #include "m68k_length.h"
+#include "move_timing.h"
+#include "control_timing.h"
+#include "immediate_timing.h"
+#include "standard_timing.h"
+#include "operand_timing.h"
 
 namespace x68k
 {
@@ -163,8 +168,7 @@ bool planMove(u16 op, PlannedOp& out)
         // **EA の An 番号は dstReg**。eaRegOf() の規約 (block_plan.h)。
         out.dstReg = static_cast<u8>(dstReg);
         out.size = static_cast<u8>(size);
-        // groupMove は EA の形にもサイズにもよらず 4 (m68k_ops_move.cpp:68)。
-        out.cycles = 4;
+        out.cycles = static_cast<u8>(moveInstructionCycles(op, size));
         return true;
     }
 
@@ -208,8 +212,7 @@ bool planMove(u16 op, PlannedOp& out)
         // 読んでから符号拡張して 32bit 書く。ここを 4 にすると
         // 読みガードの extent がずれ、窓の端で範囲外を読む。
         out.size = static_cast<u8>(size);
-        // groupMove は EA の形によらず 4 を返す (m68k_ops_move.cpp:68)。
-        out.cycles = 4;
+        out.cycles = static_cast<u8>(moveInstructionCycles(op, size));
         return true;
     }
 
@@ -239,8 +242,7 @@ bool planMove(u16 op, PlannedOp& out)
     out.srcReg = static_cast<u8>(srcReg);
     out.dstReg = static_cast<u8>(dstReg);
     out.size = static_cast<u8>(size);
-    // groupMove は MOVEA 経路も writeEa 経路も 4 を返す (m68k_ops_move.cpp)。
-    out.cycles = 4;
+    out.cycles = static_cast<u8>(moveInstructionCycles(op, size));
     return true;
 }
 
@@ -331,8 +333,7 @@ bool planMisc(u16 op, PlannedOp& out)
         // (isMemoryWriteKind が kJsr を含まないので dstReg を直に読む)。
         out.dstReg = static_cast<u8>(reg);
         out.size = static_cast<u8>(kLong);
-        // m68k_ops_group4.cpp:370 の JSR は EA の形によらず 16。
-        out.cycles = 16;
+        out.cycles = static_cast<u8>(controlInstructionCycles(op));
         return true;
     }
 
@@ -354,8 +355,7 @@ bool planMisc(u16 op, PlannedOp& out)
         out.srcReg = static_cast<u8>(reg);
         out.dstReg = static_cast<u8>((op >> 9) & 7u);
         out.size = static_cast<u8>(kLong);
-        // m68k_ops_group4.cpp の LEA は EA の形によらず 4 を返す。
-        out.cycles = 4;
+        out.cycles = static_cast<u8>(controlInstructionCycles(op));
         return true;
     }
 
@@ -430,8 +430,7 @@ bool planMisc(u16 op, PlannedOp& out)
             out.eaMode = ea;
             out.srcReg = static_cast<u8>(reg);
             out.size = static_cast<u8>(size);
-            // m68k_ops_group4.cpp:657 の TST は EA の形によらず 4。
-            out.cycles = 4;
+            out.cycles = static_cast<u8>(unaryInstructionCycles(op, size));
             return true;
         }
         if (opcodeBits == 0x2u && writeEaMode(mode, reg, ea))
@@ -441,8 +440,7 @@ bool planMisc(u16 op, PlannedOp& out)
             // **EA の An 番号は dstReg**。eaRegOf() の規約 (block_plan.h)。
             out.dstReg = static_cast<u8>(reg);
             out.size = static_cast<u8>(size);
-            // m68k_ops_group4.cpp:611 の CLR は EA の形にもサイズにもよらず 6。
-            out.cycles = 6;
+            out.cycles = static_cast<u8>(unaryInstructionCycles(op, size));
             return true;
         }
         return false;
@@ -461,11 +459,7 @@ bool planMisc(u16 op, PlannedOp& out)
         out.kind = PlanKind::kClrDreg;
         out.dstReg = static_cast<u8>(reg);
         out.size = static_cast<u8>(size);
-        // **サイズによらず 6。** 実機の 68000 は .b/.w の Dn 形が 4 だが、
-        // このエミュレータは一律 6 を返す (m68k_ops_group4.cpp)。
-        // JIT の契約は「インタプリタとビット単位で同一」なので、
-        // 実機の値へ「直す」と JIT ON/OFF でサイクルが割れる。
-        out.cycles = 6;
+        out.cycles = static_cast<u8>(unaryInstructionCycles(op, size));
         return true;
     }
     return false;
@@ -511,9 +505,11 @@ bool planAlu(u16 op, PlannedOp& out)
     const bool isAddressOrMulDiv = opmode == 3 || opmode == 7;
     if (isAddressOrMulDiv)
     {
-        // mode 0/1 以外は入れない (メモリ形と PC 相対と即値)。
+        // mode 0/1 と即値 (mode 7.4) を入れる。メモリ形と PC 相対は入れない。
+        // 即値は src が翻訳時定数になるだけで、本体もフラグの式も変わらない。
+        const bool srcIsImmediateAddr = mode == 7 && reg == 4;
         const bool srcIsRegisterDirect = mode == 0 || mode == 1;
-        if (!srcIsRegisterDirect)
+        if (!srcIsRegisterDirect && !srcIsImmediateAddr)
         {
             return false;
         }
@@ -534,25 +530,25 @@ bool planAlu(u16 op, PlannedOp& out)
         switch (group)
         {
             case 0xDu:  // ADDA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kAddaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kAddaAregToAreg
+                                                                      : PlanKind::kAddaDregToAreg);
                 out.aluOp = PlanAluOp::kAdd;
-                // **8 サイクル。** ADD / SUB の 4 ではない (m68k_ops_alu.cpp:81)。
-                out.cycles = 8;
+                out.cycles = static_cast<u8>(standardInstructionCycles(op, addrSize));
                 break;
             case 0x9u:  // SUBA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kAddaAregToAreg : PlanKind::kAddaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kAddaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kAddaAregToAreg
+                                                                      : PlanKind::kAddaDregToAreg);
                 out.aluOp = PlanAluOp::kSub;
-                out.cycles = 8;
+                out.cycles = static_cast<u8>(standardInstructionCycles(op, addrSize));
                 break;
             case 0xBu:  // CMPA
-                out.kind =
-                    srcIsAddressRegister ? PlanKind::kCmpaAregToAreg : PlanKind::kCmpaDregToAreg;
+                out.kind = srcIsImmediateAddr ? PlanKind::kCmpaImmToAreg
+                                              : (srcIsAddressRegister ? PlanKind::kCmpaAregToAreg
+                                                                      : PlanKind::kCmpaDregToAreg);
                 out.aluOp = PlanAluOp::kCmp;
-                // **6 サイクル。** CMP の 4 でも ADDA の 8 でもない
-                // (m68k_ops_alu.cpp:283)。
-                out.cycles = 6;
+                out.cycles = static_cast<u8>(standardInstructionCycles(op, addrSize));
                 break;
             default:
                 // MULU / MULS / DIVU / DIVS ($8 / $C)。上のコメントの理由。
@@ -601,8 +597,7 @@ bool planAlu(u16 op, PlannedOp& out)
         out.aluOp = immAluOp;
         out.dstReg = static_cast<u8>((op >> 9) & 7u);
         out.size = static_cast<u8>(aluSizeFromOpmode(opmode));
-        // 読み方向は EA の形によらず 4 (m68k_ops_alu.cpp の各 return)。
-        out.cycles = 4;
+        out.cycles = static_cast<u8>(standardInstructionCycles(op, out.size));
         // **srcReg は使わない。** 即値は imm 欄に入る (foldImmediate)。
         return true;
     }
@@ -633,8 +628,7 @@ bool planAlu(u16 op, PlannedOp& out)
         out.srcReg = static_cast<u8>(reg);
         out.dstReg = static_cast<u8>((op >> 9) & 7u);
         out.size = static_cast<u8>(aluSizeFromOpmode(opmode));
-        // 読み方向は EA の形によらず 4 (m68k_ops_alu.cpp の各 return)。
-        out.cycles = 4;
+        out.cycles = static_cast<u8>(standardInstructionCycles(op, out.size));
         return true;
     }
 
@@ -672,9 +666,7 @@ bool planAlu(u16 op, PlannedOp& out)
     out.srcReg = static_cast<u8>(op & 7u);
     out.dstReg = static_cast<u8>((op >> 9) & 7u);
     out.size = static_cast<u8>(aluSizeFromOpmode(opmode));
-    // groupAdd / groupSub / groupOrDiv / groupAndMul / groupCmpEor の
-    // 読み出し方向は、サイズによらず 4 を返す。
-    out.cycles = 4;
+    out.cycles = static_cast<u8>(standardInstructionCycles(op, out.size));
     return true;
 }
 
@@ -726,21 +718,50 @@ bool planImmediate(u16 op, PlannedOp& out)
         out.srcReg = static_cast<u8>(reg);
         // 対象が Dn なので 32bit で回る (m68k_ops_misc.cpp の size = kLong)。
         out.size = static_cast<u8>(kLong);
-        // **6 サイクル。** メモリ対象の 4 でも BCHG/BCLR/BSET の 8 でもない
-        // (m68k_ops_misc.cpp の `return targetIsRegister ? 6 : 4;`)。
-        out.cycles = 6;
+        out.cycles = static_cast<u8>(btstInstructionCycles(op));
         // ビット番号は拡張ワードにあるので foldImmediate が入れる。
         return true;
     }
 
-    // CMPI : 0000 110 ss mmm rrr。
+    // 即値 ALU : 0000 ooo ss mmm rrr。opType が演算種別。
     //
-    // **opType 6 だけ。** ORI/ANDI/SUBI/ADDI/EORI は書き戻しがあるので
-    // 入れない (この関数の冒頭のコメント)。
-    const bool isCmpi = opType == 6;
-    if (!isCmpi)
+    //   0=ORI  1=ANDI  2=SUBI  3=ADDI  5=EORI  6=CMPI
+    //
+    // **対象が Dn なら書き戻し先はレジスタなので、メモリの読みガードが要らない。**
+    // かつては CMPI だけを通し「他は書き戻しがあるから入れない」としていたが、
+    // 書き戻しの有無ではなく**どこへ書き戻すか**が判断の分かれ目である。
+    // emitAluBody は kAnd/kOr を emitLogicAluCore、kAdd/kSub/kCmp を
+    // emitArithAluCore へ渡し、どちらも CMP 以外は
+    // emitWriteDataRegister で d[] へ書き戻す。つまりエミッタ側は既に対応済みで、
+    // ここで弾いていたことだけが制約だった。
+    //
+    // 実測 (ゲームを 900M サイクル走らせ 1 命令ごとに planOne を呼んだもの):
+    // JIT 不可は実行回数比 15.0%、うち ANDI が 2.87%、ADDI が 0.92% で最多。
+    // Dn 対象に限っても実行の 3.79% を占める。
+    //
+    // **EORI (opType 5) は入れない。** emitAluBody が kEor で e.failed を立てる。
+    //
+    // **ORI (opType 0) も入れない。** opcode 0x0000 がちょうど
+    // 「ORI.B #imm,D0」になるため、ゼロで埋まった領域が全部この命令として
+    // 読めてしまう。未初期化 RAM やデータ領域へブロックが伸びる形を
+    // 作りたくない。実測でも ORI の実行頻度は ANDI/ADDI より桁が小さい。
+    PlanAluOp aluOp = PlanAluOp::kCmp;
+    switch (opType)
     {
-        return false;
+        case 1:
+            aluOp = PlanAluOp::kAnd;
+            break;
+        case 2:
+            aluOp = PlanAluOp::kSub;
+            break;
+        case 3:
+            aluOp = PlanAluOp::kAdd;
+            break;
+        case 6:
+            aluOp = PlanAluOp::kCmp;
+            break;
+        default:
+            return false;
     }
     // **対象は Dn だけ。** メモリ対象は読みガードを背負う。
     if (mode != 0)
@@ -753,17 +774,14 @@ bool planImmediate(u16 op, PlannedOp& out)
         return false;
     }
 
-    // **kAluImmToDreg へ載せる。** CMP #imm,Dn ($Bxxx の即値形) と
-    // 意味がビット単位で同じ (alu::sub → applyResultFlags(sr, r, false))。
-    // 違うのはサイクルだけなので、kind を増やさず cycles で分ける
-    // (block_plan.h の Tier H のコメント)。
+    // **kAluImmToDreg へ載せる。** レジスタ間形 ($Bxxx 等) と意味が
+    // ビット単位で同じで、違うのはサイクルだけなので、kind を増やさず
+    // cycles で分ける (block_plan.h の Tier H のコメント)。
     out.kind = PlanKind::kAluImmToDreg;
-    out.aluOp = PlanAluOp::kCmp;
+    out.aluOp = aluOp;
     out.dstReg = static_cast<u8>(reg);
     out.size = static_cast<u8>(sizeBits == 0 ? kByte : (sizeBits == 1 ? kWord : kLong));
-    // **8 サイクル。** CMP #imm,Dn の 4 ではない
-    // (m68k_ops_misc.cpp の CMPI が `return 8;`)。
-    out.cycles = 8;
+    out.cycles = static_cast<u8>(immediateInstructionCycles(op, out.size));
     // 即値は拡張ワードにあるので foldImmediate が入れる。
     return true;
 }
@@ -821,8 +839,7 @@ bool planQuickAlu(u16 op, PlannedOp& out)
         // **欄が情報を持たないと、その欄を誤用する変異を捕まえられない。**
         out.size = static_cast<u8>(size);
         out.imm = data;
-        // m68k_ops_misc.cpp の An 経路は 8。
-        out.cycles = 8;
+        out.cycles = static_cast<u8>(quickInstructionCycles(op, size));
         return true;
     }
 
@@ -847,8 +864,7 @@ bool planQuickAlu(u16 op, PlannedOp& out)
     // byte でも落ちないが、**マスクの形をそろえておく**。ここだけ
     // 素通しにすると、後から即値の範囲が広がったときに気づけない。
     out.imm = size == kByte ? (data & 0xFFu) : data;
-    // m68k_ops_misc.cpp の Dn 経路は 8。ADD/SUB #imm の 4 ではない。
-    out.cycles = 8;
+    out.cycles = static_cast<u8>(quickInstructionCycles(op, size));
     return true;
 }
 
@@ -1013,6 +1029,8 @@ void foldImmediate(PlannedOp& p, u16 ext0, u16 ext1, u32 length)
         // **拡張ワードを持たないので、ここでは何もしない。**
         case PlanKind::kAddqImmToAreg:
             break;
+        case PlanKind::kAddaImmToAreg:
+        case PlanKind::kCmpaImmToAreg:
         case PlanKind::kMoveaImmToAreg:
             // MOVEA.w は符号拡張して 32bit 全体を書く。
             p.imm = p.size == 4 ? longValue : sext16(ext0);

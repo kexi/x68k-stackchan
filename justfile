@@ -12,7 +12,7 @@
 
 # ホストビルドのディレクトリ。テストとエミュレータランナーを同じツリーで作る。
 host_build := "build-host"
-san_build  := "build-san"
+san_build := "build-san"
 
 # 既定ターゲット: 引数なしなら一覧を出す。
 default:
@@ -23,11 +23,29 @@ default:
 # core/ は ESP32 非依存の純粋 C++17。68000 コアもデバイスも Mac 上で動くので、
 # 実機に焼かずに Human68k の起動までデバッグできる。これが開発速度を決める。
 
+# 実機試験の入力時刻・部分行の保持・失敗時の解放をホストで検証する。
+test-tools:
+    python -m unittest discover -s tools -p 'test_*.py'
+
+# 実機の実行位置別計測と音声カウンタを、時刻差・欠測を明示したJSONで集計する。
+summarize-runtime LOG:
+    python tools/summarize_runtime.py '{{ LOG }}'
+
+# 関係ない既存差分を整形せず、指定したC/C++ファイルだけを整形する。
+fmt-files +FILES:
+    clang-format -i {{ FILES }}
+
 [doc('core/ のホストテスト (doctest) をビルドして実行する')]
 test-host:
-    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug
-    cmake --build {{host_build}}
-    ctest --test-dir {{host_build}} --output-on-failure
+    cmake -S test -B {{ host_build }} -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    cmake --build {{ host_build }}
+    ctest --test-dir {{ host_build }} --output-on-failure
+
+# ROMなしでCRTCアクセス幅・MODE3 scroll・二重buffer合成を検証する。
+test-video-hardware:
+    cmake -S test -B {{ host_build }} -G Ninja -DCMAKE_BUILD_TYPE=Debug
+    cmake --build {{ host_build }} --target x68k_tests x68k-run
+    ./{{ host_build }}/x68k_tests --source-file='*test_gvram_bus.cpp,*test_graphic_raster.cpp,*test_compositor.cpp,*test_tiled_compositor.cpp'
 
 # ASan/UBSan は 68000 コアのメモリ破壊 (EA 計算ミスによる配列外アクセス等) を
 # 一発で捕まえる。エミュレータ開発では通常テストより価値が高い場面が多い。
@@ -47,26 +65,37 @@ test-host:
 # 手元の macOS で拾えるのは UB (符号付きオーバーフロー・不正シフト量) まで。
 [doc('ASan/UBSan 付きでホストテストを実行する')]
 test-san:
-    cmake -S test -B {{san_build}} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+    cmake -S test -B {{ san_build }} -G Ninja -DCMAKE_BUILD_TYPE=Debug \
       -DENABLE_SANITIZERS=ON -DCMAKE_CXX_COMPILER=clang++
-    cmake --build {{san_build}}
+    cmake --build {{ san_build }}
     # doctest の TEST_SUITE が静的初期化で確保する文字列は解放されない
     # (設計上そうなっている)。テスト本体の漏れだけを見たいので抑制する。
     # 詳細は test/lsan.supp に書いた。
     # LSan の扱いは test/test_main.cpp の __lsan_default_options に書いた。
     # 外から LSAN_OPTIONS を渡す形はシンボル化が要り、CI で当たらなかった。
-    ctest --test-dir {{san_build}} --output-on-failure
+    ctest --test-dir {{ san_build }} --output-on-failure
 
 [doc('ホストのエミュレータランナー x68k-run をビルドする')]
 build-host:
-    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    cmake --build {{host_build}} --target x68k-run
+    cmake -S test -B {{ host_build }} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build {{ host_build }} --target x68k-run
 
 # ROM は同梱していないので rom/ に置く (NOTICE.md 参照)。
 # 例: just run --png /tmp/out.png --trace /tmp/trace.txt
+# 対話フロントエンドをビルドする。SDL2 が要る。
+[doc('対話フロントエンド x68k-play をビルドする')]
+build-play:
+    cmake -S test -B {{ host_build }} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build {{ host_build }} --target x68k-play
+
+# 窓を出して実際に操作する。--hdd でゲームのイメージを渡す。
+[doc('X68000 を対話的に動かす (窓が出る)')]
+play *ARGS: build-play
+    ./{{ host_build }}/x68k-play --iplrom rom/iplrom.dat {{ ARGS }}
+
 [doc('ホストで X68000 を起動する (rom/ に IPLROM とディスクイメージが必要)')]
 run *ARGS: build-host
-    ./{{host_build}}/x68k-run --iplrom rom/iplrom.dat {{ARGS}}
+    ./{{ host_build }}/x68k-run --iplrom rom/iplrom.dat {{ ARGS }}
 
 # ───── 68000 コアの適合性テスト ─────────────────────────────────────────────
 #
@@ -84,8 +113,8 @@ fetch-tests:
 # 「No such file or directory」で落ちた。
 [doc('68000 適合性テストをフル実行する (fetch-tests 済みが前提)')]
 test-vectors:
-    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-    cmake --build {{host_build}} --target x68k_tests
+    cmake -S test -B {{ host_build }} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build {{ host_build }} --target x68k_tests
     # X68K_TEST_VECTOR_LIMIT=0 で件数の上限を外し、全ケースを回す。
     # 既定の 200 件は「手元でさっと確かめる」ための数。
     #
@@ -93,7 +122,7 @@ test-vectors:
     # これが無いと、ベクタ未取得のまま「0 件実行して SUCCESS」になり、
     # CPU が壊れていても緑になる。
     X68K_TEST_VECTOR_LIMIT=0 X68K_TEST_VECTORS_REQUIRED=1 \
-      ./{{host_build}}/x68k_tests --test-suite=m68k-vectors
+      ./{{ host_build }}/x68k_tests --test-suite=m68k-vectors
 
 # ───── 実機 (M5Stack CoreS3 / ESP32-S3) ────────────────────────────────────
 
@@ -105,9 +134,59 @@ build:
 flash:
     idf.py flash
 
+# ROM とディスクイメージを storage パーティションへ焼く。
+#
+# 既定では SD から読むが、カード無しで動かしたいときはこちら。
+# ディスクは疎で持つので、20MB のイメージでも実体は数百 KB で収まる。
+[doc('ROM とディスクを flash 用の 1 ファイルにまとめる')]
+pack-data HDD OUT="build/x68kdata.bin" IPL="rom/iplrom.dat":
+    uv run tools/mkflashimage.py --iplrom {{ IPL }} --hdd {{ HDD }} --out {{ OUT }}
+
+# storage パーティションの位置は partitions.csv の 0x410000。
+[doc('まとめたデータを storage パーティションへ書き込む')]
+flash-data DATA="build/x68kdata.bin":
+    # esptool は単体のコマンドとしては PATH に無い。ESP-IDF が供給する
+    # Python モジュールとして呼ぶ (idf.py が内部でやっているのと同じ形)。
+    python -m esptool --chip esp32s3 write_flash 0x410000 {{ DATA }}
+
+[doc('ファームとデータを両方書き込む (カード無しで動く状態にする)')]
+flash-all HDD: build (pack-data HDD) flash flash-data
+
 [doc('CoreS3 のシリアル出力を読む')]
 monitor:
     idf.py monitor
+
+# LCDを取得する。START_AFTER指定時は初期キー送信から指定秒後にRETURNを一度押す。
+capture-lcd PORT OUT KEYS="" WAIT="0" START_AFTER="" SCENARIO="" LOG="":
+    python tools/capture_lcd.py {{ PORT }} {{ OUT }} '{{ KEYS }}' {{ WAIT }} '{{ START_AFTER }}' '{{ SCENARIO }}' '{{ LOG }}'
+
+# バックアップ済みの実機アプリ領域だけを更新する。
+flash-app PORT:
+    python -m esptool --chip esp32s3 --port {{ PORT }} write_flash 0x10000 build/x68k-stackchan.bin
+
+# 別ファームから戻す前に、CoreS3の16MB全領域を復元可能な形で退避する。
+backup-flash PORT OUT:
+    python -m esptool --chip esp32s3 --port '{{ PORT }}' --baud 921600 read_flash 0x0 0x1000000 '{{ OUT }}'
+
+# 指定ポートへ起動領域・パーティション表・アプリを戻す（storageとNVSは消去しない）。
+flash-firmware-port PORT:
+    idf.py -p '{{ PORT }}' flash
+
+# 実機のアプリパーティション全体を復元用に読み出す。
+backup-app PORT OUT:
+    python -m esptool --chip esp32s3 --port {{ PORT }} read_flash 0x10000 0x400000 {{ OUT }}
+
+# GAME.X更新前にstorage全体を復元可能な形で退避する。
+backup-data PORT OUT:
+    python -m esptool --chip esp32s3 --port {{ PORT }} --baud 921600 read_flash 0x410000 0xBF0000 {{ OUT }}
+
+# flashデータを展開せず、ROMとディスクの全バイト一致を検査する。
+verify-data DATA IPL HDD:
+    python tools/verify_flash_data.py {{ DATA }} {{ IPL }} {{ HDD }}
+
+# 指定ポートのstorageだけを更新する（事前にbackup-dataで退避する）。
+flash-data-port PORT DATA:
+    python -m esptool --chip esp32s3 --port {{ PORT }} write_flash 0x410000 {{ DATA }}
 
 [doc('書き込んでそのままシリアルを読む')]
 run-device:
@@ -182,7 +261,7 @@ tidy:
 # ここに無い検査を CI にだけ足すと、手元で通ったのに CI で落ちるようになる。
 # 実機ファームのビルド (just build) だけは数分かかるので check には入れない。
 [doc('CI と同じ検査を一括で回す')]
-check: fmt-check lint core-guard verify-rom-selftest verify-rom-lint tidy test-host test-san actionlint
+check: fmt-check lint core-guard verify-rom-selftest verify-rom-lint tidy test-host test-san test-tools actionlint
 
 # core/ に ESP32 依存が混入していないことを検査する。
 # core/ がホストで動くことが本プロジェクトの開発速度の前提なので、CI と
@@ -197,12 +276,11 @@ core-guard:
     fi
     echo "core/ is ESP32-independent: OK"
 
-# ───── IPL-ROM の根拠検証 ──────────────────────────────────────────────────
+# 「逆アセンブルして確かめた」と書いた主張を、機械的に ROM と突き合わせる。
 #
-# コメントと OKF の「IPL-ROM を逆アセンブルして確かめた」という主張を、
-# ROM と機械的に突き合わせる。2026-08-26 の手作業の再検証で、値は正しいのに
-# 根拠の番地とビット番号が違う主張が見つかった。動作は壊れないので、
-# テストでも実機でも露見しない種類の誤りだった。
+# 根拠に番地を書いた主張のうち、生ワード列を伴うものだけが照合できる。
+# 実際にこれで 1 件の誤りが見つかった。値そのものは正しく、根拠の番地が
+# 違っていたので、テストでも実機でも露見しない種類の誤りだった。
 #
 # ROM はライセンス上リポジトリに含められないので、照合できるのは手元だけ。
 # CI で回るのは selftest と lint (どちらも ROM 不要) に限られる。
@@ -242,11 +320,11 @@ gitleaks:
 # CGROM 無しでも英数字コンソールを出せる。まず目視で確認するためのツール。
 [doc('IPLROM 内の 6x12 ANK フォントを抽出して PNG で確認する')]
 extract-font IPLROM OUT="/tmp/ank6x12.png":
-    uv run tools/extract_font.py {{IPLROM}} --out {{OUT}}
+    uv run tools/extract_font.py {{ IPLROM }} --out {{ OUT }}
 
 [doc('Human68k を展開したディレクトリから SASI HDD イメージを作る')]
 make-hdd SOURCE OUT:
-    uv run tools/make_sasi_image.py {{SOURCE}} {{OUT}}
+    uv run tools/make_sasi_image.py {{ SOURCE }} {{ OUT }}
 
 # CGROM はシャープの無償公開の対象外だが、東雲フォント (実質パブリックドメイン、
 # 「他フォーマットへの変換」を明示的に許諾) から相当品を作れる。これで漢字が出る。
@@ -254,8 +332,8 @@ make-hdd SOURCE OUT:
 #   curl -O http://openlab.ring.gr.jp/efont/dist/shinonome/shinonome-0.9.11p1.tar.bz2
 [doc('東雲フォント (BDF) から CGROM 相当のイメージを作る')]
 make-cgrom BDF_DIR OUT="/tmp/cgrom.dat":
-    uv run tools/make_cgrom.py {{BDF_DIR}} {{OUT}}
+    uv run tools/make_cgrom.py {{ BDF_DIR }} {{ OUT }}
 
 [doc('ビルド成果物を消す')]
 clean:
-    rm -rf {{host_build}} {{san_build}} build-tidy build
+    rm -rf {{ host_build }} {{ san_build }} build-tidy build

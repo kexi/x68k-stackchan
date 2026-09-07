@@ -25,6 +25,7 @@
 #include <cstdint>
 
 #include "machine.h"
+#include "video/tiled_compositor.h"
 
 namespace x68k_platform
 {
@@ -38,6 +39,25 @@ public:
 
     // LCD を初期化する。表示コアから 1 度だけ呼ぶ。
     void begin();
+
+    // Core1で登録。rendererとbufferはDisplayLcdより長く生存する。
+    void attachTiledRenderer(x68k::Machine& machine, x68k::TiledCompositor& renderer,
+                             x68k::u16* bufferA, x68k::u16* bufferB, x68k::u16* bufferC)
+    {
+        tiled_ = &renderer;
+        buffers_[0] = bufferA;
+        buffers_[1] = bufferB;
+        buffers_[2] = bufferC;
+        machine.sprite().setVisualDamage(renderer.observer());
+        machine.video().setVisualDamage(renderer.observer());
+        machine.bus().setVisualDamage(renderer.observer());
+        invalidateAll();
+    }
+
+    [[nodiscard]] x68k::u32 lastRenderedTiles() const
+    {
+        return lastRenderedTiles_;
+    }
 
     // 表示位置を設定する。768x512 の中のどこを映すか。
     void setViewport(x68k::u32 x, x68k::u32 y);
@@ -80,6 +100,7 @@ public:
     void setGraphicVram(const x68k::u8* graphicVram)
     {
         graphicVram_ = graphicVram;
+        invalidateAll();
     }
 
     // --- エミュレーションコア (Core1) から呼ぶ ---
@@ -122,6 +143,11 @@ private:
     [[nodiscard]] bool shouldComposite(x68k::Machine& machine) const;
 
     const x68k::u8* graphicVram_ = nullptr;
+    x68k::TiledCompositor* tiled_ = nullptr;
+    // FrameChannel と同じ 3 枚。世代はこの並び順の添字で追う。
+    static constexpr int kBuffers = 3;
+    x68k::u16* buffers_[kBuffers] = {};
+    x68k::u32 lastRenderedTiles_ = 0;
     x68k::u32 viewX_ = 0;
     x68k::u32 viewY_ = 0;
     x68k::u32 zoom_ = 1;

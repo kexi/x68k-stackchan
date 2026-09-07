@@ -26,6 +26,7 @@
 #include <freertos/task.h>
 
 #include <atomic>
+#include <new>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -36,15 +37,21 @@
 
 #include "app_mode.h"
 #include "audio.h"
+#include "audio_playback.h"
+#include "guest_audio.h"
 #include "avatar.h"
 #include "display_lcd.h"
 #include "speaker_m5.h"
 #include "frame_channel.h"
+#include "render_budget.h"
+#include "run_profile.h"
 #include "input_touch.h"
 #include "key_queue.h"
 #include "servo.h"
 #include "io/ascii_keymap.h"
 #include "machine.h"
+#include "storage_flash.h"
+
 #include "storage_sd.h"
 #include "video/cgrom_fallback.h"
 #include "video/text_scrape.h"
@@ -73,14 +80,43 @@ x68k::u8* g_cgRom = nullptr;
 // 表示コアがもう片方を LCD へ送る。
 x68k::u16* g_frameBufferA = nullptr;
 x68k::u16* g_frameBufferB = nullptr;
+x68k::u16* g_frameBufferC = nullptr;
 
 x68k::Machine g_machine;
 x68k_platform::SdDisk g_disk;
+x68k_platform::FlashDisk g_flashDisk;
 // フロッピー 2 台。イメージが無ければ「ディスクが入っていない」まま。
 x68k_platform::SdFloppy g_floppy[x68k::Fdc::kDriveCount];
 x68k_platform::DisplayLcd g_display;
 x68k_platform::TouchKeyboard g_keyboard;
 x68k_platform::FrameChannel g_frames;
+bool g_captureRequested = false;  // Core0 のシリアル入力と LCD 消費側だけが触る。
+
+void captureLcdFrame(const x68k::u16* frame)
+{
+    // take/done の間に取得するので Core1 はこのフレームを書き換えない。
+    // 行ごとの出力にして通常ログと混ざってもホストで識別できるようにする。
+    constexpr char hex[] = "0123456789abcdef";
+    constexpr unsigned width = x68k_platform::DisplayLcd::kScreenWidth;
+    constexpr unsigned height = x68k_platform::DisplayLcd::kScreenHeight;
+    std::printf("\nX68K_FRAME_BEGIN %u %u\n", width, height);
+    for (unsigned y = 0; y < height; ++y)
+    {
+        char row[width * 4 + 1];
+        for (unsigned x = 0; x < width; ++x)
+        {
+            const auto pixel = frame[y * width + x];
+            for (unsigned nibble = 0; nibble < 4; ++nibble)
+            {
+                row[x * 4 + nibble] = hex[(pixel >> (12 - nibble * 4)) & 15];
+            }
+        }
+        row[width * 4] = '\0';
+        std::printf("\nX68K_FRAME_ROW %u %s\n", y, row);
+        vTaskDelay(1);
+    }
+    std::printf("\nX68K_FRAME_END\n");
+}
 x68k_platform::KeyQueue g_keys;
 x68k_platform::MouseQueue g_mouse;
 
@@ -143,6 +179,36 @@ std::atomic<bool> g_fastTickEnabled{true};
 // 切り替えはスライスの切れ目でしか効かないので、run の途中で経路が
 // 変わることは無い。
 std::atomic<bool> g_eventDrivenEnabled{false};
+// CPUやJITの状態はCore1だけが変更する。連打は奇偶でまとめる。
+//
+// 1 で始めるのは JIT を既定で ON にするため。最初のスライスで 1 回ぶんの
+// 切り替えが消費され、以降は 'J' で往復できる。
+//
+// Why not g_machine.cpu().setNativeExec() を起動時に直接呼ばないか: JIT の
+// 置き場 (スロット・コード領域) の確保はこのループの中でしか行わず、
+// 失敗したときの退避もそこにある。初期化の順序を二重に持つと、置き場が
+// 取れなかった場合に「JIT ON のつもりで実体が無い」状態を作れてしまう。
+std::atomic<unsigned> g_jitToggleRequests{1};
+// GPIP ポーリングの同期省略を既定 ON にする。
+//
+// ゲームは VBlank 待ちで MFP の GPIP を高頻度に読む。イベント駆動中かつ
+// スケジューラ期限前 (debt < 0) の読取だけ materialize を省く仕組みで、
+// 期限到達・外部 wake・他の MFP 読取は従来どおり同期する。
+// 通常実行との同値は GPIP 列の rolling hash で 8 設定 x 3 実行幅 x
+// Timer 読取有無 x 24 slice を照合済み (cores3-gpip-poll.md)。
+//
+// Why 既定 ON か: 効くのに OFF のままだった。'^' のトグルは A/B 用に残す。
+std::atomic<bool> g_gpipPollEnabled{true};
+std::atomic<bool> g_runProfileEnabled{false};
+// ch1を主旋律に使うゲーム用の任意補正。他ソフトを一律に増幅しない。
+//
+// 既定で ON にする。OFF だと主旋律が他声部に埋もれて聞こえないという実機の
+// 聴感報告があり、この補正込みの値 (gain 8 倍・ピークだけ 17000 で圧縮) で
+// バランスを決めてある。docs は cores3-fm-trumpet.md を見よ。
+// 他のソフトを鳴らすときは '-' で切れる。
+std::atomic<bool> g_melodyBoostEnabled{true};
+// タイトル20秒+36効果音条件の他声部peak14544に対し、和に1223の余裕を残す。
+constexpr x68k::u32 kMelodyOutputPeakLimit = 17000;
 
 // JIT の上限を測るモード (src/x68k/core/cpu/jit_probe.h)。
 //
@@ -162,11 +228,17 @@ std::atomic<bool> g_eventNullExec{false};
 // 依存する。その仮定が外れて誤診したことがあるので (SD が原因と読み違えた)、
 // 直接測れる形を常設にしておく。
 std::int64_t g_runUs = 0;
+std::int64_t g_runMaxUs = 0;
 std::uint32_t g_runCount = 0;
-#if X68K_MEASURE_DISK
 std::int64_t g_renderUs = 0;
+std::int64_t g_renderMaxUs = 0;
 std::uint32_t g_renderCount = 0;
-#endif
+std::uint32_t g_renderBackpressureCount = 0;
+std::uint32_t g_renderPublishFailureCount = 0;
+std::int64_t g_dmaTransferTimeUs = 0;
+std::int64_t g_audioSynthUs = 0;
+std::int64_t g_audioSynthMaxUs = 0;
+std::uint32_t g_audioSynthBlocks = 0;
 
 // 上限計測の段に名前を付ける。段の定義は machine.cpp の switch にある。
 //
@@ -912,7 +984,9 @@ std::uint16_t* g_codeGen = nullptr;
 //
 // 取れなければ 512 へ落とす。**JIT ごと死なせない** (段 0-I で 8192
 // エントリの確保に失敗した前例があり、フォールバックは設計どおり働いた)。
-constexpr x68k::u32 kJitSlotsWanted = 2048;
+// 上記は別負荷の過去の測定。現ゲームではcold missが支配的だったため、
+// 1024個に減らして生成コード32KiBへ配分する比較候補 (2026-09-05)。
+constexpr x68k::u32 kJitSlotsWanted = 1024;
 constexpr x68k::u32 kJitSlotsFallback = 512;
 x68k::u32 g_jitSlotCount = 0;
 
@@ -954,8 +1028,10 @@ x68k::jit::VerifySide* g_jitSides = nullptr;
 x68k::jit::BlockSlot* g_jitSlots = nullptr;
 x68k::jit::ExecMemory g_jitCode;
 x68k::jit::BlockRunner g_jitRunner;
-// 実行可能メモリの要求量。実測で 21KB 取れる。
-constexpr std::size_t kJitCodeBytes = 16 * 1024;
+// 20KiBを先に取るとスロットが512個へ縮退し、スロット2048個を
+// 先に取ると20KiB EXECが取れなかった (2026-09-05 CoreS3)。
+// 確保順序だけでは両立できないため、1024スロットへ減らして32KiBを試す。
+constexpr std::size_t kJitCodeBytes = 32 * 1024;
 
 // 顔のスプライト。無くても起動する (仮の顔は M5.Display へ直接描く)。
 x68k::u16* g_avatarSprite = nullptr;
@@ -979,6 +1055,9 @@ bool reserveMemory()
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     g_frameBufferB = static_cast<x68k::u16*>(
         heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // 3 枚目。転送中でも Core1 が書いて渡せるようにする。
+    g_frameBufferC = static_cast<x68k::u16*>(
+        heap_caps_calloc(1, kFrameBufferBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 
     // SASI の転送バッファ (64KiB)。
     //
@@ -993,24 +1072,10 @@ bool reserveMemory()
     //
     // **どちらも失敗してよい。** 取れなければ JIT を教わらないので、
     // 現行インタプリタのまま動く (挙動は 1 ビットも変わらない)。
-    // **実行可能メモリを最初に取る。** これだけ MALLOC_CAP_EXEC で、
-    // 実行できる IRAM からしか取れない。スロットや負のキャッシュは
-    // MALLOC_CAP_INTERNAL なので DRAM でも IRAM でも満たせてしまい、
-    // 先に取ると実行可能な側を食って acquire を失敗させる。
-    //
-    // 実際に踏んだ: スロット 20KB + 負のキャッシュ 16KB を先に取った
-    // ビルドで「実行可能メモリを確保できません」になり、JIT がまるごと
-    // 無効化された (さらに IPL-ROM も内部 SRAM から溢れて PSRAM へ落ち、
-    // インタプリタ単体より遅い状態で起動していた)。
-    //
-    // Why not 全部 MALLOC_CAP_EXEC にするか: 実行可能 IRAM は最も希少で、
-    // データにしか使わないものを置くと本当に必要な生成コードが入らない。
-    // **希少な順に取る**のが確保順の原則。
+    // スロットと負のキャッシュを両方先に取るとEXEC確保に失敗した。
+    // 希少な実行可能領域を先に取り、データ領域を後にする。
     if (!g_jitCode.acquire(kJitCodeBytes))
     {
-        // **EXEC の残量を必ず一緒に出す。** 空きが 0 なら断片化ではなく
-        // 「IRAM が heap に登録されていない」= memprot が有効になっている。
-        // これを出さなかったせいで、原因の特定に実機を何度も焼き直した。
         ESP_LOGW(kTag, "実行可能メモリを確保できません (JIT は無効)。EXEC 空き=%u 最大連続=%u",
                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_EXEC)),
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_EXEC)));
@@ -1159,7 +1224,7 @@ bool reserveMemory()
     // 先で別の失敗を招く。
     const bool ok = g_mainRam != nullptr && g_textVram != nullptr && g_iplRom != nullptr &&
                     g_cgRom != nullptr && g_frameBufferA != nullptr && g_frameBufferB != nullptr &&
-                    g_sasiBuffer != nullptr;
+                    g_frameBufferC != nullptr && g_sasiBuffer != nullptr;
     if (!ok)
     {
         ESP_LOGE(kTag, "メモリの確保に失敗しました");
@@ -1170,8 +1235,19 @@ bool reserveMemory()
 // SD から ROM を読む。IPL-ROM が無ければ起動できない。
 bool loadRoms()
 {
-    const std::size_t iplSize =
+    // SD を先に見る。焼き直さずに中身を変えられる方が開発中は都合がよい。
+    // 無ければ flash に焼いたものへ落ちる (カード無しで動かすため)。
+    std::size_t iplSize =
         x68k_platform::loadFile(x68k_platform::kIplromPath, g_iplRom, kIplromBytes);
+    if (iplSize != kIplromBytes)
+    {
+        const std::size_t fromFlash = x68k_platform::loadFlashIplRom(g_iplRom, kIplromBytes);
+        if (fromFlash > 0)
+        {
+            iplSize = fromFlash;
+            ESP_LOGI(kTag, "IPL-ROM を flash から読みました");
+        }
+    }
     // 長さまで確かめる。
     //
     // loadFile はバッファに収まる限り任意の長さを成功として返す。
@@ -1196,8 +1272,15 @@ bool loadRoms()
     // 一切読めなくなる。ホスト側 (host/main.cpp) と同じ扱いに揃える。
     //
     // バッファ自体は reserveMemory で確保済み (取れなければそこで止まる)。
-    const std::size_t cgSize =
-        x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes);
+    std::size_t cgSize = x68k_platform::loadFile(x68k_platform::kCgromPath, g_cgRom, kCgromBytes);
+    if (cgSize != kCgromBytes)
+    {
+        const std::size_t fromFlash = x68k_platform::loadFlashCgRom(g_cgRom, kCgromBytes);
+        if (fromFlash > 0)
+        {
+            cgSize = fromFlash;
+        }
+    }
 
     // 長さも見る。短いものを受け入れると大半の字形が欠け、「表示は出るが
     // 読めない」という切り分けにくい状態になる。合わなければ代替へ落とす。
@@ -1217,9 +1300,23 @@ bool loadRoms()
         ESP_LOGW(kTag, "CGROM がありません。IPL-ROM 内蔵 6x12 ANK フォントで代替します");
     }
 
-    if (!g_disk.open(x68k_platform::kHddPath))
+    // ディスクは flash を先に見る。
+    //
+    // Why not SD を優先しないか: flash に焼くのは「このファームで動かす
+    // ものを固定したい」という意思表示なので、たまたま挿さっている
+    // カードより優先する方が意図に沿う。SD の中身を使いたいときは
+    // flash を消す (esptool erase-region) か、SD 用のファームを焼く。
+    //
+    // ROM (IPL/CGROM) は逆に SD を優先している。あちらは「差し替えたい」
+    // 対象で、ディスクほど「これで固定したい」ものではないため。
+    bool diskFromSd = false;
+    if (!g_flashDisk.open())
     {
-        ESP_LOGW(kTag, "HDD イメージを開けません: %s", x68k_platform::kHddPath);
+        diskFromSd = g_disk.open(x68k_platform::kHddPath);
+        if (!diskFromSd)
+        {
+            ESP_LOGI(kTag, "SD に HDD イメージがありません: %s", x68k_platform::kHddPath);
+        }
     }
 
     // フロッピーは任意。無くても SASI から起動できるので、開けなくても
@@ -1246,7 +1343,21 @@ bool loadRoms()
     memory.cgRom = g_cgRom;
     g_machine.setMemory(memory);
     g_machine.setSasiBuffer(g_sasiBuffer);
-    g_machine.setDisk(&g_disk);
+    // flash に焼いたものがあればそれを、無ければ SD のものを使う。
+    if (g_flashDisk.isPresent())
+    {
+        g_machine.setDisk(&g_flashDisk);
+        ESP_LOGI(kTag, "HDD イメージを flash から使います");
+    }
+    else if (diskFromSd)
+    {
+        g_machine.setDisk(&g_disk);
+        ESP_LOGI(kTag, "HDD イメージを SD から使います");
+    }
+    else
+    {
+        ESP_LOGW(kTag, "HDD イメージがありません (SD にも flash にも)");
+    }
 
     // ゲスト RAM の書き換えを追う世代マップを配線する。
     //
@@ -1319,6 +1430,87 @@ std::atomic<bool> g_halted{false};
 // 配置されるため。エミュレーションのホットループを侵されたくない。
 void emulatorTask(void* /*arg*/)
 {
+    x68k_platform::GuestAudioProducer* guestAudio = nullptr;
+    void* const audioMemory = heap_caps_malloc(sizeof(x68k_platform::GuestAudioProducer),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const bool hasAudioMemory = audioMemory != nullptr;
+    if (hasAudioMemory)
+    {
+        auto* const producer = new (audioMemory) x68k_platform::GuestAudioProducer(g_audio);
+        guestAudio = producer;
+        g_machine.setAudioSyncCallback(
+            producer,
+            [](void* context, x68k::Machine& machine, std::uint64_t cycles,
+               x68k::Machine::AudioSyncPoint point)
+            {
+                auto& output = *static_cast<x68k_platform::GuestAudioProducer*>(context);
+                const bool reset = point == x68k::Machine::AudioSyncPoint::kReset;
+                if (reset)
+                {
+                    output.reset();
+                    return;
+                }
+                const auto before = output.publishedBlocks();
+                const auto start = esp_timer_get_time();
+                const bool ok = output.syncTo(machine, cycles);
+                const auto elapsed = esp_timer_get_time() - start;
+                g_audioSynthUs += elapsed;
+                g_audioSynthMaxUs = std::max(g_audioSynthMaxUs, elapsed);
+                g_audioSynthBlocks += static_cast<std::uint32_t>(output.publishedBlocks() - before);
+                if (!ok)
+                {
+                    ESP_LOGE(kTag, "[audio-clock] backwards cycles=%llu", cycles);
+                }
+            });
+    }
+    ESP_LOGI(kTag, "[guest-audio] enabled=%d cycles_per_sample=640", hasAudioMemory);
+    x68k_platform::AudioPacer audioPacer;
+    bool gpipPollApplied = false;
+    bool melodyBoostApplied = false;
+    x68k::u32 maxAudioSliceCycles = 0;
+    std::uint32_t queuePacingWaits = 0;
+    // 診断の置き場でJITの連続内部RAMを削らない。
+    void* const profileMemory =
+        heap_caps_malloc(sizeof(x68k_platform::RunProfile), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    auto* const profile =
+        profileMemory == nullptr ? nullptr : new (profileMemory) x68k_platform::RunProfile;
+    bool profileApplied = false;
+    std::uint32_t profileStartMs = 0;
+    std::uint32_t profileClockWaits = 0;
+    std::uint32_t profileQueueWaits = 0;
+    std::uint64_t profileRenderUs = 0;
+    // 既存診断と同じ所有Core1で採取し、音声タスクからOPMを読まない。
+    void* const opmStatsMemory =
+        heap_caps_malloc(sizeof(x68k::Opm::OutputStats), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    auto* const opmStats =
+        opmStatsMemory == nullptr ? nullptr : new (opmStatsMemory) x68k::Opm::OutputStats;
+    // JIT用の連続内部RAMを削らない。失敗時は既存の全面合成を維持する。
+    void* const tileMemory =
+        heap_caps_malloc(sizeof(x68k::TiledCompositor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const bool hasTileMemory = tileMemory != nullptr;
+    if (hasTileMemory)
+    {
+        auto* const renderer = new (tileMemory) x68k::TiledCompositor;
+        g_display.attachTiledRenderer(g_machine, *renderer, g_frameBufferA, g_frameBufferB,
+                                      g_frameBufferC);
+    }
+    ESP_LOGI(kTag, "[tile-renderer] enabled=%d bytes=%u zoom=1", hasTileMemory,
+             static_cast<unsigned>(sizeof(x68k::TiledCompositor)));
+    std::uint64_t renderedTiles = 0;
+    g_jitRunner.setCapacitySampling(true);
+    g_machine.setDmaTransferMonitor(
+        {nullptr, [](void*) -> std::int64_t { return esp_timer_get_time(); },
+         [](void*, x68k::u32 channel, x68k::u32 requested, x68k::u32 remaining,
+            std::int64_t elapsedUs)
+         {
+             g_dmaTransferTimeUs += elapsedUs;
+             const bool exceedsAudioBlock = elapsedUs >= 32768;
+             if (exceedsAudioBlock)
+             {
+                 ESP_LOGI("x68k-dma", "[slow-transfer] channel=%u bytes=%u remaining=%u us=%lld",
+                          channel, requested, remaining, elapsedUs);
+             }
+         }});
     constexpr std::uint32_t kReportIntervalMs = 5000;
 
     // SRAM を SD へ書き戻す間隔。
@@ -1380,6 +1572,53 @@ void emulatorTask(void* /*arg*/)
             g_fastTickApplied = wantFastTick;
         }
 
+        const bool shouldToggleJit = (g_jitToggleRequests.exchange(0) & 1U) != 0;
+        const bool wantMelodyBoost = g_melodyBoostEnabled.load();
+        const bool melodyBoostChanged = wantMelodyBoost != melodyBoostApplied;
+        if (melodyBoostChanged)
+        {
+            // 音源を所有するCore1だけで変更し、位相やレジスタには手を入れない。
+            const x68k::u32 gainQ8 = wantMelodyBoost ? 2048 : 256;
+            const x68k::u32 peakLimit = wantMelodyBoost ? kMelodyOutputPeakLimit : 0;
+            g_machine.opm().setChannelOutputGainQ8(1, gainQ8);
+            g_machine.opm().setChannelOutputPeakLimit(1, peakLimit);
+            melodyBoostApplied = wantMelodyBoost;
+            ESP_LOGI(kTag, "[melody-gain] channel=1 gain_q8=%u peak_limit=%u master_volume=40",
+                     gainQ8, peakLimit);
+        }
+        const bool wantGpipPoll = g_gpipPollEnabled.load();
+        const bool pollChanged = wantGpipPoll != gpipPollApplied;
+        if (pollChanged)
+        {
+            g_machine.setGpipPollAcceleration(wantGpipPoll);
+            gpipPollApplied = wantGpipPoll;
+            ESP_LOGI(kTag, "[gpip-poll-mode] enabled=%d", static_cast<int>(gpipPollApplied));
+        }
+        if (shouldToggleJit)
+        {
+            const bool turnOn = !g_machine.cpu().hasNativeExec();
+            const bool hasStorage = g_jitSlots != nullptr && g_jitCode.isReady();
+            if (turnOn && hasStorage)
+            {
+                g_jitRunner.setStorage(g_jitSlots, g_jitSlotCount, &g_jitCode);
+                g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
+                // 索引がスロットを参照するため、スロット設定より先には置けない。
+                g_jitRunner.setVerifySideStorage(g_jitSides, g_jitSideCount);
+                g_jitRunner.reset();
+                g_machine.cpu().setNativeExec(g_jitRunner.exec());
+                g_eventDrivenEnabled = true;
+            }
+            else if (!turnOn)
+            {
+                g_machine.cpu().setNativeExec(x68k::NativeExec{});
+            }
+            else
+            {
+                ESP_LOGW(kTag, "JIT: 置き場が無いので有効にできません");
+            }
+            ESP_LOGI(kTag, "JIT applied: %s", g_machine.cpu().hasNativeExec() ? "ON" : "OFF");
+        }
+
         // イベント駆動の切り替えも同じ形で写す。run() の入口で 1 回だけ
         // 読まれるので、ホットループの中には何も足さない。
         const bool wantEventDriven = g_eventDrivenEnabled.load(std::memory_order_relaxed);
@@ -1389,42 +1628,86 @@ void emulatorTask(void* /*arg*/)
             g_eventDrivenApplied = wantEventDriven;
         }
 
-        const x68k::u32 sliceCycles = g_allowedSliceCycles.load();
+        const auto allowedCycles = g_allowedSliceCycles.load();
+        const bool profileWanted = g_runProfileEnabled.load() && profile != nullptr;
+        const bool profileChanged = profileWanted != profileApplied;
+        if (profileChanged)
+        {
+            profileApplied = profileWanted;
+            g_machine.opm().setOutputStats(profileApplied ? opmStats : nullptr);
+            const bool hasOpmStats = opmStats != nullptr;
+            if (hasOpmStats)
+                *opmStats = {};
+            *profile = {};
+            profileStartMs = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            profileClockWaits = 0;
+            profileQueueWaits = 0;
+            profileRenderUs = 0;
+            ESP_LOGI(kTag, "[run-profile-mode] enabled=%d", static_cast<int>(profileApplied));
+        }
+        const bool guestPaused = allowedCycles == 0;
+        const bool hasProducer = guestAudio != nullptr;
+        if (hasProducer)
+        {
+            guestAudio->setPaused(guestPaused);
+        }
+        const bool paceClock =
+            audioPacer.needsPacing(g_machine.audioGuestCycles(),
+                                   static_cast<std::uint64_t>(esp_timer_get_time()), guestPaused);
+        const bool paceQueue =
+            hasProducer && x68k_platform::audioNeedsQueuePacing(g_audio.pending());
+        queuePacingWaits += paceQueue ? 1u : 0u;
+        if (profileApplied)
+        {
+            profileClockWaits += paceClock ? 1u : 0u;
+            profileQueueWaits += paceQueue ? 1u : 0u;
+        }
+        const bool paceAudio = paceClock || paceQueue;
+        const x68k::u32 sliceCycles = paceAudio ? 0u : allowedCycles;
         if (sliceCycles > 0)
         {
             // JIT の上限計測モードでは命令を実行せず、ループ運営と
             // デバイスの時間だけを回す (jit_probe.h)。
+            const auto pcBeforeRun = g_machine.cpu().state().pc;
+            const auto flashUsBeforeRun = g_flashDisk.readTimeUs();
+            const auto dmaUsBeforeRun = g_dmaTransferTimeUs;
             const std::int64_t runT0 = esp_timer_get_time();
+            x68k::u32 consumedCycles = 0;
             if (g_nullExecProbe.load(std::memory_order_relaxed))
             {
-                g_machine.runNullExec(sliceCycles);
+                consumedCycles = g_machine.runNullExec(sliceCycles);
             }
             else
             {
-                g_machine.run(sliceCycles);
+                consumedCycles = g_machine.run(sliceCycles);
             }
-            g_runUs += esp_timer_get_time() - runT0;
+            const auto runUs = esp_timer_get_time() - runT0;
+            if (profileApplied)
+            {
+                profile->add((pcBeforeRun - 4u) & x68k::M68k::kAddrMask, consumedCycles,
+                             static_cast<std::uint64_t>(runUs));
+            }
+            maxAudioSliceCycles = std::max(maxAudioSliceCycles, consumedCycles);
+            const bool exceedsAudioBlock = runUs >= 32768;
+            if (exceedsAudioBlock)
+            {
+                ESP_LOGI(kTag, "[slow-run] us=%lld pc_before=%08X pc_after=%08X cycles=%u", runUs,
+                         pcBeforeRun, g_machine.cpu().state().pc, consumedCycles);
+                ESP_LOGI(kTag, "[slow-run-disk] us=%lld",
+                         g_flashDisk.readTimeUs() - flashUsBeforeRun);
+                ESP_LOGI(kTag, "[slow-run-dma] us=%lld", g_dmaTransferTimeUs - dmaUsBeforeRun);
+            }
+            g_runUs += runUs;
+            const bool isLongestRun = runUs > g_runMaxUs;
+            if (isLongestRun)
+            {
+                g_runMaxUs = runUs;
+            }
             ++g_runCount;
-            totalCycles += sliceCycles;
+            totalCycles += consumedCycles;
         }
 
-        // 音を 1 ブロック合成してリングへ積む。
-        //
-        // Machine (OPM のレジスタと ADPCM の FIFO) を触るのはこのコアだけ。
-        // 表示と同じ切り分けで、できたサンプルだけを Core0 へ渡す。
-        //
-        // Why not 「1 スライスにつき必ず 1 ブロック」にしないか: 1 ブロックは
-        // 512 サンプル = 32.8ms ぶんの音だが、1 スライス (20000 サイクル) の
-        // 実時間は 6.1ms しかない。毎スライス積むと 5 倍の速さで作ることに
-        // なり、リングはすぐ満杯になって捨てるだけになる。逆にゲストの
-        // サイクル数で刻むのも合わない。実効クロックが実機の 32% なので、
-        // ゲスト時間で 32.8ms ぶんを作る頃には実時間で 100ms 経っており、
-        // スピーカーの DMA が先に枯れる。
-        //
-        // リングに溜まっている数を見て、足りないときだけ作る。消費側
-        // (音声タスク) が実時間で引いていくので、これだけで実時間に
-        // 追従する。段数から 1 枚ぶん余裕を残すのは、次の 1 枚を書ける
-        // 空きを常に確保して writeBlock の空振りを減らすため。
+        // PCMは音源MMIO/実行境界で生成する。テスト音の直接変更もCore1だけで行う。
         // テスト音を求められていたらここで鳴らす。Opm の所有者はこのコア。
         //
         // 一定時間で自動的に止める。押しっぱなしにすると、以後ずっと
@@ -1443,12 +1726,6 @@ void emulatorTask(void* /*arg*/)
             stopTestTone(g_machine);
             toneUntilMs = 0;
             ESP_LOGI(kTag, "テスト音: キーオフ");
-        }
-
-        const bool isAudioOn = g_audioEnabled.load(std::memory_order_relaxed);
-        if (isAudioOn && g_audio.pending() < x68k_platform::AudioChannel::kBlockCount - 2)
-        {
-            static_cast<void>(x68k_platform::pumpAudio(g_machine, g_audio));
         }
 
         // 溜まったキーを MFP へ流す。押下と解放の間隔は KeyQueue が持つ。
@@ -1490,19 +1767,65 @@ void emulatorTask(void* /*arg*/)
         // Machine を読むのはこのコアだけ。表示コアへは完成した RGB565 を
         // 渡すので、テキスト VRAM やダーティフラグを両コアで奪い合わない。
         followCursor();
-#if X68K_MEASURE_DISK
-        const std::int64_t renderT0 = esp_timer_get_time();
-#endif
-        const bool rendered = g_display.renderTo(g_machine, g_textVram, g_frames.writeBuffer());
-#if X68K_MEASURE_DISK
-        g_renderUs += esp_timer_get_time() - renderT0;
-        if (rendered)
+        // ゲストのVBlankやrunは間引かず、完成画像の合成だけに時間予算を設ける。
+        // 描画の最短間隔 = 33,333us (30fps)。
+        //
+        // 既定の 100,000us は 10fps の天井で、CPU をいくら上げても fps が
+        // 伸びない原因だった。ただし下げるだけでは足りない。completed() は
+        // 「前回終了 + 実測コスト x 1.5」も課すので、描画時間の側が効く。
+        //
+        //   描画 27.5ms -> 14.5fps が下限
+        //   描画  4.2ms -> 33,333us が効いて 30fps
+        //
+        // GVRAM の dirty を座標単位にして描画が 27.5 -> 4.2ms になったので、
+        // ここを下げる意味が出た。順序が逆だと効かない。
+        // 25,000us (40fps ぶん) にする。
+        //
+        // Why 33,333 では足りないか: LCD 転送が 1 枚 32.29ms なので、
+        // 生産周期 33.33ms のほうが遅い。転送から戻っても次の 1 枚が
+        // まだ出来ておらず、Core0 が毎周 1.04ms 待つ。転送より速く
+        // 作らせれば、転送が律速になり 31fps まで出せる。
+        //
+        // 描画自体は 1 枚 2.4ms しかかからないので 25,000us でも余る。
+        // かつてこの値を試して効かなかったのは、当時バッファが 2 枚で
+        // backpressure が 490回/5秒 立っており、そちらが真の律速
+        // だったため。3 枚にして backpressure=0 になって初めて効く。
+        static x68k_platform::RenderBudget renderBudget{25000};
+        const std::int64_t nowUs = esp_timer_get_time();
+        const bool mayRender = renderBudget.mayStart(nowUs);
+        auto* const renderTarget = mayRender ? g_frames.tryWriteBuffer() : nullptr;
+        const bool isBackpressured = mayRender && renderTarget == nullptr;
+        if (isBackpressured)
         {
-            ++g_renderCount;
+            ++g_renderBackpressureCount;
         }
-#endif
+        bool rendered = false;
+        const bool hasRenderTarget = renderTarget != nullptr;
+        if (hasRenderTarget)
+        {
+            rendered = g_display.renderTo(g_machine, g_textVram, renderTarget);
+            renderedTiles += g_display.lastRenderedTiles();
+            const auto renderEndUs = esp_timer_get_time();
+            renderBudget.completed(nowUs, renderEndUs);
+            const auto renderUs = renderEndUs - nowUs;
+            if (profileApplied)
+            {
+                profileRenderUs += static_cast<std::uint64_t>(renderUs);
+            }
+            g_renderUs += renderUs;
+            const bool isLongestRender = renderUs > g_renderMaxUs;
+            if (isLongestRender)
+            {
+                g_renderMaxUs = renderUs;
+            }
+            if (rendered)
+            {
+                ++g_renderCount;
+            }
+        }
         if (rendered && !g_frames.publish())
         {
+            ++g_renderPublishFailureCount;
             // 表示コアがまだ前のフレームを転送中で渡せなかった。
             //
             // renderTo はダーティフラグを消した後なので、このままだと
@@ -1515,13 +1838,137 @@ void emulatorTask(void* /*arg*/)
         // 生きていることと実効クロックを定期的に出す。実機は画面を直接
         // 見られないので、止まったのか遅いだけなのかがログでしか分からない。
         const std::uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        const bool profileDue = profileApplied && now - profileStartMs >= 1000;
+        if (profileDue)
+        {
+            const bool hasOpmStats = opmStats != nullptr;
+            if (hasOpmStats)
+            {
+                for (unsigned ch = 0; ch < x68k::Opm::kChannelCount; ++ch)
+                {
+                    const auto& s = opmStats->channels[ch];
+                    const auto& opm = g_machine.opm();
+                    ESP_LOGI(kTag,
+                             "[opm-output] to_ms=%u ch=%u samples=%u nonzero=%u peak=%u "
+                             "squares=%llu key_on=%d kc=%u tl=%u eg=%u phase=%u",
+                             now, ch, opmStats->samples, s.nonzero, s.peak,
+                             static_cast<unsigned long long>(s.squares), opm.isKeyOn(ch),
+                             opm.peekRegister(0x28 + ch), opm.peekRegister(0x60 + ch),
+                             opm.envelopeLevel(ch, 0),
+                             static_cast<unsigned>(opm.envelopePhase(ch, 0)));
+                }
+                *opmStats = {};
+            }
+            std::sort(profile->buckets.begin(), profile->buckets.end(),
+                      [](const auto& left, const auto& right) { return left.us > right.us; });
+            auto other = profile->overflow;
+            unsigned profileRows = 0;
+            for (std::size_t i = 0; i < 4; ++i)
+            {
+                profileRows += profile->buckets[i].samples != 0 ? 1u : 0u;
+            }
+            for (std::size_t i = 4; i < profile->buckets.size(); ++i)
+            {
+                other.samples += profile->buckets[i].samples;
+                other.us += profile->buckets[i].us;
+                other.cycles += profile->buckets[i].cycles;
+            }
+            ESP_LOGI(
+                kTag,
+                "[run-profile] from_ms=%u to_ms=%u render_us=%llu clock_waits=%u queue_waits=%u "
+                "other_samples=%u other_us=%llu other_cycles=%llu overflow_samples=%u pc_rows=%u",
+                profileStartMs, now, profileRenderUs, profileClockWaits, profileQueueWaits,
+                other.samples, other.us, other.cycles, profile->overflow.samples, profileRows);
+            for (std::size_t i = 0; i < 4; ++i)
+            {
+                const auto& bucket = profile->buckets[i];
+                const bool occupied = bucket.samples != 0;
+                if (occupied)
+                {
+                    // 報告時点のRAMだけを読む。ROMや副作用のあるMMIOへ触れない。
+                    char code[33] = "unavailable";
+                    const bool inRam = g_mainRam != nullptr && bucket.firstPc <= kMainRamBytes - 16;
+                    if (inRam)
+                    {
+                        constexpr char hex[] = "0123456789abcdef";
+                        for (std::size_t byte = 0; byte < 16; ++byte)
+                        {
+                            const auto value = g_mainRam[bucket.firstPc + byte];
+                            code[byte * 2] = hex[value >> 4];
+                            code[byte * 2 + 1] = hex[value & 15];
+                        }
+                        code[32] = '\0';
+                    }
+                    ESP_LOGI(kTag,
+                             "[run-profile-pc] to_ms=%u page=%06X samples=%u us=%llu cycles=%llu "
+                             "first_pc=%06X code_at_report=%s",
+                             now, bucket.page, bucket.samples, bucket.us, bucket.cycles,
+                             bucket.firstPc, code);
+                }
+            }
+            *profile = {};
+            profileStartMs = now;
+            profileClockWaits = 0;
+            profileQueueWaits = 0;
+            profileRenderUs = 0;
+        }
         const bool isReportDue = now - lastReportMs >= kReportIntervalMs;
         if (isReportDue)
         {
+            ESP_LOGI(kTag, "[tile-render] tiles_total=%llu", renderedTiles);
             const std::uint32_t elapsed = now - lastReportMs;
             const unsigned khz =
                 elapsed > 0 ? static_cast<unsigned>((totalCycles - lastReportCycles) / elapsed) : 0;
-#if X68K_MEASURE_DISK
+            ESP_LOGI(kTag, "[audio-synth] us=%lld blocks=%u max_us=%lld elapsed_ms=%u",
+                     g_audioSynthUs, static_cast<unsigned>(g_audioSynthBlocks), g_audioSynthMaxUs,
+                     static_cast<unsigned>(elapsed));
+            g_audioSynthUs = 0;
+            g_audioSynthMaxUs = 0;
+            g_audioSynthBlocks = 0;
+            // Core0の診断コマンドから変動中の64bit値を読まず、所有Core1で採取する。
+            ESP_LOGI(kTag, "[gpip-poll] enabled=%d skipped_cycles=%llu",
+                     static_cast<int>(gpipPollApplied),
+                     static_cast<unsigned long long>(g_machine.gpipPollSkippedCycles()));
+            ESP_LOGI(kTag, "[audio-pacing] queue_waits=%u max_slice_cycles=%u",
+                     static_cast<unsigned>(queuePacingWaits),
+                     static_cast<unsigned>(maxAudioSliceCycles));
+            const auto* const nativeStats = g_machine.cpu().nativeStats();
+            const bool hasNativeStats = nativeStats != nullptr;
+            if (hasNativeStats)
+            {
+                ESP_LOGI(kTag,
+                         "[jit-runtime] blocks=%llu insns=%llu unsupported=%llu "
+                         "translate_fail=%llu full=%llu reset=%llu guard=%llu zero_guard=%llu",
+                         static_cast<unsigned long long>(nativeStats->blocksRun),
+                         static_cast<unsigned long long>(nativeStats->insnsRun),
+                         static_cast<unsigned long long>(nativeStats->deferUnsupported),
+                         static_cast<unsigned long long>(nativeStats->translateFail),
+                         static_cast<unsigned long long>(nativeStats->fullDeferred),
+                         static_cast<unsigned long long>(nativeStats->capacityReset),
+                         static_cast<unsigned long long>(nativeStats->guardExit),
+                         static_cast<unsigned long long>(nativeStats->deferGuard));
+                ESP_LOGI(kTag,
+                         "[jit-key-miss] cold=%llu tag=%llu epoch=%llu stale=%llu gen=%llu "
+                         "verify_hit=%llu verify_miss=%llu no_snapshot=%llu",
+                         static_cast<unsigned long long>(nativeStats->keyMissCold),
+                         static_cast<unsigned long long>(nativeStats->keyMissTag),
+                         static_cast<unsigned long long>(nativeStats->keyMissEpoch),
+                         static_cast<unsigned long long>(nativeStats->keyMissStale),
+                         static_cast<unsigned long long>(nativeStats->keyMissGen),
+                         static_cast<unsigned long long>(nativeStats->verifyHit),
+                         static_cast<unsigned long long>(nativeStats->verifyMiss),
+                         static_cast<unsigned long long>(nativeStats->verifyNoSnapshot));
+                ESP_LOGI(kTag, "[jit-capacity-sample] samples=%llu opcode_recognized=%llu",
+                         static_cast<unsigned long long>(nativeStats->capacitySamples),
+                         static_cast<unsigned long long>(nativeStats->capacityRecognized));
+                const auto& groups = nativeStats->capacityOpcodeGroups;
+                ESP_LOGI(kTag,
+                         "[jit-capacity-groups] g0=%u g1=%u g2=%u g3=%u g4=%u g5=%u g6=%u g7=%u "
+                         "g8=%u g9=%u ga=%u gb=%u gc=%u gd=%u ge=%u gf=%u",
+                         groups[0], groups[1], groups[2], groups[3], groups[4], groups[5],
+                         groups[6], groups[7], groups[8], groups[9], groups[10], groups[11],
+                         groups[12], groups[13], groups[14], groups[15]);
+            }
             // スライスの実時間の内訳。ディスクだけでは説明が付かないので、
             // Machine::run そのものに何 ms かかっているかも並べて出す。
             {
@@ -1532,8 +1979,16 @@ void emulatorTask(void* /*arg*/)
                 const std::uint32_t renders = g_renderCount;
                 g_renderUs = 0;
                 g_renderCount = 0;
-                ESP_LOGI(kTag, "[render] %lldus 描画=%u 回 (5 秒)", renderUs, renders);
+                ESP_LOGI(kTag, "[render] us=%lld frames=%u max_us=%lld elapsed_ms=%u", renderUs,
+                         renders, g_renderMaxUs, static_cast<unsigned>(elapsed));
+                g_renderMaxUs = 0;
+                ESP_LOGI(kTag, "[frame-backpressure] skipped=%u publish_failed=%u elapsed_ms=%u",
+                         g_renderBackpressureCount, g_renderPublishFailureCount,
+                         static_cast<unsigned>(elapsed));
+                g_renderBackpressureCount = 0;
+                g_renderPublishFailureCount = 0;
             }
+#if X68K_MEASURE_DISK
             // ディスクに費やした実時間を実効クロックと並べて出す。
             // ディスクに触るスライスは全体の 1% 未満なので、平均の落ち込みが
             // 本当にディスク由来かは、逆算ではなくこの数字でしか分からない。
@@ -1544,8 +1999,8 @@ void emulatorTask(void* /*arg*/)
                 x68k_platform::g_diskReadUs = 0;
                 x68k_platform::g_diskSeekUs = 0;
                 x68k_platform::g_diskReadCount = 0;
-                ESP_LOGI(kTag, "[disk] read=%lldus seek=%lldus req=%u (この 5 秒間)", readUs,
-                         seekUs, reqs);
+                ESP_LOGI(kTag, "[disk] read_us=%lld seek_us=%lld req=%u elapsed_ms=%u", readUs,
+                         seekUs, reqs, static_cast<unsigned>(elapsed));
             }
 #endif
             // イベント駆動が実際にどれだけ飛べているか。
@@ -1555,7 +2010,9 @@ void emulatorTask(void* /*arg*/)
                 const std::uint32_t runs = g_runCount;
                 g_runUs = 0;
                 g_runCount = 0;
-                ESP_LOGI(kTag, "[slice] run=%lldus n=%u (5 秒 = 5000000us)", runUs, runs);
+                ESP_LOGI(kTag, "[slice] run_us=%lld n=%u max_us=%lld elapsed_ms=%u", runUs, runs,
+                         g_runMaxUs, static_cast<unsigned>(elapsed));
+                g_runMaxUs = 0;
             }
             {
                 const auto& st = g_machine.schedulerStats();
@@ -1571,6 +2028,13 @@ void emulatorTask(void* /*arg*/)
             }
             ESP_LOGI(kTag, "%llu サイクル実行 (実効 %u kHz)",
                      static_cast<unsigned long long>(totalCycles), khz);
+            const bool jitActive = g_eventDrivenApplied && g_machine.cpu().hasNativeExec();
+            ESP_LOGI(kTag,
+                     "[runtime] elapsed_ms=%u cycles=%llu event_driven=%d jit_active=%d probe=%d",
+                     static_cast<unsigned>(elapsed),
+                     static_cast<unsigned long long>(totalCycles - lastReportCycles),
+                     static_cast<int>(g_eventDrivenApplied), static_cast<int>(jitActive),
+                     static_cast<int>(g_nullExecProbe.load()));
             lastReportMs = now;
             lastReportCycles = totalCycles;
         }
@@ -1647,6 +2111,16 @@ void emulatorTask(void* /*arg*/)
 // サンプルだけで、frame_channel と同じ切り分けになっている。
 void audioTask(void* /*arg*/)
 {
+    void* const memory =
+        heap_caps_malloc(sizeof(x68k_platform::AudioPlayback), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const bool allocated = memory != nullptr;
+    if (!allocated)
+    {
+        ESP_LOGE(kTag, "[audio-playback] PSRAM allocation failed");
+        vTaskDelete(nullptr);
+        return;
+    }
+    auto& playback = *new (memory) x68k_platform::AudioPlayback(g_audio, g_speaker);
     // 振幅を報告する間隔。実機では音を耳で確かめられないので、
     // 「キーオンしたら非ゼロ、待機中はゼロ」をログの数字で見る。
     //
@@ -1661,22 +2135,17 @@ void audioTask(void* /*arg*/)
 
     while (true)
     {
-        // リングにあるぶんを全部流す。
-        //
-        // ここで数えるために drainAudio ではなく自分で回す。振幅は
-        // sink へ渡す前にしか見られない (playRaw から戻った後の
-        // バッファは、次のブロックで上書きされうる)。
-        while (const std::int16_t* block = g_audio.pop())
+        // 生産が続いても報告・yieldへ戻れるよう、開始時の枚数で区切る。
+        const std::size_t budget = std::max<std::size_t>(1, g_audio.pending());
+        for (std::size_t i = 0; i < budget; ++i)
         {
-            const std::int32_t peak =
-                x68k_platform::peakAmplitude(block, x68k_platform::AudioChannel::kBlockFrames);
+            playback.submit(!g_audioEnabled.load(std::memory_order_relaxed));
+            const std::int32_t peak = playback.lastPeak();
             if (peak > peakSinceReport)
             {
                 peakSinceReport = peak;
             }
             ++blocksSinceReport;
-
-            g_speaker.write(block, x68k_platform::AudioChannel::kBlockFrames);
         }
 
         const std::uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -1687,9 +2156,28 @@ void audioTask(void* /*arg*/)
             // 1 ブロック 512 サンプル / 15625Hz なので、正常なら 1 秒あたり
             // 約 30.5 ブロック。桁違いに多ければ playRaw が実際には
             // 何もしていない (speaker_m5.h の isEnabled 判定を見よ)。
-            ESP_LOGI(kTag, "音声 %u ブロック/秒 (期待 30) 最大振幅 %d 取りこぼし %u",
-                     static_cast<unsigned>(blocksSinceReport), static_cast<int>(peakSinceReport),
-                     static_cast<unsigned>(g_audio.droppedBlocks()));
+            const std::uint32_t elapsedMs = now - lastReportMs;
+            const auto blocksPerSecondMilli = static_cast<unsigned>(
+                static_cast<std::uint64_t>(blocksSinceReport) * 1000000 / elapsedMs);
+            const auto submissions = g_speaker.submissionStats();
+            ESP_LOGI(kTag,
+                     "[audio-continuity] source_frames=%llu missing_frames=%llu muted_frames=%llu",
+                     playback.sourceFrames(), playback.missingFrames(), playback.mutedFrames());
+            ESP_LOGI(kTag,
+                     "[audio-stream] paused_frames=%llu failed_frames=%llu restarts=%u "
+                     "restart_failures=%u",
+                     playback.pausedFrames(), playback.failedFrames(),
+                     static_cast<unsigned>(playback.streamRestarts()),
+                     static_cast<unsigned>(playback.restartFailures()));
+            ESP_LOGI(kTag,
+                     "音声 blocks=%u elapsed_ms=%u blocks_per_sec_milli=%u peak=%d dropped=%u "
+                     "accepted_total=%u rejected_total=%u empty_before_submit_total=%u",
+                     static_cast<unsigned>(blocksSinceReport), static_cast<unsigned>(elapsedMs),
+                     blocksPerSecondMilli, static_cast<int>(peakSinceReport),
+                     static_cast<unsigned>(g_audio.droppedBlocks()),
+                     static_cast<unsigned>(submissions.accepted),
+                     static_cast<unsigned>(submissions.rejected),
+                     static_cast<unsigned>(submissions.emptyBeforeSubmit));
             lastReportMs = now;
             peakSinceReport = 0;
             blocksSinceReport = 0;
@@ -1736,8 +2224,49 @@ public:
     }
 
 private:
+    bool scanPending_ = false;
     void handleChar(char c)
     {
+        // ESCに続く1byteはスキャンコード。診断用の文字コマンドへ流さない。
+        if (scanPending_)
+        {
+            scanPending_ = false;
+            const auto code = static_cast<std::uint8_t>(c);
+            const bool accepted = g_mode.isX68kInputEnabled() && g_keys.pushScan(code);
+            ESP_LOGI(kTag, "[remote-key] code=%02X accepted=%d", code, static_cast<int>(accepted));
+            return;
+        }
+        const bool isScanPrefix = static_cast<std::uint8_t>(c) == 0x1B;
+        if (isScanPrefix)
+        {
+            scanPending_ = true;
+            return;
+        }
+        const bool isFrameCapture = c == '?';
+        const bool enableMelodyBoost = c == '+';
+        const bool disableMelodyBoost = c == '-';
+        if (enableMelodyBoost || disableMelodyBoost)
+        {
+            g_melodyBoostEnabled = enableMelodyBoost;
+            return;
+        }
+        const bool isProfileToggle = c == '`';
+        if (isProfileToggle)
+        {
+            g_runProfileEnabled = !g_runProfileEnabled.load();
+            return;
+        }
+        const bool isPollToggle = c == '^';
+        if (isPollToggle)
+        {
+            g_gpipPollEnabled = !g_gpipPollEnabled.load();
+            return;
+        }
+        if (isFrameCapture)
+        {
+            g_captureRequested = true;
+            return;
+        }
         // '~' で画面を出す。Human68k に渡す文字と衝突しないものを選んだ。
         // Why not ここで出さないか: テキスト VRAM を読むので、
         // エミュレーションコアが書いている最中に読むとデータ競合になる。
@@ -1749,7 +2278,7 @@ private:
             return;
         }
 
-        // '|' で音源の ON/OFF を切り替える。
+        // '|' は出力mute。ゲスト音源の状態進行は止めない。
         //
         // Why not 焼き直して比べないか: 「音を足すとどれだけ遅くなるか」は
         // 同じ実行の中で比べないと、SD の中身や PSRAM の割り付けといった
@@ -1763,7 +2292,7 @@ private:
         {
             const bool enabled = !g_audioEnabled.load();
             g_audioEnabled = enabled;
-            ESP_LOGI(kTag, "音源: %s", enabled ? "ON" : "OFF");
+            ESP_LOGI(kTag, "音声出力: %s (ゲスト音源は継続)", enabled ? "ON" : "MUTE");
             return;
         }
 
@@ -1907,36 +2436,7 @@ private:
         const bool isJitToggle = c == 'J';
         if (isJitToggle)
         {
-            const bool on = !g_machine.cpu().hasNativeExec();
-            if (on)
-            {
-                if (g_jitSlots == nullptr || !g_jitCode.isReady())
-                {
-                    ESP_LOGW(kTag, "JIT: 置き場が無いので有効にできません");
-                    return;
-                }
-                g_jitRunner.setStorage(g_jitSlots, g_jitSlotCount, &g_jitCode);
-                g_jitRunner.setNegativeStorage(g_jitNeg, kJitNegEntries);
-                // **スロットを教えた後に置く。** 索引はスロットの中にあるので、
-                // 表を差し替えるときに全部打ち消す必要がある (setVerifySideStorage)。
-                g_jitRunner.setVerifySideStorage(g_jitSides, g_jitSideCount);
-                g_jitRunner.reset();
-                g_machine.cpu().setNativeExec(g_jitRunner.exec());
-                // **JIT はイベント駆動の経路にしか無い。**
-                // 毎命令 tick のまま JIT を ON にしても何も起きず、
-                // 「ON にしたのに統計が 0」という紛らわしい状態になる。
-                // 沈黙の無効化を作らないよう、ここで一緒に ON にする。
-                if (!g_eventDrivenEnabled.load(std::memory_order_relaxed))
-                {
-                    g_eventDrivenEnabled = true;
-                    ESP_LOGI(kTag, "JIT: イベント駆動も ON にしました");
-                }
-            }
-            else
-            {
-                g_machine.cpu().setNativeExec(x68k::NativeExec{});
-            }
-            ESP_LOGI(kTag, "JIT: %s", on ? "ON" : "OFF");
+            g_jitToggleRequests.fetch_add(1);
             return;
         }
 
@@ -2576,11 +3076,23 @@ extern "C" void app_main(void)
         return;
     }
 
-    if (!x68k_platform::mountSd())
+    // flash に焼いたデータがあるかを先に見ておく。
+    //
+    // SD が無くても、flash に ROM とディスクが焼いてあれば動く。
+    // カードを挿さずに配れるようにするため。
+    const bool hasFlashData = x68k_platform::mountFlashData();
+
+    const bool hasSd = x68k_platform::mountSd();
+    if (!hasSd)
     {
-        ESP_LOGE(kTag, "SD をマウントできません");
-        x68k_platform::DisplayLcd::showMessage("NO SD CARD", "see NOTICE.md for ROM setup");
-        return;
+        ESP_LOGW(kTag, "SD をマウントできません");
+        if (!hasFlashData)
+        {
+            // どちらも無ければ ROM が手に入らない。ここで止める。
+            x68k_platform::DisplayLcd::showMessage("NO SD CARD", "see NOTICE.md for ROM setup");
+            return;
+        }
+        ESP_LOGI(kTag, "SD が無いので flash のデータで起動します");
     }
 
     if (!loadRoms())
@@ -2615,7 +3127,7 @@ extern "C" void app_main(void)
     //
     // これが無いと、エミュレーションコアが画面を作れずキーも届かない。
     // 起動できないので、失敗したらここで止める。
-    if (!g_frames.begin(g_frameBufferA, g_frameBufferB))
+    if (!g_frames.begin(g_frameBufferA, g_frameBufferB, g_frameBufferC))
     {
         ESP_LOGE(kTag, "フレームの受け渡しを用意できません");
         x68k_platform::DisplayLcd::showMessage("INIT ERROR", "frame channel");
@@ -2671,7 +3183,7 @@ extern "C" void app_main(void)
     else
     {
         ESP_LOGW(kTag, "スピーカーを開けません。音は出ませんが X68000 は動きます");
-        // 合成しても捨てるだけなので、エミュレーションコアの手間を省く。
+        // 出力は無効だが、ゲストのFIFO/音源時刻は引き続き進める。
         g_audioEnabled = false;
     }
 
@@ -2715,8 +3227,8 @@ extern "C" void app_main(void)
     {
         ESP_LOGI(kTag,
                  "シリアルコンソール: 文字を打つと X68000 へ、'~' で画面をダンプ、"
-                 "'|' で音源の ON/OFF、'&' で毎命令経路の最適化の ON/OFF、"
-                 "'$' でイベント駆動の ON/OFF");
+                 "'|' で出力mute、'&' で毎命令経路の最適化の ON/OFF、"
+                 "'$' でイベント駆動の ON/OFF、'+'/'-' で主旋律ch1の8倍補正+ピーク調整ON/OFF");
     }
     else
     {
@@ -2834,10 +3346,37 @@ extern "C" void app_main(void)
             if (g_mode.mode() == x68k_platform::AppMode::X68k)
             {
                 g_display.pushFrame(frame);
+                if (g_captureRequested)
+                {
+                    g_captureRequested = false;
+                    captureLcdFrame(frame);
+                }
             }
             g_frames.done();
+            // 次の 1 枚が既に出来ているなら、眠らずに続けて送る。
+            //
+            // Why: 3 枚にしてから Core1 は転送中も作り続けており
+            // (backpressure=0)、転送から戻った時点で次はもう待っている。
+            // ここで 1 tick 眠ると、その 1ms がまるごと転送に使えない
+            // 時間になる。実測で 1 枚あたり 36.5ms のうち 4.3ms が
+            // 転送以外に消えており、30fps に必要な 33.3ms を超えていた。
+            //
+            // 転送は 32.2ms のあいだ DMA 待ちで CPU を手放すので、
+            // 連続で回しても idle task は走れる。
+            continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(16));  // 約 60Hz
+        // 待ちは 1 tick に切り詰める。
+        //
+        // Why: LCD 転送は 1 枚 32.3ms かかる。その間に Core1 は次のフレームを
+        // 作り終えている。ここで 16ms 眠ると、出来上がっているフレームを
+        // 取りに行くのが遅れる。実測では 5 秒で 204 周のうち 102 周が
+        // 「フレーム無し」で 16ms 眠っており、
+        //   102 枚 x 32.3ms + 102 回 x 16ms ≒ 5 秒
+        // と辻褄が合っていた。1.6 秒 (32%) を寝て過ごしていたことになる。
+        //
+        // Why not 完全に消さないか: 1 tick も譲らないと idle task が走れず、
+        // ウォッチドッグが鳴く。1 tick (1ms) なら譲りつつ待ちは最小になる。
+        vTaskDelay(1);
     }
 }

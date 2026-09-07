@@ -153,15 +153,17 @@ TEST_CASE("リングは書いた順に取り出せる")
 
     CHECK(channel.pending() == 2);
 
-    const std::int16_t* first = channel.pop();
+    const std::int16_t* first = channel.readBlock();
     REQUIRE(first != nullptr);
     CHECK(first[0] == 1);
+    channel.releaseRead();
 
-    const std::int16_t* second = channel.pop();
+    const std::int16_t* second = channel.readBlock();
     REQUIRE(second != nullptr);
     CHECK(second[0] == 2);
+    channel.releaseRead();
 
-    CHECK(channel.pop() == nullptr);
+    CHECK(channel.readBlock() == nullptr);
     CHECK(channel.pending() == 0);
 }
 
@@ -186,7 +188,8 @@ TEST_CASE("消費が追いつかないときは待たずに捨てる")
     CHECK(channel.droppedBlocks() == 16 - pushed);
 
     // 1 枚取り出せば、また 1 枚だけ積める。
-    CHECK(channel.pop() != nullptr);
+    CHECK(channel.readBlock() != nullptr);
+    channel.releaseRead();
     CHECK(x68k_platform::pumpAudio(machine, channel));
     CHECK(x68k_platform::pumpAudio(machine, channel) == false);
 }
@@ -212,6 +215,69 @@ TEST_CASE("リングを通しても Machine が作ったサンプルと一致す
     REQUIRE(sink.received.size() == expected.size());
     CHECK(std::memcmp(sink.received.data(), expected.data(),
                       expected.size() * sizeof(std::int16_t)) == 0);
+}
+
+TEST_CASE("借りた音声は生産者が満杯まで書いても解放まで変わらない")
+{
+    x68k_platform::AudioChannel channel;
+    auto* first = channel.writeBlock();
+    REQUIRE(first != nullptr);
+    for (std::size_t i = 0; i < channel.kBlockFrames; ++i)
+    {
+        first[i] = 1234;
+    }
+    channel.commit();
+    const auto* leased = channel.readBlock();
+    REQUIRE(leased != nullptr);
+    CHECK(channel.readBlock() == leased);
+    for (std::size_t i = 0; i < channel.kBlockCount - 2; ++i)
+    {
+        auto* block = channel.writeBlock();
+        REQUIRE(block != nullptr);
+        std::memset(block, 0, channel.kBlockFrames * sizeof(*block));
+        channel.commit();
+    }
+    CHECK(channel.writeBlock() == nullptr);
+    for (std::size_t i = 0; i < channel.kBlockFrames; ++i)
+    {
+        CHECK(leased[i] == 1234);
+    }
+    channel.releaseRead();
+    CHECK(channel.writeBlock() != nullptr);
+}
+
+TEST_CASE("出力中に生産が続いてもdrainは開始時の枚数で終了する")
+{
+    x68k_platform::AudioChannel channel;
+    class RefillingSink final : public x68k_platform::AudioSink
+    {
+    public:
+        explicit RefillingSink(x68k_platform::AudioChannel& source) : source_(source) {}
+        void write(const std::int16_t* samples, std::size_t) override
+        {
+            CHECK(samples[0] == 42);
+            auto* block = source_.writeBlock();
+            REQUIRE(block != nullptr);
+            block[0] = 42;
+            source_.commit();
+            ++count;
+        }
+        x68k::u32 sampleRate() const override
+        {
+            return 15625;
+        }
+        unsigned count = 0;
+
+    private:
+        x68k_platform::AudioChannel& source_;
+    } sink(channel);
+    channel.writeBlock()[0] = 42;
+    channel.commit();
+    CHECK(x68k_platform::drainAudio(channel, sink) == 1);
+    CHECK(sink.count == 1);
+    CHECK(channel.pending() == 1);
+    CHECK(x68k_platform::drainAudio(channel, sink) == 1);
+    CHECK(channel.pending() == 1);
 }
 
 TEST_CASE("無音の早期リターンでも 1 サンプルずつ合成した結果と一致する")

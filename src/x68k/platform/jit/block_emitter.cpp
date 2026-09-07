@@ -666,17 +666,31 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
 //
 // **加減算は必ず 32bit。** .w は src を符号拡張してから 32bit で足す
 // (m68k_ops_alu.cpp:78-82)。size で結果を切ると .w が上位を落とす。
-void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
+// src を kTmpA へ載せる。**レジスタ形と即値形の唯一の違いがここ**。
+//
+// 即値側で emitSext16 を呼ばないのは、foldImmediate が既に符号拡張済みの値を
+// 入れるから。planner とエミッタの両方が符号拡張を持つと、どちらか一方を
+// 消したときにテストが落ちなくなる。責任を planner 側 1 箇所に置く。
+void emitLoadAddressAluSource(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
+    const bool srcIsImmediate =
+        op.kind == PlanKind::kAddaImmToAreg || op.kind == PlanKind::kCmpaImmToAreg;
+    if (srcIsImmediate)
+    {
+        emitConst(e, kTmpA, op.imm);
+        return;
+    }
     const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
     emitLoadState(e, kTmpA, src);
     if (op.size == 2)
     {
-        // interpreter は readEa mode 0 で **下位 16bit に切ってから**
-        // 符号拡張し、mode 1 では An をそのまま符号拡張する (m68k.h:513-524)。
-        // どちらも「下位 16bit を符号拡張」と同じ値になるので 1 本で済む。
         emitSext16(e, kTmpA, kTmpA);
     }
+}
+
+void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
+{
+    emitLoadAddressAluSource(e, op, srcIsAddressRegister);
     emitLoadState(e, kTmpB, aOffset(op.dstReg));
     if (op.aluOp == PlanAluOp::kAdd)
     {
@@ -702,12 +716,7 @@ void emitAdda(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 // 本体側に「d が既にレジスタに載っている」入口を作って共有する。
 void emitCmpa(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
-    const std::uint32_t src = srcIsAddressRegister ? aOffset(op.srcReg) : dOffset(op.srcReg);
-    emitLoadState(e, kTmpA, src);
-    if (op.size == 2)
-    {
-        emitSext16(e, kTmpA, kTmpA);
-    }
+    emitLoadAddressAluSource(e, op, srcIsAddressRegister);
     emitLoadState(e, kTmpB, aOffset(op.dstReg));
     // **比較幅は op.size ではなく常に 4。** インタプリタは .w でも
     // src を符号拡張してから alu::sub(a[reg], value, kLong) を呼ぶ
@@ -2468,6 +2477,13 @@ void emitAll(Emitter& e, const BlockPlan& plan, std::uint16_t ir, std::uint16_t 
                 break;
             case PlanKind::kCmpaAregToAreg:
                 emitCmpa(e, op, /*srcIsAddressRegister=*/true);
+                break;
+            // 即値形。src の載せ方だけが違うので同じ関数を通す。
+            case PlanKind::kAddaImmToAreg:
+                emitAdda(e, op, /*srcIsAddressRegister=*/false);
+                break;
+            case PlanKind::kCmpaImmToAreg:
+                emitCmpa(e, op, /*srcIsAddressRegister=*/false);
                 break;
 
             // --- Tier H: デコーダ拡張が解禁した形 ---

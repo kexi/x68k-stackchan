@@ -26,10 +26,9 @@
 //
 //   Why not FreeRTOS の Queue にコピーで積まないか: 1 ブロック 1KB を
 //   キューへ入れると、積むときと降ろすときの 2 回コピーが要る。
-//   リングなら生産側が直接書き、消費側は playRaw へポインタを渡すだけ。
-//   playRaw が参照している間そのブロックを上書きしないことは、
-//   リングの段数と「再生待ちは高々 2 枚」という Speaker の仕様で保つ
-//   (kBlockCount のコメントを見よ)。
+//   リングなら生産側が直接書ける。消費側は readBlock/releaseRead で
+//   コピー完了まで領域を保持し、非同期再生用のコピーは sink が所有する。
+//   段数だけでは、再生待ち中の生産者による上書きを防げない。
 
 #ifndef X68K_PLATFORM_AUDIO_H
 #define X68K_PLATFORM_AUDIO_H
@@ -56,9 +55,15 @@ public:
 
     // frames サンプル (モノラル 16bit) を鳴らす。
     //
-    // samples は呼び出しから戻った後も、次の write が来るまで有効。
-    // 実機の playRaw はポインタを保持したまま戻るので、この約束が要る。
+    // samples は呼び出し中だけ有効。非同期出力は sink 自身の領域へコピーする。
     virtual void write(const std::int16_t* samples, std::size_t frames) = 0;
+
+    // Called by the sole output owner on a stream discontinuity. Async sinks must
+    // finish releasing all retained PCM before accepting buffers from the new epoch.
+    virtual bool restartStream()
+    {
+        return true;
+    }
 
     // 出力サンプリングレート (Hz)。
     [[nodiscard]] virtual x68k::u32 sampleRate() const = 0;
@@ -86,20 +91,13 @@ public:
 
     // リングの段数。
     //
-    // Speaker が同時に握るのは高々 2 枚 (wavinfo[0]/[1])。それに
-    // 「今 Core1 が書いている 1 枚」と「消費待ちの余裕 1 枚」を足して 4。
-    //
-    // Why 4 が必要十分か: 生産側は空きが無ければブロックを捨てる
-    // (下の push を見よ)。3 枚だと、Speaker が 2 枚を握った瞬間に
-    // 残り 1 枚が書き込み中となり、消費待ちの余裕がゼロになる。
-    // 音声タスクが 1 tick 遅れるだけで毎回取りこぼす。
+    // 消費中を含む最大3枚と予約1枚。非同期再生中の領域は別途 sink が持つ。
     static constexpr std::size_t kBlockCount = 4;
 
-    // 消費側が 1 ブロック取り出す。無ければ nullptr。
-    //
-    // 返ったポインタは、その後 kBlockCount-1 回 push されるまで
-    // 上書きされない。playRaw がポインタを保持したまま戻ることへの担保。
-    [[nodiscard]] const std::int16_t* pop();
+    // 単一消費者が先頭を借りる。releaseRead まで生産者は上書きしない。
+    // 再度呼ぶと同じ先頭を返す。空なら nullptr。
+    [[nodiscard]] const std::int16_t* readBlock();
+    void releaseRead();
 
     // 生産側が書き込む先。1 ブロックぶん (kBlockFrames サンプル)。
     //
@@ -107,8 +105,16 @@ public:
     // してある (無音でも 512 サンプルぶんの合成は無駄になる)。
     [[nodiscard]] std::int16_t* writeBlock();
 
-    // writeBlock へ書き終えたことを伝える。以後 pop で取り出せる。
+    // writeBlock へ書き終えたことを伝える。以後 readBlock で取り出せる。
     void commit();
+
+    // Producer-only, between commits. Do not rewind the consumer index or revoke
+    // a read lease; the consumer discards the old prefix when it next acquires.
+    void restartStream(bool paused);
+    [[nodiscard]] std::uint32_t streamState() const
+    {
+        return streamState_.load(std::memory_order_acquire);
+    }
 
     // 溜まっているブロック数。
     [[nodiscard]] std::size_t pending() const;
@@ -128,6 +134,10 @@ private:
     std::atomic<std::size_t> writeIndex_{0};
     std::atomic<std::size_t> readIndex_{0};
     std::atomic<std::uint32_t> dropped_{0};
+    std::atomic<std::size_t> discardBefore_{0};
+    // Low bit is paused; upper bits distinguish resets and pause/resume epochs.
+    std::atomic<std::uint32_t> streamState_{0};
+    bool readLeased_ = false;  // Consumer-owned, never read by the producer.
 };
 
 // Machine から 1 ブロックぶん合成してリングへ積む。エミュレーションコアから呼ぶ。

@@ -5,6 +5,7 @@
 
 #include "m68k.h"
 #include "m68k_alu.h"
+#include "move_timing.h"
 
 namespace x68k
 {
@@ -60,12 +61,12 @@ u32 M68k::groupMove(u16 op, u32 size)
         // MOVEA はフラグを変えない。ワードサイズなら符号拡張して 32bit で入る。
         st_.a[dstReg] =
             size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(value))) : value;
-        return 4;
+        return moveInstructionCycles(op, size);
     }
 
     writeEa(dstMode, dstReg, size, value);
     setLogicFlags(value, size);
-    return 4;
+    return moveInstructionCycles(op, size);
 }
 
 // MOVEQ #<data>,Dn

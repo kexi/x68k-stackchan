@@ -7,6 +7,7 @@
 // 「なぜか変な命令を実行している」という形でしか症状が出ない。境界値を押さえる。
 
 #include <vector>
+#include <array>
 
 #include "bus.h"
 #include "dev/video.h"
@@ -86,6 +87,43 @@ constexpr std::size_t RomOffsetOfFF0000()
 }
 
 }  // namespace
+
+TEST_CASE("Bulk RAM writes preserve bytes and saturated per-byte code generations")
+{
+    Fixture f;
+    std::array<std::uint16_t, 4> bulkGen{65000, 0, 65535, 17};
+    auto byteGen = bulkGen;
+    x68k::CodeGenMap bulkMap;
+    x68k::CodeGenMap byteMap;
+    bulkMap.setStorage(bulkGen.data(), 4);
+    byteMap.setStorage(byteGen.data(), 4);
+    f.bus.setCodeGenMap(&bulkMap);
+    std::vector<x68k::u8> data(3100, 0xA5);
+    REQUIRE(f.bus.tryWriteRamBlock(100, data.data(), static_cast<x68k::u32>(data.size())));
+    for (x68k::u32 i = 0; i < data.size(); ++i)
+    {
+        byteMap.touch(100 + i);
+        CHECK(f.mainRam[100 + i] == data[i]);
+    }
+    CHECK(bulkGen == byteGen);
+    CHECK(f.mainRam[99] == 0);
+    CHECK(f.mainRam[3200] == 0);
+}
+
+TEST_CASE("Bulk RAM writes reject side effects, boundaries and aliasing without modification")
+{
+    Fixture f;
+    const std::array<x68k::u8, 2> data{1, 2};
+    CHECK_FALSE(f.bus.tryWriteRamBlock(x68k::kMainRamSize - 1, data.data(), 2));
+    CHECK_FALSE(f.bus.tryWriteRamBlock(x68k::kMainRamSize, data.data(), 2));
+    CHECK_FALSE(f.bus.tryWriteRamBlock(0xFFFFFF, data.data(), 2));
+    CHECK_FALSE(f.bus.tryWriteRamBlock(100, f.mainRam.data(), 2));
+    f.bus.setWriteWatch(100, [](x68k::u32, x68k::u32, void*) {}, nullptr);
+    CHECK_FALSE(f.bus.tryWriteRamBlock(100, data.data(), 2));
+    CHECK(f.mainRam[100] == 0);
+    CHECK(f.mainRam.back() == 0);
+    CHECK(f.io.writeCount == 0);
+}
 
 TEST_CASE("リセット直後は $FF0000 の内容が $000000 に見える")
 {

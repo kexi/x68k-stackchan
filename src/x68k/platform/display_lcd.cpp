@@ -6,7 +6,9 @@
 #include <M5Unified.h>
 #include <esp_log.h>
 
+#include "video/compositor.h"
 #include "video/graphic_raster.h"
+#include "video/sprite_raster.h"
 #include "video/text_raster.h"
 
 namespace x68k_platform
@@ -82,7 +84,17 @@ bool DisplayLcd::shouldComposite(x68k::Machine& machine) const
     // 書いている) ので、SX-Window を起動するまでは払う必要のない代金になる。
     // ゲストが自分で許可を出した時だけ合成へ切り替えれば、既存のコンソールは
     // 今までどおりの速さで動く。
-    return graphicVram_ != nullptr && machine.video().graphicEnabled();
+    // スプライト面 (BG 2 面 + スプライト) も合成が要る。
+    //
+    // Why not グラフィック面だけ見ればよいか: ゲームは BG とスプライトだけで
+    // 絵を作り、G-VRAM を一切使わないことがある。グラフィック面の許可だけを
+    // 条件にすると、その場合にテキスト単独の経路へ落ちてスプライトが
+    // 1 つも出ない。上の「使う側が許可を出した時だけ払う」という考え方は
+    // そのままに、払う理由をもう 1 つ足す。
+    const bool hasGraphic = graphicVram_ != nullptr && machine.video().graphicEnabled();
+    const bool hasSprites =
+        x68k::SpriteRaster::hasVisibleContent(machine.sprite(), machine.video());
+    return hasGraphic || hasSprites;
 }
 
 void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, x68k::u32 srcWidth,
@@ -90,9 +102,9 @@ void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, 
 {
     if (shouldComposite(machine))
     {
-        // 奥から順に重ねる。優先順位と透明の扱いは GraphicRaster が持つ。
-        x68k::GraphicRaster::composite(graphicVram_, textVram, machine.video(), viewX_, viewY_,
-                                       srcWidth, srcHeight, out, kScreenWidth);
+        // 奥から順に重ねる。優先順位と透明の扱いは Compositor が持つ。
+        x68k::Compositor::render(graphicVram_, textVram, &machine.sprite(), machine.video(), viewX_,
+                                 viewY_, srcWidth, srcHeight, out, kScreenWidth, &machine.crtc());
         return;
     }
 
@@ -149,6 +161,7 @@ void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, 
 
 bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out)
 {
+    lastRenderedTiles_ = 0;
     if (textVram == nullptr || out == nullptr)
     {
         return false;
@@ -171,6 +184,41 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
     // 表示許可が切り替わった瞬間も描き直す。合成をやめたフレームは
     // ダーティが立たないままグラフィックの残骸が画面に残るため。
     const bool didModeChange = isCompositing != wasComposited_;
+
+    // どの枚に描くかで世代の追い先が変わる。並びの添字を引く。
+    int bufferIndex = -1;
+    for (int i = 0; i < kBuffers; ++i)
+    {
+        if (out == buffers_[i])
+        {
+            bufferIndex = i;
+            break;
+        }
+    }
+    const bool knownBuffer = bufferIndex >= 0;
+    const bool canTile = tiled_ != nullptr && zoom_ == 1 && isCompositing && knownBuffer;
+    if (canTile)
+    {
+        tiled_->setViewport(viewX_, viewY_);
+        const bool invalidate = forceFullRedraw_ || didModeChange;
+        if (invalidate)
+        {
+            tiled_->invalidateAll();
+        }
+        lastRenderedTiles_ =
+            tiled_->render(graphicVram_, textVram, &machine.sprite(), machine.video(), out,
+                           static_cast<x68k::u32>(bufferIndex), &machine.crtc());
+        bus.clearTextDirty();
+        forceFullRedraw_ = false;
+        wasComposited_ = isCompositing;
+        return lastRenderedTiles_ != 0;
+    }
+    const bool hasTiledRenderer = tiled_ != nullptr;
+    if (hasTiledRenderer)
+    {
+        // 拡大/コンソール経路がbufferを書き換えるため、復帰時は世代を再構築する。
+        tiled_->invalidateAll();
+    }
 
     // 変化が無ければ作り直さない。プロンプトが点滅しているだけなら
     // ここで抜けるので、Core1 の時間をエミュレーションに回せる。
@@ -202,6 +250,7 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
 
     bus.clearTextDirty();
     forceFullRedraw_ = false;
+    lastRenderedTiles_ = 300;
     return true;
 }
 

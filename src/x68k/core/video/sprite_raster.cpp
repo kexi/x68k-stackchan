@@ -3,6 +3,8 @@
 
 #include "sprite_raster.h"
 
+#include <cstring>
+
 namespace x68k
 {
 namespace
@@ -136,33 +138,69 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
         const u32 cellY = bgY / kCell;
         const u32 inCellY = bgY & (kCell - 1u);
 
+        // セルの情報は 16 ドットぶん変わらない。内側で毎回引き直さない。
+        //
+        // Why: 1 ドットごとにネームテーブルを読んでパターン番号と反転を
+        // 解いていたが、隣り合う 16 ドットは同じセルなので同じ答えになる。
+        // 実機 (CoreS3) で描画が 1 フレーム 50ms かかり、その大半がここだった。
+        // セルが変わったときだけ引き直す。
+        u32 cachedCell = 0xFFFFFFFFu;
+        u32 pattern = 0;
+        bool flipH = false;
+        bool flipV = false;
+        u8 pcgRow[8]{};
+
         for (u32 x = 0; x < width; ++x)
         {
             const u32 bgX = (srcX + x + scrollX) & (kBgPixelsX - 1u);
             const u32 cellX = bgX / kCell;
 
-            // ネームテーブルの 1 セルは 1 ワード。X が 2 バイト刻み、
-            // Y が 128 バイト刻み (BGTEXTST $FFC2A2 の計算と同じ)。
-            const u32 nameOffset = nameBase + cellY * (Sprite::kBgCellsX * 2u) + cellX * 2u;
-            if (nameOffset + 1 >= Sprite::kVramSize)
+            if (cellX != cachedCell)
+            {
+                cachedCell = cellX;
+
+                // ネームテーブルの 1 セルは 1 ワード。X が 2 バイト刻み、
+                // Y が 128 バイト刻み (BGTEXTST $FFC2A2 の計算と同じ)。
+                const u32 nameOffset = nameBase + cellY * (Sprite::kBgCellsX * 2u) + cellX * 2u;
+                if (nameOffset + 1 >= Sprite::kVramSize)
+                {
+                    // 範囲外のセルは透明として飛ばす。次のセルで引き直す。
+                    pattern = 0xFFFFFFFFu;
+                    continue;
+                }
+
+                // ネームテーブルのワードはスプライトの属性ワードと同じ形。
+                const u16 name = static_cast<u16>((static_cast<u16>(vram[nameOffset]) << 8) |
+                                                  vram[nameOffset + 1]);
+                pattern = name & 0x00FFu;
+                // 反転は bit14/bit15。bit8-11 はパレットブロックなので使わない
+                // (MAME の BG タイル callback は (& 0xc000) >> 14 を flags にする)。
+                flipH = (name & 0x4000u) != 0;
+                flipV = (name & 0x8000u) != 0;
+                const u32 py = flipV ? (kCell - 1u - inCellY) : inCellY;
+                const u32 rowOffset = pattern * 4u * Sprite::kPcg8Bytes +
+                                      (py >= 8u ? 2u * Sprite::kPcg8Bytes : 0u) + (py & 7u) * 4u;
+                const bool hasRow = rowOffset + Sprite::kPcg8Bytes + 4u <= Sprite::kVramSize;
+                if (!hasRow)
+                {
+                    pattern = 0xFFFFFFFFu;
+                    continue;
+                }
+                // 全パターンのキャッシュは無効化を要するため、同じセルの1行だけ保持する。
+                std::memcpy(pcgRow, vram + rowOffset, 4);
+                std::memcpy(pcgRow + 4, vram + rowOffset + Sprite::kPcg8Bytes, 4);
+            }
+
+            if (pattern == 0xFFFFFFFFu)
             {
                 continue;
             }
 
-            // ネームテーブルのワードはスプライトの属性ワードと同じ形。
-            const u16 name =
-                static_cast<u16>((static_cast<u16>(vram[nameOffset]) << 8) | vram[nameOffset + 1]);
-            const u32 pattern = name & 0x00FFu;
-            // 反転は bit14/bit15。bit8-11 はパレットブロックなので使わない
-            // (MAME の BG タイル callback は (& 0xc000) >> 14 を flags にする)。
-            const bool flipH = (name & 0x4000u) != 0;
-            const bool flipV = (name & 0x8000u) != 0;
-
             const u32 inCellX = bgX & (kCell - 1u);
             const u32 px = flipH ? (kCell - 1u - inCellX) : inCellX;
-            const u32 py = flipV ? (kCell - 1u - inCellY) : inCellY;
-
-            const u8 index = pcgPixel(vram, pattern, px, py);
+            const u8 packed = pcgRow[px >> 1];
+            const u8 index =
+                static_cast<u8>((px & 1u) ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu));
             if (index != kTransparentIndex)
             {
                 row[x] = palette[index];

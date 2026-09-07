@@ -95,6 +95,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/sprite_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/compositor.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
@@ -111,6 +112,9 @@ enable_testing()
 
 add_executable(x68k_tests
   test_main.cpp
+  test_run_deadline.cpp
+  test_btst_timing.cpp
+  test_gpip_poll_loop.cpp
   test_memmap.cpp
   test_m68k_vectors.cpp
   test_m68k_alu.cpp
@@ -144,6 +148,7 @@ add_executable(x68k_tests
   test_bus.cpp
   test_gvram_bus.cpp
   test_text_raster.cpp
+  test_compositor.cpp
   test_graphic_raster.cpp
   test_sprite.cpp
   test_text_scrape.cpp
@@ -159,6 +164,7 @@ add_executable(x68k_tests
   test_iosc.cpp
   test_scc.cpp
   test_mouse_queue.cpp
+  test_key_queue.cpp
   test_opm.cpp
   test_adpcm.cpp
   test_gui_smoke.cpp
@@ -166,6 +172,23 @@ add_executable(x68k_tests
   test_app_mode.cpp
   test_avatar.cpp
   test_audio.cpp
+  test_audio_clock.cpp
+  test_move_timing.cpp
+  test_control_timing.cpp
+  test_scc_timing.cpp
+  test_immediate_timing.cpp
+  test_standard_timing.cpp
+  test_shift_alu.cpp
+  test_unary_timing.cpp
+  test_gpip_poll.cpp
+  test_audio_playback.cpp
+  test_render_budget.cpp
+  test_run_profile.cpp
+  test_frame_channel.cpp
+  test_tile_generations.cpp
+  test_tiled_compositor.cpp
+  test_speaker_m5.cpp
+  test_storage_flash.cpp
   ${X68K_ROOT}/src/x68k/platform/jit/block_emitter.cpp
   ${X68K_ROOT}/src/x68k/platform/jit/block_runner.cpp
   # 実行可能メモリの切り出し。ESP32 では MALLOC_CAP_EXEC、ホストでは
@@ -179,6 +202,7 @@ add_executable(x68k_tests
   # 耳でしか確かめられないので、「キーオンしたら出口へ非無音のサンプルが
   # 届く」という完了条件の芯はここで検査する。
   ${X68K_ROOT}/src/x68k/platform/audio.cpp
+  ${X68K_ROOT}/src/x68k/platform/frame_channel.cpp
   # 顔 ⇄ X68000 の切り替え FSM。platform/ にあるが ESP-IDF に触らないので
   # そのままホストでビルドできる (app_mode.h の冒頭を見よ)。
   # 切り替えの副作用 (マウスのボタンを離す、画面を作り直す) は実機に焼くと
@@ -197,6 +221,9 @@ add_executable(x68k_tests
   ${X68K_ROOT}/host/gui_demo.cpp
 )
 target_link_libraries(x68k_tests PRIVATE x68k_core doctest)
+# 実際のsinkを検査し、M5の非同期2枚保持契約だけを偽物へ置換する。
+set_source_files_properties(test_speaker_m5.cpp test_storage_flash.cpp PROPERTIES
+  INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/m5_stub")
 target_include_directories(x68k_tests PRIVATE ${X68K_ROOT}/host)
 # sram_persist.h は platform/ にあるが ESP-IDF に触らないヘッダオンリーなので、
 # ホストのテストから直接読める。sram.dat の保存/復元の方針はここにしか無く、
@@ -242,3 +269,24 @@ set_tests_properties(settled_is_unforgeable PROPERTIES WILL_FAIL TRUE)
 add_executable(x68k-run ${X68K_ROOT}/host/main.cpp ${X68K_ROOT}/host/gui_demo.cpp)
 target_link_libraries(x68k-run PRIVATE x68k_core)
 target_include_directories(x68k-run PRIVATE ${X68K_ROOT}/host)
+
+# 対話フロントエンド。窓を出してキーを渡す。
+#
+# SDL2 が無い環境では作らない。x68k-run (バッチ実行) と core のテストは
+# SDL に依存しないので、CI や実機ビルドはこれが無くても通る。
+find_package(SDL2 QUIET)
+if(SDL2_FOUND)
+  add_executable(x68k-play ${X68K_ROOT}/host/play.cpp)
+  target_link_libraries(x68k-play PRIVATE x68k_core)
+  target_include_directories(x68k-play PRIVATE ${X68K_ROOT}/host)
+  # nixpkgs の sdl2-compat が出す sdl2-config --cflags は壊れた -I/SDL2 を
+  # 返すので、CMake の見つけた include ディレクトリを直接使う。
+  if(TARGET SDL2::SDL2)
+    target_link_libraries(x68k-play PRIVATE SDL2::SDL2 SDL2::SDL2main)
+  else()
+    target_include_directories(x68k-play PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(x68k-play PRIVATE ${SDL2_LIBRARIES})
+  endif()
+else()
+  message(STATUS "SDL2 が見つからないので x68k-play は作りません")
+endif()

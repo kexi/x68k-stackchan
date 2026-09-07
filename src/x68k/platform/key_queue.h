@@ -55,6 +55,8 @@ public:
     // 打たれた文字を積む。溢れたら捨てる (押しっぱなしで詰まるより、
     // 取りこぼす方が扱いやすい)。
     void push(char c);
+    // 自動解放なしのスキャンコード。bit7は解放。溢れは呼び手へ返す。
+    bool pushScan(x68k::u8 code);
 
     // --- エミュレーションコアから呼ぶ ---
 
@@ -62,6 +64,11 @@ public:
     void drain(x68k::Machine& machine);
 
 private:
+    struct Event
+    {
+        x68k::u8 code;
+        bool autoRelease;
+    };
     QueueHandle_t queue_ = nullptr;
 
     // 押下を送った後、解放を送るまでの待ち。

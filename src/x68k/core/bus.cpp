@@ -3,6 +3,8 @@
 
 #include "bus.h"
 
+#include <cstring>
+
 #include "cpu/m68k.h"
 
 namespace x68k
@@ -39,8 +41,8 @@ constexpr u32 kRomAtZeroSize = kIplromSize - kRomAtZeroOffset;
 // 窓の広さが実 VRAM 全体と同じであることは $FFAAB4 の全消去が示している。
 //   LEA $C00000,A0 / LEA $C80000,A1 / BSR $FFABC0
 //   $FFABC0: CLR.L (A0)+ / CMPA.L A1,A0 / BNE.S -6
-// 512KB ぶんを消すだけで 4 ページすべてが消える。ページごとに VRAM が
-// 分かれているなら 1/4 しか消えないので、この 1 ループでは足りない。
+// ただし全laneを消せるかは R20 のアクセス幅次第。旧実装はこのループから
+// VC R0 が CPU アクセスも決めると誤推測した (knowledge/gvram-access-and-scroll)。
 constexpr u32 kGvramWindowSize = 0x80000u;
 constexpr u32 kGvramWindowMask = kGvramWindowSize - 1u;
 
@@ -87,11 +89,8 @@ SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
     const u32 window = offsetInSpace / kGvramWindowSize;  // 0-3
     const u32 offsetInWindow = offsetInSpace & kGvramWindowMask;
 
-    // 未設定なら 16 色。VideoController::reset() が $E82400 を 0 にするので、
-    // 実機のリセット直後と同じ扱いになる。
-    const VideoController::GraphicColorMode mode =
-        video_ != nullptr ? video_->graphicColorMode()
-                          : VideoController::GraphicColorMode::k16Color;
+    const u16 mode = crtc_ != nullptr ? crtc_->graphicAccessMode() : 0u;
+    const bool buffer = crtc_ != nullptr && crtc_->graphicBufferAccess();
 
     // ワード内でのバイト位置。窓のオフセットをそのままワード境界へ丸める。
     //
@@ -101,32 +100,41 @@ SystemBus::GvramLane SystemBus::gvramLaneOf(u32 addr) const
     // ページ 0 と別の座標に出る。
     const u32 wordBase = offsetInWindow & ~1u;
 
+    // buffer/direct の有効範囲は実 VRAM の 512KB。上位窓を alias させない。
+    if (buffer)
+    {
+        return {wordBase, 0u, static_cast<u16>(window == 0 ? 0xFFFFu : 0u)};
+    }
+
     switch (mode)
     {
-        case VideoController::GraphicColorMode::k16Color:
+        case 0x0000:
             // 4 ページぶんの 4bit が 1 ワードに同居する。ページ 0 が最下位ニブル。
             // 窓 0-3 がそのままページ 0-3。
             return {wordBase, window * 4u, 0x000Fu};
 
-        case VideoController::GraphicColorMode::k256Color:
+        case 0x0100:
             // 2 ページぶんの 8bit が 1 ワードに同居する。ページ 0 が下位バイト。
             //
-            // 窓は 4 つあるが使うページは 2 つなので、$D00000 以降は
-            // $C00000 側の繰り返しになる (窓番号の bit0 だけが効く)。
-            return {wordBase, (window & 1u) * 8u, 0x00FFu};
+            // $D00000 以降は未使用。下位窓への折り返しではない。
+            return {wordBase, (window & 1u) * 8u, static_cast<u16>(window < 2 ? 0x00FFu : 0u)};
 
-        case VideoController::GraphicColorMode::kReserved:
-        case VideoController::GraphicColorMode::k65536Color:
+        case 0x0300:
+            return {wordBase, 0u, static_cast<u16>(window == 0 ? 0xFFFFu : 0u)};
+
         default:
-            // 1 ワードがそのまま 1 ドットの色。ページの概念が無く、
-            // どの窓から触っても同じワード全体に効く。
-            return {wordBase, 0u, 0xFFFFu};
+            return {wordBase, 0u, 0u};
     }
 }
 
 u16 SystemBus::readGvramDot(u32 addr) const
 {
     const GvramLane lane = gvramLaneOf(addr);
+    const bool unused = lane.mask == 0;
+    if (unused)
+    {
+        return 0xFFFFu;
+    }
     const u8* p = mem_.graphicVram + lane.byteOffset;
     // 実 VRAM はビッグエンディアンのワード列。ホストのエンディアンに依存しない
     // よう明示的に組む (video/graphic_raster.cpp の readWord と同じ理由)。
@@ -137,6 +145,11 @@ u16 SystemBus::readGvramDot(u32 addr) const
 void SystemBus::writeGvramDot(u32 addr, u16 value)
 {
     const GvramLane lane = gvramLaneOf(addr);
+    const bool unused = lane.mask == 0;
+    if (unused)
+    {
+        return;
+    }
     u8* p = mem_.graphicVram + lane.byteOffset;
     const u16 word = static_cast<u16>((static_cast<u16>(p[0]) << 8) | p[1]);
 
@@ -153,6 +166,48 @@ void SystemBus::writeGvramDot(u32 addr, u16 value)
 
     p[0] = static_cast<u8>(next >> 8);
     p[1] = static_cast<u8>(next & 0xFFu);
+    const bool changes = word != next;
+    if (changes)
+    {
+        markGraphicDirty(lane.byteOffset);
+    }
+}
+
+void SystemBus::markGraphicDirty(u32 byteOffset)
+{
+    // 書いたワードの座標だけを dirty にする。
+    //
+    // Why: ここが damage_.all() のままだと、1 画素書くたびに画面全体が
+    // dirty になり、タイル単位の差分描画が一度も効かない。実機で
+    // 「1frame あたり 300 タイル = 全画面」を毎フレーム作り直していた
+    // (タイルは 16x16 で 20列 x 15行 = 300 が全画面)。
+    //
+    // 実 VRAM は 1 ライン 512 ワード。ワード番号から x/y を出す。
+    constexpr u32 kWordsPerLine = 512u;
+    const u32 wordIndex = byteOffset / 2u;
+    const u32 x = wordIndex % kWordsPerLine;
+    const u32 y = wordIndex / kWordsPerLine;
+
+    // **1024x1024 モードは全面へ戻す。**
+    //
+    // Why not こちらも局所化しないか: 16 色の 1024 モードは 1 ワードに
+    // 4 ページのニブルが同居し、表示座標は (page, x, y) の折り込みで決まる。
+    // ワード番号だけからは表示上のどこが変わったか一意に決まらない。
+    // このゲームは 512x512 相当しか使わないので、まず 512 側だけ効かせる。
+    // CRTC R20 の色数ビットが 0 (16 色) のとき 1024x1024 になりうる。
+    // gvramLaneOf と同じ入口 (crtc_) から読み、判断を 1 箇所に揃える。
+    const u16 accessMode = crtc_ != nullptr ? crtc_->graphicAccessMode() : 0u;
+    const bool isSixteenColor = (accessMode & 0x0300u) == 0u;
+    const bool isLarge = isSixteenColor && y >= kDirtyTileHeight * kDirtyTileRows;
+    if (isLarge)
+    {
+        damage_.all();
+        return;
+    }
+
+    // 16 色モードは 1 ワードに 4 ページぶんが同居するので、同じ座標の
+    // 他ページも表示に効く。座標そのものは 1 点なので rect は 1x1 でよい。
+    damage_.rect(static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 1, 1);
 }
 
 void SystemBus::markTextDirty(u32 offsetInPlane)
@@ -160,6 +215,8 @@ void SystemBus::markTextDirty(u32 offsetInPlane)
     // テキスト VRAM は 1 ライン 128 バイト。オフセットから行番号を求め、
     // タイル行 (16 ライン単位) の印を立てる。
     const u32 line = offsetInPlane / kTvramBytesPerLine;
+    damage_.rect(static_cast<std::int32_t>((offsetInPlane % kTvramBytesPerLine) * 8u),
+                 static_cast<std::int32_t>(line), 8, 1);
     const u32 tileRow = line / kDirtyTileHeight;
     if (tileRow < kDirtyTileRows)
     {
@@ -308,6 +365,32 @@ u16 SystemBus::read16(u32 addr)
     const u8 lo = read8(a + 1);
     faulted_ = faulted_ || hiFaulted;
     return static_cast<u16>((hi << 8) | lo);
+}
+
+bool SystemBus::tryWriteRamBlock(u32 addr, const u8* data, u32 count)
+{
+    const u32 a = addr & kAddrMask;
+    const bool isPlainRam = mem_.mainRam != nullptr && watchCallback_ == nullptr &&
+                            a < kMainRamSize && count <= kMainRamSize - a;
+    if (!isPlainRam)
+    {
+        return false;
+    }
+    const auto source = reinterpret_cast<std::uintptr_t>(data);
+    const auto ram = reinterpret_cast<std::uintptr_t>(mem_.mainRam);
+    const bool overlapsRam = source >= ram ? source - ram < kMainRamSize : ram - source < count;
+    // 同一RAMからの重なりコピーは逐次転送と結果が異なり得るため、一括化しない。
+    if (overlapsRam)
+    {
+        return false;
+    }
+    const bool tracksCode = codeGen_ != nullptr;
+    if (tracksCode)
+    {
+        codeGen_->touchRange(a, count);
+    }
+    std::memcpy(mem_.mainRam + a, data, count);
+    return true;
 }
 
 void SystemBus::write8(u32 addr, u8 value)

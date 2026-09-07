@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Kei Nakayama
 
 #include "machine.h"
+#include "cpu/gpip_poll_loop.h"
 
 #include <algorithm>
 #include <cstring>
@@ -10,6 +11,26 @@ namespace x68k
 {
 namespace
 {
+
+// runWithのローカルカウンタは、その関数を出る前に必ず登録解除する。
+// run()側だけで解除すると関数間で一時的なdangling pointerが残る。
+class AudioLinearScope
+{
+public:
+    AudioLinearScope(const u32*& slot, const u32& spent) : slot_(slot)
+    {
+        slot_ = &spent;
+    }
+    ~AudioLinearScope()
+    {
+        slot_ = nullptr;
+    }
+    AudioLinearScope(const AudioLinearScope&) = delete;
+    AudioLinearScope& operator=(const AudioLinearScope&) = delete;
+
+private:
+    const u32*& slot_;
+};
 
 // SASI のコマンド。IPL-ROM がブートセクタを読むのに使う範囲だけ実装する。
 constexpr u8 kSasiTestUnitReady = 0x00;
@@ -97,7 +118,7 @@ Machine::Machine() : bus_(MemoryMap{}, sram_, *this), cpu_(bus_)
     // G-VRAM の窓 ($C00000-$DFFFFF) はページ選択を兼ねており、CPU の書き込みを
     // 共有ワードのどのニブル/バイトへ折り込むかが色数モードで決まる。
     // バスがモードを引けるようにここで繋ぐ。
-    bus_.setVideoController(&video_);
+    bus_.setCrtc(&crtc_);
 
     // メインメモリへのアクセスを仮想関数抜きで通せるようにする。
     // 以後、実体・ROM 写像・ウォッチが変わるたびにバスが CPU へ教え直す。
@@ -178,8 +199,13 @@ void Machine::reset()
     sched_.reset();
     shadowArmed_ = false;
     stopSkippedCycles_ = 0;
+    gpipPollSkippedCycles_ = 0;
 
     cpu_.reset();
+    audioCompletedCycles_ = 0;
+    audioLinearSpent_ = nullptr;
+    audioEventRun_ = false;
+    syncAudio(AudioSyncPoint::kReset);
 }
 
 u32 Machine::step()
@@ -204,10 +230,24 @@ u32 Machine::step()
         tickDevices<false, false, false>(cycles);
     }
 
+    audioCompletedCycles_ += cycles;
+    syncAudio(AudioSyncPoint::kBoundary);
     return cycles;
 }
 
 u32 Machine::run(u32 cycles)
+{
+    audioEventRun_ = eventDriven_ && !shadowVerify_;
+    audioSchedulerStart_ = sched_.cpuTime();
+    const u32 used = runDispatch(cycles);
+    audioEventRun_ = false;
+    audioLinearSpent_ = nullptr;
+    audioCompletedCycles_ += used;
+    syncAudio(AudioSyncPoint::kBoundary);
+    return used;
+}
+
+u32 Machine::runDispatch(u32 cycles)
 {
     // 最適化スイッチはここで **1 回だけ** 見る。
     //
@@ -247,6 +287,11 @@ u32 Machine::run(u32 cycles)
     }
     if (eventDriven_)
     {
+        if (gpipPollAcceleration_)
+        {
+            return cpu_.hasNativeExec() ? dispatchEventDriven<true, true>(cycles)
+                                        : dispatchEventDriven<false, true>(cycles);
+        }
         // ネイティブ実行器を教わっているときだけ UseNative=true を選ぶ。
         // 教わっていなければ if constexpr の非選択枝が実体化されないので、
         // **生成コードに tryNative の呼び出しが 1 命令も残らない**。
@@ -276,6 +321,7 @@ template <bool FastMfp, bool FastRtc, bool FastCrtc>
 u32 Machine::runWith(u32 cycles)
 {
     u32 spent = 0;
+    const AudioLinearScope audioScope(audioLinearSpent_, spent);
     while (spent < cycles)
     {
         serviceInterrupts();
@@ -312,6 +358,7 @@ template <bool FastMfp, bool FastRtc, bool FastCrtc>
 u32 Machine::runShadowVerify(u32 cycles)
 {
     u32 spent = 0;
+    const AudioLinearScope audioScope(audioLinearSpent_, spent);
     while (spent < cycles)
     {
         serviceInterrupts();
@@ -332,26 +379,27 @@ u32 Machine::runShadowVerify(u32 cycles)
     return spent;
 }
 
-template <bool UseNative>
+template <bool UseNative, bool Poll>
 u32 Machine::dispatchEventDriven(u32 cycles)
 {
     if (perf_.inlineMfpTimer)
     {
         if (perf_.inlineRtcTick)
         {
-            return perf_.inlineCrtcTick ? runEventDriven<true, true, true, UseNative>(cycles)
-                                        : runEventDriven<true, true, false, UseNative>(cycles);
+            return perf_.inlineCrtcTick
+                       ? runEventDriven<true, true, true, UseNative, Poll>(cycles)
+                       : runEventDriven<true, true, false, UseNative, Poll>(cycles);
         }
-        return perf_.inlineCrtcTick ? runEventDriven<true, false, true, UseNative>(cycles)
-                                    : runEventDriven<true, false, false, UseNative>(cycles);
+        return perf_.inlineCrtcTick ? runEventDriven<true, false, true, UseNative, Poll>(cycles)
+                                    : runEventDriven<true, false, false, UseNative, Poll>(cycles);
     }
     if (perf_.inlineRtcTick)
     {
-        return perf_.inlineCrtcTick ? runEventDriven<false, true, true, UseNative>(cycles)
-                                    : runEventDriven<false, true, false, UseNative>(cycles);
+        return perf_.inlineCrtcTick ? runEventDriven<false, true, true, UseNative, Poll>(cycles)
+                                    : runEventDriven<false, true, false, UseNative, Poll>(cycles);
     }
-    return perf_.inlineCrtcTick ? runEventDriven<false, false, true, UseNative>(cycles)
-                                : runEventDriven<false, false, false, UseNative>(cycles);
+    return perf_.inlineCrtcTick ? runEventDriven<false, false, true, UseNative, Poll>(cycles)
+                                : runEventDriven<false, false, false, UseNative, Poll>(cycles);
 }
 
 // イベント駆動の run()。**毎命令の判定は debt_ とゼロの比較 1 本だけ**。
@@ -359,7 +407,7 @@ u32 Machine::dispatchEventDriven(u32 cycles)
 // 変数同士の比較 (spent < cycles) を毎命令に入れると、過去 2 回と同じ轍を
 // 踏む (-18%, -6.5% の実測)。スライスの終端は sched_ が絶対サイクルで
 // 別に持っていて、遅い側でしか見ない。
-template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative>
+template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative, bool Poll>
 u32 Machine::runEventDriven(u32 cycles)
 {
     sched_.beginSlice(cycles);
@@ -394,20 +442,34 @@ u32 Machine::runEventDriven(u32 cycles)
         // 25,000 サイクルに 1 回まで減った今、その数字は使えない。
         //
         // **恒久的な機能ではない。** 状態は進まないのでゲストは動かない。
-        u32 used;
-        if constexpr (UseNative)
+        u32 used = 0;
+        if constexpr (Poll)
         {
-            // ブロックを 1 本走らせる。走らなければ step() へ落ちる。
-            //
-            // Why ここに if を書いてよいか: UseNative は template 引数なので
-            // 非選択枝は実体化されない。UseNative=false の生成コードに
-            // このブロックは 1 命令も残らない。
-            const NativeResult r = cpu_.tryNative();
-            used = r.exit == NativeExit::kRan ? r.cycles : cpu_.step();
+            const bool pollCandidate =
+                !nullExecInEvent_ && cpu_.state().ir == 0x1039 && !bus_.lastAccessFaulted();
+            if (pollCandidate)
+            {
+                used = tryGpipPollLoop(cpu_, mfp_.peek(Mfp::kGpip), sched_.debt());
+                gpipPollSkippedCycles_ += used;
+            }
         }
-        else
+        const bool needsInstruction = used == 0;
+        if (needsInstruction)
         {
-            used = nullExecInEvent_ ? 4u : cpu_.step();
+            if constexpr (UseNative)
+            {
+                // ブロックを 1 本走らせる。走らなければ step() へ落ちる。
+                //
+                // Why ここに if を書いてよいか: UseNative は template 引数なので
+                // 非選択枝は実体化されない。UseNative=false の生成コードに
+                // このブロックは 1 命令も残らない。
+                const NativeResult r = cpu_.tryNative();
+                used = r.exit == NativeExit::kRan ? r.cycles : cpu_.step();
+            }
+            else
+            {
+                used = nullExecInEvent_ ? 4u : cpu_.step();
+            }
         }
         if (used == 0)
         {
@@ -603,11 +665,10 @@ Settled Machine::materialize()
         return Scheduler::certify();
     }
 
-    // Why not テンプレートで分けないか: ここは I/O アクセスの経路で、
-    // 毎命令のホットループではない。ゲストが $E88000 台を読むのは
-    // 割り込みハンドラの中や初期化のときだけなので、分岐が乗っても
-    // 測れない。有効側の生成コードを変えてはいけないという規律は
-    // ホットループにかかるもので、ここには及ばない。
+    // Why not 特定のtick設定へ固定しないか: I/Oからも全設定を尊重する。
+    // GPIPを帰線待ちでポーリングするゲームではここも高頻度になる。
+    // 期限前に値が不変と証明できるGPIPだけはioRead8側で分け、
+    // timer/statusの時刻に依存する読み出しはこの経路を維持する。
     //
     // 3 つを個別に見るのは run() と同じ理由。まとめて allEnabled() で
     // 判定すると、RTC だけ切ったつもりが MFP と CRTC まで切れて、
@@ -1033,6 +1094,24 @@ bool Machine::moveMouse(int dx, int dy, bool leftButton, bool rightButton)
 }
 
 // --- 音声 --------------------------------------------------------------------
+std::uint64_t Machine::audioGuestCycles() const
+{
+    if (audioEventRun_)
+    {
+        return audioCompletedCycles_ + (sched_.cpuTime() - audioSchedulerStart_);
+    }
+    const bool linear = audioLinearSpent_ != nullptr;
+    return audioCompletedCycles_ + (linear ? *audioLinearSpent_ : 0u);
+}
+
+void Machine::syncAudio(AudioSyncPoint point)
+{
+    const bool connected = audioSyncCallback_ != nullptr;
+    if (connected)
+    {
+        audioSyncCallback_(audioSyncContext_, *this, audioGuestCycles(), point);
+    }
+}
 //
 // FM (OPM) と ADPCM を足してモノラルで返す。実機は両者を独立した経路で
 // アナログ的に混ぜるが、ここでは合成後に加算する。
@@ -1154,6 +1233,15 @@ u8 Machine::ioRead8(u32 addr)
             {
                 return 0u;
             }
+            const auto index = (addr - kMfpBase) / 2;
+            const bool stableGpip = index == Mfp::kGpip && audioEventRun_ && sched_.debt() < 0;
+            if (stableGpip)
+            {
+                // Only GPIP is constant up to the already-armed CRTC edges. Timer data and
+                // pending/status registers still need materialize, even with IRQs masked.
+                // A write/wake makes debt nonnegative, so it cannot reuse this proof.
+                return mfp_.peek(Mfp::kGpip);
+            }
             // タイマデータレジスタ (TADR/TBDR/TCDR/TDDR) と IPRA/IPRB は
             // 時間で変わる。溜まっている時間を流してから読む。
             //
@@ -1161,7 +1249,7 @@ u8 Machine::ioRead8(u32 addr)
             // 割り込みは上がらず期限にも入らないが、ゲストは 8 サイクルに
             // 1 減るカウンタとして読める。ここを落とすと quantum を入れた
             // ときとまったく同じ観測可能なずれが読み出し側から再発する。
-            return mfpRead(materialize(), (addr - kMfpBase) / 2);
+            return mfpRead(materialize(), index);
         }
 
         case kSasiBase:
@@ -1214,6 +1302,7 @@ u8 Machine::ioRead8(u32 addr)
             // データ側は書き込み専用なので読んでも 0。
             if ((addr & 0x0Fu) == 0x01)
             {
+                syncAudio(AudioSyncPoint::kAccess);
                 return adpcm_.readStatus();
             }
             return 0u;
@@ -1379,6 +1468,7 @@ void Machine::ioWrite8(u32 addr, u8 value)
             }
             else if ((addr & 0x0Fu) == 0x03)
             {
+                syncAudio(AudioSyncPoint::kAccess);
                 opm_.writeData(value);
             }
             return;
@@ -1389,10 +1479,12 @@ void Machine::ioWrite8(u32 addr, u8 value)
             // ($FF9A68 / $FF9A8C)。
             if ((addr & 0x0Fu) == 0x01)
             {
+                syncAudio(AudioSyncPoint::kAccess);
                 adpcm_.writeCommand(value);
             }
             else if ((addr & 0x0Fu) == 0x03)
             {
+                syncAudio(AudioSyncPoint::kAccess);
                 adpcm_.writeData(value);
             }
             return;
@@ -1478,6 +1570,29 @@ bool Machine::dmaRead(u8* value)
     return true;
 }
 
+u32 Machine::tryReadToMemory(DmaMemory& memory, u32 addr, u32 count)
+{
+    const bool hasData = sasi_.phase == kPhaseDataIn && sasi_.bufferPos < sasi_.bufferLength;
+    if (!hasData)
+    {
+        return 0;
+    }
+    const u32 available = std::min(count, sasi_.bufferLength - sasi_.bufferPos);
+    const bool didCopy =
+        memory.tryDmaMemWriteBlock(addr, sasi_.buffer + sasi_.bufferPos, available);
+    if (!didCopy)
+    {
+        return 0;
+    }
+    sasi_.bufferPos += available;
+    const bool isExhausted = sasi_.bufferPos == sasi_.bufferLength;
+    if (isExhausted)
+    {
+        sasi_.phase = kPhaseStatus;
+    }
+    return available;
+}
+
 // データを受け取り切った後の後始末。
 //
 // WRITE ならディスクへ書き、ステータスフェーズへ移る。$C2 のパラメータは捨てる。
@@ -1530,6 +1645,11 @@ u8 Machine::dmaMemRead(u32 addr)
 void Machine::dmaMemWrite(u32 addr, u8 value)
 {
     bus_.write8(addr, value);
+}
+
+bool Machine::tryDmaMemWriteBlock(u32 addr, const u8* data, u32 count)
+{
+    return bus_.tryWriteRamBlock(addr, data, count);
 }
 
 // --- SCC ---------------------------------------------------------------------

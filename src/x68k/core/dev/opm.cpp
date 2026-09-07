@@ -41,6 +41,24 @@ namespace x68k
 namespace
 {
 
+std::int32_t limitChannelOutput(std::int32_t sample, u32 limit)
+{
+    const bool disabled = limit == 0;
+    if (disabled)
+        return sample;
+    const bool negative = sample < 0;
+    const auto magnitude = static_cast<u32>(negative ? -sample : sample);
+    const u32 knee = limit * 7 / 8;
+    const bool belowKnee = magnitude <= knee;
+    if (belowKnee)
+        return sample;
+    // ミックス後の超過分を引くだけでは元のハードクリップと同じ波形になる。
+    const u32 compressed = knee + (magnitude - knee) / 4;
+    const bool exceedsLimit = compressed > limit;
+    const auto output = static_cast<std::int32_t>(exceedsLimit ? limit : compressed);
+    return negative ? -output : output;
+}
+
 // --- 対数正弦テーブル -------------------------------------------------------
 //
 // OPM/OPL は正弦波を「-log2(sin) を 1/256 単位で表した値」で持つ。
@@ -89,11 +107,9 @@ struct Tables
     }
 };
 
-const Tables& tables()
-{
-    static const Tables t;
-    return t;
-}
+// ESP32では関数内staticの確認が毎回__cxa_guard_acquireを呼ぶ。
+// 不変テーブルを起動時に作り、オペレータごとの同期処理を避ける。
+const Tables kTables;
 
 // 位相と減衰量からオペレータの出力を得る。
 //
@@ -101,7 +117,7 @@ const Tables& tables()
 // 戻り値は符号付きの線形値で、おおよそ ±2048 に収まる。
 std::int32_t operatorOutput(u32 phase, u32 attenuation)
 {
-    const Tables& t = tables();
+    const Tables& t = kTables;
 
     // 位相の上位 2bit が象限を決める。
     //   bit9: 符号 (後半周期は負)
@@ -181,6 +197,7 @@ u32 decay1LevelToEnvelope(u32 d1l)
 
 Opm::Opm()
 {
+    channelOutputGainsQ8_.fill(kOutputGainUnityQ8);
     reset();
 }
 
@@ -228,6 +245,46 @@ void Opm::setSampleRate(u32 rate)
             updateOperatorPhaseStep(ch, op);
         }
     }
+}
+
+bool Opm::setChannelOutputGainQ8(u32 channel, u32 gain)
+{
+    const bool invalidChannel = channel >= kChannelCount;
+    if (invalidChannel)
+    {
+        return false;
+    }
+    const bool aboveMax = gain > kOutputGainMaxQ8;
+    channelOutputGainsQ8_[channel] = aboveMax ? kOutputGainMaxQ8 : gain;
+    return true;
+}
+
+u32 Opm::channelOutputGainQ8(u32 channel) const
+{
+    const bool invalidChannel = channel >= kChannelCount;
+    if (invalidChannel)
+    {
+        return kOutputGainUnityQ8;
+    }
+    return channelOutputGainsQ8_[channel];
+}
+
+bool Opm::setChannelOutputPeakLimit(u32 channel, u32 limit)
+{
+    const bool invalidChannel = channel >= kChannelCount;
+    if (invalidChannel)
+        return false;
+    const bool aboveMax = limit > kOutputPeakLimitMax;
+    channelOutputPeakLimits_[channel] = aboveMax ? kOutputPeakLimitMax : limit;
+    return true;
+}
+
+u32 Opm::channelOutputPeakLimit(u32 channel) const
+{
+    const bool invalidChannel = channel >= kChannelCount;
+    if (invalidChannel)
+        return 0;
+    return channelOutputPeakLimits_[channel];
 }
 
 void Opm::writeAddress(u8 reg)
@@ -788,6 +845,9 @@ std::int32_t Opm::renderChannel(Channel& ch)
 
 std::int16_t Opm::renderOneSample()
 {
+    const bool observe = outputStats_ != nullptr;
+    if (observe)
+        ++outputStats_->samples;
     std::int32_t mix = 0;
     for (auto& ch : channels_)
     {
@@ -803,10 +863,28 @@ std::int16_t Opm::renderOneSample()
         {
             continue;
         }
-        mix += renderChannel(ch);
+        const auto channelIndex = static_cast<std::size_t>(&ch - channels_.data());
+        // 出力段だけに掛け、変調/フィードバックや EG の進行へ増幅を戻さない。
+        // 最大でも ±8192 * 2048 なので、積と全 ch の和は int32 に収まる。
+        const std::int32_t gained = renderChannel(ch) *
+                                    static_cast<std::int32_t>(channelOutputGainsQ8_[channelIndex]) /
+                                    static_cast<std::int32_t>(kOutputGainUnityQ8);
+        const std::int32_t sample =
+            limitChannelOutput(gained, channelOutputPeakLimits_[channelIndex]);
+        mix += sample;
+        if (observe)
+        {
+            auto& stats = outputStats_->channels[channelIndex];
+            const u32 magnitude = static_cast<u32>(sample < 0 ? -sample : sample);
+            const bool higherPeak = magnitude > stats.peak;
+            if (higherPeak)
+                stats.peak = magnitude;
+            stats.nonzero += sample != 0;
+            stats.squares += static_cast<std::uint64_t>(static_cast<std::int64_t>(sample) * sample);
+        }
     }
 
-    // 8ch ぶんの和は最大で ±2048*4*8 = ±65536 になりうる。
+    // ホスト側の最大 gain を含め、8ch の和は最大 ±2048*4*8*8 = ±524288。
     // 実チップの DAC は 16bit なので、ここで飽和させる。
     //
     // Why not 単純に 1/4 して収めるか: 実際の楽曲で 8ch すべてが

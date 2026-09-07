@@ -202,6 +202,11 @@ enum class PlanKind : u8
     kCmpaDregToAreg,  // srcReg = Dn 番号 / dstReg = An 番号
     kCmpaAregToAreg,  // srcReg = An 番号 / dstReg = An 番号
 
+    // ADDA / SUBA / CMPA .w/l #imm,An。**src が翻訳時定数**。
+    // imm は符号拡張済み (kMoveaImmToAreg と同じ合成)。
+    kAddaImmToAreg,  // imm = 符号拡張済み / dstReg = An 番号
+    kCmpaImmToAreg,  // imm = 符号拡張済み / dstReg = An 番号
+
     // --- Tier H: 命令長デコーダの拡張が解禁した形 (CMPI / ADDQ / BTST) ---
     //
     // **どれも非終端** (Tier G と同じ条件で選んである)。長さデコーダが
