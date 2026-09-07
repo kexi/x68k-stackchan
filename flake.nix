@@ -82,6 +82,13 @@
             pkgs.clang-tools
             pkgs.ruff
 
+            # 対話フロントエンド (x68k-play) 用。窓を出してキーを渡す。
+            # x68k-run と core のテストはこれに依存しないので、
+            # 無い環境でもビルドは通る (CMake が見つからなければ作らない)。
+            pkgs.SDL2
+            pkgs.SDL2.dev
+            pkgs.pkg-config
+
             # X68000 の ROM と Human68k は LZH で配布されている
             # (2000 年当時の主流だった圧縮形式)。展開に使う。
             pkgs.lhasa

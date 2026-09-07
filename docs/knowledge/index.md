@@ -10,9 +10,13 @@ sources:
   - docs/knowledge/x68000-boot-sequence.md
   - docs/knowledge/cores3-emulator-runtime.md
   - docs/knowledge/event-driven-devices.md
+  - docs/knowledge/sprite-plane-not-composited.md
+  - docs/knowledge/gcc-to-human68k-x.md
+  - docs/knowledge/x68000-game-input-and-libgcc.md
+  - docs/knowledge/verify-playability-by-search.md
   - 実測（IPL-ROM EXPERT 用 v1.0、MD5 7fd4caabac1d9169e289f0f7bbf71d8e）
   - 実測（Human68k 3.02 の HUMAN.SYS、58496 バイト）
-updated: 2026-08-24
+updated: 2026-08-27
 ---
 
 # ナレッジ索引
@@ -33,6 +37,10 @@ X68000 の仕様と、このプロジェクトで実際に手を動かして分�
 | [CoreS3 実機でエミュレータを動かすときの知見](cores3-emulator-runtime.md) | `confirmed` | ウォッチドッグ、シリアル経由のデバッグ、メモリ配置、LCD の見え方。ホストでは起きない種類の問題 |
 | [デバイスへ時間を渡す仕組みをイベント駆動にする](event-driven-devices.md) | `measured` | 律速は 68000 の命令実行ではなくデバイスの tick だった。**「JIT は 1.03 倍にしかならない」という結論は誤りで、2026-08-24 に訂正**。上限の見積もりがどう外れるかの記録として残してある |
 | [イベント駆動デバイスと JIT — 実機 10MHz までの記録](event-driven-implementation.md) | `measured` | イベント駆動から JIT まで、**実機 10063 kHz (実機比 100.6%)** に到達するまでの実測。効かなかった手 (admission / direct chaining / eviction) と、その見誤りの構造も残してある |
+| [実装済みのラスタライザが「呼ばれていない」ことは、テストでは見えない](sprite-plane-not-composited.md) | `confirmed` | スプライトと BG が、テスト 37 ケースつきで正しく動いていたのに 1 ドットも画面に出ていなかった話。「実装した」と「繋いだ」の間にあるテストの空白と、その見つけ方 |
+| [gcc の 68000 コードを Human68k の .X として動かす](gcc-to-human68k-x.md) | `confirmed` | nixpkgs の pkgsCross.m68k で X68000 の実行ファイルを作る手順。PIC・ELF ヘッダの下駄・crt0 のリンク順という 3 つの罠と、hello が A> から動くまでの実測 |
+| [X68000 で自作ゲームを書くときに詰まる 5 つ](x68000-game-input-and-libgcc.md) | `confirmed` | IOCS のキー入力は待つ。68000 に 32bit 除算が無い。GPIP4 の帰線はアクティブ L。パレットは 16 色。Human68k のスタックが狭くローカル変数 1 つで絵が出なくなる |
+| [「遊べる」は探索で確かめる](verify-playability-by-search.md) | `confirmed` | 手で操作の台本を書いても、失敗が「詰み」か「台本が下手」か区別できない。探索させると区別が付き、実際に足場敵の上下が裏返っているバグが見つかった |
 | [ストレージ実装方針](storage-readahead.md) | `measured` | SD の読み出しが遅い件。flash 移行と LRU キャッシュを却下した根拠と、「そもそもディスク由来か」を先に測る撤退条件 |
 
 ## X68000 の仕様（資料ベース + 一部実測）

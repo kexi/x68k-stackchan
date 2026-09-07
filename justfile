@@ -64,6 +64,17 @@ build-host:
 
 # ROM は同梱していないので rom/ に置く (NOTICE.md 参照)。
 # 例: just run --png /tmp/out.png --trace /tmp/trace.txt
+# 対話フロントエンドをビルドする。SDL2 が要る。
+[doc('対話フロントエンド x68k-play をビルドする')]
+build-play:
+    cmake -S test -B {{host_build}} -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake --build {{host_build}} --target x68k-play
+
+# 窓を出して実際に操作する。--hdd でゲームのイメージを渡す。
+[doc('X68000 を対話的に動かす (窓が出る)')]
+play *ARGS: build-play
+    ./{{host_build}}/x68k-play --iplrom rom/iplrom.dat {{ARGS}}
+
 [doc('ホストで X68000 を起動する (rom/ に IPLROM とディスクイメージが必要)')]
 run *ARGS: build-host
     ./{{host_build}}/x68k-run --iplrom rom/iplrom.dat {{ARGS}}
@@ -104,6 +115,24 @@ build:
 [doc('実機ファームをビルドして CoreS3 に書き込む')]
 flash:
     idf.py flash
+
+# ROM とディスクイメージを storage パーティションへ焼く。
+#
+# 既定では SD から読むが、カード無しで動かしたいときはこちら。
+# ディスクは疎で持つので、20MB のイメージでも実体は数百 KB で収まる。
+[doc('ROM とディスクを flash 用の 1 ファイルにまとめる')]
+pack-data HDD OUT="build/x68kdata.bin":
+    uv run tools/mkflashimage.py --iplrom rom/iplrom.dat --hdd {{HDD}} --out {{OUT}}
+
+# storage パーティションの位置は partitions.csv の 0x410000。
+[doc('まとめたデータを storage パーティションへ書き込む')]
+flash-data DATA="build/x68kdata.bin":
+    # esptool は単体のコマンドとしては PATH に無い。ESP-IDF が供給する
+    # Python モジュールとして呼ぶ (idf.py が内部でやっているのと同じ形)。
+    python -m esptool --chip esp32s3 write_flash 0x410000 {{DATA}}
+
+[doc('ファームとデータを両方書き込む (カード無しで動く状態にする)')]
+flash-all HDD: build (pack-data HDD) flash flash-data
 
 [doc('CoreS3 のシリアル出力を読む')]
 monitor:

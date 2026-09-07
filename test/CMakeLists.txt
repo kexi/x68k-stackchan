@@ -95,6 +95,7 @@ add_library(x68k_core STATIC
   ${X68K_ROOT}/src/x68k/core/video/text_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/graphic_raster.cpp
   ${X68K_ROOT}/src/x68k/core/video/sprite_raster.cpp
+  ${X68K_ROOT}/src/x68k/core/video/compositor.cpp
   ${X68K_ROOT}/src/x68k/core/video/text_scrape.cpp
   ${X68K_ROOT}/src/x68k/core/video/cgrom_fallback.cpp
 )
@@ -144,6 +145,7 @@ add_executable(x68k_tests
   test_bus.cpp
   test_gvram_bus.cpp
   test_text_raster.cpp
+  test_compositor.cpp
   test_graphic_raster.cpp
   test_sprite.cpp
   test_text_scrape.cpp
@@ -242,3 +244,24 @@ set_tests_properties(settled_is_unforgeable PROPERTIES WILL_FAIL TRUE)
 add_executable(x68k-run ${X68K_ROOT}/host/main.cpp ${X68K_ROOT}/host/gui_demo.cpp)
 target_link_libraries(x68k-run PRIVATE x68k_core)
 target_include_directories(x68k-run PRIVATE ${X68K_ROOT}/host)
+
+# 対話フロントエンド。窓を出してキーを渡す。
+#
+# SDL2 が無い環境では作らない。x68k-run (バッチ実行) と core のテストは
+# SDL に依存しないので、CI や実機ビルドはこれが無くても通る。
+find_package(SDL2 QUIET)
+if(SDL2_FOUND)
+  add_executable(x68k-play ${X68K_ROOT}/host/play.cpp)
+  target_link_libraries(x68k-play PRIVATE x68k_core)
+  target_include_directories(x68k-play PRIVATE ${X68K_ROOT}/host)
+  # nixpkgs の sdl2-compat が出す sdl2-config --cflags は壊れた -I/SDL2 を
+  # 返すので、CMake の見つけた include ディレクトリを直接使う。
+  if(TARGET SDL2::SDL2)
+    target_link_libraries(x68k-play PRIVATE SDL2::SDL2 SDL2::SDL2main)
+  else()
+    target_include_directories(x68k-play PRIVATE ${SDL2_INCLUDE_DIRS})
+    target_link_libraries(x68k-play PRIVATE ${SDL2_LIBRARIES})
+  endif()
+else()
+  message(STATUS "SDL2 が見つからないので x68k-play は作りません")
+endif()
