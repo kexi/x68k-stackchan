@@ -162,7 +162,7 @@ TEST_SUITE("compositor")
         placeSprite(sprite, 0, 0, 0, 1);
 
         // テキスト VRAM の左上を埋めて、同じ位置でスプライトが勝つことを見る。
-        std::vector<x68k::u8> textVram(0x20000u, 0);
+        std::vector<x68k::u8> textVram(x68k::kTvramSize, 0);
         for (x68k::u32 i = 0; i < 4u; ++i)
         {
             textVram[i] = 0xFFu;
@@ -183,7 +183,7 @@ TEST_SUITE("compositor")
         sprite.reset();  // $EB0808 を書かない = スプライト面 OFF
         VideoController video = makeVideo();
 
-        std::vector<x68k::u8> textVram(0x20000u, 0);
+        std::vector<x68k::u8> textVram(x68k::kTvramSize, 0);
         for (x68k::u32 i = 0; i < 8u; ++i)
         {
             textVram[i] = 0xA5u;
@@ -204,7 +204,7 @@ TEST_SUITE("compositor")
     {
         // 実機の初期化前など、スプライトデバイスを渡せない経路を想定する。
         VideoController video = makeVideo();
-        std::vector<x68k::u8> textVram(0x20000u, 0);
+        std::vector<x68k::u8> textVram(x68k::kTvramSize, 0);
         textVram[0] = 0xFFu;
 
         std::vector<x68k::u16> out = makeOut();
