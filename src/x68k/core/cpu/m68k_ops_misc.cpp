@@ -5,6 +5,10 @@
 
 #include "m68k.h"
 #include "m68k_alu.h"
+#include "scc_timing.h"
+#include "immediate_timing.h"
+#include "operand_timing.h"
+#include "shift_alu.h"
 
 namespace x68k
 {
@@ -170,7 +174,7 @@ u32 M68k::groupImmediate(u16 op)
             {
                 st_.sr |= sr_bit::kZero;
             }
-            return 4;
+            return btstInstructionCycles(op);
         }
 
         u32 addr = 0;
@@ -185,7 +189,7 @@ u32 M68k::groupImmediate(u16 op)
 
         if (bitOp == 0)
         {
-            return targetIsRegister ? 6 : 4;
+            return btstInstructionCycles(op);
         }
 
         u32 next = value;
@@ -269,41 +273,41 @@ u32 M68k::groupImmediate(u16 op)
             const u32 value = alu::truncate(dst | immediate, size);
             setLogicFlags(value, size);
             writeEaToAddr(mode, reg, size, addr, value);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         case 1:  // ANDI
         {
             const u32 value = alu::truncate(dst & immediate, size);
             setLogicFlags(value, size);
             writeEaToAddr(mode, reg, size, addr, value);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         case 2:  // SUBI
         {
             const alu::Result r = alu::sub(dst, immediate, size);
             st_.sr = applyResultFlags(st_.sr, r, true);
             writeEaToAddr(mode, reg, size, addr, r.value);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         case 3:  // ADDI
         {
             const alu::Result r = alu::add(dst, immediate, size);
             st_.sr = applyResultFlags(st_.sr, r, true);
             writeEaToAddr(mode, reg, size, addr, r.value);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         case 5:  // EORI
         {
             const u32 value = alu::truncate(dst ^ immediate, size);
             setLogicFlags(value, size);
             writeEaToAddr(mode, reg, size, addr, value);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         case 6:  // CMPI: 結果を書かずフラグだけ
         {
             const alu::Result r = alu::sub(dst, immediate, size);
             st_.sr = applyResultFlags(st_.sr, r, false);
-            return 8;
+            return immediateInstructionCycles(op, size);
         }
         default:
             return unimplemented(op);
@@ -346,11 +350,12 @@ u32 M68k::groupQuickAlu(u16 op)
         }
 
         // Scc: 条件が真なら $FF、偽なら $00 を書く。
-        const u32 value = testCondition(cond) ? 0xFFu : 0x00u;
+        const bool condition = testCondition(cond);
+        const u32 value = condition ? 0xFFu : 0x00u;
         u32 addr = 0;
         readEaForModify(mode, reg, kByte, addr);
         writeEaToAddr(mode, reg, kByte, addr, value);
-        return 4;
+        return sccInstructionCycles(op, condition);
     }
 
     const u32 size = sizeFromField(sizeField);
@@ -366,7 +371,7 @@ u32 M68k::groupQuickAlu(u16 op)
     {
         // An に対する ADDQ/SUBQ はフラグを変えず、常に 32bit で作用する。
         st_.a[reg] = isSub ? (st_.a[reg] - data) : (st_.a[reg] + data);
-        return 8;
+        return quickInstructionCycles(op, size);
     }
 
     u32 addr = 0;
@@ -374,7 +379,7 @@ u32 M68k::groupQuickAlu(u16 op)
     const alu::Result r = isSub ? alu::sub(dst, data, size) : alu::add(dst, data, size);
     st_.sr = applyResultFlags(st_.sr, r, true);
     writeEaToAddr(mode, reg, size, addr, r.value);
-    return 8;
+    return quickInstructionCycles(op, size);
 }
 
 // 1110: シフトとローテート
@@ -495,155 +500,33 @@ u32 M68k::memoryShift(u16 op)
     }
 
     st_.sr = sr;
-    return 8;
+    return 8 + operandReadCycles(op, kWord);
 }
 
 u32 M68k::groupShift(u16 op)
 {
     const u32 sizeField = (op >> 6) & 3u;
-
-    if (sizeField == 3)
+    const bool memory = sizeField == 3;
+    if (memory)
     {
         return memoryShift(op);
     }
-
     const u32 size = sizeFromField(sizeField);
     const u32 reg = op & 7u;
     const bool isLeft = (op & 0x0100u) != 0;
-    const u32 shiftType = (op >> 3) & 3u;  // 0=AS 1=LS 2=ROX 3=RO
+    const u32 shiftType = (op >> 3) & 3u;
     const bool countInRegister = (op & 0x0020u) != 0;
-
-    u32 count = 0;
-    if (countInRegister)
-    {
-        // レジスタ指定のシフト量は 64 で剰余を取る。
-        count = st_.d[(op >> 9) & 7u] % 64u;
-    }
-    else
-    {
-        count = (op >> 9) & 7u;
-        if (count == 0)
-        {
-            count = 8;
-        }
-    }
-
-    u32 value = alu::truncate(st_.d[reg], size);
-    const u32 bits = size * 8;
-    const u32 msb = alu::signBit(size);
-
-    bool carry = false;
-    bool overflow = false;
+    const u32 countField = (op >> 9) & 7u;
+    const u32 count =
+        countInRegister ? st_.d[countField] & 63u : (countField == 0 ? 8u : countField);
     const bool extendIn = (st_.sr & sr_bit::kExtend) != 0;
-    bool extendOut = extendIn;
-
-    for (u32 i = 0; i < count; ++i)
-    {
-        if (isLeft)
-        {
-            const bool bitOut = (value & msb) != 0;
-            const u32 before = value;
-            if (shiftType == 3)
-            {
-                // ROL: 押し出したビットが下位へ回る
-                value = alu::truncate((value << 1) | (bitOut ? 1u : 0u), size);
-            }
-            else if (shiftType == 2)
-            {
-                // ROXL: X を経由して回る
-                value = alu::truncate((value << 1) | (extendOut ? 1u : 0u), size);
-                extendOut = bitOut;
-            }
-            else
-            {
-                value = alu::truncate(value << 1, size);
-                if (shiftType != 3)
-                {
-                    extendOut = bitOut;
-                }
-            }
-            carry = bitOut;
-            // ASL は符号ビットが変化したら V を立てる。
-            if (shiftType == 0 && ((before ^ value) & msb) != 0)
-            {
-                overflow = true;
-            }
-        }
-        else
-        {
-            const bool bitOut = (value & 1u) != 0;
-            if (shiftType == 3)
-            {
-                // ROR
-                value = alu::truncate((value >> 1) | (bitOut ? msb : 0u), size);
-            }
-            else if (shiftType == 2)
-            {
-                // ROXR
-                value = alu::truncate((value >> 1) | (extendOut ? msb : 0u), size);
-                extendOut = bitOut;
-            }
-            else if (shiftType == 0)
-            {
-                // ASR: 符号ビットを保つ
-                const bool sign = (value & msb) != 0;
-                value = alu::truncate((value >> 1) | (sign ? msb : 0u), size);
-                extendOut = bitOut;
-            }
-            else
-            {
-                // LSR
-                value = alu::truncate(value >> 1, size);
-                extendOut = bitOut;
-            }
-            carry = bitOut;
-        }
-    }
-
-    writeEa(0, reg, size, value);
-
-    u16 sr = static_cast<u16>(
-        st_.sr & ~(sr_bit::kNegative | sr_bit::kZero | sr_bit::kOverflow | sr_bit::kCarry));
-    if (value == 0)
-    {
-        sr |= sr_bit::kZero;
-    }
-    if (alu::isNegative(value, size))
-    {
-        sr |= sr_bit::kNegative;
-    }
-    if (overflow)
-    {
-        sr |= sr_bit::kOverflow;
-    }
-    // シフト量が 0 のとき C はクリアされる (ROX 系は X の値が入る)。
-    if (count != 0 && carry)
-    {
-        sr |= sr_bit::kCarry;
-    }
-    else if (count == 0 && shiftType == 2 && extendIn)
-    {
-        sr |= sr_bit::kCarry;
-    }
-
-    // ROL/ROR は X を変えない。
-    if (shiftType != 3)
-    {
-        sr = static_cast<u16>(sr & ~sr_bit::kExtend);
-        if (count != 0 ? extendOut : extendIn)
-        {
-            sr |= sr_bit::kExtend;
-        }
-    }
-    else
-    {
-        sr =
-            static_cast<u16>((sr & clearMask(sr_bit::kExtend)) | (extendIn ? sr_bit::kExtend : 0u));
-    }
-
-    st_.sr = sr;
-    (void)bits;
-    return 6 + 2 * count;
+    const auto result = alu::shift(st_.d[reg], size, count, shiftType, isLeft, extendIn);
+    writeEa(0, reg, size, result.value);
+    setLogicFlags(result.value, size);
+    st_.sr = static_cast<u16>(
+        (st_.sr & clearMask(sr_bit::kExtend)) | (result.extend ? sr_bit::kExtend : 0u) |
+        (result.carry ? sr_bit::kCarry : 0u) | (result.overflow ? sr_bit::kOverflow : 0u));
+    return (size == kLong ? 8u : 6u) + 2u * count;
 }
 
 }  // namespace x68k

@@ -75,6 +75,7 @@
 #include <cstdint>
 
 #include "../cpu/m68k_types.h"
+#include "../video/visual_damage.h"
 
 namespace x68k
 {
@@ -105,6 +106,10 @@ public:
     static constexpr u32 kBgCellSize = 16;
 
     void reset();
+    void setVisualDamage(VisualDamage damage)
+    {
+        damage_ = damage;
+    }
 
     // --- レジスタ ($EB0000-$EB080D) ---
     //
@@ -122,9 +127,12 @@ public:
 
     void vramWrite8(u32 offset, u8 value)
     {
-        if (offset < kVramSize)
+        const bool changes = offset < kVramSize && vram_[offset] != value;
+        if (changes)
         {
             vram_[offset] = value;
+            // PCGと名前表は重なるため、片方だけの利用と決めつけない。
+            damage_.all();
         }
     }
 
@@ -344,12 +352,10 @@ private:
         return reg_[(index * kSpriteStride) / 2u + word];
     }
 
-    // 表示中のスプライト数を数え直す。プライオリティのワードが変わったときだけ呼ぶ。
-    void recountVisible();
-
     std::array<u16, kRegWords> reg_{};
     std::array<u8, kVramSize> vram_{};
     u32 visibleCount_ = 0;
+    VisualDamage damage_{};
 };
 
 }  // namespace x68k

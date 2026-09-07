@@ -111,6 +111,11 @@ struct NativeStats
     // deferUnsupported == negativeHit + translateFail + fullDeferred が
     // 成り立つ (収支が閉じる) ことをテストで縛る。
     u64 fullDeferred = 0;
+    // 任意の診断。満杯時の間引き標本で、先頭opcodeの認識だけを調べる。
+    // 拡張語・窓・世代・発行可否は未検査なので「翻訳できる数」ではない。
+    u64 capacitySamples = 0;
+    u64 capacityRecognized = 0;
+    u32 capacityOpcodeGroups[16] = {};
     // 空きスロットを引いた回数 (コールドミス)。
     //
     // 鍵外れの帰属は slot->code != nullptr の中でしか数えていないので、

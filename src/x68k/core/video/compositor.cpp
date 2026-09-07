@@ -11,7 +11,7 @@ namespace x68k
 
 void Compositor::render(const u8* graphicVram, const u8* textVram, const Sprite* sprite,
                         const VideoController& video, u32 srcX, u32 srcY, u32 width, u32 height,
-                        u16* out, u32 outStride)
+                        u16* out, u32 outStride, const Crtc* crtc)
 {
     if (out == nullptr)
     {
@@ -33,7 +33,7 @@ void Compositor::render(const u8* graphicVram, const u8* textVram, const Sprite*
     if (showGraphic || showText)
     {
         GraphicRaster::composite(graphicVram, textVram, video, srcX, srcY, width, height, out,
-                                 outStride);
+                                 outStride, crtc);
     }
     else
     {

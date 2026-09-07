@@ -143,6 +143,14 @@ public:
         return now_;
     }
 
+    // 実体化を起こさず、完了済み命令の時刻を返す。音源MMIOの境界に使う。
+    [[nodiscard]] std::uint64_t cpuTime() const
+    {
+        const bool negative = debt_ < 0;
+        return negative ? deadlineAt_ - static_cast<std::uint64_t>(-std::int64_t{debt_})
+                        : deadlineAt_ + static_cast<std::uint64_t>(debt_);
+    }
+
     [[nodiscard]] bool degraded() const
     {
         return degraded_;

@@ -3,6 +3,8 @@
 
 #include "sprite_raster.h"
 
+#include <cstring>
+
 namespace x68k
 {
 namespace
@@ -146,6 +148,7 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
         u32 pattern = 0;
         bool flipH = false;
         bool flipV = false;
+        u8 pcgRow[8]{};
 
         for (u32 x = 0; x < width; ++x)
         {
@@ -174,6 +177,18 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
                 // (MAME の BG タイル callback は (& 0xc000) >> 14 を flags にする)。
                 flipH = (name & 0x4000u) != 0;
                 flipV = (name & 0x8000u) != 0;
+                const u32 py = flipV ? (kCell - 1u - inCellY) : inCellY;
+                const u32 rowOffset = pattern * 4u * Sprite::kPcg8Bytes +
+                                      (py >= 8u ? 2u * Sprite::kPcg8Bytes : 0u) + (py & 7u) * 4u;
+                const bool hasRow = rowOffset + Sprite::kPcg8Bytes + 4u <= Sprite::kVramSize;
+                if (!hasRow)
+                {
+                    pattern = 0xFFFFFFFFu;
+                    continue;
+                }
+                // 全パターンのキャッシュは無効化を要するため、同じセルの1行だけ保持する。
+                std::memcpy(pcgRow, vram + rowOffset, 4);
+                std::memcpy(pcgRow + 4, vram + rowOffset + Sprite::kPcg8Bytes, 4);
             }
 
             if (pattern == 0xFFFFFFFFu)
@@ -183,24 +198,7 @@ void SpriteRaster::renderBg(const Sprite& sprite, const VideoController& video, 
 
             const u32 inCellX = bgX & (kCell - 1u);
             const u32 px = flipH ? (kCell - 1u - inCellX) : inCellX;
-            const u32 py = flipV ? (kCell - 1u - inCellY) : inCellY;
-
-            // PCG のバイトを直に引く。
-            //
-            // Why not pcgPixel を呼ばないか: あちらはドットごとに
-            // 「16x16 のどの 8x8 か」を判定し、パターン番号からアドレスを
-            // 組み立て直す。同じセルの中では上位の計算が変わらないので、
-            // ここでは 1 ドットぶんのバイト読みまで落とす。
-            // CoreS3 では VRAM が PSRAM にあり、この経路が描画時間の
-            // 半分近くを占めていた。
-            const u32 quadrant = ((py >= 8u) ? 2u : 0u) | ((px >= 8u) ? 1u : 0u);
-            const u32 offset =
-                (pattern * 4u + quadrant) * Sprite::kPcg8Bytes + (py & 7u) * 4u + ((px & 7u) >> 1);
-            if (offset >= Sprite::kVramSize)
-            {
-                continue;
-            }
-            const u8 packed = vram[offset];
+            const u8 packed = pcgRow[px >> 1];
             const u8 index =
                 static_cast<u8>((px & 1u) ? (packed & 0x0Fu) : ((packed >> 4) & 0x0Fu));
             if (index != kTransparentIndex)

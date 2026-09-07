@@ -66,6 +66,74 @@ std::vector<x68k::u8> makeGvram()
 
 // --- 色数モードごとのドット解釈 ---------------------------------------------
 
+TEST_CASE("MODE3: G0だけの9bit XY scrollをviewportとstrideを保って折り返す")
+{
+    auto vram = makeGvram();
+    VideoController video;
+    video.write(kScreenModeOffset, 3);
+    video.write(kDisplayCtrlOffset, 0x1F);
+    x68k::Crtc crtc;
+    for (x68k::u32 y = 0; y < 512; ++y)
+        for (x68k::u32 x = 0; x < 512; ++x)
+            writeWord(vram, x, y, static_cast<x68k::u16>((y * 512u + x) * 131u + 1u));
+    for (x68k::u32 reg = 14; reg < 20; ++reg)
+        crtc.write(reg, 127);
+    constexpr x68k::u32 width = 19, height = 7, stride = 23;
+    for (const x68k::u16 sx : std::initializer_list<x68k::u16>{0, 1, 511, 512, 0xFFFF})
+        for (const x68k::u16 sy : std::initializer_list<x68k::u16>{0, 1, 255, 256, 511, 512})
+            for (const x68k::u32 view : {0u, 507u, 1023u})
+            {
+                CAPTURE(sx);
+                CAPTURE(sy);
+                CAPTURE(view);
+                crtc.write(12, sx);
+                crtc.write(13, sy);
+                std::vector<x68k::u16> out(stride * height + 2, 0xDEAD);
+                GraphicRaster::render(vram.data(), video, view, view, width, height, out.data() + 1,
+                                      stride, &crtc);
+                CHECK(out.front() == 0xDEAD);
+                CHECK(out.back() == 0xDEAD);
+                for (x68k::u32 y = 0; y < height; ++y)
+                    for (x68k::u32 x = 0; x < stride; ++x)
+                    {
+                        x68k::u16 expected = 0xDEAD;
+                        if (const bool visible = x < width; visible)
+                        {
+                            const auto px = (view + x + sx) & 511u;
+                            const auto py = (view + y + sy) & 511u;
+                            const auto word = static_cast<x68k::u16>((py * 512u + px) * 131u + 1u);
+                            if (const bool opaque = word != 0; opaque)
+                                expected = VideoController::toRgb565(word);
+                        }
+                        CHECK(out[1 + y * stride + x] == expected);
+                    }
+            }
+}
+
+TEST_CASE("MODE3 scroll接続は旧indexedとraw pixel accessorを変更しない")
+{
+    auto vram = makeGvram();
+    writeWord(vram, 0, 0, 0x4321);
+    writeWord(vram, 1, 1, 0x8765);
+    VideoController video;
+    video.write(kDisplayCtrlOffset, 0x1F);
+    for (x68k::u32 index = 0; index < 256; ++index)
+        video.write(index * 2u, static_cast<x68k::u16>(index * 173u));
+    x68k::Crtc crtc;
+    crtc.write(12, 1);
+    crtc.write(13, 1);
+    for (const x68k::u16 mode : std::initializer_list<x68k::u16>{0, 1, 2, 4})
+    {
+        video.write(kScreenModeOffset, mode);
+        std::vector<x68k::u16> raw(16, 0), connected(16, 0);
+        GraphicRaster::render(vram.data(), video, 0, 0, 4, 4, raw.data(), 4);
+        GraphicRaster::render(vram.data(), video, 0, 0, 4, 4, connected.data(), 4, &crtc);
+        CHECK(connected == raw);
+    }
+    video.write(kScreenModeOffset, 3);
+    CHECK(GraphicRaster::pixelColor(vram.data(), video, 0, 0, 0) == 0x4321);
+}
+
 TEST_CASE("16 色モードでは 1 ワードに 4 ページぶんの 4bit が詰まる")
 {
     auto vram = makeGvram();

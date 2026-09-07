@@ -669,8 +669,7 @@ void emitArithAlu(Emitter& e, const PlannedOp& op)
 // src を kTmpA へ載せる。**レジスタ形と即値形の唯一の違いがここ**。
 //
 // 即値側で emitSext16 を呼ばないのは、foldImmediate が既に符号拡張済みの値を
-// 入れるから (block_plan.h の kAddaImmToAreg のコメント)。二重に掛けても値は
-// 変わらないが、planner とエミッタの両方が符号拡張を持つと、どちらか一方を
+// 入れるから。planner とエミッタの両方が符号拡張を持つと、どちらか一方を
 // 消したときにテストが落ちなくなる。責任を planner 側 1 箇所に置く。
 void emitLoadAddressAluSource(Emitter& e, const PlannedOp& op, bool srcIsAddressRegister)
 {
@@ -685,9 +684,6 @@ void emitLoadAddressAluSource(Emitter& e, const PlannedOp& op, bool srcIsAddress
     emitLoadState(e, kTmpA, src);
     if (op.size == 2)
     {
-        // interpreter は readEa mode 0 で **下位 16bit に切ってから**
-        // 符号拡張し、mode 1 では An をそのまま符号拡張する (m68k.h:513-524)。
-        // どちらも「下位 16bit を符号拡張」と同じ値になるので 1 本で済む。
         emitSext16(e, kTmpA, kTmpA);
     }
 }

@@ -12,9 +12,11 @@
 //   - レート変換してもエンベロープの実時間が保たれる
 
 #include "dev/opm.h"
+#include "dev/opm_envelope.h"
 #include "doctest.h"
 
 #include <cmath>
+#include <limits>
 
 namespace
 {
@@ -73,7 +75,133 @@ std::int32_t peakOver(x68k::Opm& opm, std::size_t frames)
     return peak;
 }
 
+std::int16_t saturatedSample(std::int32_t sample)
+{
+    constexpr auto min = std::numeric_limits<std::int16_t>::min();
+    constexpr auto max = std::numeric_limits<std::int16_t>::max();
+    const bool belowMin = sample < min;
+    const bool aboveMax = sample > max;
+    if (belowMin)
+        return min;
+    if (aboveMax)
+        return max;
+    return static_cast<std::int16_t>(sample);
+}
+
+void observeExpected(x68k::Opm::OutputStats::ChannelOutput& stats, std::int32_t sample)
+{
+    const auto magnitude = static_cast<x68k::u32>(sample < 0 ? -sample : sample);
+    const bool higherPeak = magnitude > stats.peak;
+    if (higherPeak)
+        stats.peak = magnitude;
+    stats.nonzero += sample != 0;
+    stats.squares += static_cast<std::uint64_t>(static_cast<std::int64_t>(sample) * sample);
+}
+
+void checkChannelOutput(const x68k::Opm::OutputStats::ChannelOutput& actual,
+                        const x68k::Opm::OutputStats::ChannelOutput& expected)
+{
+    CHECK(actual.peak == expected.peak);
+    CHECK(actual.nonzero == expected.nonzero);
+    CHECK(actual.squares == expected.squares);
+}
+
 }  // namespace
+
+TEST_CASE("OPM PCM golden: 最適化前の音源出力を保持する")
+{
+    // e4356d6の未変更opm.cppから採取する。実チップとの一致ではなく回帰の検出。
+    // rates[0] の 0 は「既定レートを使う」の意味。既定は 62500Hz なので、
+    // その期待値は他の 4 つとは別に持つ (以前は 15625 と同じ値だった)。
+    const std::array<x68k::u32, 5> rates{0, 15625, 31250, 44100, 55930};
+    const std::array<std::uint64_t, 5> expected{12671540257663357227ull, 5791532205415170417ull,
+                                                15667092462324130126ull, 11433102273017827615ull,
+                                                3975217357743097295ull};
+    for (std::size_t scenario = 0; scenario < rates.size(); ++scenario)
+    {
+        x68k::Opm opm;
+        opm.setSampleRate(rates[scenario]);
+        opm.reset();
+        for (x68k::u8 ch = 0; ch < 8; ++ch)
+        {
+            setupLoudChannel(opm, ch, ch);
+            writeReg(opm, 0x20 + ch, static_cast<x68k::u8>(0xC0 | (ch << 3) | ch));
+            writeReg(opm, 0x28 + ch, 0x30 + ch * 3);
+            writeReg(opm, 0x30 + ch, ch * 28);
+            for (x68k::u8 slot = 0; slot < 4; ++slot)
+            {
+                const x68k::u8 offset = ch + slot * 8;
+                writeReg(opm, 0x40 + offset, static_cast<x68k::u8>((slot << 4) | (slot + 1)));
+                writeReg(opm, 0x60 + offset, 12 + ch + slot * 4);
+                writeReg(opm, 0x80 + offset, static_cast<x68k::u8>((slot << 6) | (18 + ch)));
+                writeReg(opm, 0xA0 + offset, 8 + ch);
+                writeReg(opm, 0xC0 + offset, static_cast<x68k::u8>((slot << 6) | (4 + ch)));
+                writeReg(opm, 0xE0 + offset, static_cast<x68k::u8>((slot << 4) | (4 + ch)));
+            }
+            keyOn(opm, ch);
+        }
+        std::uint64_t hash = 14695981039346656037ull;
+        unsigned nonzero = 0;
+        for (unsigned frame = 0; frame < 8192; ++frame)
+        {
+            const bool release = frame == 2048;
+            const bool retrigger = frame == 4096;
+            const bool changeRate = frame == 6144;
+            if (release)
+            {
+                for (x68k::u8 ch = 0; ch < 8; ++ch)
+                    keyOff(opm, ch);
+            }
+            if (retrigger)
+            {
+                for (x68k::u8 ch = 0; ch < 8; ++ch)
+                    keyOn(opm, ch);
+            }
+            if (changeRate)
+                opm.setSampleRate(22050);
+            const auto sample = opm.renderOneSample();
+            nonzero += sample != 0;
+            const auto bits = static_cast<std::uint32_t>(sample);
+            for (unsigned byte = 0; byte < 4; ++byte)
+            {
+                hash ^= (bits >> (byte * 8)) & 0xFFu;
+                hash *= 1099511628211ull;
+            }
+        }
+        CAPTURE(rates[scenario]);
+        CHECK(nonzero > 1024);
+        CHECK(hash == expected[scenario]);
+    }
+}
+
+TEST_CASE("EGの事前計算は全実効レートで旧64bit計算の丸めを保持する")
+{
+    const std::array<std::uint32_t, 10> scales{
+        0,      1,          65535,      65536,      65537,
+        234585, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFE, std::numeric_limits<std::uint32_t>::max()};
+    auto checkScale = [](std::uint32_t scale)
+    {
+        const auto bases = x68k::detail::envelopeStepBases(scale);
+        for (unsigned rate = 1; rate < 64; ++rate)
+        {
+            const unsigned shift = rate < 48 ? 11 - (rate >> 2) : 0;
+            const auto original = static_cast<std::uint32_t>(
+                (((std::uint64_t{4 + (rate & 3)} << 4) * scale) >> 16) >> shift);
+            CHECK((bases[rate & 3] >> shift) == original);
+        }
+    };
+    for (auto scale : scales)
+    {
+        checkScale(scale);
+    }
+    // 乗算・丸めの境界と、通常の合成レートだけに偏らない入力を保証する。
+    std::uint32_t scale = 0x12345678;
+    for (unsigned i = 0; i < 4096; ++i)
+    {
+        scale = scale * 1664525u + 1013904223u;
+        checkScale(scale);
+    }
+}
 
 TEST_CASE("レジスタはアドレス latch のあとデータで書かれる")
 {
@@ -1174,4 +1302,362 @@ TEST_CASE("キーオンを重ねてもアタックはやり直されない")
     // 同じキーオンをもう一度書く。実チップは立ち上がりでしか反応しない。
     keyOn(opm, 0);
     CHECK(opm.envelopeLevel(0, 0) == levelAfterAttack);
+}
+
+TEST_CASE("OPM channel observation preserves samples and counts the actual output")
+{
+    x68k::Opm measured;
+    x68k::Opm reference;
+    setupLoudChannel(measured, 3, 7);
+    setupLoudChannel(reference, 3, 7);
+    x68k::Opm::OutputStats stats{};
+    measured.setOutputStats(&stats);
+    for (unsigned i = 0; i < 20; ++i)
+    {
+        CHECK(measured.renderOneSample() == 0);
+        CHECK(reference.renderOneSample() == 0);
+    }
+    CHECK(stats.samples == 20);
+    CHECK(stats.channels[3].peak == 0);
+    stats = {};
+    keyOn(measured, 3);
+    keyOn(reference, 3);
+    x68k::Opm::OutputStats::ChannelOutput expected{};
+    for (unsigned i = 0; i < 1024; ++i)
+    {
+        const std::int32_t sample = reference.renderOneSample();
+        CHECK(measured.renderOneSample() == sample);
+        const auto magnitude = static_cast<x68k::u32>(sample < 0 ? -sample : sample);
+        const bool higher = magnitude > expected.peak;
+        if (higher)
+            expected.peak = magnitude;
+        expected.nonzero += sample != 0;
+        expected.squares += static_cast<std::uint64_t>(static_cast<std::int64_t>(sample) * sample);
+    }
+    CHECK(stats.samples == 1024);
+    CHECK(stats.channels[3].peak == expected.peak);
+    CHECK(stats.channels[3].nonzero == expected.nonzero);
+    CHECK(stats.channels[3].squares == expected.squares);
+    CHECK(expected.peak > 0);
+    keyOff(measured, 3);
+    keyOff(reference, 3);
+    for (unsigned i = 0; i < 64; ++i)
+        CHECK(measured.renderOneSample() == reference.renderOneSample());
+    const auto beforeDisable = stats;
+    for (unsigned ch = 0; ch < 8; ++ch)
+    {
+        const bool measuredChannel = ch == 3;
+        if (measuredChannel)
+            continue;
+        CHECK(stats.channels[ch].nonzero == 0);
+        CHECK(stats.channels[ch].squares == 0);
+    }
+    measured.setOutputStats(nullptr);
+    for (unsigned i = 0; i < 32; ++i)
+        CHECK(measured.renderOneSample() == reference.renderOneSample());
+    CHECK(stats.samples == beforeDisable.samples);
+    CHECK(stats.channels[3].squares == beforeDisable.channels[3].squares);
+}
+
+TEST_CASE("OPM output gain defaults to unity, rejects invalid channels and survives reset")
+{
+    x68k::Opm opm;
+    for (x68k::u32 ch = 0; ch < x68k::Opm::kChannelCount; ++ch)
+        CHECK(opm.channelOutputGainQ8(ch) == x68k::Opm::kOutputGainUnityQ8);
+    CHECK(opm.setChannelOutputGainQ8(0, 0));
+    CHECK(opm.setChannelOutputGainQ8(1, 383));
+    CHECK(opm.setChannelOutputGainQ8(7, x68k::Opm::kOutputGainMaxQ8 + 1));
+    CHECK(opm.channelOutputGainQ8(7) == x68k::Opm::kOutputGainMaxQ8);
+    CHECK(opm.setChannelOutputGainQ8(7, std::numeric_limits<x68k::u32>::max()));
+    CHECK(opm.channelOutputGainQ8(7) == x68k::Opm::kOutputGainMaxQ8);
+    CHECK_FALSE(opm.setChannelOutputGainQ8(x68k::Opm::kChannelCount, 512));
+    CHECK_FALSE(opm.setChannelOutputGainQ8(std::numeric_limits<x68k::u32>::max(), 128));
+    CHECK(opm.channelOutputGainQ8(x68k::Opm::kChannelCount) == x68k::Opm::kOutputGainUnityQ8);
+    CHECK(opm.channelOutputGainQ8(std::numeric_limits<x68k::u32>::max()) ==
+          x68k::Opm::kOutputGainUnityQ8);
+
+    setupLoudChannel(opm, 1);
+    keyOn(opm, 1);
+    CHECK(peakOver(opm, 64) > 0);
+    opm.reset();
+    CHECK(opm.channelOutputGainQ8(0) == 0);
+    CHECK(opm.channelOutputGainQ8(1) == 383);
+    CHECK(opm.channelOutputGainQ8(7) == x68k::Opm::kOutputGainMaxQ8);
+    for (x68k::u32 ch = 2; ch < 7; ++ch)
+        CHECK(opm.channelOutputGainQ8(ch) == x68k::Opm::kOutputGainUnityQ8);
+    for (x68k::u32 reg = 0; reg < x68k::Opm::kRegCount; ++reg)
+        CHECK(opm.peekRegister(static_cast<x68k::u8>(reg)) == 0);
+    CHECK(opm.isSilent());
+    std::array<std::int16_t, 256> buffer{};
+    buffer.fill(1234);
+    opm.renderSamples(buffer.data(), buffer.size());
+    for (const auto sample : buffer)
+        CHECK(sample == 0);
+}
+
+TEST_CASE("OPM output gain scales every algorithm once and unity restores unchanged sound state")
+{
+    const std::array<x68k::u32, 7> gains{0, 128, 256, 257, 512, 1024, 2048};
+    for (x68k::u8 ch = 0; ch < x68k::Opm::kChannelCount; ++ch)
+    {
+        for (const auto gain : gains)
+        {
+            CAPTURE(ch);
+            CAPTURE(gain);
+            x68k::Opm reference;
+            x68k::Opm gained;
+            setupLoudChannel(reference, ch, ch);
+            setupLoudChannel(gained, ch, ch);
+            for (auto* opm : {&reference, &gained})
+                writeReg(*opm, static_cast<x68k::u8>(0x20 + ch),
+                         static_cast<x68k::u8>(0xC0 | (ch << 3) | ch));
+            CHECK(gained.setChannelOutputGainQ8(ch, gain));
+            keyOn(reference, ch);
+            keyOn(gained, ch);
+            CHECK_FALSE(gained.isSilent());
+            x68k::Opm::OutputStats actual{};
+            x68k::Opm::OutputStats::ChannelOutput expected{};
+            gained.setOutputStats(&actual);
+            for (unsigned frame = 0; frame < 256; ++frame)
+            {
+                const std::int32_t sample = reference.renderOneSample();
+                const std::int32_t scaled = sample * static_cast<std::int32_t>(gain) / 256;
+                CHECK(gained.renderOneSample() == saturatedSample(scaled));
+                observeExpected(expected, scaled);
+            }
+            CHECK(actual.samples == 256);
+            checkChannelOutput(actual.channels[ch], expected);
+            for (x68k::u32 other = 0; other < x68k::Opm::kChannelCount; ++other)
+            {
+                const bool selectedChannel = other == ch;
+                if (selectedChannel)
+                    continue;
+                CHECK(gained.channelOutputGainQ8(other) == x68k::Opm::kOutputGainUnityQ8);
+                checkChannelOutput(actual.channels[other], {});
+            }
+            for (x68k::u32 reg = 0; reg < x68k::Opm::kRegCount; ++reg)
+                CHECK(gained.peekRegister(static_cast<x68k::u8>(reg)) ==
+                      reference.peekRegister(static_cast<x68k::u8>(reg)));
+            for (x68k::u32 op = 0; op < x68k::Opm::kOperatorsPerChannel; ++op)
+            {
+                CHECK(gained.envelopeLevel(ch, op) == reference.envelopeLevel(ch, op));
+                CHECK(gained.envelopePhase(ch, op) == reference.envelopePhase(ch, op));
+            }
+            CHECK(gained.setChannelOutputGainQ8(ch, x68k::Opm::kOutputGainUnityQ8));
+            for (unsigned frame = 0; frame < 256; ++frame)
+                CHECK(gained.renderOneSample() == reference.renderOneSample());
+        }
+    }
+}
+
+TEST_CASE("OPM output gain leaves simultaneous unselected channels unchanged")
+{
+    const std::array<x68k::u8, 3> channels{0, 3, 7};
+    std::array<x68k::Opm, 3> references;
+    x68k::Opm gained;
+    x68k::Opm::OutputStats actual{};
+    std::array<x68k::Opm::OutputStats::ChannelOutput, 3> expected{};
+    for (unsigned index = 0; index < channels.size(); ++index)
+    {
+        const auto ch = channels[index];
+        setupLoudChannel(references[index], ch, 7);
+        setupLoudChannel(gained, ch, 7);
+        for (auto* opm : {&references[index], &gained})
+        {
+            writeReg(*opm, static_cast<x68k::u8>(0x28 + ch),
+                     static_cast<x68k::u8>(0x40 + index * 3));
+            for (x68k::u8 slot = 0; slot < 4; ++slot)
+                writeReg(*opm, static_cast<x68k::u8>(0x60 + ch + slot * 8), 32);
+            keyOn(*opm, ch);
+        }
+    }
+    CHECK(gained.setChannelOutputGainQ8(3, 2048));
+    gained.setOutputStats(&actual);
+    for (unsigned frame = 0; frame < 1024; ++frame)
+    {
+        std::int32_t mix = 0;
+        for (unsigned index = 0; index < channels.size(); ++index)
+        {
+            const std::int32_t sample = references[index].renderOneSample();
+            const bool selectedChannel = channels[index] == 3;
+            const std::int32_t scaled = sample * (selectedChannel ? 8 : 1);
+            mix += scaled;
+            observeExpected(expected[index], scaled);
+        }
+        CHECK(gained.renderOneSample() == saturatedSample(mix));
+    }
+    CHECK(actual.samples == 1024);
+    for (unsigned index = 0; index < channels.size(); ++index)
+    {
+        checkChannelOutput(actual.channels[channels[index]], expected[index]);
+        CHECK(expected[index].nonzero > 0);
+    }
+}
+
+TEST_CASE("OPM output gain preserves silence, panning mute and release to silence")
+{
+    x68k::Opm reference;
+    x68k::Opm gained;
+    CHECK(gained.setChannelOutputGainQ8(2, 512));
+    CHECK(gained.isSilent());
+    CHECK(peakOver(gained, 64) == 0);
+    for (auto* opm : {&reference, &gained})
+    {
+        setupLoudChannel(*opm, 2, 7);
+        writeReg(*opm, 0x22, 0x07);
+        for (x68k::u8 slot = 0; slot < 4; ++slot)
+            writeReg(*opm, static_cast<x68k::u8>(0xE2 + slot * 8), 0x0F);
+        keyOn(*opm, 2);
+    }
+    for (unsigned frame = 0; frame < 256; ++frame)
+    {
+        CHECK(reference.renderOneSample() == 0);
+        CHECK(gained.renderOneSample() == 0);
+    }
+    CHECK_FALSE(gained.isSilent());
+    CHECK(gained.envelopeLevel(2, 0) == reference.envelopeLevel(2, 0));
+    writeReg(reference, 0x22, 0xC7);
+    writeReg(gained, 0x22, 0xC7);
+    for (unsigned frame = 0; frame < 256; ++frame)
+        CHECK(gained.renderOneSample() == reference.renderOneSample() * 2);
+    keyOff(reference, 2);
+    keyOff(gained, 2);
+    CHECK(gained.envelopePhase(2, 0) == x68k::Opm::EgPhase::kRelease);
+    for (unsigned frame = 0; frame < 4096; ++frame)
+        CHECK(gained.renderOneSample() == reference.renderOneSample() * 2);
+    CHECK(gained.isSilent());
+    CHECK(reference.isSilent());
+    for (x68k::u32 op = 0; op < x68k::Opm::kOperatorsPerChannel; ++op)
+    {
+        CHECK(gained.envelopeLevel(2, op) == reference.envelopeLevel(2, op));
+        CHECK(gained.envelopePhase(2, op) == x68k::Opm::EgPhase::kOff);
+    }
+    CHECK(peakOver(gained, 256) == 0);
+}
+
+TEST_CASE("OPM maximum output gain saturates eight loud channels without wrapping")
+{
+    x68k::Opm reference;
+    x68k::Opm gained;
+    setupLoudChannel(reference, 0, 7);
+    keyOn(reference, 0);
+    for (x68k::u8 ch = 0; ch < x68k::Opm::kChannelCount; ++ch)
+    {
+        setupLoudChannel(gained, ch, 7);
+        CHECK(gained.setChannelOutputGainQ8(ch, x68k::Opm::kOutputGainMaxQ8));
+        keyOn(gained, ch);
+    }
+    x68k::Opm::OutputStats actual{};
+    x68k::Opm::OutputStats::ChannelOutput expected{};
+    gained.setOutputStats(&actual);
+    unsigned positiveClips = 0;
+    unsigned negativeClips = 0;
+    for (unsigned frame = 0; frame < 1024; ++frame)
+    {
+        const std::int32_t sample = reference.renderOneSample() * 8;
+        const auto expectedSample = saturatedSample(sample * 8);
+        CHECK(gained.renderOneSample() == expectedSample);
+        observeExpected(expected, sample);
+        positiveClips += expectedSample == std::numeric_limits<std::int16_t>::max();
+        negativeClips += expectedSample == std::numeric_limits<std::int16_t>::min();
+    }
+    CHECK(positiveClips > 0);
+    CHECK(negativeClips > 0);
+    CHECK(actual.samples == 1024);
+    for (const auto& channel : actual.channels)
+        checkChannelOutput(channel, expected);
+}
+
+TEST_CASE("OPM output peak limits default off, reject invalid channels and survive reset")
+{
+    x68k::Opm opm;
+    for (x68k::u32 ch = 0; ch < x68k::Opm::kChannelCount; ++ch)
+        CHECK(opm.channelOutputPeakLimit(ch) == 0);
+    CHECK(opm.setChannelOutputPeakLimit(1, 18000));
+    CHECK(opm.setChannelOutputPeakLimit(7, std::numeric_limits<x68k::u32>::max()));
+    CHECK(opm.channelOutputPeakLimit(7) == x68k::Opm::kOutputPeakLimitMax);
+    CHECK_FALSE(opm.setChannelOutputPeakLimit(8, 18000));
+    CHECK_FALSE(opm.setChannelOutputPeakLimit(std::numeric_limits<x68k::u32>::max(), 18000));
+    CHECK(opm.channelOutputPeakLimit(8) == 0);
+    CHECK(opm.channelOutputPeakLimit(std::numeric_limits<x68k::u32>::max()) == 0);
+    opm.reset();
+    CHECK(opm.channelOutputPeakLimit(1) == 18000);
+    CHECK(opm.channelOutputPeakLimit(7) == x68k::Opm::kOutputPeakLimitMax);
+    CHECK(opm.isSilent());
+    CHECK(peakOver(opm, 64) == 0);
+    CHECK(opm.setChannelOutputPeakLimit(1, 0));
+    CHECK(opm.channelOutputPeakLimit(1) == 0);
+}
+
+TEST_CASE("OPM peak limiting changes only selected output peaks, not sound state or other channels")
+{
+    for (const std::int32_t limit : {1, 18000, 32767})
+    {
+        CAPTURE(limit);
+        x68k::Opm lead;
+        x68k::Opm accompaniment;
+        x68k::Opm measured;
+        for (auto* opm : {&lead, &measured})
+        {
+            setupLoudChannel(*opm, 1, 7);
+            writeReg(*opm, 0x21, 0xFF);
+            keyOn(*opm, 1);
+        }
+        for (auto* opm : {&accompaniment, &measured})
+        {
+            setupLoudChannel(*opm, 3, 4);
+            writeReg(*opm, 0x2B, 0x53);
+            for (x68k::u8 slot = 0; slot < 4; ++slot)
+                writeReg(*opm, static_cast<x68k::u8>(0x63 + slot * 8), 32);
+            keyOn(*opm, 3);
+        }
+        CHECK(measured.setChannelOutputGainQ8(1, 2048));
+        CHECK(measured.setChannelOutputPeakLimit(1, static_cast<x68k::u32>(limit)));
+        x68k::Opm::OutputStats actual{};
+        x68k::Opm::OutputStats::ChannelOutput expectedLead{};
+        x68k::Opm::OutputStats::ChannelOutput expectedOther{};
+        measured.setOutputStats(&actual);
+        unsigned positivePeaks = 0;
+        unsigned negativePeaks = 0;
+        unsigned untouched = 0;
+        for (unsigned frame = 0; frame < 2048; ++frame)
+        {
+            const std::int32_t input = lead.renderOneSample() * 8;
+            const std::int32_t other = accompaniment.renderOneSample();
+            const auto magnitude = std::abs(input);
+            const auto knee = limit * 7 / 8;
+            const bool peak = magnitude > knee;
+            const auto reduced = peak ? knee + (magnitude - knee) / 4 : magnitude;
+            const auto bounded = reduced > limit ? limit : reduced;
+            const std::int32_t expected = input < 0 ? -bounded : bounded;
+            CHECK(measured.renderOneSample() == saturatedSample(expected + other));
+            observeExpected(expectedLead, expected);
+            observeExpected(expectedOther, other);
+            positivePeaks += peak && input > 0;
+            negativePeaks += peak && input < 0;
+            untouched += !peak;
+            CHECK(std::abs(expected) <= limit);
+        }
+        CHECK(positivePeaks > 0);
+        CHECK(negativePeaks > 0);
+        const bool hasNonzeroPassThroughBand = limit * 7 / 8 > 0;
+        if (hasNonzeroPassThroughBand)
+            CHECK(untouched > 0);
+        checkChannelOutput(actual.channels[1], expectedLead);
+        checkChannelOutput(actual.channels[3], expectedOther);
+        CHECK(measured.channelOutputPeakLimit(3) == 0);
+        CHECK(measured.channelOutputGainQ8(3) == 256);
+        for (x68k::u32 slot = 0; slot < 4; ++slot)
+        {
+            CHECK(measured.envelopeLevel(1, slot) == lead.envelopeLevel(1, slot));
+            CHECK(measured.envelopePhase(1, slot) == lead.envelopePhase(1, slot));
+        }
+        CHECK(measured.setChannelOutputPeakLimit(1, 0));
+        for (unsigned frame = 0; frame < 512; ++frame)
+        {
+            const std::int32_t input = lead.renderOneSample() * 8;
+            const std::int32_t other = accompaniment.renderOneSample();
+            CHECK(measured.renderOneSample() == saturatedSample(input + other));
+        }
+    }
 }

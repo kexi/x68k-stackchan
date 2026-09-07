@@ -32,6 +32,17 @@
 namespace x68k
 {
 
+// 所有コアでのみ設定/呼出する。時刻と出力先を外から与え、coreをSDK非依存にする。
+struct DmaTransferMonitor
+{
+    void* context = nullptr;
+    std::int64_t (*nowUs)(void*) = nullptr;
+    void (*completed)(void*, u32 channel, u32 requested, u32 remaining,
+                      std::int64_t elapsedUs) = nullptr;
+};
+
+class DmaMemory;
+
 // DMAC が転送するデータの出どころ。SASI と FDC がこれを実装する。
 class DmaDevice
 {
@@ -42,6 +53,11 @@ public:
     virtual bool dmaRead(u8* value) = 0;
     // メモリからデバイスへ 1 バイト受け取る。
     virtual bool dmaWrite(u8 value) = 0;
+    // 0は未処理を表す。副作用を保てるデバイス/通常RAMの組だけが実装する。
+    virtual u32 tryReadToMemory(DmaMemory&, u32, u32)
+    {
+        return 0;
+    }
 
     // 転送が終わった (ターミナルカウントに達した、または打ち切られた)。
     //
@@ -64,6 +80,10 @@ public:
 
     virtual u8 dmaMemRead(u32 addr) = 0;
     virtual void dmaMemWrite(u32 addr, u8 value) = 0;
+    virtual bool tryDmaMemWriteBlock(u32, const u8*, u32)
+    {
+        return false;
+    }
 };
 
 class Dmac
@@ -109,6 +129,11 @@ public:
 
     void reset();
 
+    void setTransferMonitor(DmaTransferMonitor monitor)
+    {
+        monitor_ = monitor;
+    }
+
     // チャネルに繋ぐデバイスを指定する。
     //
     // Why not 単一のデバイスに戻すか: 以前は「デバイスは 1 つ」で、
@@ -145,6 +170,7 @@ private:
 
     std::array<DmaDevice*, kChannelCount> devices_{};
     DmaMemory* memory_ = nullptr;
+    DmaTransferMonitor monitor_{};
 };
 
 }  // namespace x68k

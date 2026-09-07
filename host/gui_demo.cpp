@@ -581,7 +581,7 @@ Result run(u16* pixels)
 
     // --- 合成 ------------------------------------------------------------
     GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0, 0,
-                             kScreenWidth, kScreenHeight, pixels, kScreenWidth);
+                             kScreenWidth, kScreenHeight, pixels, kScreenWidth, &machine.crtc());
 
     result.ok = true;
     return result;

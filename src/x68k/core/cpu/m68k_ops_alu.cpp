@@ -5,6 +5,7 @@
 
 #include "m68k.h"
 #include "m68k_alu.h"
+#include "standard_timing.h"
 
 namespace x68k
 {
@@ -80,7 +81,7 @@ u32 M68k::groupAdd(u16 op)
         const u32 value =
             size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(src))) : src;
         st_.a[reg] = (st_.a[reg] + value) & 0xFFFFFFFFu;
-        return 8;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 size = sizeFromOpmode(opmode);
@@ -158,7 +159,7 @@ u32 M68k::groupAdd(u16 op)
         const alu::Result r = alu::add(dst, st_.d[reg], size);
         st_.sr = applyFlags(st_.sr, r, true);
         writeEaToAddr(mode, rm, size, addr, r.value);
-        return 12;
+        return standardInstructionCycles(op, size);
     }
 
     // ADD <ea>,Dn
@@ -166,7 +167,7 @@ u32 M68k::groupAdd(u16 op)
     const alu::Result r = alu::add(st_.d[reg], src, size);
     st_.sr = applyFlags(st_.sr, r, true);
     writeEa(0, reg, size, r.value);
-    return 4;
+    return standardInstructionCycles(op, size);
 }
 
 // SUB / SUBA / SUBX (1001)
@@ -185,7 +186,7 @@ u32 M68k::groupSub(u16 op)
         const u32 value =
             size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(src))) : src;
         st_.a[reg] = (st_.a[reg] - value) & 0xFFFFFFFFu;
-        return 8;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 size = sizeFromOpmode(opmode);
@@ -255,14 +256,14 @@ u32 M68k::groupSub(u16 op)
         const alu::Result r = alu::sub(dst, st_.d[reg], size);
         st_.sr = applyFlags(st_.sr, r, true);
         writeEaToAddr(mode, rm, size, addr, r.value);
-        return 12;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 src = readEa(mode, rm, size);
     const alu::Result r = alu::sub(st_.d[reg], src, size);
     st_.sr = applyFlags(st_.sr, r, true);
     writeEa(0, reg, size, r.value);
-    return 4;
+    return standardInstructionCycles(op, size);
 }
 
 // CMP / CMPA / CMPM / EOR (1011)
@@ -282,7 +283,7 @@ u32 M68k::groupCmpEor(u16 op)
             size == kWord ? static_cast<u32>(static_cast<s32>(static_cast<s16>(src))) : src;
         const alu::Result r = alu::sub(st_.a[reg], value, kLong);
         st_.sr = applyFlags(st_.sr, r, false);
-        return 6;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 size = sizeFromOpmode(opmode);
@@ -293,7 +294,7 @@ u32 M68k::groupCmpEor(u16 op)
         const u32 src = readEa(mode, rm, size);
         const alu::Result r = alu::sub(st_.d[reg], src, size);
         st_.sr = applyFlags(st_.sr, r, false);
-        return 4;
+        return standardInstructionCycles(op, size);
     }
 
     if (mode == 1)
@@ -316,7 +317,7 @@ u32 M68k::groupCmpEor(u16 op)
     const u32 value = alu::truncate(dst ^ st_.d[reg], size);
     setLogicFlags(value, size);
     writeEaToAddr(mode, rm, size, addr, value);
-    return 8;
+    return standardInstructionCycles(op, size);
 }
 
 // ABCD / SBCD の共通処理。
@@ -445,14 +446,14 @@ u32 M68k::groupOrDiv(u16 op)
         const u32 value = alu::truncate(dst | st_.d[reg], size);
         setLogicFlags(value, size);
         writeEaToAddr(mode, rm, size, addr, value);
-        return 12;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 src = readEa(mode, rm, size);
     const u32 value = alu::truncate(st_.d[reg] | src, size);
     setLogicFlags(value, size);
     writeEa(0, reg, size, value);
-    return 4;
+    return standardInstructionCycles(op, size);
 }
 
 // AND / MULU / MULS / ABCD / EXG (1100)
@@ -532,14 +533,14 @@ u32 M68k::groupAndMul(u16 op)
         const u32 value = alu::truncate(dst & st_.d[reg], size);
         setLogicFlags(value, size);
         writeEaToAddr(mode, rm, size, addr, value);
-        return 12;
+        return standardInstructionCycles(op, size);
     }
 
     const u32 src = readEa(mode, rm, size);
     const u32 value = alu::truncate(st_.d[reg] & src, size);
     setLogicFlags(value, size);
     writeEa(0, reg, size, value);
-    return 4;
+    return standardInstructionCycles(op, size);
 }
 
 }  // namespace x68k

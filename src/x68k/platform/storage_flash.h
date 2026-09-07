@@ -53,9 +53,14 @@ public:
     bool readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCount) override;
     bool writeSector(x68k::u32 lba, const x68k::u8* buffer, x68k::u32 sectorCount) override;
     [[nodiscard]] bool isPresent() const override;
+    [[nodiscard]] std::int64_t readTimeUs() const
+    {
+        return readTimeUs_;
+    }
 
 private:
     bool present_ = false;
+    std::int64_t readTimeUs_ = 0;
 };
 
 }  // namespace x68k_platform

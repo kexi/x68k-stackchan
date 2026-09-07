@@ -6,6 +6,8 @@
 
 #include "m68k.h"
 #include "m68k_alu.h"
+#include "control_timing.h"
+#include "operand_timing.h"
 
 namespace x68k
 {
@@ -306,7 +308,7 @@ u32 M68k::groupMisc(u16 op)
             return 0;
         }
         st_.a[dstReg] = addr;
-        return 4;
+        return controlInstructionCycles(op);
     }
 
     // CHK <ea>,Dn : op = 0100 rrr 110 mmm rrr
@@ -348,7 +350,7 @@ u32 M68k::groupMisc(u16 op)
             return 0;
         }
         refillPrefetch(addr);
-        return 8;
+        return controlInstructionCycles(op);
     }
 
     if ((op & 0xFFC0u) == 0x4E80u)  // JSR
@@ -367,7 +369,7 @@ u32 M68k::groupMisc(u16 op)
         st_.a[7] = st_.a[7] - 4;
         write32(st_.a[7], returnAddr);
         refillPrefetch(addr);
-        return 16;
+        return controlInstructionCycles(op);
     }
 
     // PEA <ea> : 0100 1000 01 mmm rrr
@@ -380,7 +382,7 @@ u32 M68k::groupMisc(u16 op)
         }
         st_.a[7] = st_.a[7] - 4;
         write32(st_.a[7], addr);
-        return 12;
+        return controlInstructionCycles(op);
     }
 
     // MOVEM : 0100 1d00 1s mmm rrr
@@ -597,7 +599,7 @@ unary_ops:
                 }
                 st_.sr = sr;
                 writeEaToAddr(mode, reg, size, addr, second.value);
-                return 8;
+                return unaryInstructionCycles(op, size);
             }
 
             case 0x2:  // CLR: 0 を書く。読み出しは行われる (RMW)
@@ -608,7 +610,7 @@ unary_ops:
                 st_.sr = static_cast<u16>(
                     (st_.sr & ~(sr_bit::kNegative | sr_bit::kOverflow | sr_bit::kCarry)) |
                     sr_bit::kZero);
-                return 6;
+                return unaryInstructionCycles(op, size);
             }
 
             case 0x4:  // NEG
@@ -637,7 +639,7 @@ unary_ops:
                 }
                 st_.sr = sr;
                 writeEaToAddr(mode, reg, size, addr, r.value);
-                return 6;
+                return unaryInstructionCycles(op, size);
             }
 
             case 0x6:  // NOT
@@ -647,14 +649,14 @@ unary_ops:
                 const u32 value = alu::truncate(~dst, size);
                 setLogicFlags(value, size);
                 writeEaToAddr(mode, reg, size, addr, value);
-                return 6;
+                return unaryInstructionCycles(op, size);
             }
 
             case 0xA:  // TST
             {
                 const u32 value = readEa(mode, reg, size);
                 setLogicFlags(value, size);
-                return 4;
+                return unaryInstructionCycles(op, size);
             }
 
             default:

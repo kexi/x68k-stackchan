@@ -413,7 +413,8 @@ int main(int argc, char** argv)
         machine.run(x68k::Crtc::kCyclesPerFrame);
 
         x68k::Compositor::render(graphicVram.data(), textVram.data(), &machine.sprite(),
-                                 machine.video(), 0, 0, viewW, viewH, pixels.data(), viewW);
+                                 machine.video(), 0, 0, viewW, viewH, pixels.data(), viewW,
+                                 &machine.crtc());
 
         SDL_UpdateTexture(texture, nullptr, pixels.data(),
                           static_cast<int>(viewW) * static_cast<int>(sizeof(x68k::u16)));

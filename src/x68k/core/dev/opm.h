@@ -57,19 +57,53 @@ public:
     static constexpr u32 kChannelCount = 8;
     static constexpr u32 kOperatorsPerChannel = 4;
     static constexpr u32 kRegCount = 256;
+    static constexpr u32 kOutputGainUnityQ8 = 256;
+    static constexpr u32 kOutputGainMaxQ8 = 2048;
+    static constexpr u32 kOutputPeakLimitMax = 32767;
 
     // 既定の合成レート。
     //
     // 実チップの内部スロットレートは φM(3.579545MHz)/64 = 55.9kHz。
-    // ESP32-S3 で 8ch × 4op を 55.9kHz で回すのは重すぎるので、既定は
-    // 15625Hz にする。これは X68000 の実機で ADPCM が使う 15.625kHz と
-    // 同じで、両者を混ぜるときにリサンプルが要らない。
+    // ESP32-S3 で 8ch × 4op を 55.9kHz で回すのは重すぎるので落とすが、
+    // 15625Hz では足りない。
+    //
+    // Why not 15625Hz (ADPCM と同じ値):
+    // ナイキストが 7812Hz しかなく、ゲームの主旋律 (約1568Hz, KC=96) では
+    // **第4倍音までしか収まらない**。第5倍音以降は折り返して基音と無関係な
+    // 位置に現れる。FM の変調を深くするほど高次倍音が増えるので、深くする
+    // ほど非調和な成分が増えて濁る。実機で「FM音源に聞こえない、PSGに
+    // 聞こえる」と言われた原因がこれだった。
+    //
+    // 同じ patch で測ると (KC=96、基音1568Hz):
+    //   15625Hz : 2nd=123%  3rd= 71%  4th=11%  5th= 3.7%
+    //   31250Hz : 2nd=158%  3rd=141%  4th=30%  5th= 7.7%
+    // 金管の「輝き」は高次倍音なので、レートが足りないと原理的に出せない。
+    //
+    // 31250Hz でも足りなかった。1568Hz を 31250Hz で鳴らすと 1 周期あたり
+    // **約20点**しか無く、波形が階段状のまま残る。実際に同じ patch を
+    // 15625/31250/55930Hz で鳴らして聴き比べ、一番高いレートが明らかに
+    // 良いと確認した。倍音が収まるかどうかだけでなく、1 周期を何点で
+    // 描けるかが効く。
+    //
+    //   15625Hz : 10.0 点/周期
+    //   31250Hz : 19.9 点/周期
+    //   62500Hz : 39.9 点/周期  <- これを採る
+    //
+    // 62500Hz は 160 cycles/sample で、ゲスト 10MHz との積 (10^7) を割り切る。
+    // 実チップの内部レート 55930Hz より高いが、割り切れる値の方が
+    // ゲスト時間とのずれが出ない。
+    //
+    // 合成コストはホスト実測で 15625Hz の約1.36倍 (3ch・1秒ぶんで
+    // 4.37ms -> 5.95ms)。レートは4倍だが1サンプルあたりの仕事が減るので
+    // 比例はしない。50000Hz より速いのは 10^7 を割り切れるため。
+    //
+    // ADPCM は実機どおり 15.625kHz のまま。4:1 の整数比なので変換は単純。
     //
     // Why not 実チップと同じ 55.9kHz にするか: エンベロープの進み方は
     // 「1 サンプルあたり何ステップ」で決まる。レートを変えてもエンベロープ
     // 時間が変わらないよう、レート比を EG の歩進に掛けて補正する
     // (envelopeStepScale_)。これで実時間としての ADSR は保たれる。
-    static constexpr u32 kDefaultSampleRate = 15625;
+    static constexpr u32 kDefaultSampleRate = 62500;
 
     // 実チップの内部レート。エンベロープと位相の基準。
     static constexpr u32 kChipRate = 55930;
@@ -85,6 +119,17 @@ public:
     {
         return sampleRate_;
     }
+
+    // レジスタ音色を変えずにホスト側だけで調整するため、reset 後も保持する。
+    // 所有コアだけで設定/読取する。無効 ch は変更せず false、gain は上限で止める。
+    bool setChannelOutputGainQ8(u32 channel, u32 gain);
+    // 無効 ch の参照を末尾へ折り返さない。既定の unity を返す。
+    [[nodiscard]] u32 channelOutputGainQ8(u32 channel) const;
+
+    // 増幅後のピークだけを抑えるホスト設定。0 は無効、reset 後も保持する。
+    // ゲストの音色を一律変更しないため、既定は全 ch 無効。
+    bool setChannelOutputPeakLimit(u32 channel, u32 limit);
+    [[nodiscard]] u32 channelOutputPeakLimit(u32 channel) const;
 
     // --- CPU から見える口 ($E90001 / $E90003) ---
 
@@ -149,7 +194,25 @@ public:
     // ch がキーオンされているか (どれかのスロットが on)。
     [[nodiscard]] bool isKeyOn(u32 channel) const;
 
+    struct OutputStats
+    {
+        struct ChannelOutput
+        {
+            u32 peak = 0;
+            u32 nonzero = 0;
+            std::uint64_t squares = 0;
+        };
+        u32 samples = 0;
+        std::array<ChannelOutput, kChannelCount> channels{};
+    };
+    // 所有コアだけで設定/読取する。再合成して測ると音源時間を二重に進めてしまう。
+    void setOutputStats(OutputStats* stats)
+    {
+        outputStats_ = stats;
+    }
+
 private:
+    OutputStats* outputStats_ = nullptr;
     struct Operator
     {
         // --- レジスタから写した値 ---
@@ -212,6 +275,8 @@ private:
     static constexpr u32 kEnvelopeShift = 4;
 
     std::array<Channel, kChannelCount> channels_{};
+    std::array<u32, kChannelCount> channelOutputGainsQ8_{};
+    std::array<u32, kChannelCount> channelOutputPeakLimits_{};
     std::array<u8, kRegCount> regs_{};
     u8 address_ = 0;
 

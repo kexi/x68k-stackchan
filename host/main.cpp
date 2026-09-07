@@ -20,6 +20,7 @@
 
 #include "io/ascii_keymap.h"
 #include "gui_demo.h"
+#include "run_deadline.h"
 #include "machine.h"
 
 #if X68K_COUNT_JIT_COVERAGE
@@ -530,6 +531,7 @@ void printUsage()
         "  --no-fast-tick  毎命令通る経路の最適化を切って走らせる\n"
         "                  付けた側と付けない側で最終状態が一致するはず\n"
         "  --event-driven  次にデバイスの状態が変わる時点まで飛ばす\n"
+        "  --gpip-poll     GPIP待機の完全周回をまとめる (event-driven専用・実験用)\n"
         "                  (docs/knowledge/event-driven-implementation.md)\n"
         "                  付けた側と付けない側で最終状態が一致するはず\n"
         "  --shadow-verify 期限を計算するが飛ばさず、予測と実際を突き合わせる\n"
@@ -717,6 +719,7 @@ int main(int argc, char** argv)
     bool showStats = false;
     bool noFastTick = false;
     bool eventDriven = false;
+    bool gpipPoll = false;
     bool shadowVerify = false;
 
     for (int i = 1; i < argc; ++i)
@@ -831,6 +834,10 @@ int main(int argc, char** argv)
         else if (arg == "--event-driven")
         {
             eventDriven = true;
+        }
+        else if (arg == "--gpip-poll")
+        {
+            gpipPoll = true;
         }
         // 段 1 の shadow 検証。飛ばさずに期限の予測だけを突き合わせる。
         else if (arg == "--shadow-verify")
@@ -1079,10 +1086,17 @@ int main(int argc, char** argv)
     // キーは「次に打つサイクル」までで run() を刻めば送れる。
     const bool canUseFastRun = !trace && !hasTraceFrom && traceLast == 0 && !showStats &&
                                mouseScript.empty() && watchAddr == 0;
+    const bool enablePoll = gpipPoll && eventDriven && !shadowVerify && canUseFastRun;
+    machine.setGpipPollAcceleration(enablePoll);
     if (canUseFastRun)
     {
         while (spent < cycleLimit)
         {
+            while (inputIndex < inputScript.size() && spent >= inputScript[inputIndex].cycle)
+            {
+                machine.pressKey(inputScript[inputIndex].code);
+                ++inputIndex;
+            }
             // 1 回の run() で回す量。大きすぎると停止の検出が遅れる。
             constexpr x68k::u32 kFastRunChunk = 100000;
             x68k::u64 limit = std::min<x68k::u64>(kFastRunChunk, cycleLimit - spent);
@@ -1092,6 +1106,11 @@ int main(int argc, char** argv)
             if (hasMoreKeys && nextKeyCycle > spent)
             {
                 limit = std::min<x68k::u64>(limit, nextKeyCycle - spent);
+            }
+            const bool hasInputEvent = inputIndex < inputScript.size();
+            if (hasInputEvent)
+            {
+                limit = x68k_host::limitRunToEvent(limit, spent, inputScript[inputIndex].cycle);
             }
             const x68k::u32 chunk = static_cast<x68k::u32>(limit > 0 ? limit : 1);
             const x68k::u32 used = machine.run(chunk);
@@ -1285,6 +1304,8 @@ int main(int argc, char** argv)
     {
         stats.dump();
     }
+    std::printf("[gpip-poll] enabled=%d skipped_cycles=%llu\n", enablePoll ? 1 : 0,
+                static_cast<unsigned long long>(machine.gpipPollSkippedCycles()));
 
     // SRAM と MFP の状態は --stats 無しでも出す。
     // run() 経路と step() 経路が同じ結果になることを確かめるのに使う
@@ -1515,7 +1536,8 @@ int main(int argc, char** argv)
         else
         {
             x68k::Compositor::render(graphicVram.data(), textVram.data(), &machine.sprite(),
-                                     machine.video(), 0, 0, kWidth, kHeight, pixels.data(), kWidth);
+                                     machine.video(), 0, 0, kWidth, kHeight, pixels.data(), kWidth,
+                                     &machine.crtc());
         }
 
         if (writePpm(ppmPath, pixels.data(), kWidth, kHeight))

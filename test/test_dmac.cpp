@@ -143,6 +143,89 @@ struct DmacFixture
 
 }  // namespace
 
+TEST_CASE("DMA monitor measures complete and short transfers after register completion")
+{
+    DmacFixture f;
+    struct Trace
+    {
+        DmacFixture* fixture;
+        std::int64_t now = 100;
+        unsigned clockReads = 0;
+        unsigned completions = 0;
+        x68k::u32 requested = 0;
+        x68k::u32 remaining = 0;
+        std::int64_t elapsed = 0;
+    } trace{&f};
+    f.dmac.setTransferMonitor({&trace,
+                               [](void* context) -> std::int64_t
+                               {
+                                   auto& t = *static_cast<Trace*>(context);
+                                   ++t.clockReads;
+                                   const auto value = t.now;
+                                   t.now += 17;
+                                   return value;
+                               },
+                               [](void* context, x68k::u32 channel, x68k::u32 requested,
+                                  x68k::u32 remaining, std::int64_t elapsed)
+                               {
+                                   auto& t = *static_cast<Trace*>(context);
+                                   ++t.completions;
+                                   t.requested = requested;
+                                   t.remaining = remaining;
+                                   t.elapsed = elapsed;
+                                   CHECK(channel == x68k::Dmac::kSasiChannel);
+                                   CHECK(t.fixture->count() == remaining);
+                                   CHECK((t.fixture->csr() & x68k::Dmac::kCsrChannelActive) == 0);
+                               }});
+    f.device.readable = {1, 2, 3};
+    f.setAddress(0x100);
+    f.setCount(2);
+    f.startToMemory();
+    CHECK(trace.clockReads == 2);
+    CHECK(trace.completions == 1);
+    CHECK(trace.requested == 2);
+    CHECK(trace.remaining == 0);
+    CHECK(trace.elapsed == 17);
+    CHECK(f.memory.bytes[0x100] == 1);
+    CHECK(f.memory.bytes[0x101] == 2);
+
+    f.dmac.reset();
+    f.setAddress(0x200);
+    f.setCount(4);
+    f.startToMemory();
+    CHECK(trace.clockReads == 4);
+    CHECK(trace.completions == 2);
+    CHECK(trace.requested == 4);
+    CHECK(trace.remaining == 3);
+    CHECK(trace.elapsed == 17);
+    CHECK(f.memory.bytes[0x200] == 3);
+    CHECK((f.csr() & x68k::Dmac::kCsrError) != 0);
+}
+
+TEST_CASE("incomplete or detached DMA monitor never calls a partial hook")
+{
+    DmacFixture f;
+    unsigned calls = 0;
+    f.dmac.setTransferMonitor({&calls,
+                               [](void* context) -> std::int64_t
+                               {
+                                   ++*static_cast<unsigned*>(context);
+                                   return 0;
+                               },
+                               nullptr});
+    f.setCount(1);
+    f.startToMemory();
+    CHECK(calls == 0);
+    f.dmac.setTransferMonitor({&calls, nullptr,
+                               [](void* context, x68k::u32, x68k::u32, x68k::u32, std::int64_t)
+                               { ++*static_cast<unsigned*>(context); }});
+    f.startToMemory();
+    CHECK(calls == 0);
+    f.dmac.setTransferMonitor({});
+    f.startToMemory();
+    CHECK(calls == 0);
+}
+
 TEST_CASE("デバイスからメモリへ指定バイト数だけ転送する")
 {
     // 保証すること: 転送量が MTC の値ちょうどであること。
@@ -389,10 +472,36 @@ TEST_CASE("SASI からメモリへの転送で SASI がステータスフェー�
     } disk;
     m.setDisk(&disk);
 
+    x68k::u32 requestedBytes = 256;
+    x68k::u32 diskBytes = 256;
+    unsigned watchHits = 0;
+    bool watches = false;
+    SUBCASE("bulk completion") {}
+    SUBCASE("watch callback fallback")
+    {
+        watches = true;
+        m.bus().setWriteWatch(
+            0x10000, [](x68k::u32, x68k::u32, void* user) { ++*static_cast<unsigned*>(user); },
+            &watchHits);
+    }
+    SUBCASE("partial request retains SASI data phase")
+    {
+        requestedBytes = 128;
+    }
+    SUBCASE("device exhaustion leaves DMA remainder")
+    {
+        requestedBytes = 512;
+    }
+    SUBCASE("zero MTC transfers 65536 bytes")
+    {
+        requestedBytes = diskBytes = 65536;
+    }
+
     // READ コマンドを送る。
     m.ioWrite8(x68k::kSasiBase + 7, 0x01);
     m.ioRead8(x68k::kSasiBase + 3);
-    const x68k::u8 command[6] = {0x08, 0x00, 0x00, 0x05, 0x01, 0x00};
+    const x68k::u8 command[6] = {0x08, 0x00, 0x00, 0x05, static_cast<x68k::u8>(diskBytes / 256),
+                                 0x00};
     for (const x68k::u8 b : command)
     {
         m.ioWrite8(x68k::kSasiBase + 1, b);
@@ -406,17 +515,26 @@ TEST_CASE("SASI からメモリへの転送で SASI がステータスフェー�
     m.ioWrite8(kCh1Io + x68k::Dmac::kRegMar + 1, static_cast<x68k::u8>(kDest >> 16));
     m.ioWrite8(kCh1Io + x68k::Dmac::kRegMar + 2, static_cast<x68k::u8>(kDest >> 8));
     m.ioWrite8(kCh1Io + x68k::Dmac::kRegMar + 3, static_cast<x68k::u8>(kDest));
-    m.ioWrite8(kCh1Io + x68k::Dmac::kRegMtc + 0, 0x01);
-    m.ioWrite8(kCh1Io + x68k::Dmac::kRegMtc + 1, 0x00);
+    m.ioWrite8(kCh1Io + x68k::Dmac::kRegMtc + 0, static_cast<x68k::u8>(requestedBytes >> 8));
+    m.ioWrite8(kCh1Io + x68k::Dmac::kRegMtc + 1, static_cast<x68k::u8>(requestedBytes));
     m.ioWrite8(kCh1Io + x68k::Dmac::kRegCcr, x68k::Dmac::kCcrStart);
 
     // セクタ 5 の中身が届いている。
     CHECK(m.bus().read8(kDest) == 0x05);
-    CHECK(m.bus().read8(kDest + 255) == 0x05);
+    const x68k::u32 transferred = std::min(requestedBytes, diskBytes);
+    CHECK(m.bus().read8(kDest + transferred - 1) == 0x05);
     // 転送量ちょうどで止まる。
-    CHECK(m.bus().read8(kDest + 256) == 0x00);
+    CHECK(m.bus().read8(kDest + transferred) == 0x00);
     // SASI 側もステータスフェーズへ進む。
-    CHECK(m.ioRead8(x68k::kSasiBase + 3) == 0x0F);
+    CHECK(m.ioRead8(x68k::kSasiBase + 3) == (transferred == diskBytes ? 0x0F : 0x07));
+    CHECK(watchHits == (watches ? 1 : 0));
+    const auto csr = m.ioRead8(kCh1Io + x68k::Dmac::kRegCsr);
+    const bool hasError = (csr & x68k::Dmac::kCsrError) != 0;
+    CHECK(hasError == (requestedBytes > diskBytes));
+    const x68k::u32 remainder =
+        (static_cast<x68k::u32>(m.ioRead8(kCh1Io + x68k::Dmac::kRegMtc)) << 8) |
+        m.ioRead8(kCh1Io + x68k::Dmac::kRegMtc + 1);
+    CHECK(remainder == requestedBytes - transferred);
 }
 
 // --- 転送が完走しなかったときの扱い -------------------------------------------

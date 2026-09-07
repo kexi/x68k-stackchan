@@ -321,9 +321,6 @@ bool specSafeAlu(x68k::u16 op)
         {
             return false;
         }
-        // Dn / An 直接に加えて即値 (mode 7.4) を受ける。src が翻訳時定数に
-        // なるだけで、メモリを読まないので読みガードが要らない。
-        // メモリ形と PC 相対はどちらも読みガードを背負うので入れない。
         return mode == 0 || mode == 1 || (mode == 7 && reg == 4);
     }
 
@@ -377,10 +374,15 @@ bool specSafeBranch(x68k::u16 op)
 //                        読むだけで書き戻さない (bit6-7 == 0)
 //   opType == 6          CMPI。結果を書かずフラグだけ
 //   opType 1/2/3         ANDI/SUBI/ADDI。**対象が Dn なら書き戻し先は
-//                        レジスタ**なのでメモリの読みガードが要らない
-//   opType == 0          ORI。**入れない。** opcode 0x0000 がそれ自身なので、
-//                        ゼロで埋まった領域が全部この命令として読める
-//   opType == 5          EORI。**入れない。** エミッタが kEor を扱わない
+//                        レジスタ**なのでメモリの読みガードが要らない。
+//                        エミッタは emitAluBody が kAnd/kSub/kAdd を
+//                        既に扱い、CMP 以外は d[] へ書き戻す
+//   opType == 0          ORI。**入れない。** opcode 0x0000 がちょうど
+//                        ORI.B #imm,D0 になるので、ゼロで埋まった領域が
+//                        全部この命令として読める。未初期化 RAM へ
+//                        ブロックが伸びる形を作らない
+//   opType == 5          EORI。**入れない。** emitAluBody が kEor で
+//                        e.failed を立てる
 //
 // どちらも **対象は Dn (mode 0) だけ**。メモリ対象は読みガードを背負う。
 bool specSafeImmediate(x68k::u16 op)
@@ -409,9 +411,7 @@ bool specSafeImmediate(x68k::u16 op)
         return ((op >> 6) & 3u) == 0;
     }
 
-    // ANDI(1) / SUBI(2) / ADDI(3) / CMPI(6)。
-    // ORI(0) は opcode 0x0000 がそれ自身なのでゼロ領域を命令として読ませない
-    // ために除く。EORI(5) はエミッタが kEor を扱わないので除く。
+    // ANDI(1) / SUBI(2) / ADDI(3) / CMPI(6)。ORI(0) と EORI(5) は上記の理由で除く。
     const bool isAllowedAlu = opType == 1 || opType == 2 || opType == 3 || opType == 6;
     if (!isAllowedAlu)
     {
@@ -656,7 +656,7 @@ TEST_SUITE("BlockPlanner")
     // 落ちる変異:
     //   - Bcc.w の不成立側を 8 にする (12 が要る)
     //   - 成立側を「不成立 + 2」で導く (Bcc.w で 4 ずれる)
-    //   - MOVE / MOVEQ / ALU の cycles を 4 以外にする
+    //   - MOVEのEA/幅別時間を通常実行と異なる値にする
     TEST_CASE("計画のサイクル数が実行と一致する")
     {
         std::size_t checked = 0;

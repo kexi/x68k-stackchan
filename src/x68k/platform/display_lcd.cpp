@@ -104,7 +104,7 @@ void DisplayLcd::renderPlanes(x68k::Machine& machine, const x68k::u8* textVram, 
     {
         // 奥から順に重ねる。優先順位と透明の扱いは Compositor が持つ。
         x68k::Compositor::render(graphicVram_, textVram, &machine.sprite(), machine.video(), viewX_,
-                                 viewY_, srcWidth, srcHeight, out, kScreenWidth);
+                                 viewY_, srcWidth, srcHeight, out, kScreenWidth, &machine.crtc());
         return;
     }
 
@@ -161,6 +161,7 @@ void DisplayLcd::renderZoomed(x68k::Machine& machine, const x68k::u8* textVram, 
 
 bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k::u16* out)
 {
+    lastRenderedTiles_ = 0;
     if (textVram == nullptr || out == nullptr)
     {
         return false;
@@ -183,6 +184,31 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
     // 表示許可が切り替わった瞬間も描き直す。合成をやめたフレームは
     // ダーティが立たないままグラフィックの残骸が画面に残るため。
     const bool didModeChange = isCompositing != wasComposited_;
+
+    const bool knownBuffer = out == buffers_[0] || out == buffers_[1];
+    const bool canTile = tiled_ != nullptr && zoom_ == 1 && isCompositing && knownBuffer;
+    if (canTile)
+    {
+        tiled_->setViewport(viewX_, viewY_);
+        const bool invalidate = forceFullRedraw_ || didModeChange;
+        if (invalidate)
+        {
+            tiled_->invalidateAll();
+        }
+        lastRenderedTiles_ =
+            tiled_->render(graphicVram_, textVram, &machine.sprite(), machine.video(), out,
+                           out == buffers_[0] ? 0u : 1u, &machine.crtc());
+        bus.clearTextDirty();
+        forceFullRedraw_ = false;
+        wasComposited_ = isCompositing;
+        return lastRenderedTiles_ != 0;
+    }
+    const bool hasTiledRenderer = tiled_ != nullptr;
+    if (hasTiledRenderer)
+    {
+        // 拡大/コンソール経路がbufferを書き換えるため、復帰時は世代を再構築する。
+        tiled_->invalidateAll();
+    }
 
     // 変化が無ければ作り直さない。プロンプトが点滅しているだけなら
     // ここで抜けるので、Core1 の時間をエミュレーションに回せる。
@@ -214,6 +240,7 @@ bool DisplayLcd::renderTo(x68k::Machine& machine, const x68k::u8* textVram, x68k
 
     bus.clearTextDirty();
     forceFullRedraw_ = false;
+    lastRenderedTiles_ = 300;
     return true;
 }
 

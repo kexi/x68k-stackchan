@@ -91,6 +91,49 @@ std::vector<x68k::u16> makeOut()
 
 TEST_SUITE("compositor")
 {
+    TEST_CASE("MODE3 G0 scrollはgraphicsだけを動かしtextとsprite位置を保持する")
+    {
+        auto video = makeVideo();
+        auto sprite = makeSprite();
+        x68k::Crtc crtc;
+        video.write(0x400, 3);
+        video.write(0x500, 0x0200);  // textがgraphicより前
+        video.write(0x600, 0x7F);
+        fillPattern16(sprite, 0, 2);
+        placeSprite(sprite, 0, 8, 12, 1);
+        std::vector<x68k::u8> graphic(0x80000), text(0x80000);
+        for (x68k::u32 y = 0; y < 512; ++y)
+            for (x68k::u32 x = 0; x < 512; ++x)
+            {
+                const auto word = static_cast<x68k::u16>(((x * 31u + y * 173u) & 0xFFFEu) | 1u);
+                graphic[(y * 512u + x) * 2u] = static_cast<x68k::u8>(word >> 8);
+                graphic[(y * 512u + x) * 2u + 1u] = static_cast<x68k::u8>(word);
+            }
+        text[2 * 128] = 0x80;  // text index1 at(0,2)
+        for (const x68k::u16 scroll : std::initializer_list<x68k::u16>{0, 1, 256, 511})
+        {
+            crtc.write(12, scroll);
+            crtc.write(13, scroll);
+            auto out = makeOut();
+            Compositor::render(graphic.data(), text.data(), &sprite, video, 0, 0, kOutW, kOutH,
+                               out.data(), kOutW, &crtc);
+            for (x68k::u32 y = 0; y < kOutH; ++y)
+                for (x68k::u32 x = 0; x < kOutW; ++x)
+                {
+                    const auto px = (x + scroll) & 511u;
+                    const auto py = (y + scroll) & 511u;
+                    const auto word =
+                        static_cast<x68k::u16>(((px * 31u + py * 173u) & 0xFFFEu) | 1u);
+                    auto expected = VideoController::toRgb565(word);
+                    if (const bool onText = x == 0 && y == 2; onText)
+                        expected = VideoController::toRgb565(video.textPalette(1));
+                    if (const bool onSprite = x >= 8 && x < 24 && y >= 12 && y < 28; onSprite)
+                        expected = VideoController::toRgb565(video.textPalette(2));
+                    CHECK(at(out, x, y) == expected);
+                }
+        }
+    }
+
     TEST_CASE("スプライトが合成の結果に現れる")
     {
         // これがこのファイルの主題。個々のラスタライザではなく、

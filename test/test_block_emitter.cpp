@@ -7626,6 +7626,43 @@ TEST_CASE("諦めた回数は理由別カウンタの合計と常に一致する
 
 // --- T2: 満杯からの回復 (生存性) --------------------------------------------
 
+TEST_CASE("capacity sampling distinguishes recognized opcodes without executing them")
+{
+    using namespace runner_accounting;
+    Harness h;
+    REQUIRE(h.code.allocate(h.code.capacity()) != nullptr);
+    REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+    const auto samplePeriod = x68k::jit::BlockRunner::kCapacitySamplePeriod;
+    for (std::uint64_t i = 0; i < samplePeriod; ++i)
+    {
+        REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+    }
+    CHECK(h.stats().capacitySamples == 0);
+    h.runner.setCapacitySampling(true);
+    for (std::uint64_t i = 0; i < samplePeriod; ++i)
+    {
+        REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+    }
+    CHECK(h.stats().capacitySamples == 1);
+    CHECK(h.stats().capacityRecognized == 1);
+    CHECK(h.stats().capacityOpcodeGroups[7] == 1);
+    h.ram[kEntry] = 0x4e;
+    h.ram[kEntry + 1] = 0x40;  // TRAP #0 cannot be emitted.
+    for (std::uint64_t i = 0; i < samplePeriod; ++i)
+    {
+        REQUIRE(h.runAt(kEntry).exit == x68k::NativeExit::kDeferToStep);
+    }
+    CHECK(h.stats().capacitySamples == 2);
+    CHECK(h.stats().capacityRecognized == 1);
+    CHECK(h.stats().capacityOpcodeGroups[4] == 1);
+    CHECK(h.cpu().state().pc == kEntry + 4);
+    CHECK(h.cpu().state().ir == 0x4e40);
+    CHECK(h.code.used() == h.code.capacity());
+    CHECK(h.stats().capacityReset == 0);
+    CHECK(h.stats().blocksRun == 0);
+    checkDeferAccounting(h.stats(), "capacity sampling");
+}
+
 TEST_CASE("コード領域が満杯になっても有限回で翻訳器が回復する")
 {
     // **これは「正しさ」ではなく「生存性」のテストである。**

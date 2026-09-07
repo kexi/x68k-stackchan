@@ -133,6 +133,55 @@ x68k::u16 at(const std::vector<x68k::u16>& out, x68k::u32 x, x68k::u32 y)
 
 // --- PCG のパターン解釈 ------------------------------------------------------
 
+TEST_CASE("incremental visible count agrees with a full scan after arbitrary register writes")
+{
+    Sprite sprite;
+    sprite.reset();
+    x68k::u32 random = 0x13579bdfu;
+    for (unsigned i = 0; i < 10000; ++i)
+    {
+        random = random * 1664525u + 1013904223u;
+        const auto offset = (random >> 8) % 0x900u;
+        const auto value = static_cast<x68k::u16>(random >> 16);
+        sprite.write(offset, value);
+        x68k::u32 expected = 0;
+        for (x68k::u32 index = 0; index < Sprite::kSpriteCount; ++index)
+        {
+            expected += (sprite.read(index * 8u + 6u) & 3u) != 0 ? 1u : 0u;
+        }
+        CHECK(sprite.visibleSpriteCount() == expected);
+        CHECK(sprite.anySpriteVisible() == (expected != 0));
+    }
+    sprite.reset();
+    CHECK(sprite.visibleSpriteCount() == 0);
+}
+
+TEST_CASE("byte read-modify-write and all priority words preserve the visible count")
+{
+    x68k::Machine machine;
+    machine.reset();
+    auto& bus = machine.bus();
+    auto& sprite = machine.sprite();
+    for (x68k::u32 value = 0; value < 65536; ++value)
+    {
+        bus.write16(x68k::kSpriteRegBase + 6u, static_cast<x68k::u16>(value));
+        CHECK(sprite.visibleSpriteCount() == ((value & 3u) != 0 ? 1u : 0u));
+    }
+    bus.write8(x68k::kSpriteRegBase + 6u, 0x12);
+    CHECK(sprite.visibleSpriteCount() == 1);
+    bus.write8(x68k::kSpriteRegBase + 7u, 0);
+    CHECK(sprite.visibleSpriteCount() == 0);
+    for (x68k::u32 index = 0; index < Sprite::kSpriteCount; ++index)
+    {
+        bus.write16(x68k::kSpriteRegBase + index * 8u + 6u, 3);
+        bus.write16(x68k::kSpriteRegBase + index * 8u + 6u, 3);
+        CHECK(sprite.visibleSpriteCount() == index + 1);
+    }
+    CHECK(sprite.visibleSpriteCount() == Sprite::kSpriteCount);
+    machine.reset();
+    CHECK(sprite.visibleSpriteCount() == 0);
+}
+
 TEST_CASE("8x8 PCG は 1 行 4 バイト、上位ニブルが左のドットになる")
 {
     Sprite sprite;
@@ -727,6 +776,57 @@ TEST_CASE("BG はネームテーブルの指すパターンをセルに並べる
     CHECK(at(out, 31, 47) == expected);
     CHECK(at(out, 15, 32) == 0);
     CHECK(at(out, 16, 31) == 0);
+}
+
+TEST_CASE("BG row cache matches pixel reference across flips, quadrants, wraps and strides")
+{
+    Sprite sprite = makeSprite();
+    VideoController video = makeVideo();
+    sprite.write(0x808, 0x0201);
+    sprite.write(0x800, 5);
+    sprite.write(0x802, 9);
+    x68k::u32 random = 0x81234567;
+    for (x68k::u32 i = 0; i < Sprite::kVramSize; ++i)
+    {
+        random = random * 1664525u + 1013904223u;
+        sprite.vramWrite8(i, static_cast<x68k::u8>(random >> 24));
+    }
+    constexpr x68k::u32 width = 37;
+    constexpr x68k::u32 height = 19;
+    constexpr x68k::u32 stride = 41;
+    for (const x68k::u32 srcX : {0u, 1u, 7u, 8u, 15u, 16u, 1007u, 1023u})
+    {
+        for (const x68k::u32 srcY : {0u, 7u, 8u, 15u, 1023u})
+        {
+            std::vector<x68k::u16> actual(stride * height, 0xBEEF);
+            auto expected = actual;
+            SpriteRaster::renderBg(sprite, video, 0, srcX, srcY, width, height, actual.data(),
+                                   stride);
+            for (x68k::u32 y = 0; y < height; ++y)
+            {
+                for (x68k::u32 x = 0; x < width; ++x)
+                {
+                    const x68k::u32 bx = (srcX + x + sprite.bgScrollX(0)) & 1023u;
+                    const x68k::u32 by = (srcY + y + sprite.bgScrollY(0)) & 1023u;
+                    const x68k::u32 offset =
+                        Sprite::kBg0NameOffset + ((by / 16) * 64 + bx / 16) * 2;
+                    const x68k::u16 name = static_cast<x68k::u16>(
+                        (static_cast<x68k::u16>(sprite.vramRead8(offset)) << 8) |
+                        sprite.vramRead8(offset + 1));
+                    const auto px = (name & 0x4000u) != 0 ? 15u - (bx & 15u) : bx & 15u;
+                    const auto py = (name & 0x8000u) != 0 ? 15u - (by & 15u) : by & 15u;
+                    const auto index = SpriteRaster::pcgPixel(sprite.vram(), name & 255u, px, py);
+                    const bool isOpaque = index != 0;
+                    if (isOpaque)
+                    {
+                        expected[y * stride + x] =
+                            VideoController::toRgb565(video.textPalette(index));
+                    }
+                }
+            }
+            CHECK(actual == expected);
+        }
+    }
 }
 
 TEST_CASE("BG のスクロールはセルの位置をずらす")

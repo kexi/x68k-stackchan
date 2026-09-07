@@ -37,6 +37,11 @@ namespace x68k_platform
 class FrameChannel
 {
 public:
+    FrameChannel() = default;
+    ~FrameChannel();
+    FrameChannel(const FrameChannel&) = delete;
+    FrameChannel& operator=(const FrameChannel&) = delete;
+
     // バッファ 2 枚を受け取る。実体の確保は呼び出し側の責務
     // (PSRAM の断片化を避けるため起動直後に一括確保したい)。
     // 各バッファは width * height 個の u16 が要る。
@@ -49,6 +54,10 @@ public:
     {
         return writeBuffer_;
     }
+
+    // 未取得/転送中の画像があればnullptr。Core1の単一producerだけが呼ぶ。
+    // 確認後はpublishまで新規frontが生じないため、合成中にtakeされても安全。
+    [[nodiscard]] x68k::u16* tryWriteBuffer();
 
     // 書き終えたフレームを Core0 へ渡す。以後 writeBuffer() は
     // もう 1 枚を返す。

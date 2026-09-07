@@ -3,10 +3,12 @@
 
 #include "storage_flash.h"
 
+#include <algorithm>
 #include <cstring>
 
 #include <esp_log.h>
 #include <esp_partition.h>
+#include <esp_timer.h>
 
 namespace x68k_platform
 {
@@ -36,6 +38,9 @@ struct FlashHeader
 const esp_partition_t* g_part = nullptr;
 FlashHeader g_header{};
 bool g_ready = false;
+const std::uint8_t* g_mapped = nullptr;
+std::size_t g_mappedSize = 0;
+esp_partition_mmap_handle_t g_mapping = 0;
 
 // ビッグエンディアンの 32bit を読む。
 //
@@ -53,6 +58,18 @@ bool readAt(std::uint32_t offset, void* dst, std::size_t size)
     {
         return false;
     }
+    const bool isOutsidePartition = offset > g_part->size || size > g_part->size - offset;
+    if (isOutsidePartition)
+    {
+        return false;
+    }
+    const bool isMapped =
+        g_mapped != nullptr && offset <= g_mappedSize && size <= g_mappedSize - offset;
+    if (isMapped)
+    {
+        std::memcpy(dst, g_mapped + offset, size);
+        return true;
+    }
     return esp_partition_read(g_part, offset, dst, size) == ESP_OK;
 }
 
@@ -61,6 +78,13 @@ bool readAt(std::uint32_t offset, void* dst, std::size_t size)
 bool mountFlashData()
 {
     g_ready = false;
+    const bool hasMapping = g_mapped != nullptr;
+    if (hasMapping)
+    {
+        esp_partition_munmap(g_mapping);
+    }
+    g_mapped = nullptr;
+    g_mappedSize = 0;
 
     g_part =
         esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage");
@@ -97,6 +121,42 @@ bool mountFlashData()
     g_header.index_offset = be32(head + 28);
     g_header.data_offset = be32(head + 32);
     g_header.data_sectors = be32(head + 36);
+
+    std::uint64_t imageEnd = sizeof(head);
+    const auto includeRange = [&](std::uint32_t offset, std::uint64_t size)
+    {
+        const auto end = static_cast<std::uint64_t>(offset) + size;
+        imageEnd = std::max(imageEnd, end);
+        return end <= g_part->size;
+    };
+    const bool hasValidRanges =
+        includeRange(g_header.ipl_offset, g_header.ipl_size) &&
+        includeRange(g_header.cgrom_offset, g_header.cgrom_size) &&
+        includeRange(g_header.index_offset,
+                     static_cast<std::uint64_t>(g_header.disk_sectors) * 4) &&
+        includeRange(g_header.data_offset,
+                     static_cast<std::uint64_t>(g_header.data_sectors) * kSectorSize);
+    if (!hasValidRanges)
+    {
+        ESP_LOGW(kTag, "flash のデータ範囲がパーティション外です");
+        return false;
+    }
+
+    // 全パーティションを写すと未使用領域にもMMU枠を使うため、実データ末尾までに限る。
+    const void* mapped = nullptr;
+    const auto mapResult = esp_partition_mmap(g_part, 0, static_cast<std::size_t>(imageEnd),
+                                              ESP_PARTITION_MMAP_DATA, &mapped, &g_mapping);
+    const bool didMap = mapResult == ESP_OK;
+    if (didMap)
+    {
+        g_mapped = static_cast<const std::uint8_t*>(mapped);
+        g_mappedSize = static_cast<std::size_t>(imageEnd);
+        ESP_LOGI(kTag, "[mapped-read] bytes=%u", static_cast<unsigned>(g_mappedSize));
+    }
+    else
+    {
+        ESP_LOGW(kTag, "[mapped-read-fallback] error=%d", static_cast<int>(mapResult));
+    }
 
     g_ready = true;
     ESP_LOGI(kTag, "flash のデータを使います (IPL %u バイト / ディスク %u セクタ中 %u 実体)",
@@ -142,11 +202,14 @@ bool FlashDisk::readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCoun
     {
         return false;
     }
-    if (lba + sectorCount > g_header.disk_sectors)
+    const bool isOutsideDisk =
+        lba > g_header.disk_sectors || sectorCount > g_header.disk_sectors - lba;
+    if (isOutsideDisk)
     {
         return false;
     }
 
+    const auto startedUs = esp_timer_get_time();
     for (x68k::u32 i = 0; i < sectorCount; ++i)
     {
         std::uint8_t raw[4];
@@ -171,6 +234,15 @@ bool FlashDisk::readSector(x68k::u32 lba, x68k::u8* buffer, x68k::u32 sectorCoun
         {
             return false;
         }
+    }
+    const auto readUs = esp_timer_get_time() - startedUs;
+    readTimeUs_ += readUs;
+    // 全要求のログは再生を妨げるため、音声1ブロックの時間を超えた要求だけ出す。
+    const bool exceedsAudioBlock = readUs >= 32768;
+    if (exceedsAudioBlock)
+    {
+        ESP_LOGI(kTag, "[slow-read] lba=%u sectors=%u us=%lld", static_cast<unsigned>(lba),
+                 static_cast<unsigned>(sectorCount), readUs);
     }
     return true;
 }

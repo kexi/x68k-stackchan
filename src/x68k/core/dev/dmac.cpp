@@ -93,6 +93,17 @@ void Dmac::runTransfer(u32 channel)
 
     const bool isToDevice = (regs[kRegOcr] & kOcrDirectionToMemory) == 0;
 
+    const bool isMonitored = monitor_.nowUs != nullptr && monitor_.completed != nullptr;
+    const auto startedUs = isMonitored ? monitor_.nowUs(monitor_.context) : 0;
+    const auto requestedBytes = count;
+
+    if (!isToDevice)
+    {
+        const u32 transferred = device->tryReadToMemory(*memory_, addr, count);
+        addr += transferred;
+        count -= transferred;
+    }
+
     while (count > 0)
     {
         if (isToDevice)
@@ -149,6 +160,11 @@ void Dmac::runTransfer(u32 channel)
         regs[kRegCer] = kCerBusErrorDevice;
     }
     regs[kRegCsr] = static_cast<u8>(regs[kRegCsr] & ~kCsrChannelActive);
+    if (isMonitored)
+    {
+        const auto transferUs = monitor_.nowUs(monitor_.context) - startedUs;
+        monitor_.completed(monitor_.context, channel, requestedBytes, count, transferUs);
+    }
 }
 
 }  // namespace x68k

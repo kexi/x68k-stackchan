@@ -21,6 +21,8 @@ updated: 2026-08-27
 
 # ナレッジ索引
 
+* [GVRAMのCPUアクセス幅とMODE3表示スクロールの分離](gvram-access-and-scroll.md) - VC R0をCPUアクセス幅に流用した誤りを訂正し、CRTC R20とMODE3 G0スクロールをホストで検証。
+
 X68000 の仕様と、このプロジェクトで実際に手を動かして分かったことを置く。
 
 形式は OKF（Markdown + YAML frontmatter）。`verified` フィールドで

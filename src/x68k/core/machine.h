@@ -178,6 +178,16 @@ public:
         eventDriven_ = enabled;
     }
 
+    // Experimental, opt-in at slice boundaries; step/shadow execution never batches.
+    void setGpipPollAcceleration(bool enabled)
+    {
+        gpipPollAcceleration_ = enabled;
+    }
+    [[nodiscard]] std::uint64_t gpipPollSkippedCycles() const
+    {
+        return gpipPollSkippedCycles_;
+    }
+
     [[nodiscard]] bool eventDriven() const
     {
         return eventDriven_;
@@ -240,8 +250,13 @@ public:
     {
         return bus_;
     }
+    void setDmaTransferMonitor(DmaTransferMonitor monitor)
+    {
+        dmac_.setTransferMonitor(monitor);
+    }
     // DMAC がデータを取りに来る口。SASI のデータインフェーズから 1 バイト渡す。
     bool dmaRead(u8* value) override;
+    u32 tryReadToMemory(DmaMemory& memory, u32 addr, u32 count) override;
     bool dmaWrite(u8 value) override;
 
     // データを受け取り切った後の後始末。DMA 経由と CPU 経由で共有する。
@@ -250,6 +265,7 @@ public:
     // DMAC がメモリを触る口。バスへそのまま流す。
     u8 dmaMemRead(u32 addr) override;
     void dmaMemWrite(u32 addr, u8 value) override;
+    bool tryDmaMemWriteBlock(u32 addr, const u8* data, u32 count) override;
 
     [[nodiscard]] Sram& sram()
     {
@@ -316,6 +332,21 @@ public:
     // リアルタイムループから毎スライス呼べるのはこの早期リターンのため
     // (実測は docs/knowledge/cores3-emulator-runtime.md の音声の節)。
     void renderAudio(std::int16_t* out, std::size_t frames);
+
+    enum class AudioSyncPoint
+    {
+        kAccess,
+        kBoundary,
+        kReset
+    };
+    using AudioSyncCallback = void (*)(void*, Machine&, std::uint64_t, AudioSyncPoint);
+    // Core1専用。callbackからrun/step/MMIOへ再入しない。reset時はPCM端数も破棄する。
+    void setAudioSyncCallback(void* context, AudioSyncCallback callback)
+    {
+        audioSyncContext_ = context;
+        audioSyncCallback_ = callback;
+    }
+    [[nodiscard]] std::uint64_t audioGuestCycles() const;
 
     // キーボードから 1 バイト届いた。
     void pressKey(u8 scanCode);
@@ -446,9 +477,11 @@ private:
     // run() の本体。スイッチの組み合わせごとに実体化する。
     template <bool FastMfp, bool FastRtc, bool FastCrtc>
     u32 runWith(u32 cycles);
+    u32 runDispatch(u32 cycles);
+    void syncAudio(AudioSyncPoint point);
 
     // イベント駆動版の run()。毎命令は debt_ への加算とゼロ比較だけになる。
-    template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative = false>
+    template <bool FastMfp, bool FastRtc, bool FastCrtc, bool UseNative = false, bool Poll = false>
     u32 runEventDriven(u32 cycles);
 
     // 上の 3 段ネストを UseNative ごとに 1 回ずつ通すための入口。
@@ -457,7 +490,7 @@ private:
     // RTC だけ切ったつもりが MFP と CRTC まで切れて、どれが効いたのか
     // 分からなくなる」失敗を既に記録している (perf_switch.h)。測定器が
     // 測定対象を勝手に変える形は採らない。素直に実体化を増やす。
-    template <bool UseNative>
+    template <bool UseNative, bool Poll = false>
     u32 dispatchEventDriven(u32 cycles);
 
     // 段 1 の shadow 検証を回す run()。**ホスト専用**。
@@ -482,9 +515,8 @@ private:
     // 溜まった時間をデバイスへ流し、「機械全体が今の時刻に追いついた」
     // 証明を返す。イベント駆動でないときは何もせず証明だけ返す。
     //
-    // 実行時の bool を見るが、ここは I/O アクセスの経路であって毎命令の
-    // ホットループではない。ゲストが $E88000 台を読むのは割り込みハンドラの
-    // 中や初期化のときだけで、頻度が 3 桁違う。
+    // I/Oポーリングもここへ来る。期限前のGPIPのように読取値が不変と
+    // 証明できる場合だけ呼出側で省略し、timer/statusは必ず実体化する。
     [[nodiscard]] Settled materialize();
 
     // 時間で動くデバイスのレジスタを読む。実体化してからでないと呼べない。
@@ -595,6 +627,8 @@ private:
     Scheduler sched_{};
 
     bool eventDriven_ = false;
+    bool gpipPollAcceleration_ = false;
+    std::uint64_t gpipPollSkippedCycles_ = 0;
     bool shadowVerify_ = false;
     u32 shadowMismatches_ = 0;
     u32 shadowChecks_ = 0;
@@ -620,6 +654,12 @@ private:
     Scc scc_;
     IoSc iosc_;
     Opm opm_;
+    std::uint64_t audioCompletedCycles_ = 0;
+    std::uint64_t audioSchedulerStart_ = 0;
+    const u32* audioLinearSpent_ = nullptr;
+    bool audioEventRun_ = false;
+    void* audioSyncContext_ = nullptr;
+    AudioSyncCallback audioSyncCallback_ = nullptr;
     Adpcm adpcm_;
     Sprite sprite_;
     Dmac dmac_;

@@ -24,6 +24,7 @@
 #include <cstdint>
 
 #include "../cpu/m68k_types.h"
+#include "../video/visual_damage.h"
 
 namespace x68k
 {
@@ -47,6 +48,27 @@ public:
 
     [[nodiscard]] u16 read(u32 regIndex) const;
     void write(u32 regIndex, u16 value);
+
+    // CPU の G-VRAM 窓は表示側 VC R0 とは独立した R20 の設定で選ぶ。
+    [[nodiscard]] u16 graphicAccessMode() const
+    {
+        return reg_[20] & 0x0300u;
+    }
+
+    [[nodiscard]] bool graphicBufferAccess() const
+    {
+        return (reg_[20] & 0x0800u) != 0;
+    }
+
+    [[nodiscard]] u32 graphicScrollX() const
+    {
+        return reg_[12] & 0x01FFu;
+    }
+
+    [[nodiscard]] u32 graphicScrollY() const
+    {
+        return reg_[13] & 0x01FFu;
+    }
 
     // CPU サイクルぶん時間を進める。戻り値は垂直帰線の状態が変化したかどうか。
     // フレーム内の位置を進める。垂直帰線に入った / 出たなら true。
@@ -143,6 +165,10 @@ private:
 class VideoController
 {
 public:
+    void setVisualDamage(VisualDamage damage)
+    {
+        damage_ = damage;
+    }
     // テキスト/スプライト用パレットは 16 色。$E82200 から。
     static constexpr u32 kTextPaletteCount = 16;
     // グラフィック用パレットは 256 色。$E82000 から。
@@ -346,6 +372,7 @@ public:
 
 private:
     std::array<u16, kTextPaletteCount> textPalette_{};
+    VisualDamage damage_{};
     std::array<u16, kGraphicPaletteCount> graphicPalette_{};
     // R0: 画面モード、R1: プライオリティ、R2: 表示制御。
     u16 screenMode_ = 0;

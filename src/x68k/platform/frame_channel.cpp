@@ -6,9 +6,21 @@
 namespace x68k_platform
 {
 
+FrameChannel::~FrameChannel()
+{
+    // 所有タスク停止後だけ破棄する。使用中のmutexを時間待ちで解放しない。
+    const bool isInitialized = mutex_ != nullptr;
+    if (isInitialized)
+    {
+        vSemaphoreDelete(mutex_);
+    }
+}
+
 bool FrameChannel::begin(x68k::u16* bufferA, x68k::u16* bufferB)
 {
-    if (bufferA == nullptr || bufferB == nullptr)
+    const bool invalidBuffers = bufferA == nullptr || bufferB == nullptr || bufferA == bufferB;
+    const bool alreadyInitialized = mutex_ != nullptr;
+    if (invalidBuffers || alreadyInitialized)
     {
         return false;
     }
@@ -24,6 +36,20 @@ bool FrameChannel::begin(x68k::u16* bufferA, x68k::u16* bufferB)
     hasNewFrame_ = false;
     isFrontInUse_ = false;
     return true;
+}
+
+x68k::u16* FrameChannel::tryWriteBuffer()
+{
+    const bool isInitialized = mutex_ != nullptr;
+    if (!isInitialized)
+    {
+        return nullptr;
+    }
+    xSemaphoreTake(mutex_, portMAX_DELAY);
+    const bool mayPublish = !isFrontInUse_ && !hasNewFrame_;
+    auto* const result = mayPublish ? writeBuffer_ : nullptr;
+    xSemaphoreGive(mutex_);
+    return result;
 }
 
 bool FrameChannel::publish()

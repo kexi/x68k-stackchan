@@ -91,6 +91,8 @@ public:
     //   height   : 切り出す高さ (ピクセル)
     //   out      : 変換先。width * height 個の u16 が必要
     //   outStride: out の 1 行あたりの要素数 (width と違う場合に指定)
+    //   crtc     : MODE3 の G0 XY scroll。nullptr は raw fixture の互換用で、
+    //              本番の Machine 経路では必ず実 CRTC を渡す。
     //
     // 表示が許可されたグラフィックページどうしを、$E82500 の GP3-GP0 の順
     // (値が小さいほど手前) に重ねる。手前のページが透明なドットでは、その
@@ -98,7 +100,7 @@ public:
     // (out の元の内容が残る)。背後の面を先に描いてからこれを呼べば
     // 面どうしの重ね合わせになる。
     static void render(const u8* vram, const VideoController& video, u32 srcX, u32 srcY, u32 width,
-                       u32 height, u16* out, u32 outStride);
+                       u32 height, u16* out, u32 outStride, const Crtc* crtc = nullptr);
 
     // テキスト画面とグラフィック画面を優先順位に従って合成する。
     //
@@ -109,7 +111,8 @@ public:
     // 透明ドット (パレット番号 0) は背後が透ける。どちらの面も出ない位置は
     // 黒 (RGB565 の 0) になる。
     static void composite(const u8* graphicVram, const u8* textVram, const VideoController& video,
-                          u32 srcX, u32 srcY, u32 width, u32 height, u16* out, u32 outStride);
+                          u32 srcX, u32 srcY, u32 width, u32 height, u16* out, u32 outStride,
+                          const Crtc* crtc = nullptr);
 
 private:
     // テキスト画面を透明を考慮して重ねる。

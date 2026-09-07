@@ -12,7 +12,10 @@
 #define X68K_PLATFORM_SPEAKER_M5_H
 
 #include <M5Unified.h>
+#include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <cstring>
+#include <memory>
 
 #include "audio.h"
 
@@ -22,6 +25,19 @@ namespace x68k_platform
 class M5SpeakerSink final : public AudioSink
 {
 public:
+    struct SubmissionStats
+    {
+        std::uint32_t accepted = 0;
+        std::uint32_t rejected = 0;
+        std::uint32_t emptyBeforeSubmit = 0;
+    };
+
+    // writeと同じ音声タスクから読む。DMAのアンダーラン回数ではない。
+    [[nodiscard]] SubmissionStats submissionStats() const
+    {
+        return submissions_;
+    }
+
     // 出力レート。Machine の合成レート (OPM/ADPCM とも既定 15625Hz) と揃える。
     //
     // Why not 48000Hz (M5Unified の既定) にするか: 揃えないと playRaw の
@@ -34,6 +50,20 @@ public:
     // スピーカーを開始する。使えなければ false。
     bool begin()
     {
+        // 内部RAMはCPUタスクのスタック用に残す。ここはDMAへ直接渡さないPCM。
+        const bool needsStorage = playback_ == nullptr;
+        if (needsStorage)
+        {
+            playback_.reset(static_cast<std::int16_t*>(
+                heap_caps_malloc(3 * AudioChannel::kBlockFrames * sizeof(std::int16_t),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)));
+        }
+        const bool hasStorage = playback_ != nullptr;
+        if (!hasStorage)
+        {
+            ESP_LOGW("x68k.spk", "PCM保持用PSRAMを確保できません");
+            return false;
+        }
         auto cfg = M5.Speaker.config();
         cfg.sample_rate = kSampleRate;
         cfg.stereo = false;
@@ -78,7 +108,9 @@ public:
 
         // 既定の音量は最大 (255)。CoreS3 の内蔵スピーカーで X68000 の
         // FM を最大振幅で鳴らすと割れるので下げる。
-        M5.Speaker.setVolume(160);
+        // 深夜作業のため最小音量。元は 40/255。
+        // 音が鳴っていることは確認できるが、部屋には響かない水準にする。
+        M5.Speaker.setVolume(40);
 
         ESP_LOGI("x68k.spk", "スピーカー: %u Hz pin_data_out=%d bck=%d ws=%d core=%u",
                  static_cast<unsigned>(cfg.sample_rate), cfg.pin_data_out, cfg.pin_bck, cfg.pin_ws,
@@ -86,25 +118,77 @@ public:
         return true;
     }
 
+    bool restartStream() override
+    {
+        // end() joins the M5 output task and clears both wavinfo references.
+        // Do not rely on elapsed time, stop(channel), or playRaw's return alone.
+        M5.Speaker.end();
+        nextPlayback_ = 0;
+        hasSubmitted_ = false;
+        return begin();
+    }
+
     void end()
     {
         M5.Speaker.end();
+        playback_.reset();
+        nextPlayback_ = 0;
+        submissions_ = {};
+        hasSubmitted_ = false;
     }
 
     void write(const std::int16_t* samples, std::size_t frames) override
     {
+        const bool isInvalid = playback_ == nullptr || samples == nullptr || frames == 0 ||
+                               frames > AudioChannel::kBlockFrames;
+        if (isInvalid)
+        {
+            ++submissions_.rejected;
+            return;
+        }
+        const bool running = M5.Speaker.isEnabled() && M5.Speaker.isRunning();
+        if (!running)
+        {
+            // playRaw may report true without a live output task. Keep retained storage
+            // untouched until the owner explicitly ends/reinitializes the sink.
+            ++submissions_.rejected;
+            return;
+        }
+        // M5はcurrent/nextの2枚を保持する。第3領域へコピーしてから送る。
+        // 単一送信者・channel 0・repeat 1・割り込み再生なしの場合、
+        // nの受付完了時にはn-2は解放済み。リング段数では寿命を保証できない。
+        std::int16_t* owned = playback_.get() + nextPlayback_ * AudioChannel::kBlockFrames;
+        std::memcpy(owned, samples, frames * sizeof(*samples));
         // stop_current_sound = false。前のブロックを切らずに後ろへ繋ぐ。
         //
         // 前の 2 枚がまだ再生待ちならここで待つ (Speaker_Class.cpp の
         // _set_next_wav)。待つのはこのタスクだけで、エミュレーションコアは
         // リングへ積むだけなので影響を受けない。これがリングを挟んだ理由。
-        M5.Speaker.playRaw(samples, frames, kSampleRate, false, 1, 0, false);
+        // ch0だけを使う。個別chのvolatileなrepeat値ではなく公開APIのatomic値を読む。
+        // 空でもI2S DMAに音が残る場合があり、実際の音切れと同一視しない。
+        const bool wasEmpty = hasSubmitted_ && M5.Speaker.getPlayingChannels() == 0;
+        const bool accepted = M5.Speaker.playRaw(owned, frames, kSampleRate, false, 1, 0, false);
+        if (accepted)
+        {
+            ++submissions_.accepted;
+            submissions_.emptyBeforeSubmit += wasEmpty ? 1u : 0u;
+            hasSubmitted_ = true;
+            nextPlayback_ = (nextPlayback_ + 1) % 3;
+            return;
+        }
+        ++submissions_.rejected;
     }
 
     [[nodiscard]] x68k::u32 sampleRate() const override
     {
         return kSampleRate;
     }
+
+private:
+    std::unique_ptr<std::int16_t[], decltype(&heap_caps_free)> playback_{nullptr, heap_caps_free};
+    std::size_t nextPlayback_ = 0;
+    SubmissionStats submissions_{};
+    bool hasSubmitted_ = false;
 };
 
 }  // namespace x68k_platform

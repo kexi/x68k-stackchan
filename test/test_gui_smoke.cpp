@@ -444,7 +444,7 @@ struct GuiFixture
     {
         std::vector<x68k::u16> pixels(static_cast<std::size_t>(width) * height, 0);
         x68k::GraphicRaster::composite(graphicVram.data(), textVram.data(), machine.video(), 0, 0,
-                                       width, height, pixels.data(), width);
+                                       width, height, pixels.data(), width, &machine.crtc());
         return pixels;
     }
 };

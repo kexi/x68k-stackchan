@@ -58,7 +58,7 @@ public:
     // 「スプライト面が最前面」に固定する。実機で確かめられたら見直す。
     static void render(const u8* graphicVram, const u8* textVram, const Sprite* sprite,
                        const VideoController& video, u32 srcX, u32 srcY, u32 width, u32 height,
-                       u16* out, u32 outStride);
+                       u16* out, u32 outStride, const Crtc* crtc = nullptr);
 };
 
 }  // namespace x68k

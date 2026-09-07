@@ -101,6 +101,7 @@ void VideoController::reset()
     // IPL-ROM が SRAM の値で上書きするが、それ以前に何か描かれても
     // 真っ黒にならないよう白を入れておく。
     textPalette_[1] = 0xFFFF;
+    damage_.all();
 }
 
 u16 VideoController::read(u32 addr) const
@@ -134,6 +135,12 @@ u16 VideoController::read(u32 addr) const
 void VideoController::write(u32 addr, u16 value)
 {
     const u32 offset = addr & 0x3FFFu;
+    const bool changes = read(addr) != value;
+    const bool supported = offset < 0x400 || offset == 0x400 || offset == 0x500 || offset == 0x600;
+    if (changes && supported)
+    {
+        damage_.all();
+    }
 
     if (offset < 0x200)
     {

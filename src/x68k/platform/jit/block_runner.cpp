@@ -94,6 +94,19 @@ BlockSlot* BlockRunner::translate(M68k& cpu, std::uint32_t entryPc)
     if (codeFull_)
     {
         ++stats_.fullDeferred;
+        const bool sampleCapacity =
+            capacitySampling_ && stats_.fullDeferred % kCapacitySamplePeriod == 0;
+        if (sampleCapacity)
+        {
+            // バスを読まず、実行前prefetch済みopcodeを純粋なplanOneへ渡す。
+            // 満杯経路で実翻訳を試すと、測る対象のキャッシュ状態まで変わる。
+            const auto opcode = cpu.state().ir;
+            PlannedOp operation{};
+            const bool recognized = BlockPlanner::planOne(opcode, entryPc, operation);
+            ++stats_.capacitySamples;
+            stats_.capacityRecognized += recognized ? 1u : 0u;
+            ++stats_.capacityOpcodeGroups[opcode >> 12];
+        }
         if (++fullSeen_ >= kCapacityResetThreshold)
         {
             // reset() が codeFull_ を false へ戻し、スロットと負の記憶も

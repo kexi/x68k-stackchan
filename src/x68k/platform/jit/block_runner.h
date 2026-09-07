@@ -263,6 +263,12 @@ public:
         return stats_;
     }
 
+    void setCapacitySampling(bool enabled)
+    {
+        capacitySampling_ = enabled;
+    }
+    static constexpr u64 kCapacitySamplePeriod = 4096;
+
     // 満杯のまま何回諦めたら全部捨てるか。
     //
     // 捨てる費用は常駐ブロック (16KB に 100 本前後) の再翻訳まるごと。
@@ -435,6 +441,7 @@ private:
     // 直近に見た写像の世代。変わったら負の記憶を全部捨てる。
     std::uint32_t seenEpoch_ = 0;
     NativeStats stats_{};
+    bool capacitySampling_ = false;
     // 実行可能メモリを使い切ったら、それ以上翻訳しない。
     bool codeFull_ = false;
     // 満杯のまま諦めた回数 (kCapacityResetThreshold に達したら捨てる)。

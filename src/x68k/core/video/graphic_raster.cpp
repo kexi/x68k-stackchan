@@ -190,7 +190,7 @@ u16 GraphicRaster::pixelColor(const u8* vram, const VideoController& video, u32 
 // --- 矩形の変換 -------------------------------------------------------------
 
 void GraphicRaster::render(const u8* vram, const VideoController& video, u32 srcX, u32 srcY,
-                           u32 width, u32 height, u16* out, u32 outStride)
+                           u32 width, u32 height, u16* out, u32 outStride, const Crtc* crtc)
 {
     if (vram == nullptr || out == nullptr)
     {
@@ -208,6 +208,12 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     u16 palette[VideoController::kGraphicPaletteCount];
     const bool isDirectColor = mode == VideoController::GraphicColorMode::k65536Color ||
                                mode == VideoController::GraphicColorMode::kReserved;
+    // G0 の表示 fetch だけを折り返す。viewport や text/sprite 座標は動かさない。
+    // nullptr は raw VRAM の既存単体 fixture 用。本番は実 CRTC を渡す。
+    const bool scrollDirect =
+        crtc != nullptr && mode == VideoController::GraphicColorMode::k65536Color;
+    const u32 scrollX = scrollDirect ? crtc->graphicScrollX() : 0u;
+    const u32 scrollY = scrollDirect ? crtc->graphicScrollY() : 0u;
     if (!isDirectColor)
     {
         for (u32 i = 0; i < VideoController::kGraphicPaletteCount; ++i)
@@ -269,7 +275,8 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
     for (u32 y = 0; y < height; ++y)
     {
         const u32 vy = srcY + y;
-        if (vy >= screen.height)
+        const bool outsideY = !scrollDirect && vy >= screen.height;
+        if (outsideY)
         {
             break;
         }
@@ -279,7 +286,8 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
         for (u32 x = 0; x < width; ++x)
         {
             const u32 vx = srcX + x;
-            if (vx >= screen.width)
+            const bool outsideX = !scrollDirect && vx >= screen.width;
+            if (outsideX)
             {
                 break;
             }
@@ -291,7 +299,9 @@ void GraphicRaster::render(const u8* vram, const VideoController& video, u32 src
                 // Why not ここでもページを重ねないか: 65536 色モードの表示
                 // ページは 1 枚しかない (IPL-ROM は $FFB30C で GS3-GS0 を
                 // moveq #$F と一括で立てる)。重ねる相手が存在しない。
-                const u16 color = readWord(vram, wordIndexOf(vx, vy));
+                const u32 sampleX = scrollDirect ? ((vx + scrollX) & 511u) : vx;
+                const u32 sampleY = scrollDirect ? ((vy + scrollY) & 511u) : vy;
+                const u16 color = readWord(vram, wordIndexOf(sampleX, sampleY));
                 if (color != 0)
                 {
                     row[x] = VideoController::toRgb565(color);
@@ -443,7 +453,7 @@ void GraphicRaster::renderTextOver(const u8* vram, const VideoController& video,
 
 void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
                               const VideoController& video, u32 srcX, u32 srcY, u32 width,
-                              u32 height, u16* out, u32 outStride)
+                              u32 height, u16* out, u32 outStride, const Crtc* crtc)
 {
     if (out == nullptr)
     {
@@ -480,7 +490,7 @@ void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
     {
         if (showGraphic)
         {
-            render(graphicVram, video, srcX, srcY, width, height, out, outStride);
+            render(graphicVram, video, srcX, srcY, width, height, out, outStride, crtc);
         }
         if (showText)
         {
@@ -495,7 +505,7 @@ void GraphicRaster::composite(const u8* graphicVram, const u8* textVram,
     }
     if (showGraphic)
     {
-        render(graphicVram, video, srcX, srcY, width, height, out, outStride);
+        render(graphicVram, video, srcX, srcY, width, height, out, outStride, crtc);
     }
 }
 

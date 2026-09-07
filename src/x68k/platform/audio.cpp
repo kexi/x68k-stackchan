@@ -12,22 +12,51 @@
 namespace x68k_platform
 {
 
-const std::int16_t* AudioChannel::pop()
+const std::int16_t* AudioChannel::readBlock()
 {
-    const std::size_t read = readIndex_.load(std::memory_order_relaxed);
+    std::size_t read = readIndex_.load(std::memory_order_relaxed);
+    if (readLeased_)
+    {
+        return blocks_[read % kBlockCount];
+    }
+    const auto discard = discardBefore_.load(std::memory_order_acquire);
+    const auto staleCount = discard - read;
+    const bool hasStalePrefix = staleCount != 0 && staleCount < kBlockCount;
+    if (hasStalePrefix)
+    {
+        read = discard;
+        readIndex_.store(read, std::memory_order_release);
+    }
 
     // acquire で読むのは、生産側が commit (release) するより前に書いた
     // サンプルがこちらから見えることを保証するため。これが無いと、
     // インデックスだけ進んで中身が古いままのブロックを鳴らしうる。
     const std::size_t write = writeIndex_.load(std::memory_order_acquire);
-    if (read == write)
+    const bool isEmpty = read == write;
+    if (isEmpty)
     {
         return nullptr;
     }
 
-    const std::int16_t* const block = blocks_[read % kBlockCount];
+    readLeased_ = true;
+    return blocks_[read % kBlockCount];
+}
+
+void AudioChannel::releaseRead()
+{
+    const bool hasLease = readLeased_;
+    if (!hasLease)
+    {
+        return;
+    }
+    readLeased_ = false;
+    const std::size_t read = readIndex_.load(std::memory_order_relaxed);
+    const bool isEmpty = read == writeIndex_.load(std::memory_order_acquire);
+    if (isEmpty)
+    {
+        return;
+    }
     readIndex_.store(read + 1, std::memory_order_release);
-    return block;
 }
 
 std::int16_t* AudioChannel::writeBlock()
@@ -57,8 +86,15 @@ std::int16_t* AudioChannel::writeBlock()
 void AudioChannel::commit()
 {
     const std::size_t write = writeIndex_.load(std::memory_order_relaxed);
-    // release で公開する。上の pop の acquire と対になる。
+    // release で公開する。上の readBlock の acquire と対になる。
     writeIndex_.store(write + 1, std::memory_order_release);
+}
+
+void AudioChannel::restartStream(bool paused)
+{
+    discardBefore_.store(writeIndex_.load(std::memory_order_relaxed), std::memory_order_release);
+    const auto epoch = (streamState_.load(std::memory_order_relaxed) + 2u) & ~1u;
+    streamState_.store(epoch | (paused ? 1u : 0u), std::memory_order_release);
 }
 
 std::size_t AudioChannel::pending() const
@@ -106,9 +142,17 @@ std::int32_t peakAmplitude(const std::int16_t* samples, std::size_t frames)
 std::size_t drainAudio(AudioChannel& channel, AudioSink& sink)
 {
     std::size_t written = 0;
-    while (const std::int16_t* block = channel.pop())
+    const std::size_t budget = channel.pending();
+    for (std::size_t i = 0; i < budget; ++i)
     {
+        const std::int16_t* block = channel.readBlock();
+        const bool isEmpty = block == nullptr;
+        if (isEmpty)
+        {
+            break;
+        }
         sink.write(block, AudioChannel::kBlockFrames);
+        channel.releaseRead();
         ++written;
     }
     return written;
